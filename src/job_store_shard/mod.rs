@@ -39,7 +39,7 @@ use crate::gubernator::RateLimitClient;
 use crate::job::{JobStatus, JobStatusKind, JobView};
 use crate::job_attempt::JobAttemptView;
 use crate::keys::{attempt_key, job_info_key, job_status_key};
-use crate::lease_tracker::LeaseTracker;
+use crate::lease_manager::LeaseManager;
 use crate::metrics::Metrics;
 use crate::query::ShardQueryEngine;
 use crate::settings::DatabaseConfig;
@@ -109,7 +109,7 @@ pub struct JobStoreShard {
     /// The shard's tenant range, immutable after opening.
     range: ShardRange,
     /// In-memory lease tracker to avoid expensive DB scans during reaping.
-    pub(crate) lease_tracker: Arc<LeaseTracker>,
+    pub(crate) lease_manager: Arc<LeaseManager>,
 }
 
 #[derive(Debug, Error)]
@@ -349,7 +349,7 @@ impl JobStoreShard {
         // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready
         concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
 
-        let lease_tracker = Arc::new(LeaseTracker::new());
+        let lease_manager = Arc::new(LeaseManager::new());
 
         let shard = Arc::new(Self {
             name,
@@ -365,12 +365,12 @@ impl JobStoreShard {
             store,
             db_path: db_path.to_string(),
             range: range.clone(),
-            lease_tracker,
+            lease_manager,
         });
 
         // Hydrate the lease tracker from DB in the background
         {
-            let tracker = Arc::clone(&shard.lease_tracker);
+            let tracker = Arc::clone(&shard.lease_manager);
             let db = Arc::clone(&shard.db);
             let range = range.clone();
             tokio::spawn(async move {
@@ -522,8 +522,8 @@ impl JobStoreShard {
 
     /// Update the in-memory lease tracker's expiry for a task, inserting if absent.
     /// Primarily used by tests that directly mutate lease records in the DB.
-    pub fn update_lease_tracker_expiry(&self, task_id: &str, expiry_ms: i64) {
-        self.lease_tracker.insert(task_id.to_string(), expiry_ms);
+    pub fn update_lease_manager_expiry(&self, task_id: &str, expiry_ms: i64) {
+        self.lease_manager.insert(task_id.to_string(), expiry_ms);
     }
 
     /// Get the SlateDB metrics registry for this shard.

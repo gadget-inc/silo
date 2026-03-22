@@ -1017,7 +1017,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_tracker_expiry(&_leased_task_id, expired_ms);
+    shard.update_lease_manager_expiry(&_leased_task_id, expired_ms);
 
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 1);

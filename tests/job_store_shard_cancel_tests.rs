@@ -393,7 +393,7 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
             .await
             .expect("put mutated lease");
         shard.db().flush().await.expect("flush mutated lease");
-        shard.update_lease_tracker_expiry(&_leased_task_id, expired_ms);
+        shard.update_lease_manager_expiry(&_leased_task_id, expired_ms);
 
         // Reap expired leases
         let reaped = shard.reap_expired_leases("-").await.expect("reap");

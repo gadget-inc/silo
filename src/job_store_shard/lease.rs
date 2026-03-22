@@ -76,7 +76,7 @@ impl JobStoreShard {
             .await?;
 
         // Update in-memory lease tracker with new expiry
-        self.lease_tracker.update_expiry(task_id, new_expiry_ms);
+        self.lease_manager.update_expiry(task_id, new_expiry_ms);
 
         // Check cancellation status to return in response
         // Worker discovers cancellation via heartbeat response per Alloy spec
@@ -333,7 +333,7 @@ impl JobStoreShard {
         dst_events::confirm_write(write_op);
 
         // Remove lease from in-memory tracker
-        self.lease_tracker.remove(task_id);
+        self.lease_manager.remove(task_id);
 
         // Post-commit: release in-memory concurrency counts and signal grant scanner.
         for queue in &held_queues_local {
@@ -368,14 +368,14 @@ impl JobStoreShard {
     /// Uses the in-memory lease tracker instead of scanning the DB.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self, _tenant: &str) -> Result<usize, JobStoreShardError> {
-        if !self.lease_tracker.is_hydrated() {
-            self.lease_tracker
+        if !self.lease_manager.is_hydrated() {
+            self.lease_manager
                 .hydrate_from_db(self.db.as_ref(), &self.range)
                 .await;
         }
 
         let now_ms = now_epoch_ms();
-        let expired = self.lease_tracker.expired_leases(now_ms);
+        let expired = self.lease_manager.expired_leases(now_ms);
 
         if expired.is_empty() {
             return Ok(0);
@@ -392,14 +392,14 @@ impl JobStoreShard {
             let maybe_raw = self.db.get(&key).await?;
             let Some(value_bytes) = maybe_raw else {
                 // Lease was already removed (e.g., worker completed between check and reap)
-                self.lease_tracker.remove(task_id);
+                self.lease_manager.remove(task_id);
                 continue;
             };
 
             let decoded = match decode_lease(value_bytes) {
                 Ok(l) => l,
                 Err(_) => {
-                    self.lease_tracker.remove(task_id);
+                    self.lease_manager.remove(task_id);
                     continue;
                 }
             };
@@ -426,7 +426,7 @@ impl JobStoreShard {
                     );
                     continue;
                 }
-                self.lease_tracker.remove(&lease.task_id);
+                self.lease_manager.remove(&lease.task_id);
                 reaped += 1;
                 continue;
             }
@@ -614,8 +614,8 @@ mod tests {
         shard.db().flush().await.expect("flush mutated lease");
 
         // Simulate a freshly reopened shard before background hydration has repopulated the tracker.
-        shard.lease_tracker.clear_for_test();
-        shard.lease_tracker.set_hydrated_for_test(false);
+        shard.lease_manager.clear_for_test();
+        shard.lease_manager.set_hydrated_for_test(false);
 
         let reaped = shard.reap_expired_leases("-").await.expect("reap");
         assert_eq!(reaped, 1, "reaper should hydrate before consulting tracker");

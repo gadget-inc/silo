@@ -20,7 +20,7 @@ pub struct TrackedLease {
 }
 
 /// Thread-safe in-memory tracker for active leases.
-pub struct LeaseTracker {
+pub struct LeaseManager {
     /// task_id → expiry_ms
     leases: DashMap<String, i64>,
     /// Whether the initial DB scan has completed.
@@ -31,7 +31,7 @@ pub struct LeaseTracker {
     hydration_notify: Notify,
 }
 
-impl LeaseTracker {
+impl LeaseManager {
     pub fn new() -> Self {
         Self {
             leases: DashMap::new(),

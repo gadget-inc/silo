@@ -437,7 +437,7 @@ async fn lease_task_leases_are_reaped_after_expiry() {
             .await
             .expect("put mutated lease");
         shard.db().flush().await.expect("flush mutated lease");
-        shard.update_lease_tracker_expiry(&task_id, expired_ms);
+        shard.update_lease_manager_expiry(&task_id, expired_ms);
 
         let reaped = shard.reap_expired_leases("-").await.expect("reap");
         assert_eq!(reaped, 1, "expired direct lease should be reaped");

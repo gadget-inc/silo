@@ -11,7 +11,7 @@ pub mod job;
 pub mod job_attempt;
 pub mod job_store_shard;
 pub mod keys;
-pub mod lease_tracker;
+pub mod lease_manager;
 pub mod metrics;
 pub mod query;
 pub mod retry;

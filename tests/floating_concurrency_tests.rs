@@ -1817,7 +1817,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_tracker_expiry(&task_id, expired_ms);
+    shard.update_lease_manager_expiry(&task_id, expired_ms);
 
     // Reap expired leases - this should handle the expired refresh task
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
@@ -1990,7 +1990,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_tracker_expiry(&task_id, expired_ms);
+    shard.update_lease_manager_expiry(&task_id, expired_ms);
 
     // Reap the expired lease
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
@@ -2138,7 +2138,7 @@ async fn floating_limit_refresh_reap_retries_after_transient_failure() {
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_tracker_expiry(&task_id, expired_ms);
+    shard.update_lease_manager_expiry(&task_id, expired_ms);
 
     // Corrupt the state so the first reap attempt fails inside refresh-task cleanup.
     shard
