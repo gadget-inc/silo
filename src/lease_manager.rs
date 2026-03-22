@@ -51,13 +51,6 @@ impl LeaseManager {
         self.leases.remove(task_id);
     }
 
-    /// Update the expiry of an existing lease (called during heartbeat).
-    pub fn update_expiry(&self, task_id: &str, new_expiry_ms: i64) {
-        if let Some(mut entry) = self.leases.get_mut(task_id) {
-            *entry = new_expiry_ms;
-        }
-    }
-
     /// Returns true if the initial DB hydration scan has completed.
     pub fn is_hydrated(&self) -> bool {
         self.hydrated.load(Ordering::Acquire)

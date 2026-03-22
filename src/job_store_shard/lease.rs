@@ -75,8 +75,10 @@ impl JobStoreShard {
             )
             .await?;
 
-        // Update in-memory lease tracker with new expiry
-        self.lease_manager.update_expiry(task_id, new_expiry_ms);
+        // Update in-memory lease tracker with new expiry (upsert to self-heal
+        // if the lease was missing from the tracker, e.g. during hydration window)
+        self.lease_manager
+            .insert(task_id.to_string(), new_expiry_ms);
 
         // Check cancellation status to return in response
         // Worker discovers cancellation via heartbeat response per Alloy spec
