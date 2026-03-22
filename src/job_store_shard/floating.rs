@@ -207,6 +207,8 @@ impl JobStoreShard {
 
         self.db.write(batch).await?;
 
+        self.lease_manager.remove(task_id);
+
         tracing::debug!(
             queue_key = %queue_key,
             new_max_concurrency = new_max_concurrency,
@@ -309,6 +311,8 @@ impl JobStoreShard {
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
+
+        self.lease_manager.remove(task_id);
 
         if has_waiters {
             tracing::warn!(
