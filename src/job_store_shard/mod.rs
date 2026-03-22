@@ -526,6 +526,45 @@ impl JobStoreShard {
         self.lease_manager.insert(task_id.to_string(), expiry_ms);
     }
 
+    /// Verify that the in-memory lease manager is consistent with the DB.
+    /// Returns (manager_count, db_count, missing_from_manager, extra_in_manager).
+    /// In a correct system, missing and extra should both be empty.
+    pub async fn verify_lease_manager_consistency(
+        &self,
+    ) -> Result<(usize, usize, Vec<String>, Vec<String>), JobStoreShardError> {
+        use std::collections::HashSet;
+
+        // Collect all lease task_ids from the DB
+        let start = crate::keys::leases_prefix();
+        let end = crate::keys::end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut db_task_ids: HashSet<String> = HashSet::new();
+        while let Some(kv) = iter.next().await? {
+            if let Ok(decoded) = crate::codec::decode_lease(kv.value.clone()) {
+                if let Some(task_id) = decoded.task_id() {
+                    db_task_ids.insert(task_id.to_string());
+                } else if let Some((task_id, _)) = decoded.refresh_floating_limit_info() {
+                    db_task_ids.insert(task_id.to_string());
+                }
+            }
+        }
+
+        // Collect all task_ids from the lease manager
+        let manager_task_ids: HashSet<String> = self.lease_manager.all_task_ids();
+
+        let missing_from_manager: Vec<String> =
+            db_task_ids.difference(&manager_task_ids).cloned().collect();
+        let extra_in_manager: Vec<String> =
+            manager_task_ids.difference(&db_task_ids).cloned().collect();
+
+        Ok((
+            manager_task_ids.len(),
+            db_task_ids.len(),
+            missing_from_manager,
+            extra_in_manager,
+        ))
+    }
+
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {

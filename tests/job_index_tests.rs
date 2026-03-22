@@ -1,9 +1,7 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
-use silo::task::LeaseRecord;
 use test_helpers::*;
 
 #[silo::test]
@@ -238,20 +236,8 @@ async fn reaper_without_retries_marks_failed_in_index() {
         .attempt()
         .task_id()
         .to_string();
-    // Make lease expired
-    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    let decoded = decode_lease(lease_value).expect("decode lease");
-    let expired = LeaseRecord {
-        worker_id: decoded.worker_id().to_string(),
-        task: decoded.to_task().unwrap(),
-        expiry_ms: now_ms() - 1,
-        started_at_ms: decoded.started_at_ms(),
-    };
-    let new_val = encode_lease(&expired);
-    shard.db().put(&lease_key, &new_val).await.unwrap();
-    shard.db().flush().await.unwrap();
-    shard.update_lease_manager_expiry(&_tid, now_ms() - 1);
-    // Reap
+    // Make lease expired and reap
+    expire_first_lease(&shard, &_tid).await;
     let _ = shard.reap_expired_leases("-").await.unwrap();
     // Should be Failed in index (no retries)
     let failed = shard
@@ -291,19 +277,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
         .attempt()
         .task_id()
         .to_string();
-    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    let decoded = decode_lease(lease_value).expect("decode lease");
-    let expired = LeaseRecord {
-        worker_id: decoded.worker_id().to_string(),
-        task: decoded.to_task().unwrap(),
-        expiry_ms: now_ms() - 1,
-        started_at_ms: decoded.started_at_ms(),
-    };
-    let new_val = encode_lease(&expired);
-    shard.db().put(&lease_key, &new_val).await.unwrap();
-    shard.db().flush().await.unwrap();
-    shard.update_lease_manager_expiry(&_tid, now_ms() - 1);
-    // Reap
+    expire_first_lease(&shard, &_tid).await;
     let _ = shard.reap_expired_leases("-").await.unwrap();
     // Should be Scheduled in index (retries present)
     let scheduled = shard

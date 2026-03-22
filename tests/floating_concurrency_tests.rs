@@ -6,10 +6,9 @@
 
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
-use silo::task::{LeaseRecord, Task};
+use silo::task::Task;
 
 use test_helpers::*;
 
@@ -1780,7 +1779,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
 
     // Verify the lease was created
     let lease_key = silo::keys::leased_task_key(&task_id);
-    let lease_raw = shard
+    let _lease_raw = shard
         .db()
         .get(&lease_key)
         .await
@@ -1801,23 +1800,8 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         "refresh_task_scheduled should be true after dequeue"
     );
 
-    // Manually mutate the lease to make it expired (this is how other tests handle lease expiry)
-    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
-    let expired_ms = now_ms() - 1; // Set expiry to the past
-    let new_record = LeaseRecord {
-        worker_id: decoded_lease.worker_id().to_string(),
-        task: decoded_lease.to_task().unwrap(),
-        expiry_ms: expired_ms,
-        started_at_ms: decoded_lease.started_at_ms(),
-    };
-    let new_val = encode_lease(&new_record);
-    shard
-        .db()
-        .put(&lease_key, &new_val)
-        .await
-        .expect("put mutated lease");
-    shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_manager_expiry(&task_id, expired_ms);
+    // Force-expire the lease so the reaper picks it up
+    expire_first_lease(&shard, &task_id).await;
 
     // Reap expired leases - this should handle the expired refresh task
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
@@ -1969,28 +1953,13 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
 
     // Mutate the lease to be expired (simulating worker crash)
     let lease_key = silo::keys::leased_task_key(&task_id);
-    let lease_raw = shard
+    let _lease_raw = shard
         .db()
         .get(&lease_key)
         .await
         .expect("db get")
         .expect("lease should exist");
-    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
-    let expired_ms = now_ms() - 1; // Set expiry to the past
-    let new_record = LeaseRecord {
-        worker_id: decoded_lease.worker_id().to_string(),
-        task: decoded_lease.to_task().unwrap(),
-        expiry_ms: expired_ms,
-        started_at_ms: decoded_lease.started_at_ms(),
-    };
-    let new_val = encode_lease(&new_record);
-    shard
-        .db()
-        .put(&lease_key, &new_val)
-        .await
-        .expect("put mutated lease");
-    shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_manager_expiry(&task_id, expired_ms);
+    expire_first_lease(&shard, &task_id).await;
 
     // Reap the expired lease
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
@@ -2110,7 +2079,7 @@ async fn floating_limit_refresh_reap_retries_after_transient_failure() {
 
     let lease_key = silo::keys::leased_task_key(&task_id);
     let state_key = silo::keys::floating_limit_state_key("-", &queue);
-    let lease_raw = shard
+    let _lease_raw = shard
         .db()
         .get(&lease_key)
         .await
@@ -2123,22 +2092,7 @@ async fn floating_limit_refresh_reap_retries_after_transient_failure() {
         .expect("db get")
         .expect("state should exist");
 
-    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
-    let expired_ms = now_ms() - 1;
-    let new_record = LeaseRecord {
-        worker_id: decoded_lease.worker_id().to_string(),
-        task: decoded_lease.to_task().unwrap(),
-        expiry_ms: expired_ms,
-        started_at_ms: decoded_lease.started_at_ms(),
-    };
-    let new_val = encode_lease(&new_record);
-    shard
-        .db()
-        .put(&lease_key, &new_val)
-        .await
-        .expect("put mutated lease");
-    shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_manager_expiry(&task_id, expired_ms);
+    expire_first_lease(&shard, &task_id).await;
 
     // Corrupt the state so the first reap attempt fails inside refresh-task cleanup.
     shard

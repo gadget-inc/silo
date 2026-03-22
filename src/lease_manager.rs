@@ -63,6 +63,11 @@ impl LeaseManager {
         self.hydrated.load(Ordering::Acquire)
     }
 
+    /// Return the set of all tracked task IDs.
+    pub fn all_task_ids(&self) -> std::collections::HashSet<String> {
+        self.leases.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Return all leases that have expired as of `now_ms`.
     pub fn expired_leases(&self, now_ms: i64) -> Vec<TrackedLease> {
         self.leases

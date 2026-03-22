@@ -1,10 +1,10 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, decode_task, encode_lease};
+use silo::codec::decode_task;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
 use silo::retry::{RetryPolicy, next_retry_time_ms};
-use silo::task::{LeaseRecord, Task};
+use silo::task::Task;
 
 use test_helpers::*;
 
@@ -1000,29 +1000,14 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .tasks;
     let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
-    // Find the lease and rewrite expiry to the past
-    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    let decoded = decode_lease(lease_value).expect("decode lease");
-    let expired_ms = now_ms() - 1;
-    let new_record = LeaseRecord {
-        worker_id: decoded.worker_id().to_string(),
-        task: decoded.to_task().unwrap(),
-        expiry_ms: expired_ms,
-        started_at_ms: decoded.started_at_ms(),
-    };
-    let new_val = encode_lease(&new_record);
-    shard
-        .db()
-        .put(&lease_key, &new_val)
-        .await
-        .expect("put mutated lease");
-    shard.db().flush().await.expect("flush mutated lease");
-    shard.update_lease_manager_expiry(&_leased_task_id, expired_ms);
+    // Force-expire the lease so the reaper picks it up
+    expire_first_lease(&shard, &_leased_task_id).await;
 
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 1);
 
     // Lease removed
+    let lease_key = silo::keys::leased_task_key(&_leased_task_id);
     let lease = shard
         .db()
         .get(&lease_key)

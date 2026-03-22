@@ -1,11 +1,11 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, decode_task, encode_concurrency_action, encode_lease};
+use silo::codec::{decode_task, encode_concurrency_action};
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::keys::{concurrency_holder_key, concurrency_request_key};
 use silo::retry::RetryPolicy;
-use silo::task::{ConcurrencyAction, LeaseRecord, Task};
+use silo::task::{ConcurrencyAction, Task};
 use slatedb::{DbIterator, WriteBatch};
 
 use test_helpers::*;
@@ -651,25 +651,8 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .tasks;
     let _leased_task_id = tasks[0].attempt().task_id().to_string();
 
-    // Find the lease and rewrite expiry to the past
-    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-    let decoded = decode_lease(lease_value).expect("decode lease");
-    let expired_ms = now_ms() - 1;
-    let new_record = LeaseRecord {
-        worker_id: decoded.worker_id().to_string(),
-        task: decoded.to_task().unwrap(),
-        expiry_ms: expired_ms,
-        started_at_ms: decoded.started_at_ms(),
-    };
-    let new_val = encode_lease(&new_record);
-    shard
-        .db()
-        .put(&lease_key, &new_val)
-        .await
-        .expect("put mutated lease");
-    shard.db().flush().await.expect("flush mutated lease");
-    // Also update in-memory lease tracker so the reaper sees the expired lease
-    shard.update_lease_manager_expiry(&_leased_task_id, expired_ms);
+    // Force-expire the lease so the reaper picks it up
+    expire_first_lease(&shard, &_leased_task_id).await;
 
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
     assert_eq!(reaped, 1);
@@ -677,7 +660,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
     // Lease removed
     let lease = shard
         .db()
-        .get(&lease_key)
+        .get(&silo::keys::leased_task_key(&_leased_task_id))
         .await
         .expect("get lease after reap");
     assert!(lease.is_none(), "lease should be removed by reaper");
@@ -1233,23 +1216,7 @@ async fn concurrency_reap_expired_lease_releases_holder() {
         .expect("enqueue2");
 
     // Expire the lease for job 1
-    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease");
-    let decoded = decode_lease(lease_value).expect("decode lease");
-    let expired_record = LeaseRecord {
-        worker_id: decoded.worker_id().to_string(),
-        task: decoded.to_task().unwrap(),
-        expiry_ms: now_ms() - 1,
-        started_at_ms: decoded.started_at_ms(),
-    };
-    let expired_val = encode_lease(&expired_record);
-    shard
-        .db()
-        .put(&lease_key, &expired_val)
-        .await
-        .expect("put expired");
-    shard.db().flush().await.expect("flush");
-    // Also update in-memory lease tracker so the reaper sees the expired lease
-    shard.update_lease_manager_expiry(&_t1, now_ms() - 1);
+    expire_first_lease(&shard, &_t1).await;
 
     // Reap -> should release holder and schedule retry
     let reaped = shard.reap_expired_leases("-").await.expect("reap");

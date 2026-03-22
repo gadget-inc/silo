@@ -1,10 +1,8 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::job_store_shard::JobStoreShardError;
-use silo::task::LeaseRecord;
 
 use test_helpers::*;
 
@@ -376,24 +374,8 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
         // Cancel the job while it's running
         shard.cancel_job("-", &job_id).await.expect("cancel_job");
 
-        // Find the lease and rewrite expiry to the past (simulate worker crash)
-        let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
-        let decoded = decode_lease(lease_value).expect("decode lease");
-        let expired_ms = now_ms() - 1;
-        let new_record = LeaseRecord {
-            worker_id: decoded.worker_id().to_string(),
-            task: decoded.to_task().unwrap(),
-            expiry_ms: expired_ms,
-            started_at_ms: decoded.started_at_ms(),
-        };
-        let new_val = encode_lease(&new_record);
-        shard
-            .db()
-            .put(&lease_key, &new_val)
-            .await
-            .expect("put mutated lease");
-        shard.db().flush().await.expect("flush mutated lease");
-        shard.update_lease_manager_expiry(&_leased_task_id, expired_ms);
+        // Simulate worker crash by force-expiring the lease
+        expire_first_lease(&shard, &_leased_task_id).await;
 
         // Reap expired leases
         let reaped = shard.reap_expired_leases("-").await.expect("reap");

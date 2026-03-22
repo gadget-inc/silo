@@ -1,11 +1,8 @@
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
-use silo::keys::leased_task_key;
-use silo::task::LeaseRecord;
 
 use test_helpers::*;
 
@@ -415,36 +412,14 @@ async fn lease_task_leases_are_reaped_after_expiry() {
             .expect("lease_task");
         let task_id = leased.attempt().task_id().to_string();
 
-        let lease_key = leased_task_key(&task_id);
-        let lease_raw = shard
-            .db()
-            .get(&lease_key)
-            .await
-            .expect("get lease")
-            .expect("lease exists");
-        let decoded = decode_lease(lease_raw).expect("decode lease");
-        let expired_ms = now_ms() - 1;
-        let new_record = LeaseRecord {
-            worker_id: decoded.worker_id().to_string(),
-            task: decoded.to_task().expect("decode task"),
-            expiry_ms: expired_ms,
-            started_at_ms: decoded.started_at_ms(),
-        };
-        let new_val = encode_lease(&new_record);
-        shard
-            .db()
-            .put(&lease_key, &new_val)
-            .await
-            .expect("put mutated lease");
-        shard.db().flush().await.expect("flush mutated lease");
-        shard.update_lease_manager_expiry(&task_id, expired_ms);
+        expire_first_lease(&shard, &task_id).await;
 
         let reaped = shard.reap_expired_leases("-").await.expect("reap");
         assert_eq!(reaped, 1, "expired direct lease should be reaped");
 
         let lease = shard
             .db()
-            .get(&lease_key)
+            .get(&silo::keys::leased_task_key(&task_id))
             .await
             .expect("get lease after reap");
         assert!(lease.is_none(), "lease should be removed after reaping");
@@ -467,5 +442,118 @@ async fn lease_task_leases_are_reaped_after_expiry() {
             }
             other => panic!("expected Failed, got {:?}", other),
         }
+    });
+}
+
+/// Verify the lease manager stays consistent with the DB through a full job lifecycle:
+/// enqueue → dequeue → heartbeat → report_outcome, and with lease expiry + reaping.
+#[silo::test]
+async fn lease_manager_consistency_through_full_lifecycle() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+        let tenant = "-";
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"test": true}));
+
+        // Verify: empty at start
+        let (mgr, db, missing, extra) = shard.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(mgr, 0, "manager should be empty at start");
+        assert_eq!(db, 0, "db should be empty at start");
+
+        // Enqueue and dequeue 3 jobs
+        let mut task_ids = Vec::new();
+        for i in 0..3 {
+            let job_id = format!("lifecycle-job-{}", i);
+            shard
+                .enqueue(
+                    tenant,
+                    Some(job_id),
+                    50,
+                    now,
+                    None,
+                    payload.clone(),
+                    vec![],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+        let tasks = shard
+            .dequeue("worker-1", "default", 3)
+            .await
+            .expect("dequeue")
+            .tasks;
+        for t in &tasks {
+            task_ids.push(t.attempt().task_id().to_string());
+        }
+
+        // Verify: 3 leases tracked and consistent with DB
+        let (mgr, db, missing, extra) = shard.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(mgr, 3, "manager should have 3 leases after dequeue");
+        assert_eq!(db, 3, "db should have 3 leases after dequeue");
+        assert!(
+            missing.is_empty(),
+            "no leases missing from manager: {:?}",
+            missing
+        );
+        assert!(extra.is_empty(), "no extra leases in manager: {:?}", extra);
+
+        // Heartbeat one lease
+        shard
+            .heartbeat_task("worker-1", &task_ids[0])
+            .await
+            .expect("heartbeat");
+
+        // Verify: still 3 leases, all consistent
+        let (mgr, db, missing, extra) = shard.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(mgr, 3);
+        assert_eq!(db, 3);
+        assert!(missing.is_empty(), "missing after heartbeat: {:?}", missing);
+        assert!(extra.is_empty(), "extra after heartbeat: {:?}", extra);
+
+        // Complete one job
+        shard
+            .report_attempt_outcome(&task_ids[0], AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report success");
+
+        // Verify: 2 leases remaining
+        let (mgr, db, missing, extra) = shard.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(mgr, 2, "manager should have 2 leases after completing one");
+        assert_eq!(db, 2, "db should have 2 leases after completing one");
+        assert!(missing.is_empty(), "missing after complete: {:?}", missing);
+        assert!(extra.is_empty(), "extra after complete: {:?}", extra);
+
+        // Fail one job
+        shard
+            .report_attempt_outcome(
+                &task_ids[1],
+                AttemptOutcome::Error {
+                    error_code: "TEST_ERROR".to_string(),
+                    error: b"test".to_vec(),
+                },
+            )
+            .await
+            .expect("report error");
+
+        // Verify: 1 lease remaining
+        let (mgr, db, missing, extra) = shard.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(mgr, 1, "manager should have 1 lease after failing one");
+        assert_eq!(db, 1, "db should have 1 lease after failing one");
+        assert!(missing.is_empty(), "missing after fail: {:?}", missing);
+        assert!(extra.is_empty(), "extra after fail: {:?}", extra);
+
+        // Force-expire the last lease and reap it
+        expire_first_lease(&shard, &task_ids[2]).await;
+        let reaped = shard.reap_expired_leases(tenant).await.expect("reap");
+        assert_eq!(reaped, 1, "should reap the expired lease");
+
+        // Verify: 0 leases, fully consistent
+        let (mgr, db, missing, extra) = shard.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(mgr, 0, "manager should be empty after reaping last lease");
+        assert_eq!(db, 0, "db should be empty after reaping last lease");
+        assert!(missing.is_empty(), "missing after reap: {:?}", missing);
+        assert!(extra.is_empty(), "extra after reap: {:?}", extra);
     });
 }
