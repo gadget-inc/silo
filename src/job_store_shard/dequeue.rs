@@ -27,7 +27,7 @@ struct DequeueIterationState {
     leased_tasks_for_dst: Vec<(String, String, String)>,
     /// Task IDs and expiry times for leases created in this iteration,
     /// used to update the in-memory lease tracker after durable write.
-    leased_for_tracker: Vec<(String, i64)>,
+    pending_lease_tracker_entries: Vec<(String, i64)>,
     pending_attempts: Vec<(String, JobView, Vec<u8>)>,
     processed_internal: bool,
 }
@@ -40,7 +40,7 @@ impl DequeueIterationState {
             tombstone_keys: Vec::with_capacity(claimed_len),
             grants_to_rollback: Vec::new(),
             leased_tasks_for_dst: Vec::new(),
-            leased_for_tracker: Vec::new(),
+            pending_lease_tracker_entries: Vec::new(),
             pending_attempts: Vec::new(),
             processed_internal: false,
         }
@@ -234,7 +234,7 @@ impl JobStoreShard {
             pending_attempts.append(&mut state.pending_attempts);
 
             // Update in-memory lease tracker with newly created leases
-            for (task_id, expiry_ms) in &state.leased_for_tracker {
+            for (task_id, expiry_ms) in &state.pending_lease_tracker_entries {
                 self.lease_tracker.insert(task_id.clone(), *expiry_ms);
             }
 
@@ -433,7 +433,7 @@ impl JobStoreShard {
 
                 // Track for lease tracker update after durable write
                 state
-                    .leased_for_tracker
+                    .pending_lease_tracker_entries
                     .push((request_id.clone(), expiry_ms));
 
                 // Track for DST event emission after commit
@@ -644,7 +644,7 @@ impl JobStoreShard {
 
         // Track for lease tracker update after durable write
         state
-            .leased_for_tracker
+            .pending_lease_tracker_entries
             .push((task_id.to_string(), expiry_ms));
 
         Ok(())
@@ -716,7 +716,7 @@ impl JobStoreShard {
 
         // Track for lease tracker update after durable write
         state
-            .leased_for_tracker
+            .pending_lease_tracker_entries
             .push((task_id.to_string(), expiry_ms));
 
         // Track for DST event emission after commit
