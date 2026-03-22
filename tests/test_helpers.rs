@@ -213,16 +213,21 @@ pub async fn first_lease_kv(db: &Db) -> Option<(Vec<u8>, bytes::Bytes)> {
     first_kv_with_binary_prefix(db, &silo::keys::leases_prefix()).await
 }
 
-/// Force-expire the first lease in the DB and update the in-memory lease manager.
-/// Returns the decoded lease for further assertions.
+/// Force-expire a lease by task_id in the DB and update the in-memory lease manager.
 pub async fn expire_first_lease(
     shard: &std::sync::Arc<silo::job_store_shard::JobStoreShard>,
     task_id: &str,
-) -> silo::codec::DecodedLease {
+) {
     use silo::codec::{decode_lease, encode_lease};
     use silo::task::LeaseRecord;
 
-    let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
+    let lease_key = silo::keys::leased_task_key(task_id);
+    let lease_value = shard
+        .db()
+        .get(&lease_key)
+        .await
+        .expect("db get")
+        .expect("lease should exist for task_id");
     let decoded = decode_lease(lease_value).expect("decode lease");
     let expired_ms = now_ms() - 1;
     let new_record = LeaseRecord {
@@ -239,9 +244,6 @@ pub async fn expire_first_lease(
         .expect("put expired lease");
     shard.db().flush().await.expect("flush expired lease");
     shard.update_lease_manager_expiry(task_id, expired_ms);
-
-    // Re-decode from the new value so caller gets the expired version
-    decode_lease(bytes::Bytes::from(new_val)).expect("decode expired lease")
 }
 
 /// Get first concurrency request key/value (0x08 prefix).
