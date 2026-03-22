@@ -1,8 +1,11 @@
 mod test_helpers;
 
+use silo::codec::{decode_lease, encode_lease};
 use silo::job::JobStatusKind;
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
+use silo::keys::leased_task_key;
+use silo::task::LeaseRecord;
 
 use test_helpers::*;
 
@@ -382,5 +385,87 @@ async fn lease_task_then_report_outcome() {
             ),
             "attempt should be succeeded"
         );
+    });
+}
+
+#[silo::test]
+async fn lease_task_leases_are_reaped_after_expiry() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let leased = shard
+            .lease_task("-", &job_id, "test-worker")
+            .await
+            .expect("lease_task");
+        let task_id = leased.attempt().task_id().to_string();
+
+        let lease_key = leased_task_key(&task_id);
+        let lease_raw = shard
+            .db()
+            .get(&lease_key)
+            .await
+            .expect("get lease")
+            .expect("lease exists");
+        let decoded = decode_lease(lease_raw).expect("decode lease");
+        let expired_ms = now_ms() - 1;
+        let new_record = LeaseRecord {
+            worker_id: decoded.worker_id().to_string(),
+            task: decoded.to_task().expect("decode task"),
+            expiry_ms: expired_ms,
+            started_at_ms: decoded.started_at_ms(),
+        };
+        let new_val = encode_lease(&new_record);
+        shard
+            .db()
+            .put(&lease_key, &new_val)
+            .await
+            .expect("put mutated lease");
+        shard.db().flush().await.expect("flush mutated lease");
+        shard.update_lease_tracker_expiry(&task_id, expired_ms);
+
+        let reaped = shard.reap_expired_leases("-").await.expect("reap");
+        assert_eq!(reaped, 1, "expired direct lease should be reaped");
+
+        let lease = shard
+            .db()
+            .get(&lease_key)
+            .await
+            .expect("get lease after reap");
+        assert!(lease.is_none(), "lease should be removed after reaping");
+
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("job exists");
+        assert_eq!(status.kind, JobStatusKind::Failed);
+
+        let attempt = shard
+            .get_job_attempt("-", &job_id, 1)
+            .await
+            .expect("get attempt")
+            .expect("attempt exists");
+        match attempt.state() {
+            silo::job_attempt::AttemptStatus::Failed { error_code, .. } => {
+                assert_eq!(error_code, "WORKER_CRASHED");
+            }
+            other => panic!("expected Failed, got {:?}", other),
+        }
     });
 }

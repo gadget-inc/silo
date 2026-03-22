@@ -1817,6 +1817,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
+    shard.update_lease_tracker_expiry(&task_id, expired_ms);
 
     // Reap expired leases - this should handle the expired refresh task
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
@@ -1989,6 +1990,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
         .await
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
+    shard.update_lease_tracker_expiry(&task_id, expired_ms);
 
     // Reap the expired lease
     let reaped = shard.reap_expired_leases("-").await.expect("reap");
@@ -2040,4 +2042,153 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     // Verify the lease was deleted
     let lease_exists = shard.db().get(&lease_key).await.expect("db get").is_some();
     assert!(!lease_exists, "lease should be deleted after reaping");
+}
+
+#[silo::test]
+async fn floating_limit_refresh_reap_retries_after_transient_failure() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-refresh-retry-q".to_string();
+    let refresh_interval_ms = 12_345i64;
+
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j1");
+
+    tokio::time::advance(std::time::Duration::from_millis(20_000)).await;
+
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j2");
+
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
+    assert!(
+        !result.refresh_tasks.is_empty(),
+        "should have refresh task after dequeue"
+    );
+    let task_id = result.refresh_tasks[0].task_id.clone();
+
+    let lease_key = silo::keys::leased_task_key(&task_id);
+    let state_key = silo::keys::floating_limit_state_key("-", &queue);
+    let lease_raw = shard
+        .db()
+        .get(&lease_key)
+        .await
+        .expect("db get")
+        .expect("lease should exist");
+    let original_state = shard
+        .db()
+        .get(&state_key)
+        .await
+        .expect("db get")
+        .expect("state should exist");
+
+    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
+    let expired_ms = now_ms() - 1;
+    let new_record = LeaseRecord {
+        worker_id: decoded_lease.worker_id().to_string(),
+        task: decoded_lease.to_task().unwrap(),
+        expiry_ms: expired_ms,
+        started_at_ms: decoded_lease.started_at_ms(),
+    };
+    let new_val = encode_lease(&new_record);
+    shard
+        .db()
+        .put(&lease_key, &new_val)
+        .await
+        .expect("put mutated lease");
+    shard.db().flush().await.expect("flush mutated lease");
+    shard.update_lease_tracker_expiry(&task_id, expired_ms);
+
+    // Corrupt the state so the first reap attempt fails inside refresh-task cleanup.
+    shard
+        .db()
+        .put(&state_key, b"not-a-valid-floating-limit-state")
+        .await
+        .expect("corrupt state");
+    shard.db().flush().await.expect("flush corrupted state");
+
+    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    assert_eq!(
+        reaped, 0,
+        "failed refresh cleanup should not count as reaped"
+    );
+
+    let lease_still_exists = shard.db().get(&lease_key).await.expect("db get").is_some();
+    assert!(
+        lease_still_exists,
+        "lease should remain when refresh cleanup fails"
+    );
+
+    // Restore the state to simulate the transient failure clearing.
+    shard
+        .db()
+        .put(&state_key, &original_state)
+        .await
+        .expect("restore state");
+    shard.db().flush().await.expect("flush restored state");
+
+    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    assert_eq!(
+        reaped, 1,
+        "expired refresh lease should be retried and reaped"
+    );
+
+    let lease_still_exists = shard.db().get(&lease_key).await.expect("db get").is_some();
+    assert!(
+        !lease_still_exists,
+        "lease should be removed once refresh cleanup succeeds"
+    );
+
+    let state_raw = shard
+        .db()
+        .get(&state_key)
+        .await
+        .expect("db get")
+        .expect("state should exist");
+    let decoded = silo::codec::decode_floating_limit_state(state_raw).expect("decode");
+    assert!(
+        !decoded.refresh_task_scheduled(),
+        "refresh_task_scheduled should be reset after successful retry"
+    );
 }

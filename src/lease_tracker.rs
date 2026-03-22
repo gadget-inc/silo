@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
+use tokio::sync::Notify;
 use tracing::debug;
 
 /// Minimal lease info needed for reaping decisions.
@@ -24,6 +25,10 @@ pub struct LeaseTracker {
     leases: DashMap<String, i64>,
     /// Whether the initial DB scan has completed.
     hydrated: AtomicBool,
+    /// Ensures only one hydration scan runs at a time.
+    hydrating: AtomicBool,
+    /// Wake waiters once hydration completes.
+    hydration_notify: Notify,
 }
 
 impl LeaseTracker {
@@ -31,6 +36,8 @@ impl LeaseTracker {
         Self {
             leases: DashMap::new(),
             hydrated: AtomicBool::new(false),
+            hydrating: AtomicBool::new(false),
+            hydration_notify: Notify::new(),
         }
     }
 
@@ -79,14 +86,28 @@ impl LeaseTracker {
         db: &slatedb::Db,
         range: &crate::shard_range::ShardRange,
     ) {
+        if self.is_hydrated() {
+            return;
+        }
+
+        if self
+            .hydrating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            while !self.is_hydrated() {
+                self.hydration_notify.notified().await;
+            }
+            return;
+        }
+
         let start = crate::keys::leases_prefix();
         let end = crate::keys::end_bound(&start);
         let mut iter = match db.scan::<Vec<u8>, _>(start..end).await {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(error = %e, "lease tracker: failed to scan leases for hydration");
-                // Mark as hydrated anyway so the reaper doesn't wait forever
-                self.hydrated.store(true, Ordering::Release);
+                self.finish_hydration();
                 return;
             }
         };
@@ -123,7 +144,27 @@ impl LeaseTracker {
             }
         }
 
-        self.hydrated.store(true, Ordering::Release);
+        self.finish_hydration();
         debug!(count, "lease tracker: hydration complete");
+    }
+
+    fn finish_hydration(&self) {
+        self.hydrated.store(true, Ordering::Release);
+        self.hydrating.store(false, Ordering::Release);
+        self.hydration_notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_for_test(&self) {
+        self.leases.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_hydrated_for_test(&self, hydrated: bool) {
+        self.hydrated.store(hydrated, Ordering::Release);
+        self.hydrating.store(false, Ordering::Release);
+        if hydrated {
+            self.hydration_notify.notify_waiters();
+        }
     }
 }

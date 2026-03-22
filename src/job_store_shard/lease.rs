@@ -368,6 +368,12 @@ impl JobStoreShard {
     /// Uses the in-memory lease tracker instead of scanning the DB.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self, _tenant: &str) -> Result<usize, JobStoreShardError> {
+        if !self.lease_tracker.is_hydrated() {
+            self.lease_tracker
+                .hydrate_from_db(self.db.as_ref(), &self.range)
+                .await;
+        }
+
         let now_ms = now_epoch_ms();
         let expired = self.lease_tracker.expired_leases(now_ms);
 
@@ -407,9 +413,19 @@ impl JobStoreShard {
             // Handle RefreshFloatingLimit tasks separately
             if let Some((task_id, queue_key)) = decoded.refresh_floating_limit_info() {
                 let task_tenant = decoded.tenant();
-                let _ = self
+                if let Err(error) = self
                     .reap_expired_refresh_task(task_tenant, task_id, queue_key, &decoded)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        tenant = %task_tenant,
+                        task_id = %task_id,
+                        queue_key = %queue_key,
+                        error = %error,
+                        "failed to reap expired floating limit refresh lease"
+                    );
+                    continue;
+                }
                 self.lease_tracker.remove(&lease.task_id);
                 reaped += 1;
                 continue;
@@ -504,5 +520,111 @@ impl JobStoreShard {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::codec::{decode_lease, encode_lease};
+    use crate::gubernator::MockGubernatorClient;
+    use crate::job::JobStatusKind;
+    use crate::settings::{Backend, DatabaseConfig};
+    use crate::shard_range::ShardRange;
+    use crate::task::LeaseRecord;
+
+    async fn open_temp_shard() -> (tempfile::TempDir, Arc<JobStoreShard>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = DatabaseConfig {
+            name: "test".to_string(),
+            backend: Backend::Fs,
+            path: tmp.path().to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            slatedb: Some(slatedb::config::Settings {
+                flush_interval: Some(Duration::from_millis(10)),
+                ..Default::default()
+            }),
+            memory_cache: None,
+        };
+
+        let shard = JobStoreShard::open(
+            &cfg,
+            MockGubernatorClient::new_arc(),
+            None,
+            ShardRange::full(),
+        )
+        .await
+        .expect("open shard");
+
+        (tmp, shard)
+    }
+
+    #[tokio::test]
+    async fn reap_expired_leases_hydrates_tracker_before_relying_on_it() {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_epoch_ms(),
+                None,
+                br#"{"k":"v"}"#.to_vec(),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        assert_eq!(tasks.len(), 1);
+        let task_id = tasks[0].attempt().task_id().to_string();
+
+        let lease_key = leased_task_key(&task_id);
+        let lease_raw = shard
+            .db()
+            .get(&lease_key)
+            .await
+            .expect("get lease")
+            .expect("lease exists");
+        let decoded = decode_lease(lease_raw).expect("decode lease");
+        let expired_ms = now_epoch_ms() - 1;
+        let new_record = LeaseRecord {
+            worker_id: decoded.worker_id().to_string(),
+            task: decoded.to_task().expect("decode task"),
+            expiry_ms: expired_ms,
+            started_at_ms: decoded.started_at_ms(),
+        };
+        let new_val = encode_lease(&new_record);
+        shard
+            .db()
+            .put(&lease_key, &new_val)
+            .await
+            .expect("put mutated lease");
+        shard.db().flush().await.expect("flush mutated lease");
+
+        // Simulate a freshly reopened shard before background hydration has repopulated the tracker.
+        shard.lease_tracker.clear_for_test();
+        shard.lease_tracker.set_hydrated_for_test(false);
+
+        let reaped = shard.reap_expired_leases("-").await.expect("reap");
+        assert_eq!(reaped, 1, "reaper should hydrate before consulting tracker");
+
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("job exists");
+        assert_eq!(status.kind, JobStatusKind::Failed);
     }
 }

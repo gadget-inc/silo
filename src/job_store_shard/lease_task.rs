@@ -217,6 +217,10 @@ impl JobStoreShard {
         })
         .await?;
 
+        // Keep the in-memory tracker aligned with leases created outside dequeue.
+        self.lease_tracker
+            .insert(attempt.task_id.clone(), expiry_ms);
+
         // Post-commit: evict old task key from broker buffer and wake broker
         self.brokers.evict_keys(&[old_task_key]);
         self.brokers.wakeup(&task_group);

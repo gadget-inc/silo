@@ -123,6 +123,10 @@ harness = false
 name = "query_profile"
 harness = false
 
+[[bench]]
+name = "scan_tombstone_profile"
+harness = false
+
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"
