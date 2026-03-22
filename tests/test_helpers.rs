@@ -175,6 +175,23 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
     (config, shard)
 }
 
+/// Reopen a shard at the given path (simulates recovery after crash).
+pub async fn reopen_shard_at_path(path: &str) -> std::sync::Arc<JobStoreShard> {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: path.to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: Some(fast_flush_slatedb_settings()),
+        memory_cache: None,
+    };
+    JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
+        .await
+        .expect("reopen shard")
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

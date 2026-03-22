@@ -557,3 +557,84 @@ async fn lease_manager_consistency_through_full_lifecycle() {
         assert!(extra.is_empty(), "extra after reap: {:?}", extra);
     });
 }
+
+/// Verify crash safety: the DB is always the source of truth.
+/// After a simulated crash (drop without close), reopening the shard must
+/// rehydrate the lease manager to match the DB — no missing leases.
+#[silo::test]
+async fn lease_manager_rehydrates_correctly_after_crash() {
+    with_timeout!(20000, {
+        let (tmp, shard) = open_temp_shard().await;
+        let path = tmp.path().to_string_lossy().to_string();
+        let now = now_ms();
+        let tenant = "-";
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"crash": true}));
+
+        // Enqueue and dequeue 3 jobs to create leases
+        for i in 0..3 {
+            shard
+                .enqueue(
+                    tenant,
+                    Some(format!("crash-job-{}", i)),
+                    50,
+                    now,
+                    None,
+                    payload.clone(),
+                    vec![],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+        let tasks = shard
+            .dequeue("worker-1", "default", 3)
+            .await
+            .expect("dequeue")
+            .tasks;
+        assert_eq!(tasks.len(), 3, "should dequeue 3 tasks");
+        let task_ids: Vec<String> = tasks
+            .iter()
+            .map(|t| t.attempt().task_id().to_string())
+            .collect();
+
+        // Complete one job — leaves 2 active leases
+        shard
+            .report_attempt_outcome(&task_ids[0], AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report success");
+
+        // Verify 2 leases in manager and DB before crash
+        let (mgr, db, missing, extra) = shard.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(mgr, 2);
+        assert_eq!(db, 2);
+        assert!(missing.is_empty());
+        assert!(extra.is_empty());
+
+        // Simulate crash: drop the shard without calling close()
+        drop(shard);
+
+        // Reopen the shard — lease manager should rehydrate from DB
+        let shard2 = reopen_shard_at_path(&path).await;
+
+        // Give the background hydration task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Verify the lease manager rehydrated correctly
+        let (mgr, db, missing, extra) = shard2.verify_lease_manager_consistency().await.unwrap();
+        assert_eq!(db, 2, "DB should still have 2 leases after crash recovery");
+        assert_eq!(mgr, 2, "lease manager should rehydrate 2 leases from DB");
+        assert!(
+            missing.is_empty(),
+            "no leases should be missing from manager after rehydration: {:?}",
+            missing
+        );
+        assert!(
+            extra.is_empty(),
+            "no extra leases should be in manager after rehydration: {:?}",
+            extra
+        );
+
+        shard2.close().await.expect("close");
+    });
+}
