@@ -1968,16 +1968,8 @@ async fn shard_compact_handler(
         }
     };
 
-    let Some(shard) = state.factory.get(&parsed_shard_id) else {
-        return Redirect::to(&format!(
-            "/shard?id={}&compact_error={}",
-            shard_id,
-            urlencoding::encode("Shard not found on this node")
-        ));
-    };
-
-    match shard.submit_full_compaction().await {
-        Ok(()) => Redirect::to(&format!(
+    match state.cluster_client.compact_shard(&parsed_shard_id).await {
+        Ok(_) => Redirect::to(&format!(
             "/shard?id={}&compact_message={}",
             shard_id,
             urlencoding::encode(

@@ -38,8 +38,9 @@ use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, GetJobRequest, GetJobResponse, GetNodeInfoRequest, JobStatus,
-    QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
+    CancelJobRequest, ColumnInfo, CompactShardRequest, GetJobRequest, GetJobResponse,
+    GetNodeInfoRequest, JobStatus, QueryRequest, RequestSplitRequest, RequestSplitResponse,
+    SerializedBytes, serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -793,6 +794,36 @@ impl ClusterClient {
         }
 
         Ok(())
+    }
+
+    /// Trigger a full compaction on a shard (local or remote)
+    pub async fn compact_shard(&self, shard_id: &ShardId) -> Result<String, ClusterClientError> {
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(shard_id) {
+            debug!(shard_id = %shard_id, "compacting local shard");
+            shard
+                .submit_full_compaction()
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+            return Ok(format!("full compaction submitted for shard {}", shard_id));
+        }
+
+        // Shard is not local, route to remote owner
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = %shard_id, addr = %addr, "compacting shard on remote node");
+
+        let mut client = self.get_client(&addr).await?;
+        let request = CompactShardRequest {
+            shard: shard_id.to_string(),
+        };
+
+        match client.compact_shard(request).await {
+            Ok(resp) => Ok(resp.into_inner().status),
+            Err(e) => {
+                self.invalidate_connection(&addr);
+                Err(ClusterClientError::RpcFailed(e.to_string()))
+            }
+        }
     }
 
     /// Request a shard split operation
