@@ -1974,7 +1974,7 @@ where
     let reaper_factory = factory.clone();
     let reaper_metrics = metrics.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tokio::select! {
                 biased;

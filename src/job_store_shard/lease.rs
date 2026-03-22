@@ -1,7 +1,7 @@
 //! Lease management: heartbeat, outcome reporting, and expired lease reaping.
 
+use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
-use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
 use crate::codec::{
@@ -74,6 +74,9 @@ impl JobStoreShard {
                 },
             )
             .await?;
+
+        // Update in-memory lease tracker with new expiry
+        self.lease_tracker.update_expiry(task_id, new_expiry_ms);
 
         // Check cancellation status to return in response
         // Worker discovers cancellation via heartbeat response per Alloy spec
@@ -329,6 +332,9 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
 
+        // Remove lease from in-memory tracker
+        self.lease_tracker.remove(task_id);
+
         // Post-commit: release in-memory concurrency counts and signal grant scanner.
         for queue in &held_queues_local {
             let span = info_span!(
@@ -357,48 +363,46 @@ impl JobStoreShard {
         Ok(())
     }
 
-    /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code, or as Cancelled if the job was cancelled.
-    /// For RefreshFloatingLimit tasks, resets the floating limit state so it can be retried on next periodic refresh.
-    /// Skips and deletes leases for tenants outside the shard's range.
+    /// Check all tracked leases and mark any expired ones as failed with a WORKER_CRASHED error code,
+    /// or as Cancelled if the job was cancelled.
+    /// Uses the in-memory lease tracker instead of scanning the DB.
     /// Returns the number of expired leases reaped.
-    pub async fn reap_expired_leases(&self, tenant: &str) -> Result<usize, JobStoreShardError> {
-        // Scan all lease keys using the binary prefix
-        let start = crate::keys::leases_prefix();
-        let end = crate::keys::end_bound(&start);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+    pub async fn reap_expired_leases(&self, _tenant: &str) -> Result<usize, JobStoreShardError> {
+        // Wait for lease tracker to be hydrated from DB before reaping
+        if !self.lease_tracker.is_hydrated() {
+            return Ok(0);
+        }
 
         let now_ms = now_epoch_ms();
+        let expired = self.lease_tracker.expired_leases(now_ms);
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
         let mut reaped: usize = 0;
 
-        // Get the shard range for split-aware filtering
-        let shard_range = self.get_range();
+        for lease in &expired {
+            let task_id = &lease.task_id;
 
-        // Collect defunct lease keys to delete
-        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
-
-        while let Some(kv) = iter.next().await? {
-            let decoded = match decode_lease(kv.value.clone()) {
-                Ok(l) => l,
-                Err(_) => continue,
+            // Read the lease from DB to get full details needed for reaping
+            let key = leased_task_key(task_id);
+            let maybe_raw = self.db.get(&key).await?;
+            let Some(value_bytes) = maybe_raw else {
+                // Lease was already removed (e.g., worker completed between check and reap)
+                self.lease_tracker.remove(task_id);
+                continue;
             };
 
-            // Check if lease's tenant is within shard range
-            let lease_tenant = decoded.tenant();
+            let decoded = match decode_lease(value_bytes) {
+                Ok(l) => l,
+                Err(_) => {
+                    self.lease_tracker.remove(task_id);
+                    continue;
+                }
+            };
 
-            if !shard_range.contains_tenant(lease_tenant) {
-                // Lease is for a tenant outside our range - mark for deletion
-                debug!(
-                    key = ?kv.key,
-                    tenant = %lease_tenant,
-                    range = %shard_range,
-                    "deleting defunct lease (tenant outside shard range)"
-                );
-                defunct_keys.push(kv.key.to_vec());
-                continue;
-            }
-
-            // [SILO-REAP-1] Pre: Lease exists (we found it)
-            // [SILO-REAP-2] Pre: Check if lease has expired
+            // Double-check expiry (could have been renewed via heartbeat since we read the tracker)
             if decoded.expiry_ms() > now_ms {
                 continue;
             }
@@ -409,29 +413,21 @@ impl JobStoreShard {
                 let _ = self
                     .reap_expired_refresh_task(task_tenant, task_id, queue_key, &decoded)
                     .await;
+                self.lease_tracker.remove(&lease.task_id);
                 reaped += 1;
                 continue;
             }
 
-            // Get task_id and job_id using helper methods (for RunAttempt tasks)
-            let Some(task_id) = decoded.task_id() else {
-                continue; // Not a RunAttempt lease
-            };
+            // Get job_id for cancellation check
             let job_id = decoded.job_id().to_string();
 
-            // Check if job was cancelled - if so, report Cancelled instead of WORKER_CRASHED
-            let was_cancelled = self
-                .is_job_cancelled(tenant, &job_id)
+            let outcome = if self
+                .is_job_cancelled(decoded.tenant(), &job_id)
                 .await
-                .unwrap_or(false);
-
-            let outcome = if was_cancelled {
-                // Job was cancelled - report as Cancelled (clean termination)
+                .unwrap_or(false)
+            {
                 AttemptOutcome::Cancelled
             } else {
-                // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
-                // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
-                // SILO-REAP-4: Post: Set attempt status to AttemptFailed
                 AttemptOutcome::Error {
                     error_code: "WORKER_CRASHED".to_string(),
                     error: format!(
@@ -444,25 +440,9 @@ impl JobStoreShard {
                 }
             };
 
-            // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
+            // report_attempt_outcome removes the lease from the tracker via its own remove() call
             let _ = self.report_attempt_outcome(task_id, outcome).await;
             reaped += 1;
-        }
-
-        // Delete defunct leases from the database
-        if !defunct_keys.is_empty() {
-            let mut batch = WriteBatch::new();
-            for key in &defunct_keys {
-                batch.delete(key);
-            }
-            if let Err(e) = self.db.write(batch).await {
-                debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct leases");
-            } else {
-                debug!(
-                    count = defunct_keys.len(),
-                    "deleted defunct leases outside shard range"
-                );
-            }
         }
 
         Ok(reaped)

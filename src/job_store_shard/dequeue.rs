@@ -25,6 +25,9 @@ struct DequeueIterationState {
     tombstone_keys: Vec<Vec<u8>>,
     grants_to_rollback: Vec<(String, String, String)>,
     leased_tasks_for_dst: Vec<(String, String, String)>,
+    /// Task IDs and expiry times for leases created in this iteration,
+    /// used to update the in-memory lease tracker after durable write.
+    leased_for_tracker: Vec<(String, i64)>,
     pending_attempts: Vec<(String, JobView, Vec<u8>)>,
     processed_internal: bool,
 }
@@ -37,6 +40,7 @@ impl DequeueIterationState {
             tombstone_keys: Vec::with_capacity(claimed_len),
             grants_to_rollback: Vec::new(),
             leased_tasks_for_dst: Vec::new(),
+            leased_for_tracker: Vec::new(),
             pending_attempts: Vec::new(),
             processed_internal: false,
         }
@@ -228,6 +232,11 @@ impl JobStoreShard {
 
             // Collect pending attempts from this iteration
             pending_attempts.append(&mut state.pending_attempts);
+
+            // Update in-memory lease tracker with newly created leases
+            for (task_id, expiry_ms) in &state.leased_for_tracker {
+                self.lease_tracker.insert(task_id.clone(), *expiry_ms);
+            }
 
             // [SILO-DEQ-3] Ack durable and evict from buffer.
             // TaskBroker tracks all release keys for inflight cleanup, but only
@@ -421,6 +430,11 @@ impl JobStoreShard {
                     .pending_attempts
                     .push((tenant.clone(), view, attempt_val));
                 state.ack_deleted(task_key);
+
+                // Track for lease tracker update after durable write
+                state
+                    .leased_for_tracker
+                    .push((request_id.clone(), expiry_ms));
 
                 // Track for DST event emission after commit
                 state
@@ -628,6 +642,11 @@ impl JobStoreShard {
         });
         state.ack_deleted(task_key);
 
+        // Track for lease tracker update after durable write
+        state
+            .leased_for_tracker
+            .push((task_id.to_string(), expiry_ms));
+
         Ok(())
     }
 
@@ -694,6 +713,11 @@ impl JobStoreShard {
             .pending_attempts
             .push((tenant.to_string(), view, attempt_val));
         state.ack_deleted(task_key);
+
+        // Track for lease tracker update after durable write
+        state
+            .leased_for_tracker
+            .push((task_id.to_string(), expiry_ms));
 
         // Track for DST event emission after commit
         state.leased_tasks_for_dst.push((
