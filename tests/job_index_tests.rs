@@ -250,6 +250,7 @@ async fn reaper_without_retries_marks_failed_in_index() {
     let new_val = encode_lease(&expired);
     shard.db().put(&lease_key, &new_val).await.unwrap();
     shard.db().flush().await.unwrap();
+    shard.update_lease_tracker_expiry(&_tid, now_ms() - 1);
     // Reap
     let _ = shard.reap_expired_leases("-").await.unwrap();
     // Should be Failed in index (no retries)
@@ -301,6 +302,7 @@ async fn reaper_with_retries_moves_to_scheduled_in_index() {
     let new_val = encode_lease(&expired);
     shard.db().put(&lease_key, &new_val).await.unwrap();
     shard.db().flush().await.unwrap();
+    shard.update_lease_tracker_expiry(&_tid, now_ms() - 1);
     // Reap
     let _ = shard.reap_expired_leases("-").await.unwrap();
     // Should be Scheduled in index (retries present)
