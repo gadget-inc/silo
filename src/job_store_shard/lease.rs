@@ -368,11 +368,6 @@ impl JobStoreShard {
     /// Uses the in-memory lease tracker instead of scanning the DB.
     /// Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self, _tenant: &str) -> Result<usize, JobStoreShardError> {
-        // Wait for lease tracker to be hydrated from DB before reaping
-        if !self.lease_tracker.is_hydrated() {
-            return Ok(0);
-        }
-
         let now_ms = now_epoch_ms();
         let expired = self.lease_tracker.expired_leases(now_ms);
 
@@ -385,6 +380,7 @@ impl JobStoreShard {
         for lease in &expired {
             let task_id = &lease.task_id;
 
+            // [SILO-REAP-1] Pre: Lease exists (found in in-memory tracker)
             // Read the lease from DB to get full details needed for reaping
             let key = leased_task_key(task_id);
             let maybe_raw = self.db.get(&key).await?;
@@ -402,6 +398,7 @@ impl JobStoreShard {
                 }
             };
 
+            // [SILO-REAP-2] Pre: Check if lease has expired
             // Double-check expiry (could have been renewed via heartbeat since we read the tracker)
             if decoded.expiry_ms() > now_ms {
                 continue;
@@ -428,6 +425,9 @@ impl JobStoreShard {
             {
                 AttemptOutcome::Cancelled
             } else {
+                // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
+                // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
+                // SILO-REAP-4: Post: Set attempt status to AttemptFailed
                 AttemptOutcome::Error {
                     error_code: "WORKER_CRASHED".to_string(),
                     error: format!(
@@ -440,7 +440,7 @@ impl JobStoreShard {
                 }
             };
 
-            // report_attempt_outcome removes the lease from the tracker via its own remove() call
+            // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
             let _ = self.report_attempt_outcome(task_id, outcome).await;
             reaped += 1;
         }
