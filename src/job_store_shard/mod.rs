@@ -520,6 +520,12 @@ impl JobStoreShard {
         &self.db
     }
 
+    /// Update the in-memory lease tracker's expiry for a task.
+    /// Primarily used by tests that directly mutate lease records in the DB.
+    pub fn update_lease_tracker_expiry(&self, task_id: &str, expiry_ms: i64) {
+        self.lease_tracker.update_expiry(task_id, expiry_ms);
+    }
+
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {
