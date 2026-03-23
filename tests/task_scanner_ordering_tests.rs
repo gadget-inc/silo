@@ -99,7 +99,12 @@ async fn enqueue_start_at_zero_picked_up_after_buffer_populated() {
             all_ids
         );
         // Should have gotten all 5 remaining tasks (5 enqueued - 1 dequeued + 1 zero = 5)
-        assert_eq!(all_ids.len(), 5, "all tasks must be drained; got: {:?}", all_ids);
+        assert_eq!(
+            all_ids.len(),
+            5,
+            "all tasks must be drained; got: {:?}",
+            all_ids
+        );
     });
 }
 
@@ -355,10 +360,7 @@ async fn concurrency_grant_task_picked_up_by_scanner() {
 
         // Complete holder — this frees the concurrency slot
         shard
-            .report_attempt_outcome(
-                &holder_task_id,
-                AttemptOutcome::Success { result: vec![] },
-            )
+            .report_attempt_outcome(&holder_task_id, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("complete holder");
 
@@ -570,7 +572,12 @@ async fn higher_priority_enqueued_later_picked_up() {
             all_ids
         );
         // 5 original - 1 dequeued + 1 high-pri = 5
-        assert_eq!(all_ids.len(), 5, "all tasks must be drained; got: {:?}", all_ids);
+        assert_eq!(
+            all_ids.len(),
+            5,
+            "all tasks must be drained; got: {:?}",
+            all_ids
+        );
     });
 }
 
@@ -638,11 +645,7 @@ async fn retry_task_picked_up_after_backoff() {
             .dequeue("w", "default", 1)
             .await
             .expect("dequeue retry");
-        assert_eq!(
-            retry_result.tasks.len(),
-            1,
-            "retry task should be dequeued"
-        );
+        assert_eq!(retry_result.tasks.len(), 1, "retry task should be dequeued");
         assert_eq!(retry_result.tasks[0].job().id(), "retry-job");
         assert_eq!(
             retry_result.tasks[0].attempt().attempt_number(),

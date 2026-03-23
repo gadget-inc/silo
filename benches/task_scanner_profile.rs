@@ -150,10 +150,7 @@ async fn main() {
 
     let metadata = ensure_golden_shard().await;
 
-    println!(
-        "Cloning golden shard and adding {} tasks...",
-        TASK_COUNT
-    );
+    println!("Cloning golden shard and adding {} tasks...", TASK_COUNT);
     let (_guard, shard) = clone_golden_shard("scanner-profile", &metadata).await;
     enqueue_many_tasks(&shard, TASK_COUNT).await;
 
@@ -164,8 +161,7 @@ async fn main() {
     // --- Sustained dequeue throughput ---
     println!("\n--- Sustained dequeue throughput (batch_size=32) ---");
     {
-        let (total, elapsed, mut durations) =
-            sustained_dequeue(&shard, 32, TASK_COUNT).await;
+        let (total, elapsed, mut durations) = sustained_dequeue(&shard, 32, TASK_COUNT).await;
         let rate = total as f64 / elapsed.as_secs_f64();
         println!(
             "  Dequeued {} tasks in {:.1}s = {:.0} tasks/sec",
@@ -186,8 +182,7 @@ async fn main() {
     println!("\n--- Sustained dequeue throughput (batch_size=1) ---");
     {
         // Only drain 2000 with batch_size=1 to keep it reasonable
-        let (total, elapsed, mut durations) =
-            sustained_dequeue(&shard2, 1, 2000).await;
+        let (total, elapsed, mut durations) = sustained_dequeue(&shard2, 1, 2000).await;
         let rate = total as f64 / elapsed.as_secs_f64();
         println!(
             "  Dequeued {} tasks in {:.1}s = {:.0} tasks/sec",
