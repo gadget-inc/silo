@@ -1819,7 +1819,8 @@ export class SiloGRPCClient {
 
       // Send one ImportJobs RPC per tenant group and collect results
       const allResults: ImportJobResult[] = [];
-      const resultsByJobId = new Map<string, ImportJobResult>();
+      // Key by "tenant\0id" to avoid collisions across tenants with the same job ID
+      const resultsByKey = new Map<string, ImportJobResult>();
 
       for (const [tenant, tenantJobs] of jobsByTenant) {
         const results = await this._withShardRetry(tenant, async (client, shard) => {
@@ -1878,15 +1879,23 @@ export class SiloGRPCClient {
             error: result.error,
             status: protoJobStatusToPublic(result.status),
           };
-          resultsByJobId.set(result.id, mapped);
+          resultsByKey.set(`${tenant ?? ""}\0${result.id}`, mapped);
         }
       }
 
       // Return results in the same order as the input jobs
       for (const job of jobs) {
-        const result = resultsByJobId.get(job.id);
+        const key = `${job.tenant ?? ""}\0${job.id}`;
+        const result = resultsByKey.get(key);
         if (result) {
           allResults.push(result);
+        } else {
+          allResults.push({
+            id: job.id,
+            success: false,
+            error: `No result returned from server for job ${job.id}`,
+            status: JobStatus.Scheduled,
+          });
         }
       }
 
