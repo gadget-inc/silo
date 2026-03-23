@@ -1968,13 +1968,13 @@ where
         .set_serving::<SiloServer<SiloService>>()
         .await;
 
-    // Periodic reaper that iterates all shards every 100ms for lease reaping,
+    // Periodic reaper that iterates all shards every 1s for lease reaping,
     // and collects SlateDB metrics from each shard.
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
     let reaper_metrics = metrics.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tokio::select! {
                 biased;
