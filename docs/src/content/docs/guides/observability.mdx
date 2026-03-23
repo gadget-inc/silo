@@ -121,23 +121,26 @@ Silo uses [SlateDB](https://slatedb.io/) as its underlying embedded key-value st
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `silo_slatedb_get_requests_total` | Gauge | `shard` | Total number of GET (read) requests to SlateDB |
-| `silo_slatedb_scan_requests_total` | Gauge | `shard` | Total number of scan (range query) requests |
-| `silo_slatedb_write_ops_total` | Gauge | `shard` | Total number of individual write operations |
-| `silo_slatedb_write_batch_count_total` | Gauge | `shard` | Total number of write batches |
-| `silo_slatedb_backpressure_count_total` | Gauge | `shard` | Number of times writes were blocked by back-pressure |
+| `silo_slatedb_get_requests_total` | Counter | `shard` | Total number of GET (read) requests to SlateDB |
+| `silo_slatedb_scan_requests_total` | Counter | `shard` | Total number of scan (range query) requests |
+| `silo_slatedb_write_ops_total` | Counter | `shard` | Total number of individual write operations |
+| `silo_slatedb_write_batch_count_total` | Counter | `shard` | Total number of write batches |
+| `silo_slatedb_flush_requests_total` | Counter | `shard` | Total number of flush requests to SlateDB |
+| `silo_slatedb_backpressure_count_total` | Counter | `shard` | Number of times writes were blocked by back-pressure |
+| `silo_slatedb_total_mem_size_bytes` | Gauge | `shard` | Total memory usage of SlateDB (memtables, WAL buffers, etc.) |
 
 **Key insights:**
 - High `silo_slatedb_backpressure_count_total` indicates the storage layer is under write pressure
 - Compare `silo_slatedb_write_ops_total` to `silo_slatedb_write_batch_count_total` to understand batching efficiency
+- `silo_slatedb_total_mem_size_bytes` helps track memory pressure per shard — sudden increases may indicate write spikes or slow flushes
 
 #### WAL (Write-Ahead Log) Metrics
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `silo_slatedb_wal_buffer_estimated_bytes` | Gauge | `shard` | Estimated bytes buffered in the WAL buffer |
-| `silo_slatedb_wal_buffer_flushes_total` | Gauge | `shard` | Total number of WAL buffer flushes |
-| `silo_slatedb_immutable_memtable_flushes_total` | Gauge | `shard` | Total number of immutable memtable flushes to SSTs |
+| `silo_slatedb_wal_buffer_flushes_total` | Counter | `shard` | Total number of WAL buffer flushes |
+| `silo_slatedb_immutable_memtable_flushes_total` | Counter | `shard` | Total number of immutable memtable flushes to SSTs |
 
 **Key insights:**
 - `silo_slatedb_wal_buffer_estimated_bytes` shows pending writes not yet durably flushed
@@ -150,9 +153,9 @@ SlateDB uses bloom filters to avoid unnecessary SST reads. These metrics track f
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `silo_slatedb_sst_filter_positives_total` | Gauge | `shard` | True positives: key exists and filter said yes |
-| `silo_slatedb_sst_filter_negatives_total` | Gauge | `shard` | True negatives: key absent and filter said no (avoided read) |
-| `silo_slatedb_sst_filter_false_positives_total` | Gauge | `shard` | False positives: key absent but filter said yes (wasted read) |
+| `silo_slatedb_sst_filter_positives_total` | Counter | `shard` | True positives: key exists and filter said yes |
+| `silo_slatedb_sst_filter_negatives_total` | Counter | `shard` | True negatives: key absent and filter said no (avoided read) |
+| `silo_slatedb_sst_filter_false_positives_total` | Counter | `shard` | False positives: key absent but filter said yes (wasted read) |
 
 **Key insights:**
 - High `silo_slatedb_sst_filter_negatives_total` rate indicates filters are effective at avoiding reads
@@ -165,14 +168,35 @@ SlateDB periodically compacts SST files to reclaim space and improve read perfor
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `silo_slatedb_bytes_compacted_total` | Gauge | `shard` | Total number of bytes compacted |
+| `silo_slatedb_bytes_compacted_total` | Counter | `shard` | Total number of bytes compacted |
 | `silo_slatedb_running_compactions` | Gauge | `shard` | Number of compactions currently running |
 | `silo_slatedb_last_compaction_ts_seconds` | Gauge | `shard` | Unix timestamp of the last compaction |
+| `silo_slatedb_l0_sst_count` | Gauge | `shard` | Number of Level-0 SSTs (high values indicate compaction lag) |
 
 **Key insights:**
 - `silo_slatedb_running_compactions` > 0 indicates compaction is actively working
 - Monitor `silo_slatedb_bytes_compacted_total` rate to understand compaction throughput
 - If `silo_slatedb_last_compaction_ts_seconds` is very old, compaction may be stuck or disabled
+- High `silo_slatedb_l0_sst_count` means scans must merge across many unsorted files, directly increasing scan latency. This is the most important metric for diagnosing slow scans
+
+#### Cache Metrics
+
+SlateDB maintains an in-memory block cache for SST data blocks, index blocks, and bloom filters. These metrics track cache effectiveness — low hit rates indicate that reads are falling through to object storage.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `silo_slatedb_cache_data_block_hit_total` | Counter | `shard` | Data block cache hits |
+| `silo_slatedb_cache_data_block_miss_total` | Counter | `shard` | Data block cache misses (requires object storage read) |
+| `silo_slatedb_cache_index_hit_total` | Counter | `shard` | Index block cache hits |
+| `silo_slatedb_cache_index_miss_total` | Counter | `shard` | Index block cache misses |
+| `silo_slatedb_cache_filter_hit_total` | Counter | `shard` | Bloom filter cache hits |
+| `silo_slatedb_cache_filter_miss_total` | Counter | `shard` | Bloom filter cache misses |
+
+**Key insights:**
+- Compute hit rates as `hit / (hit + miss)` for each cache tier
+- Low data block hit rate combined with high L0 SST count strongly suggests compaction isn't keeping up
+- Low filter/index cache hit rates may indicate the cache is too small for the working set — consider increasing SlateDB's block cache size
+- Filter cache misses are especially expensive because they force a full block read to check for key existence
 
 ## Tracing
 

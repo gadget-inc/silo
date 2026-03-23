@@ -191,10 +191,18 @@ max_sst_size = 1073741824
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `flush_interval` | duration | `"100ms"` | How often to flush the memtable to SST files |
-| `l0_sst_size_bytes` | number | `67108864` | Target size for L0 SST files (64MB default) |
+| `flush_interval` | duration | `"100ms"` | How often to flush the WAL to object storage. Also controls how frequently memtable size is checked against `l0_sst_size_bytes`. |
+| `l0_sst_size_bytes` | number | `67108864` | Minimum memtable size before it is frozen and flushed as an L0 SST to object storage (64MB default). See below for tuning guidance. |
 | `l0_max_ssts` | number | `8` | Maximum number of L0 SSTs before compaction triggers |
 | `max_unflushed_bytes` | number | `536870912` | Maximum unflushed data in memory (512MB default) |
+
+#### `l0_sst_size_bytes`
+
+This setting controls the minimum size a memtable must reach before SlateDB freezes it and flushes it to object storage as an L0 SST. The memtable size is checked every `flush_interval`. Writes are always durably persisted to the WAL regardless of this setting — `l0_sst_size_bytes` only affects when data moves from the in-memory memtable into the SST layer that is visible to readers on other nodes.
+
+Silo is a high write-throughput workload — each job enqueue, dequeue, heartbeat, and completion generates multiple key writes. With the default of 64MB, memtables flush frequently, producing many small L0 SSTs that increase object storage PUT costs, read amplification, and compaction pressure. **You should strongly consider raising this value** (e.g. 256MB or higher) to reduce the number of L0 SSTs produced and give the compactor larger, more efficient inputs.
+
+The tradeoff of a higher value is **increased memory usage** (the unflushed memtable grows larger before being flushed) and **higher read latency for other nodes** (data stays in the memtable longer before becoming visible in object storage via SSTs). In practice, Silo nodes are the primary readers of their own shards, so the cross-node visibility delay is rarely a concern.
 
 #### Compactor Options
 

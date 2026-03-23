@@ -106,11 +106,22 @@ pub struct Metrics {
     slatedb_sst_filter_negatives: CounterVec,
     slatedb_sst_filter_false_positives: CounterVec,
     slatedb_bytes_compacted: CounterVec,
+    slatedb_flush_requests: CounterVec,
 
     // SlateDB storage gauges (per-shard, point-in-time values)
     slatedb_wal_buffer_estimated_bytes: GaugeVec,
     slatedb_running_compactions: GaugeVec,
     slatedb_last_compaction_ts_sec: GaugeVec,
+    slatedb_l0_sst_count: GaugeVec,
+    slatedb_total_mem_size_bytes: GaugeVec,
+
+    // SlateDB cache counters (per-shard, monotonically increasing)
+    slatedb_cache_data_block_hit: CounterVec,
+    slatedb_cache_data_block_miss: CounterVec,
+    slatedb_cache_index_hit: CounterVec,
+    slatedb_cache_index_miss: CounterVec,
+    slatedb_cache_filter_hit: CounterVec,
+    slatedb_cache_filter_miss: CounterVec,
 
     /// Tracks previous SlateDB counter values per (stat_name, shard) for delta computation.
     /// SlateDB exposes counters as absolute values via `stat.get()`, but Prometheus counters
@@ -296,6 +307,19 @@ impl Metrics {
                 &self.slatedb_sst_filter_false_positives,
             ),
             ("compactor/bytes_compacted", &self.slatedb_bytes_compacted),
+            (
+                slatedb::db_stats::FLUSH_REQUESTS,
+                &self.slatedb_flush_requests,
+            ),
+            ("dbcache/data_block_hit", &self.slatedb_cache_data_block_hit),
+            (
+                "dbcache/data_block_miss",
+                &self.slatedb_cache_data_block_miss,
+            ),
+            ("dbcache/index_hit", &self.slatedb_cache_index_hit),
+            ("dbcache/index_miss", &self.slatedb_cache_index_miss),
+            ("dbcache/filter_hit", &self.slatedb_cache_filter_hit),
+            ("dbcache/filter_miss", &self.slatedb_cache_filter_miss),
         ];
 
         // Gauge-type stats: point-in-time values
@@ -311,6 +335,11 @@ impl Metrics {
             (
                 "compactor/last_compaction_timestamp_sec",
                 &self.slatedb_last_compaction_ts_sec,
+            ),
+            (slatedb::db_stats::L0_SST_COUNT, &self.slatedb_l0_sst_count),
+            (
+                slatedb::db_stats::TOTAL_MEM_SIZE_BYTES,
+                &self.slatedb_total_mem_size_bytes,
             ),
         ];
 
@@ -722,6 +751,106 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let slatedb_flush_requests = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_flush_requests_total",
+                "Total number of flush requests to SlateDB",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_l0_sst_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_l0_sst_count",
+                "Number of Level-0 SSTs in SlateDB (high values indicate compaction lag)",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_total_mem_size_bytes = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_total_mem_size_bytes",
+                "Total memory usage of SlateDB",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    // SlateDB cache counters
+    let slatedb_cache_data_block_hit = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_cache_data_block_hit_total",
+                "Total SlateDB data block cache hits",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_cache_data_block_miss = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_cache_data_block_miss_total",
+                "Total SlateDB data block cache misses",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_cache_index_hit = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_cache_index_hit_total",
+                "Total SlateDB index block cache hits",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_cache_index_miss = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_cache_index_miss_total",
+                "Total SlateDB index block cache misses",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_cache_filter_hit = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_cache_filter_hit_total",
+                "Total SlateDB bloom filter cache hits",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_cache_filter_miss = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_cache_filter_miss_total",
+                "Total SlateDB bloom filter cache misses",
+            ),
+            &["shard"],
+        )?,
+    );
+
     Ok(Metrics {
         registry: Arc::new(registry),
         jobs_enqueued,
@@ -755,9 +884,18 @@ pub fn init() -> anyhow::Result<Metrics> {
         slatedb_sst_filter_negatives,
         slatedb_sst_filter_false_positives,
         slatedb_bytes_compacted,
+        slatedb_flush_requests,
         slatedb_wal_buffer_estimated_bytes,
         slatedb_running_compactions,
         slatedb_last_compaction_ts_sec,
+        slatedb_l0_sst_count,
+        slatedb_total_mem_size_bytes,
+        slatedb_cache_data_block_hit,
+        slatedb_cache_data_block_miss,
+        slatedb_cache_index_hit,
+        slatedb_cache_index_miss,
+        slatedb_cache_filter_hit,
+        slatedb_cache_filter_miss,
         slatedb_prev_values: Arc::new(Mutex::new(HashMap::new())),
     })
 }

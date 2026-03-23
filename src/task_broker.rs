@@ -522,10 +522,10 @@ impl TaskBrokerRegistry {
     /// Keys may belong to different task groups; only evicts from brokers that already exist.
     pub fn evict_keys(&self, keys: &[Vec<u8>]) {
         for k in keys {
-            if let Some(parsed) = parse_task_key(k) {
-                if let Some(broker) = self.brokers.get(&parsed.task_group) {
-                    broker.evict_keys(std::slice::from_ref(k));
-                }
+            if let Some(parsed) = parse_task_key(k)
+                && let Some(broker) = self.brokers.get(&parsed.task_group)
+            {
+                broker.evict_keys(std::slice::from_ref(k));
             }
         }
     }
