@@ -64,13 +64,14 @@ The task broker maintains an in-memory buffer of ready tasks for efficient deque
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `silo_broker_buffer_size` | Gauge | `shard` | Number of tasks in the broker's in-memory buffer |
-| `silo_broker_inflight_size` | Gauge | `shard` | Tasks claimed but not yet durably leased |
+| `silo_broker_buffer_size` | Gauge | `shard`, `task_group` | Number of tasks in the broker's in-memory buffer per task group |
+| `silo_broker_inflight_size` | Gauge | `shard`, `task_group` | Tasks claimed but not yet durably leased per task group |
 | `silo_broker_scan_duration_seconds` | Histogram | `shard` | Duration of broker task scanning operations |
 | `silo_broker_scans_total` | Counter | `shard` | Total number of broker task scan operations |
 
 **Key insights:**
 - `silo_broker_buffer_size` near 0 with pending work may indicate scan issues
+- Break down `silo_broker_buffer_size` by `task_group` to identify which queues are starved vs saturated
 - High `silo_broker_scan_duration_seconds` suggests database pressure
 - `silo_broker_inflight_size` should be transiently low; persistent high values indicate dequeue bottlenecks
 

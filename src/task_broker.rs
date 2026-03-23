@@ -271,6 +271,16 @@ impl TaskBroker {
                         &broker.shard_name,
                         scan_start.elapsed().as_secs_f64(),
                     );
+                    m.set_broker_buffer_size(
+                        &broker.shard_name,
+                        &broker.task_group,
+                        broker.buffer.len() as u64,
+                    );
+                    m.set_broker_inflight_size(
+                        &broker.shard_name,
+                        &broker.task_group,
+                        broker.inflight.lock().unwrap().len() as u64,
+                    );
                 }
 
                 // Adjust backoff: stay aggressive when buffer needs filling
