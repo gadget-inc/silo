@@ -16,17 +16,31 @@ use dashmap::DashMap;
 use tokio::sync::Notify;
 use tracing::debug;
 
-/// Minimal lease info needed for reaping decisions.
+/// Information tracked per lease, sufficient for reaping without a DB read.
+#[derive(Debug, Clone)]
+pub enum TrackedLeaseKind {
+    /// A normal job execution lease.
+    RunAttempt {
+        tenant: String,
+        job_id: String,
+        worker_id: String,
+    },
+    /// A floating limit refresh task lease.
+    RefreshFloatingLimit { tenant: String, queue_key: String },
+}
+
+/// A tracked lease entry with expiry and metadata for reaping.
 #[derive(Debug, Clone)]
 pub struct TrackedLease {
     pub task_id: String,
     pub expiry_ms: i64,
+    pub kind: TrackedLeaseKind,
 }
 
 /// Thread-safe in-memory tracker for active leases.
 pub struct LeaseManager {
-    /// task_id → expiry_ms
-    leases: DashMap<String, i64>,
+    /// task_id → (expiry_ms, kind)
+    leases: DashMap<String, (i64, TrackedLeaseKind)>,
     /// Notified once when the initial DB hydration scan completes.
     hydration_complete: Notify,
     /// Whether hydration has finished (for fast-path skip of await).
@@ -42,10 +56,21 @@ impl LeaseManager {
         }
     }
 
-    /// Record a new lease (called when a task is leased during dequeue).
+    /// Record a new lease.
     /// Safe to call before hydration — new leases are always tracked immediately.
-    pub fn insert(&self, task_id: String, expiry_ms: i64) {
-        self.leases.insert(task_id, expiry_ms);
+    pub fn insert(&self, task_id: String, expiry_ms: i64, kind: TrackedLeaseKind) {
+        self.leases.insert(task_id, (expiry_ms, kind));
+    }
+
+    /// Update the expiry of an existing lease (upsert if missing for self-healing).
+    /// Used by heartbeat which doesn't change the lease kind.
+    pub fn update_expiry(&self, task_id: &str, new_expiry_ms: i64) {
+        if let Some(mut entry) = self.leases.get_mut(task_id) {
+            entry.0 = new_expiry_ms;
+        }
+        // If not present (e.g., during hydration window), the next heartbeat
+        // or hydration will pick it up. We don't upsert here because we don't
+        // have the kind information.
     }
 
     /// Remove a lease (called when a lease is released via report_outcome or reaping).
@@ -54,16 +79,16 @@ impl LeaseManager {
     }
 
     /// Return all leases that have expired as of `now_ms`.
-    /// Awaits hydration if it hasn't completed yet, so the result includes
-    /// pre-existing leases from the DB.
+    /// Awaits hydration if it hasn't completed yet.
     pub async fn expired_leases(&self, now_ms: i64) -> Vec<TrackedLease> {
         self.await_hydration().await;
         self.leases
             .iter()
-            .filter(|entry| *entry.value() <= now_ms)
+            .filter(|entry| entry.value().0 <= now_ms)
             .map(|entry| TrackedLease {
                 task_id: entry.key().clone(),
-                expiry_ms: *entry.value(),
+                expiry_ms: entry.value().0,
+                kind: entry.value().1.clone(),
             })
             .collect()
     }
@@ -129,15 +154,12 @@ impl LeaseManager {
 
     /// Wait for hydration to complete. Fast no-op if already done.
     async fn await_hydration(&self) {
-        // Fast path: already hydrated
         if self
             .hydration_done
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return;
         }
-        // Slow path: wait for notification. Create the Notified future
-        // BEFORE re-checking to avoid a TOCTOU race.
         loop {
             let notified = self.hydration_complete.notified();
             if self
@@ -173,17 +195,34 @@ impl LeaseManager {
                 Err(_) => continue,
             };
 
-            // Only track leases for tenants in our shard range
             if !range.contains_tenant(decoded.tenant()) {
                 continue;
             }
 
-            if let Some(task_id) = decoded.task_id() {
-                self.leases.insert(task_id.to_string(), decoded.expiry_ms());
+            if let Some((task_id, queue_key)) = decoded.refresh_floating_limit_info() {
+                self.leases.insert(
+                    task_id.to_string(),
+                    (
+                        decoded.expiry_ms(),
+                        TrackedLeaseKind::RefreshFloatingLimit {
+                            tenant: decoded.tenant().to_string(),
+                            queue_key: queue_key.to_string(),
+                        },
+                    ),
+                );
                 count += 1;
-            } else if decoded.refresh_floating_limit_info().is_some() {
-                let (task_id, _) = decoded.refresh_floating_limit_info().unwrap();
-                self.leases.insert(task_id.to_string(), decoded.expiry_ms());
+            } else if let Some(task_id) = decoded.task_id() {
+                self.leases.insert(
+                    task_id.to_string(),
+                    (
+                        decoded.expiry_ms(),
+                        TrackedLeaseKind::RunAttempt {
+                            tenant: decoded.tenant().to_string(),
+                            job_id: decoded.job_id().to_string(),
+                            worker_id: decoded.worker_id().to_string(),
+                        },
+                    ),
+                );
                 count += 1;
             }
         }

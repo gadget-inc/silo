@@ -75,10 +75,8 @@ impl JobStoreShard {
             )
             .await?;
 
-        // Update in-memory lease tracker with new expiry (upsert to self-heal
-        // if the lease was missing from the tracker, e.g. during hydration window)
-        self.lease_manager
-            .insert(task_id.to_string(), new_expiry_ms);
+        // Update in-memory lease tracker with new expiry
+        self.lease_manager.update_expiry(task_id, new_expiry_ms);
 
         // Check cancellation status to return in response
         // Worker discovers cancellation via heartbeat response per Alloy spec
@@ -383,78 +381,67 @@ impl JobStoreShard {
             let task_id = &lease.task_id;
 
             // [SILO-REAP-1] Pre: Lease exists (found in in-memory tracker)
-            // Read the lease from DB to get full details needed for reaping
-            let key = leased_task_key(task_id);
-            let maybe_raw = self.db.get(&key).await?;
-            let Some(value_bytes) = maybe_raw else {
-                // Lease was already removed (e.g., worker completed between check and reap)
-                self.lease_manager.remove(task_id);
-                continue;
-            };
-
-            let decoded = match decode_lease(value_bytes) {
-                Ok(l) => l,
-                Err(_) => {
+            // [SILO-REAP-2] Pre: Lease has expired (filtered by expired_leases)
+            match &lease.kind {
+                crate::lease_manager::TrackedLeaseKind::RefreshFloatingLimit {
+                    tenant,
+                    queue_key,
+                } => {
+                    // Handle RefreshFloatingLimit leases: read the full lease from DB
+                    // because reap_expired_refresh_task needs the decoded lease for logging.
+                    let key = leased_task_key(task_id);
+                    let maybe_raw = self.db.get(&key).await?;
+                    let Some(value_bytes) = maybe_raw else {
+                        self.lease_manager.remove(task_id);
+                        continue;
+                    };
+                    let decoded = match decode_lease(value_bytes) {
+                        Ok(l) => l,
+                        Err(_) => {
+                            self.lease_manager.remove(task_id);
+                            continue;
+                        }
+                    };
+                    if let Err(error) = self
+                        .reap_expired_refresh_task(tenant, task_id, queue_key, &decoded)
+                        .await
+                    {
+                        tracing::warn!(
+                            tenant = %tenant,
+                            task_id = %task_id,
+                            queue_key = %queue_key,
+                            error = %error,
+                            "failed to reap expired floating limit refresh lease"
+                        );
+                        continue;
+                    }
                     self.lease_manager.remove(task_id);
-                    continue;
+                    reaped += 1;
                 }
-            };
+                crate::lease_manager::TrackedLeaseKind::RunAttempt {
+                    tenant,
+                    job_id,
+                    worker_id,
+                } => {
+                    let outcome = if self.is_job_cancelled(tenant, job_id).await.unwrap_or(false) {
+                        AttemptOutcome::Cancelled
+                    } else {
+                        // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
+                        AttemptOutcome::Error {
+                            error_code: "WORKER_CRASHED".to_string(),
+                            error: format!(
+                                "lease expired at {} (now {}), worker={}",
+                                lease.expiry_ms, now_ms, worker_id
+                            )
+                            .into_bytes(),
+                        }
+                    };
 
-            // [SILO-REAP-2] Pre: Check if lease has expired
-            // Double-check expiry (could have been renewed via heartbeat since we read the tracker)
-            if decoded.expiry_ms() > now_ms {
-                continue;
+                    // [SILO-REAP-REL] Release lease and update job/attempt status
+                    let _ = self.report_attempt_outcome(task_id, outcome).await;
+                    reaped += 1;
+                }
             }
-
-            // Handle RefreshFloatingLimit tasks separately
-            if let Some((task_id, queue_key)) = decoded.refresh_floating_limit_info() {
-                let task_tenant = decoded.tenant();
-                if let Err(error) = self
-                    .reap_expired_refresh_task(task_tenant, task_id, queue_key, &decoded)
-                    .await
-                {
-                    tracing::warn!(
-                        tenant = %task_tenant,
-                        task_id = %task_id,
-                        queue_key = %queue_key,
-                        error = %error,
-                        "failed to reap expired floating limit refresh lease"
-                    );
-                    continue;
-                }
-                self.lease_manager.remove(&lease.task_id);
-                reaped += 1;
-                continue;
-            }
-
-            // Get job_id for cancellation check
-            let job_id = decoded.job_id().to_string();
-
-            let outcome = if self
-                .is_job_cancelled(decoded.tenant(), &job_id)
-                .await
-                .unwrap_or(false)
-            {
-                AttemptOutcome::Cancelled
-            } else {
-                // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
-                // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
-                // SILO-REAP-4: Post: Set attempt status to AttemptFailed
-                AttemptOutcome::Error {
-                    error_code: "WORKER_CRASHED".to_string(),
-                    error: format!(
-                        "lease expired at {} (now {}), worker={}",
-                        decoded.expiry_ms(),
-                        now_ms,
-                        decoded.worker_id()
-                    )
-                    .into_bytes(),
-                }
-            };
-
-            // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
-            let _ = self.report_attempt_outcome(task_id, outcome).await;
-            reaped += 1;
         }
 
         Ok(reaped)

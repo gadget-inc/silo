@@ -27,7 +27,7 @@ struct DequeueIterationState {
     leased_tasks_for_dst: Vec<(String, String, String)>,
     /// Task IDs and expiry times for leases created in this iteration,
     /// used to update the in-memory lease tracker after durable write.
-    pending_lease_manager_entries: Vec<(String, i64)>,
+    pending_lease_manager_entries: Vec<(String, i64, crate::lease_manager::TrackedLeaseKind)>,
     pending_attempts: Vec<(String, JobView, Vec<u8>)>,
     processed_internal: bool,
 }
@@ -234,8 +234,8 @@ impl JobStoreShard {
             pending_attempts.append(&mut state.pending_attempts);
 
             // Update in-memory lease tracker with newly created leases
-            for (task_id, expiry_ms) in &state.pending_lease_manager_entries {
-                self.lease_manager.insert(task_id.clone(), *expiry_ms);
+            for (task_id, expiry_ms, kind) in state.pending_lease_manager_entries {
+                self.lease_manager.insert(task_id, expiry_ms, kind);
             }
 
             // [SILO-DEQ-3] Ack durable and evict from buffer.
@@ -432,9 +432,15 @@ impl JobStoreShard {
                 state.ack_deleted(task_key);
 
                 // Track for lease tracker update after durable write
-                state
-                    .pending_lease_manager_entries
-                    .push((request_id.clone(), expiry_ms));
+                state.pending_lease_manager_entries.push((
+                    request_id.clone(),
+                    expiry_ms,
+                    crate::lease_manager::TrackedLeaseKind::RunAttempt {
+                        tenant: tenant.clone(),
+                        job_id: job_id.to_string(),
+                        worker_id: worker_id.to_string(),
+                    },
+                ));
 
                 // Track for DST event emission after commit
                 state
@@ -643,9 +649,14 @@ impl JobStoreShard {
         state.ack_deleted(task_key);
 
         // Track for lease tracker update after durable write
-        state
-            .pending_lease_manager_entries
-            .push((task_id.to_string(), expiry_ms));
+        state.pending_lease_manager_entries.push((
+            task_id.to_string(),
+            expiry_ms,
+            crate::lease_manager::TrackedLeaseKind::RefreshFloatingLimit {
+                tenant: rfl.tenant().unwrap_or_default().to_string(),
+                queue_key: rfl.queue_key().unwrap_or_default().to_string(),
+            },
+        ));
 
         Ok(())
     }
@@ -715,9 +726,15 @@ impl JobStoreShard {
         state.ack_deleted(task_key);
 
         // Track for lease tracker update after durable write
-        state
-            .pending_lease_manager_entries
-            .push((task_id.to_string(), expiry_ms));
+        state.pending_lease_manager_entries.push((
+            task_id.to_string(),
+            expiry_ms,
+            crate::lease_manager::TrackedLeaseKind::RunAttempt {
+                tenant: tenant.to_string(),
+                job_id: job_id.to_string(),
+                worker_id: worker_id.to_string(),
+            },
+        ));
 
         // Track for DST event emission after commit
         state.leased_tasks_for_dst.push((

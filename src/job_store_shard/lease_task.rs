@@ -218,8 +218,15 @@ impl JobStoreShard {
         .await?;
 
         // Record the lease in the lease manager after durably commiting it
-        self.lease_manager
-            .insert(attempt.task_id.clone(), expiry_ms);
+        self.lease_manager.insert(
+            attempt.task_id.clone(),
+            expiry_ms,
+            crate::lease_manager::TrackedLeaseKind::RunAttempt {
+                tenant: tenant.to_string(),
+                job_id: id.to_string(),
+                worker_id: worker_id.to_string(),
+            },
+        );
 
         // Post-commit: evict old task key from broker buffer and wake broker
         self.brokers.evict_keys(&[old_task_key]);

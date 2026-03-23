@@ -515,10 +515,10 @@ impl JobStoreShard {
         &self.db
     }
 
-    /// Update the in-memory lease tracker's expiry for a task, inserting if absent.
+    /// Update the in-memory lease manager's expiry for a task.
     /// Primarily used by tests that directly mutate lease records in the DB.
     pub fn update_lease_manager_expiry(&self, task_id: &str, expiry_ms: i64) {
-        self.lease_manager.insert(task_id.to_string(), expiry_ms);
+        self.lease_manager.update_expiry(task_id, expiry_ms);
     }
 
     /// Verify that the in-memory lease manager is consistent with the DB.
