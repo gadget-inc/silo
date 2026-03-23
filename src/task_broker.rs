@@ -64,6 +64,16 @@ pub struct TaskBroker {
     metrics: Option<Metrics>,
     /// The shard's tenant range for filtering defunct tasks.
     range: ShardRange,
+    /// Scan cursor: the last key read by the scanner. When set, the next scan
+    /// resumes from just after this key instead of re-reading from the
+    /// beginning of the task group range. Invalidated by `wakeup()` so that
+    /// newly-created tasks behind the cursor are not missed.
+    scan_cursor: Mutex<Option<Vec<u8>>>,
+    /// Set to true when a wakeup fires, forcing the next scan to start from
+    /// the beginning of the key range. This ensures tasks created behind the
+    /// cursor (by enqueue, expedite, restart, concurrency grants, etc.) are
+    /// picked up on the next scan pass.
+    cursor_invalidated: AtomicBool,
 }
 
 impl TaskBroker {
@@ -99,6 +109,8 @@ impl TaskBroker {
             shard_name,
             metrics,
             range,
+            scan_cursor: Mutex::new(None),
+            cursor_invalidated: AtomicBool::new(false),
         })
     }
 
@@ -124,11 +136,50 @@ impl TaskBroker {
         });
     }
 
+    /// Determine the scan start key. If we have a valid cursor (not
+    /// invalidated), resume scanning from just after the cursor. Otherwise
+    /// start from the beginning of the task group range.
+    fn take_scan_start(&self) -> (Vec<u8>, bool) {
+        let group_prefix = task_group_prefix(&self.task_group);
+
+        // If cursor was invalidated by a wakeup, start from the beginning
+        if self.cursor_invalidated.swap(false, Ordering::SeqCst) {
+            *self.scan_cursor.lock().unwrap() = None;
+            return (group_prefix, true);
+        }
+
+        let cursor = self.scan_cursor.lock().unwrap();
+        match cursor.as_ref() {
+            Some(last_key) => {
+                // Resume just after the last key we read
+                let resume_from = end_bound(last_key);
+                (resume_from, false)
+            }
+            None => (group_prefix, true),
+        }
+    }
+
+    /// Update the scan cursor to the last key read in the scan.
+    fn set_scan_cursor(&self, last_key: Option<Vec<u8>>) {
+        *self.scan_cursor.lock().unwrap() = last_key;
+    }
+
+    /// Reset the cursor so the next scan starts from the beginning.
+    fn reset_scan_cursor(&self) {
+        *self.scan_cursor.lock().unwrap() = None;
+    }
+
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
         // [SILO-SCAN-1] Scan only this task group's key range
-        let start = task_group_prefix(&self.task_group);
-        let end = end_bound(&start);
+        let (start, is_full_scan) = self.take_scan_start();
+        let end = end_bound(&task_group_prefix(&self.task_group));
+
+        // If the cursor is past the end of the range, wrap around
+        if start >= end {
+            self.reset_scan_cursor();
+            return 0;
+        }
 
         let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..end).await else {
             return 0;
@@ -138,18 +189,23 @@ impl TaskBroker {
         let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
 
         let mut inserted = 0;
+        let mut last_key_read: Option<Vec<u8>> = None;
+        let mut reached_end = true;
         while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
             let Ok(Some(kv)) = iter.next().await else {
                 break;
             };
+            reached_end = false;
 
             // Parse the task key to extract timestamp
             let Some(parsed_key) = parse_task_key(&kv.key) else {
+                last_key_read = Some(kv.key.to_vec());
                 continue;
             };
 
             // Filter out future tasks
             if parsed_key.start_time_ms > now_ms as u64 {
+                last_key_read = Some(kv.key.to_vec());
                 continue;
             }
 
@@ -157,6 +213,7 @@ impl TaskBroker {
 
             // [SILO-SCAN-3] Skip inflight tasks
             if self.inflight.lock().unwrap().contains(&key_bytes) {
+                last_key_read = Some(key_bytes);
                 continue;
             }
 
@@ -172,12 +229,16 @@ impl TaskBroker {
                 }
             };
             if suppress_due_to_tombstone {
+                last_key_read = Some(key_bytes);
                 continue;
             }
 
             let decoded = match decode_task_validated(kv.value.clone()) {
                 Ok(t) => t,
-                Err(_) => continue, // Skip malformed tasks
+                Err(_) => {
+                    last_key_read = Some(key_bytes);
+                    continue; // Skip malformed tasks
+                }
             };
 
             // Check if task's tenant is within shard range
@@ -193,6 +254,7 @@ impl TaskBroker {
                     range = %self.range,
                     "skipping defunct task (tenant outside shard range)"
                 );
+                last_key_read = Some(key_bytes);
                 continue;
             }
 
@@ -203,7 +265,7 @@ impl TaskBroker {
 
             // [SILO-SCAN-2] Insert into buffer if not already present
             if self.buffer.get(&key_bytes).is_none() {
-                self.buffer.insert(key_bytes, entry);
+                self.buffer.insert(key_bytes.clone(), entry);
                 inserted += 1;
 
                 // Yield periodically to avoid starving other tasks
@@ -211,6 +273,26 @@ impl TaskBroker {
                     tokio::task::yield_now().await;
                 }
             }
+
+            last_key_read = Some(key_bytes);
+        }
+
+        // Update cursor position
+        if let Some(last_key) = last_key_read {
+            self.set_scan_cursor(Some(last_key));
+        } else if reached_end {
+            // Iterator returned nothing — we've exhausted the range.
+            // Reset cursor so next scan starts from the beginning.
+            self.reset_scan_cursor();
+        }
+        // If we stopped because inserted >= scan_batch or buffer is full,
+        // and we got a cursor update above, we'll resume from there next time.
+
+        // On a full scan that inserted nothing, the cursor has now walked
+        // through the entire range without finding new work. Reset it so
+        // the next scan starts fresh rather than repeatedly scanning the tail.
+        if is_full_scan && inserted == 0 {
+            self.reset_scan_cursor();
         }
 
         // Delete defunct tasks from the database
@@ -418,8 +500,11 @@ impl TaskBroker {
         }
     }
 
-    /// Wake the scanner to refill promptly.
+    /// Wake the scanner to refill promptly. Invalidates the scan cursor so
+    /// that the next scan starts from the beginning of the key range, ensuring
+    /// newly-created tasks that sort before the cursor are not missed.
     fn wakeup(&self) {
+        self.cursor_invalidated.store(true, Ordering::SeqCst);
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
     }
