@@ -90,7 +90,12 @@ impl TaskBroker {
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
             target_buffer: 8192,
-            scan_batch: 1024,
+            // Must be >= target_buffer / 2 (the low watermark) so that a
+            // single scan pass can refill from low-watermark to target.
+            // With a smaller batch the scanner needs multiple passes and
+            // each pass re-reads every already-buffered entry from the
+            // start of the key range, wasting O(buffer_size) reads/pass.
+            scan_batch: 4096,
             shard_name,
             metrics,
             range,
