@@ -39,8 +39,9 @@ use crate::factory::ShardFactory;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ColumnInfo, CompactShardRequest, GetJobRequest, GetJobResponse,
-    GetNodeInfoRequest, JobStatus, QueryRequest, RequestSplitRequest, RequestSplitResponse,
-    SerializedBytes, serialized_bytes,
+    GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse, JobStatus,
+    QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes, SortedRunInfo,
+    serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -819,6 +820,53 @@ impl ClusterClient {
 
         match client.compact_shard(request).await {
             Ok(resp) => Ok(resp.into_inner().status),
+            Err(e) => {
+                self.invalidate_connection(&addr);
+                Err(ClusterClientError::RpcFailed(e.to_string()))
+            }
+        }
+    }
+
+    /// Get storage (LSM tree) information for a shard (local or remote).
+    pub async fn get_shard_storage_info(
+        &self,
+        shard_id: &ShardId,
+    ) -> Result<GetShardStorageInfoResponse, ClusterClientError> {
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(shard_id) {
+            debug!(shard_id = %shard_id, "reading LSM state from local shard");
+            let lsm = shard
+                .read_lsm_state()
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
+            return Ok(GetShardStorageInfoResponse {
+                l0_sst_count: lsm.l0_ssts.len() as u64,
+                total_l0_size: lsm.total_l0_size,
+                sorted_run_count: lsm.sorted_runs.len() as u64,
+                total_sorted_run_size: lsm.total_sorted_run_size,
+                sorted_runs: lsm
+                    .sorted_runs
+                    .iter()
+                    .map(|sr| SortedRunInfo {
+                        id: sr.id,
+                        sst_count: sr.sst_count as u64,
+                        estimated_size: sr.estimated_size,
+                    })
+                    .collect(),
+            });
+        }
+
+        // Shard is not local, route to remote owner
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = %shard_id, addr = %addr, "reading LSM state from remote shard");
+
+        let mut client = self.get_client(&addr).await?;
+        let request = GetShardStorageInfoRequest {
+            shard: shard_id.to_string(),
+        };
+
+        match client.get_shard_storage_info(request).await {
+            Ok(resp) => Ok(resp.into_inner()),
             Err(e) => {
                 self.invalidate_connection(&addr);
                 Err(ClusterClientError::RpcFailed(e.to_string()))
