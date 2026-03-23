@@ -789,6 +789,64 @@ export interface EnqueueJobOptions {
   metadata?: Record<string, string>;
 }
 
+/** A historical attempt to attach to an imported job. All attempts must be in a terminal state. */
+export interface ImportAttemptOptions {
+  /** Terminal status of the attempt: Succeeded, Failed, or Cancelled */
+  status: AttemptStatus.Succeeded | AttemptStatus.Failed | AttemptStatus.Cancelled;
+  /** Timestamp when the attempt started (epoch ms) */
+  startedAtMs: bigint;
+  /** Timestamp when the attempt finished (epoch ms) */
+  finishedAtMs: bigint;
+  /** Result data if the attempt succeeded */
+  result?: unknown;
+  /** Error code if the attempt failed */
+  errorCode?: string;
+  /** Error data if the attempt failed */
+  errorData?: unknown;
+}
+
+/** Options for importing a single job from another system */
+export interface ImportJobOptions {
+  /** Required job ID (migration preserves IDs from the source system) */
+  id: string;
+  /** The JSON-serializable payload for the job */
+  payload: unknown;
+  /**
+   * Task group for organizing tasks.
+   * Workers must specify which task group to poll for tasks.
+   * Required.
+   */
+  taskGroup: string;
+  /** Priority 0-99, where 0 is highest priority. Defaults to 50. */
+  priority?: number;
+  /** Original enqueue time from the source system (epoch ms). Defaults to now. */
+  enqueueTimeMs?: bigint;
+  /** When the next attempt should start (epoch ms). Defaults to now. Only relevant for non-terminal jobs. */
+  startAtMs?: bigint;
+  /** Optional retry policy */
+  retryPolicy?: RetryPolicy;
+  /** Optional limits (concurrency limits and/or rate limits) */
+  limits?: JobLimit[];
+  /** Tenant ID for routing to the correct shard. Uses default tenant if not provided. */
+  tenant?: string;
+  /** Optional key/value metadata stored with the job */
+  metadata?: Record<string, string>;
+  /** Historical attempts from the source system. All must be in terminal states. */
+  attempts?: ImportAttemptOptions[];
+}
+
+/** Result of importing a single job */
+export interface ImportJobResult {
+  /** The job's ID */
+  id: string;
+  /** Whether the import succeeded */
+  success: boolean;
+  /** Error message if import failed */
+  error?: string;
+  /** The determined status of the imported job */
+  status: JobStatus;
+}
+
 /** Options for leasing a specific job's task directly */
 export interface LeaseTaskOptions {
   /** The job ID to lease */
@@ -1078,6 +1136,27 @@ function protoAttemptStatusToPublic(status: ProtoAttemptStatus): AttemptStatus {
       return AttemptStatus.Failed;
     case ProtoAttemptStatus.CANCELLED:
       return AttemptStatus.Cancelled;
+    default: {
+      const _exhaustive: never = status;
+      throw new Error(`Unknown attempt status: ${String(_exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * Convert public AttemptStatus enum to proto AttemptStatus enum.
+ * @internal
+ */
+function publicAttemptStatusToProto(status: AttemptStatus): ProtoAttemptStatus {
+  switch (status) {
+    case AttemptStatus.Running:
+      return ProtoAttemptStatus.RUNNING;
+    case AttemptStatus.Succeeded:
+      return ProtoAttemptStatus.SUCCEEDED;
+    case AttemptStatus.Failed:
+      return ProtoAttemptStatus.FAILED;
+    case AttemptStatus.Cancelled:
+      return ProtoAttemptStatus.CANCELLED;
     default: {
       const _exhaustive: never = status;
       throw new Error(`Unknown attempt status: ${String(_exhaustive)}`);
@@ -1705,6 +1784,116 @@ export class SiloGRPCClient {
         operation: "enqueue",
         jobId: options.id,
         tenant: options.tenant,
+      });
+    }
+  }
+
+  /**
+   * Import jobs from another system with their historical attempts.
+   *
+   * Jobs are grouped by tenant and sent to the appropriate shards automatically.
+   * Each job's result is returned independently, allowing partial batch success.
+   *
+   * @param jobs Array of jobs to import.
+   * @returns Array of results, one per job in the same order as the input.
+   */
+  public async importJobs(jobs: ImportJobOptions[]): Promise<ImportJobResult[]> {
+    if (jobs.length === 0) {
+      return [];
+    }
+
+    try {
+      await this._ensureTopology();
+
+      // Group jobs by tenant so they are routed to the correct shard
+      const jobsByTenant = new Map<string | undefined, ImportJobOptions[]>();
+      for (const job of jobs) {
+        const key = job.tenant;
+        let group = jobsByTenant.get(key);
+        if (!group) {
+          group = [];
+          jobsByTenant.set(key, group);
+        }
+        group.push(job);
+      }
+
+      // Send one ImportJobs RPC per tenant group and collect results
+      const allResults: ImportJobResult[] = [];
+      const resultsByJobId = new Map<string, ImportJobResult>();
+
+      for (const [tenant, tenantJobs] of jobsByTenant) {
+        const results = await this._withShardRetry(tenant, async (client, shard) => {
+          const protoJobs = tenantJobs.map((job) => ({
+            shard,
+            id: job.id,
+            priority: job.priority ?? 50,
+            enqueueTimeMs: job.enqueueTimeMs ?? BigInt(0),
+            startAtMs: job.startAtMs ?? BigInt(0),
+            retryPolicy: job.retryPolicy,
+            payload: {
+              encoding: {
+                oneofKind: "msgpack" as const,
+                msgpack: encodeBytes(job.payload),
+              },
+            },
+            limits: job.limits?.map(toProtoLimit) ?? [],
+            tenant: job.tenant,
+            metadata: job.metadata ?? {},
+            taskGroup: job.taskGroup,
+            attempts: (job.attempts ?? []).map((attempt) => ({
+              status: publicAttemptStatusToProto(attempt.status),
+              startedAtMs: attempt.startedAtMs,
+              finishedAtMs: attempt.finishedAtMs,
+              result:
+                attempt.result !== undefined
+                  ? {
+                      encoding: {
+                        oneofKind: "msgpack" as const,
+                        msgpack: encodeBytes(attempt.result),
+                      },
+                    }
+                  : undefined,
+              errorCode: attempt.errorCode,
+              errorData:
+                attempt.errorData !== undefined
+                  ? {
+                      encoding: {
+                        oneofKind: "msgpack" as const,
+                        msgpack: encodeBytes(attempt.errorData),
+                      },
+                    }
+                  : undefined,
+            })),
+          }));
+
+          const call = client.importJobs({ jobs: protoJobs }, this._rpcOptions());
+          const response = await call.response;
+          return response.results;
+        });
+
+        for (const result of results) {
+          const mapped: ImportJobResult = {
+            id: result.id,
+            success: result.success,
+            error: result.error,
+            status: protoJobStatusToPublic(result.status),
+          };
+          resultsByJobId.set(result.id, mapped);
+        }
+      }
+
+      // Return results in the same order as the input jobs
+      for (const job of jobs) {
+        const result = resultsByJobId.get(job.id);
+        if (result) {
+          allResults.push(result);
+        }
+      }
+
+      return allResults;
+    } catch (error) {
+      throwMappedRpcError(error, {
+        operation: "importJobs",
       });
     }
   }
