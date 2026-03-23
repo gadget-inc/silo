@@ -1912,21 +1912,7 @@ impl Silo for SiloService {
             .await
             .map_err(|e| Status::internal(format!("failed to read LSM state: {}", e)))?;
 
-        Ok(Response::new(GetShardStorageInfoResponse {
-            l0_sst_count: lsm.l0_ssts.len() as u64,
-            total_l0_size: lsm.total_l0_size,
-            sorted_run_count: lsm.sorted_runs.len() as u64,
-            total_sorted_run_size: lsm.total_sorted_run_size,
-            sorted_runs: lsm
-                .sorted_runs
-                .iter()
-                .map(|sr| SortedRunInfo {
-                    id: sr.id,
-                    sst_count: sr.sst_count as u64,
-                    estimated_size: sr.estimated_size,
-                })
-                .collect(),
-        }))
+        Ok(Response::new(lsm.into()))
     }
 }
 

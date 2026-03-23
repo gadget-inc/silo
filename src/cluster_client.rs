@@ -40,8 +40,7 @@ use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ColumnInfo, CompactShardRequest, GetJobRequest, GetJobResponse,
     GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse, JobStatus,
-    QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes, SortedRunInfo,
-    serialized_bytes,
+    QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -839,21 +838,7 @@ impl ClusterClient {
                 .read_lsm_state()
                 .await
                 .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
-            return Ok(GetShardStorageInfoResponse {
-                l0_sst_count: lsm.l0_ssts.len() as u64,
-                total_l0_size: lsm.total_l0_size,
-                sorted_run_count: lsm.sorted_runs.len() as u64,
-                total_sorted_run_size: lsm.total_sorted_run_size,
-                sorted_runs: lsm
-                    .sorted_runs
-                    .iter()
-                    .map(|sr| SortedRunInfo {
-                        id: sr.id,
-                        sst_count: sr.sst_count as u64,
-                        estimated_size: sr.estimated_size,
-                    })
-                    .collect(),
-            });
+            return Ok(lsm.into());
         }
 
         // Shard is not local, route to remote owner
