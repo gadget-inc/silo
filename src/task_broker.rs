@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
-use slatedb::{Db, WriteBatch};
+use slatedb::{Db, DbIterator, KeyValue, WriteBatch};
 use tokio::sync::Notify;
 
 use crate::codec::{DecodedTask, decode_task_validated};
@@ -28,10 +28,29 @@ pub struct BrokerTask {
     pub decoded: DecodedTask,
 }
 
+/// Result of a single scan pass from the cached iterator.
+enum ScanOutcome {
+    /// Inserted entries, stopped at batch limit or buffer full.
+    /// The iterator has more entries to read.
+    ReadBatch { inserted: usize },
+    /// Hit a task with a future timestamp. The consumed entry is returned
+    /// so the caller can re-evaluate it on the next pass with a fresh
+    /// `now_ms` without losing it from the iterator.
+    HitFuture {
+        inserted: usize,
+        pending_kv: KeyValue,
+    },
+    /// The iterator reached the end of the key range.
+    Exhausted { inserted: usize },
+}
+
 /// A single per-task-group broker that scans only its own key range.
 ///
 /// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key bytes.
-/// - Populates from SlateDB in the background with exponential backoff when no work is found.
+/// - Populates from SlateDB in the background using a cached iterator that marches
+///   forward through the key range, avoiding redundant re-reads of buffered entries.
+/// - When wakeup() fires (new tasks written), the cached iterator is dropped and
+///   recreated from the beginning to pick up tasks behind the old cursor.
 /// - Ensures tasks claimed but not yet durably leased are tracked as in-flight and not reinserted.
 pub struct TaskBroker {
     // The task group this broker is responsible for
@@ -52,11 +71,12 @@ pub struct TaskBroker {
     running: Arc<AtomicBool>,
     // A notify object to wake up the background scanner when a task is claimed
     notify: Arc<Notify>,
-    // Whether the background scanner should be woken up
+    // Whether the background scanner should be woken up and the cached
+    // iterator should be dropped (new tasks may exist behind the cursor).
     scan_requested: Arc<AtomicBool>,
     // The target buffer size
     target_buffer: usize,
-    // The batch size for the background scanner to read out of the DB
+    // Maximum entries to read per scan pass before yielding control
     scan_batch: usize,
     // The shard name for metrics labeling
     shard_name: String,
@@ -64,22 +84,17 @@ pub struct TaskBroker {
     metrics: Option<Metrics>,
     /// The shard's tenant range for filtering defunct tasks.
     range: ShardRange,
-    /// Scan cursor: the last key read by the scanner. When set, the next scan
-    /// resumes from just after this key instead of re-reading from the
-    /// beginning of the task group range. Invalidated by `wakeup()` so that
-    /// newly-created tasks behind the cursor are not missed.
-    scan_cursor: Mutex<Option<Vec<u8>>>,
-    /// Set to true when a wakeup fires, forcing the next scan to start from
-    /// the beginning of the key range. This ensures tasks created behind the
-    /// cursor (by enqueue, expedite, restart, concurrency grants, etc.) are
-    /// picked up on the next scan pass.
-    cursor_invalidated: AtomicBool,
 }
 
 impl TaskBroker {
     // Keep ack tombstones for a bounded number of completed scan generations and
     // refresh the tombstone generation whenever a stale key is observed again.
     const ACK_TOMBSTONE_RETAIN_GENERATIONS: u64 = 64;
+
+    // Maximum age of a cached iterator before it's recreated. This bounds
+    // how long we hold a snapshot-isolated view that can't see new writes
+    // when no wakeups arrive (e.g. scheduled tasks becoming ready).
+    const MAX_ITER_AGE: Duration = Duration::from_secs(5);
 
     fn new(
         task_group: String,
@@ -100,17 +115,10 @@ impl TaskBroker {
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
             target_buffer: 8192,
-            // Must be >= target_buffer / 2 (the low watermark) so that a
-            // single scan pass can refill from low-watermark to target.
-            // With a smaller batch the scanner needs multiple passes and
-            // each pass re-reads every already-buffered entry from the
-            // start of the key range, wasting O(buffer_size) reads/pass.
             scan_batch: 4096,
             shard_name,
             metrics,
             range,
-            scan_cursor: Mutex::new(None),
-            cursor_invalidated: AtomicBool::new(false),
         })
     }
 
@@ -136,84 +144,69 @@ impl TaskBroker {
         });
     }
 
-    /// Determine the scan start key. If we have a valid cursor (not
-    /// invalidated), resume scanning from just after the cursor. Otherwise
-    /// start from the beginning of the task group range.
-    fn take_scan_start(&self) -> (Vec<u8>, bool) {
-        let group_prefix = task_group_prefix(&self.task_group);
-
-        // If cursor was invalidated by a wakeup, start from the beginning
-        if self.cursor_invalidated.swap(false, Ordering::SeqCst) {
-            *self.scan_cursor.lock().unwrap() = None;
-            return (group_prefix, true);
-        }
-
-        let cursor = self.scan_cursor.lock().unwrap();
-        match cursor.as_ref() {
-            Some(last_key) => {
-                // Resume just after the last key we read
-                let resume_from = end_bound(last_key);
-                (resume_from, false)
-            }
-            None => (group_prefix, true),
-        }
-    }
-
-    /// Update the scan cursor to the last key read in the scan.
-    fn set_scan_cursor(&self, last_key: Option<Vec<u8>>) {
-        *self.scan_cursor.lock().unwrap() = last_key;
-    }
-
-    /// Reset the cursor so the next scan starts from the beginning.
-    fn reset_scan_cursor(&self) {
-        *self.scan_cursor.lock().unwrap() = None;
-    }
-
-    /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
-    async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
+    /// Create a fresh iterator over the full task group key range.
+    async fn new_scan_iter(&self) -> Option<DbIterator> {
         // [SILO-SCAN-1] Scan only this task group's key range
-        let (start, is_full_scan) = self.take_scan_start();
-        let end = end_bound(&task_group_prefix(&self.task_group));
+        let start = task_group_prefix(&self.task_group);
+        let end = end_bound(&start);
+        self.db.scan::<Vec<u8>, _>(start..end).await.ok()
+    }
 
-        // If the cursor is past the end of the range, wrap around
-        if start >= end {
-            self.reset_scan_cursor();
-            return 0;
-        }
-
-        let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..end).await else {
-            return 0;
-        };
-
-        // Collect keys to delete for defunct tasks (outside shard range)
+    /// Read entries from an existing iterator, inserting ready tasks into the
+    /// buffer. Stops when the batch limit is hit, the buffer is full, a
+    /// future-timestamped task is encountered, or the iterator is exhausted.
+    ///
+    /// `pending_kv` is a previously-consumed entry that was returned from a
+    /// prior `HitFuture` outcome. If provided, it is processed first before
+    /// reading from the iterator.
+    async fn scan_from_iter(
+        &self,
+        iter: &mut DbIterator,
+        pending_kv: Option<KeyValue>,
+        now_ms: i64,
+        generation: u64,
+    ) -> ScanOutcome {
         let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
-
         let mut inserted = 0;
-        let mut last_key_read: Option<Vec<u8>> = None;
-        let mut reached_end = true;
-        while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
-            let Ok(Some(kv)) = iter.next().await else {
-                break;
+        let mut next_kv = pending_kv;
+
+        loop {
+            if inserted >= self.scan_batch || self.buffer.len() >= self.target_buffer {
+                self.delete_defunct_keys(defunct_keys).await;
+                return ScanOutcome::ReadBatch { inserted };
+            }
+
+            // Use the held-back entry first, then read from the iterator.
+            let kv = match next_kv.take() {
+                Some(kv) => kv,
+                None => {
+                    let Ok(Some(kv)) = iter.next().await else {
+                        self.delete_defunct_keys(defunct_keys).await;
+                        return ScanOutcome::Exhausted { inserted };
+                    };
+                    kv
+                }
             };
-            reached_end = false;
 
             // Parse the task key to extract timestamp
             let Some(parsed_key) = parse_task_key(&kv.key) else {
-                last_key_read = Some(kv.key.to_vec());
                 continue;
             };
 
-            // Filter out future tasks
+            // Stop when we reach future tasks. Return the consumed entry so
+            // the caller can re-evaluate it on the next pass with a fresh now_ms.
             if parsed_key.start_time_ms > now_ms as u64 {
-                last_key_read = Some(kv.key.to_vec());
-                continue;
+                self.delete_defunct_keys(defunct_keys).await;
+                return ScanOutcome::HitFuture {
+                    inserted,
+                    pending_kv: kv,
+                };
             }
 
             let key_bytes = kv.key.to_vec();
 
             // [SILO-SCAN-3] Skip inflight tasks
             if self.inflight.lock().unwrap().contains(&key_bytes) {
-                last_key_read = Some(key_bytes);
                 continue;
             }
 
@@ -229,23 +222,18 @@ impl TaskBroker {
                 }
             };
             if suppress_due_to_tombstone {
-                last_key_read = Some(key_bytes);
                 continue;
             }
 
             let decoded = match decode_task_validated(kv.value.clone()) {
                 Ok(t) => t,
-                Err(_) => {
-                    last_key_read = Some(key_bytes);
-                    continue; // Skip malformed tasks
-                }
+                Err(_) => continue,
             };
 
             // Check if task's tenant is within shard range
             let task_tenant = decoded.tenant();
 
             if !self.range.contains_tenant(task_tenant) {
-                // Task is for a tenant outside our range - mark for deletion
                 defunct_keys.push(kv.key.to_vec());
                 debug!(
                     task_group = %parsed_key.task_group,
@@ -254,7 +242,6 @@ impl TaskBroker {
                     range = %self.range,
                     "skipping defunct task (tenant outside shard range)"
                 );
-                last_key_read = Some(key_bytes);
                 continue;
             }
 
@@ -265,7 +252,7 @@ impl TaskBroker {
 
             // [SILO-SCAN-2] Insert into buffer if not already present
             if self.buffer.get(&key_bytes).is_none() {
-                self.buffer.insert(key_bytes.clone(), entry);
+                self.buffer.insert(key_bytes, entry);
                 inserted += 1;
 
                 // Yield periodically to avoid starving other tasks
@@ -273,48 +260,37 @@ impl TaskBroker {
                     tokio::task::yield_now().await;
                 }
             }
-
-            last_key_read = Some(key_bytes);
         }
+    }
 
-        // Update cursor position
-        if let Some(last_key) = last_key_read {
-            self.set_scan_cursor(Some(last_key));
-        } else if reached_end {
-            // Iterator returned nothing — we've exhausted the range.
-            // Reset cursor so next scan starts from the beginning.
-            self.reset_scan_cursor();
+    /// Delete defunct tasks (outside shard range) from the database.
+    async fn delete_defunct_keys(&self, defunct_keys: Vec<Vec<u8>>) {
+        if defunct_keys.is_empty() {
+            return;
         }
-        // If we stopped because inserted >= scan_batch or buffer is full,
-        // and we got a cursor update above, we'll resume from there next time.
-
-        // On a full scan that inserted nothing, the cursor has now walked
-        // through the entire range without finding new work. Reset it so
-        // the next scan starts fresh rather than repeatedly scanning the tail.
-        if is_full_scan && inserted == 0 {
-            self.reset_scan_cursor();
+        let mut batch = WriteBatch::new();
+        for key in &defunct_keys {
+            batch.delete(key);
         }
-
-        // Delete defunct tasks from the database
-        if !defunct_keys.is_empty() {
-            let mut batch = WriteBatch::new();
-            for key in &defunct_keys {
-                batch.delete(key);
-            }
-            if let Err(e) = self.db.write(batch).await {
-                debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct tasks");
-            } else {
-                debug!(
-                    count = defunct_keys.len(),
-                    "deleted defunct tasks outside shard range"
-                );
-            }
+        if let Err(e) = self.db.write(batch).await {
+            debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct tasks");
+        } else {
+            debug!(
+                count = defunct_keys.len(),
+                "deleted defunct tasks outside shard range"
+            );
         }
-
-        inserted
     }
 
     /// Start the background scanning loop.
+    ///
+    /// The scan loop holds a cached `DbIterator` that marches forward through
+    /// the task group's key range. This avoids re-reading already-buffered
+    /// entries on each pass. The iterator is dropped and recreated when:
+    /// - `wakeup()` fires (new tasks may have been written behind the cursor)
+    /// - The iterator is exhausted (reached end of range)
+    /// - The iterator is older than `MAX_ITER_AGE` (to pick up time-based
+    ///   changes like scheduled tasks becoming ready)
     fn start(self: &Arc<Self>) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
@@ -327,6 +303,14 @@ impl TaskBroker {
             let mut sleep_ms = min_sleep_ms;
             let scan_low_watermark = broker.target_buffer / 2;
             let mut scanning = false;
+
+            // Cached iterator state — lives across loop iterations
+            let mut cached_iter: Option<DbIterator> = None;
+            let mut iter_created_at = std::time::Instant::now();
+            // Entry consumed from the iterator that turned out to be a future
+            // task. Held here so the next scan pass can re-evaluate it with a
+            // fresh now_ms without losing it.
+            let mut pending_future_kv: Option<KeyValue> = None;
 
             loop {
                 if !broker.running.load(Ordering::SeqCst) {
@@ -347,12 +331,46 @@ impl TaskBroker {
                     continue;
                 }
 
+                // Check if the cached iterator needs to be dropped and recreated.
+                // This happens when:
+                // 1. wakeup() fired (scan_requested) — new tasks may be behind cursor
+                // 2. Iterator is too old — scheduled tasks may have become ready
+                // 3. No iterator exists yet
+                let was_scan_requested = broker.scan_requested.swap(false, Ordering::SeqCst);
+                let need_fresh_iter = was_scan_requested
+                    || cached_iter.is_none()
+                    || iter_created_at.elapsed() > Self::MAX_ITER_AGE;
+
+                if need_fresh_iter {
+                    cached_iter = broker.new_scan_iter().await;
+                    iter_created_at = std::time::Instant::now();
+                    // Drop any held-back future entry — the fresh iterator
+                    // will re-read it from the new snapshot.
+                    pending_future_kv = None;
+                    if cached_iter.is_none() {
+                        sleep_ms = (sleep_ms * 2).min(max_sleep_ms);
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        continue;
+                    }
+                }
+
+                let iter = cached_iter.as_mut().unwrap();
+
                 // Scan for ready tasks
                 let now_ms = crate::job_store_shard::now_epoch_ms();
                 let scan_start = std::time::Instant::now();
                 let generation = broker.begin_scan_generation();
-                let inserted = broker.scan_tasks(now_ms, generation).await;
+                let outcome = broker
+                    .scan_from_iter(iter, pending_future_kv.take(), now_ms, generation)
+                    .await;
                 broker.complete_scan_generation(generation);
+
+                let inserted = match &outcome {
+                    ScanOutcome::ReadBatch { inserted }
+                    | ScanOutcome::HitFuture { inserted, .. }
+                    | ScanOutcome::Exhausted { inserted } => *inserted,
+                };
+
                 if let Some(ref m) = broker.metrics {
                     m.record_broker_scan_duration(
                         &broker.shard_name,
@@ -370,18 +388,38 @@ impl TaskBroker {
                     );
                 }
 
-                // Adjust backoff: stay aggressive when buffer needs filling
-                // AND the scan actually found tasks to insert. If the scan
-                // found nothing, back off even if the buffer is low — the DB
-                // is empty and there's no point hammering it at 200 scans/s.
-                if inserted == 0 {
-                    sleep_ms = (sleep_ms * 2).min(max_sleep_ms);
-                } else {
-                    sleep_ms = min_sleep_ms;
+                match outcome {
+                    ScanOutcome::ReadBatch { .. } => {
+                        // More entries available — stay aggressive
+                        sleep_ms = min_sleep_ms;
+                    }
+                    ScanOutcome::HitFuture { pending_kv, .. } => {
+                        // Hold the consumed future entry for the next pass.
+                        pending_future_kv = Some(pending_kv);
+                        if inserted == 0 {
+                            sleep_ms = (sleep_ms * 2).min(max_sleep_ms);
+                        } else {
+                            sleep_ms = min_sleep_ms;
+                        }
+                    }
+                    ScanOutcome::Exhausted { .. } => {
+                        // Nothing left in range. Drop iterator so next pass
+                        // creates a fresh one from the beginning.
+                        cached_iter = None;
+                        if inserted == 0 {
+                            sleep_ms = (sleep_ms * 2).min(max_sleep_ms);
+                        } else {
+                            sleep_ms = min_sleep_ms;
+                        }
+                    }
                 }
 
-                // Handle explicit scan requests with minimal sleep
-                if broker.scan_requested.swap(false, Ordering::SeqCst) {
+                // Fast-path: if this scan was triggered by a wakeup, or a
+                // new wakeup arrived during the scan, loop immediately with
+                // minimal delay. This ensures the scanner stays responsive
+                // to enqueue→wakeup→dequeue sequences without requiring
+                // the full backoff sleep to elapse.
+                if was_scan_requested || broker.scan_requested.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     continue;
                 }
@@ -396,6 +434,9 @@ impl TaskBroker {
                         // resetting to min — keeps scan rate reasonable
                         // while still responding to demand.
                         sleep_ms = (sleep_ms / 2).max(min_sleep_ms);
+                        // Mark scan_requested so the loop drops the cached
+                        // iterator on the next pass.
+                        broker.scan_requested.store(true, Ordering::SeqCst);
                         debug!(task_group = %broker.task_group, "broker woken by notification");
                     }
                     _ = &mut delay => {},
@@ -500,11 +541,11 @@ impl TaskBroker {
         }
     }
 
-    /// Wake the scanner to refill promptly. Invalidates the scan cursor so
-    /// that the next scan starts from the beginning of the key range, ensuring
-    /// newly-created tasks that sort before the cursor are not missed.
+    /// Wake the scanner to refill promptly. Signals the scan loop to drop its
+    /// cached iterator and create a fresh one from the beginning of the key
+    /// range, ensuring newly-created tasks that sort before the old cursor
+    /// position are picked up.
     fn wakeup(&self) {
-        self.cursor_invalidated.store(true, Ordering::SeqCst);
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
     }

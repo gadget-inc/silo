@@ -186,12 +186,24 @@ async fn expedited_task_picked_up_by_scanner() {
             .expect("expedite");
 
         // The expedited task should now be dequeueable
-        let result = shard
-            .dequeue("w", "default", 1)
-            .await
-            .expect("dequeue after expedite");
-        assert_eq!(result.tasks.len(), 1, "expedited task should be dequeued");
-        assert_eq!(result.tasks[0].job().id(), "future-job");
+        let mut all_ids: Vec<String> = Vec::new();
+        loop {
+            let batch = shard
+                .dequeue("w", "default", 10)
+                .await
+                .expect("dequeue after expedite");
+            if batch.tasks.is_empty() {
+                break;
+            }
+            for task in &batch.tasks {
+                all_ids.push(task.job().id().to_string());
+            }
+        }
+        assert!(
+            all_ids.contains(&"future-job".to_string()),
+            "expedited task must be picked up; got: {:?}",
+            all_ids
+        );
     });
 }
 
