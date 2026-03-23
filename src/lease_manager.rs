@@ -4,9 +4,13 @@
 //! a parallel in-memory view that is populated on shard startup by scanning the
 //! DB once, then kept in sync via insert/remove/update calls from the dequeue,
 //! heartbeat, and report_outcome paths.
+//!
+//! Hydration (the initial DB scan) runs asynchronously on shard open. Methods
+//! that need a complete view of pre-existing leases (like `expired_leases`)
+//! internally await hydration before returning, so callers don't need to know
+//! about it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::Notify;
@@ -23,25 +27,23 @@ pub struct TrackedLease {
 pub struct LeaseManager {
     /// task_id → expiry_ms
     leases: DashMap<String, i64>,
-    /// Whether the initial DB scan has completed.
-    hydrated: AtomicBool,
-    /// Ensures only one hydration scan runs at a time.
-    hydrating: AtomicBool,
-    /// Wake waiters once hydration completes.
-    hydration_notify: Notify,
+    /// Notified once when the initial DB hydration scan completes.
+    hydration_complete: Notify,
+    /// Whether hydration has finished (for fast-path skip of await).
+    hydration_done: std::sync::atomic::AtomicBool,
 }
 
 impl LeaseManager {
     pub fn new() -> Self {
         Self {
             leases: DashMap::new(),
-            hydrated: AtomicBool::new(false),
-            hydrating: AtomicBool::new(false),
-            hydration_notify: Notify::new(),
+            hydration_complete: Notify::new(),
+            hydration_done: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Record a new lease (called when a task is leased during dequeue).
+    /// Safe to call before hydration — new leases are always tracked immediately.
     pub fn insert(&self, task_id: String, expiry_ms: i64) {
         self.leases.insert(task_id, expiry_ms);
     }
@@ -51,18 +53,11 @@ impl LeaseManager {
         self.leases.remove(task_id);
     }
 
-    /// Returns true if the initial DB hydration scan has completed.
-    pub fn is_hydrated(&self) -> bool {
-        self.hydrated.load(Ordering::Acquire)
-    }
-
-    /// Return the set of all tracked task IDs.
-    pub fn all_task_ids(&self) -> std::collections::HashSet<String> {
-        self.leases.iter().map(|e| e.key().clone()).collect()
-    }
-
     /// Return all leases that have expired as of `now_ms`.
-    pub fn expired_leases(&self, now_ms: i64) -> Vec<TrackedLease> {
+    /// Awaits hydration if it hasn't completed yet, so the result includes
+    /// pre-existing leases from the DB.
+    pub async fn expired_leases(&self, now_ms: i64) -> Vec<TrackedLease> {
+        self.await_hydration().await;
         self.leases
             .iter()
             .filter(|entry| *entry.value() <= now_ms)
@@ -73,72 +68,85 @@ impl LeaseManager {
             .collect()
     }
 
+    /// Return the set of all tracked task IDs.
+    /// Awaits hydration if it hasn't completed yet.
+    pub async fn all_task_ids(&self) -> std::collections::HashSet<String> {
+        self.await_hydration().await;
+        self.leases.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Number of tracked leases.
     pub fn len(&self) -> usize {
         self.leases.len()
     }
 
-    /// Populate the tracker from a DB scan. Called once during shard startup.
+    /// Kick off hydration from a DB scan. Must be called exactly once during shard startup.
     /// Retries on failure with backoff to ensure pre-existing leases are not lost.
-    pub async fn hydrate_from_db(
+    pub fn start_hydration(
         self: &Arc<Self>,
-        db: &slatedb::Db,
-        range: &crate::shard_range::ShardRange,
+        db: Arc<slatedb::Db>,
+        range: crate::shard_range::ShardRange,
     ) {
-        if self.is_hydrated() {
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            const MAX_RETRIES: usize = 5;
+            let mut attempt = 0;
+
+            loop {
+                match mgr.try_hydrate(&db, &range).await {
+                    Ok(count) => {
+                        debug!(count, "lease manager: hydration complete");
+                        break;
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt >= MAX_RETRIES {
+                            tracing::error!(
+                                error = %e,
+                                attempts = attempt,
+                                "lease manager: hydration failed after max retries, \
+                                 pre-existing leases may not be tracked"
+                            );
+                            break;
+                        }
+                        let backoff_ms = 100 * (1 << attempt.min(4));
+                        tracing::warn!(
+                            error = %e,
+                            attempt,
+                            backoff_ms,
+                            "lease manager: hydration scan failed, retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+
+            mgr.hydration_done
+                .store(true, std::sync::atomic::Ordering::Release);
+            mgr.hydration_complete.notify_waiters();
+        });
+    }
+
+    /// Wait for hydration to complete. Fast no-op if already done.
+    async fn await_hydration(&self) {
+        // Fast path: already hydrated
+        if self
+            .hydration_done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
-
-        if self
-            .hydrating
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            // Another task is already hydrating — wait for it to finish.
-            // Create the Notified future BEFORE checking the condition to
-            // avoid a TOCTOU race where the notification fires between the
-            // check and the await.
-            loop {
-                let notified = self.hydration_notify.notified();
-                if self.is_hydrated() {
-                    return;
-                }
-                notified.await;
-            }
-        }
-
-        const MAX_RETRIES: usize = 5;
-        let mut attempt = 0;
-
+        // Slow path: wait for notification. Create the Notified future
+        // BEFORE re-checking to avoid a TOCTOU race.
         loop {
-            match self.try_hydrate(db, range).await {
-                Ok(count) => {
-                    self.finish_hydration();
-                    debug!(count, "lease manager: hydration complete");
-                    return;
-                }
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= MAX_RETRIES {
-                        tracing::error!(
-                            error = %e,
-                            attempts = attempt,
-                            "lease manager: hydration failed after max retries, \
-                             pre-existing leases may not be tracked"
-                        );
-                        self.finish_hydration();
-                        return;
-                    }
-                    let backoff_ms = 100 * (1 << attempt.min(4));
-                    tracing::warn!(
-                        error = %e,
-                        attempt,
-                        backoff_ms,
-                        "lease manager: hydration scan failed, retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                }
+            let notified = self.hydration_complete.notified();
+            if self
+                .hydration_done
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
             }
+            notified.await;
         }
     }
 
@@ -181,25 +189,5 @@ impl LeaseManager {
         }
 
         Ok(count)
-    }
-
-    fn finish_hydration(&self) {
-        self.hydrated.store(true, Ordering::Release);
-        self.hydrating.store(false, Ordering::Release);
-        self.hydration_notify.notify_waiters();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_for_test(&self) {
-        self.leases.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_hydrated_for_test(&self, hydrated: bool) {
-        self.hydrated.store(hydrated, Ordering::Release);
-        self.hydrating.store(false, Ordering::Release);
-        if hydrated {
-            self.hydration_notify.notify_waiters();
-        }
     }
 }

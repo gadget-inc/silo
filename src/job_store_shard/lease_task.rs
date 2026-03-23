@@ -217,7 +217,7 @@ impl JobStoreShard {
         })
         .await?;
 
-        // Keep the in-memory tracker aligned with leases created outside dequeue.
+        // Record the lease in the lease manager after durably commiting it
         self.lease_manager
             .insert(attempt.task_id.clone(), expiry_ms);
 

@@ -108,7 +108,7 @@ pub struct JobStoreShard {
     db_path: String,
     /// The shard's tenant range, immutable after opening.
     range: ShardRange,
-    /// In-memory lease tracker to avoid expensive DB scans during reaping.
+    /// In-memory lease tracker that avoids expensive DB scans to check lease expiry.
     pub(crate) lease_manager: Arc<LeaseManager>,
 }
 
@@ -368,15 +368,10 @@ impl JobStoreShard {
             lease_manager,
         });
 
-        // Hydrate the lease tracker from DB in the background
-        {
-            let tracker = Arc::clone(&shard.lease_manager);
-            let db = Arc::clone(&shard.db);
-            let range = range.clone();
-            tokio::spawn(async move {
-                tracker.hydrate_from_db(&db, &range).await;
-            });
-        }
+        // Hydrate the lease manager from DB in the background
+        shard
+            .lease_manager
+            .start_hydration(Arc::clone(&shard.db), range.clone());
 
         // Periodically reconcile pending concurrency requests to self-heal from
         // missed in-memory notifications or transient scanner failures.
@@ -550,7 +545,7 @@ impl JobStoreShard {
         }
 
         // Collect all task_ids from the lease manager
-        let manager_task_ids: HashSet<String> = self.lease_manager.all_task_ids();
+        let manager_task_ids: HashSet<String> = self.lease_manager.all_task_ids().await;
 
         let missing_from_manager: Vec<String> =
             db_task_ids.difference(&manager_task_ids).cloned().collect();
