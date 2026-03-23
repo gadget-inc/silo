@@ -144,9 +144,9 @@ async fn test_metrics_gauge_values() {
 
     // Set some gauge values
     metrics.set_shards_owned(3);
-    metrics.set_broker_buffer_size("0", 100);
-    metrics.set_broker_buffer_size("1", 50);
-    metrics.set_broker_inflight_size("0", 10);
+    metrics.set_broker_buffer_size("0", "default", 100);
+    metrics.set_broker_buffer_size("1", "default", 50);
+    metrics.set_broker_inflight_size("0", "default", 10);
 
     let request = Request::builder()
         .method("GET")
@@ -180,13 +180,33 @@ async fn test_metrics_gauge_values() {
         body_str.contains("silo_shards_owned 3"),
         "shards_owned should be 3"
     );
+    // Use find_line helper since label order may vary
+    let find_line = |substrings: &[&str]| -> Option<String> {
+        body_str
+            .lines()
+            .find(|l| substrings.iter().all(|s| l.contains(s)))
+            .map(|s| s.to_string())
+    };
+
+    let buf0 = find_line(&[
+        "silo_broker_buffer_size",
+        "shard=\"0\"",
+        "task_group=\"default\"",
+    ]);
     assert!(
-        body_str.contains("silo_broker_buffer_size{shard=\"0\"} 100"),
-        "buffer size for shard 0 should be 100"
+        buf0.as_ref().map_or(false, |l| l.ends_with(" 100")),
+        "buffer size for shard 0 should be 100, found: {:?}",
+        buf0
     );
+    let buf1 = find_line(&[
+        "silo_broker_buffer_size",
+        "shard=\"1\"",
+        "task_group=\"default\"",
+    ]);
     assert!(
-        body_str.contains("silo_broker_buffer_size{shard=\"1\"} 50"),
-        "buffer size for shard 1 should be 50"
+        buf1.as_ref().map_or(false, |l| l.ends_with(" 50")),
+        "buffer size for shard 1 should be 50, found: {:?}",
+        buf1
     );
 }
 

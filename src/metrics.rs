@@ -194,17 +194,17 @@ impl Metrics {
         self.coordination_shards_open.set(count as f64);
     }
 
-    /// Update broker buffer size for a shard.
-    pub fn set_broker_buffer_size(&self, shard: &str, size: u64) {
+    /// Update broker buffer size for a shard and task group.
+    pub fn set_broker_buffer_size(&self, shard: &str, task_group: &str, size: u64) {
         self.broker_buffer_size
-            .with_label_values(&[shard])
+            .with_label_values(&[shard, task_group])
             .set(size as f64);
     }
 
-    /// Update broker inflight size for a shard.
-    pub fn set_broker_inflight_size(&self, shard: &str, size: u64) {
+    /// Update broker inflight size for a shard and task group.
+    pub fn set_broker_inflight_size(&self, shard: &str, task_group: &str, size: u64) {
         self.broker_inflight_size
-            .with_label_values(&[shard])
+            .with_label_values(&[shard, task_group])
             .set(size as f64);
     }
 
@@ -477,7 +477,7 @@ pub fn init() -> anyhow::Result<Metrics> {
                 "silo_broker_buffer_size",
                 "Number of tasks in the broker buffer",
             ),
-            &["shard"],
+            &["shard", "task_group"],
         )?,
     );
 
@@ -488,7 +488,7 @@ pub fn init() -> anyhow::Result<Metrics> {
                 "silo_broker_inflight_size",
                 "Number of tasks currently in-flight (claimed but not durably leased)",
             ),
-            &["shard"],
+            &["shard", "task_group"],
         )?,
     );
 
