@@ -298,10 +298,24 @@ impl TaskBroker {
                     sleep_ms = min_sleep_ms;
                 }
 
-                // Handle explicit scan requests with minimal sleep
+                // Handle explicit scan requests. When scan_requested is set
+                // (wakeup fired), use minimal sleep if we found tasks, or
+                // reset to min_sleep if we didn't. This prevents continuous
+                // enqueues from keeping the scanner spinning at 100+ scans/s
+                // (old behavior: always 1ms) while still keeping it responsive
+                // (won't exponentially back off to 2s during active workloads).
                 if broker.scan_requested.swap(false, Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
+                    if inserted > 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    // Wakeup arrived but scan found nothing new. Use a
+                    // short sleep instead of the 1ms fast-path (which
+                    // causes spinning at 100+/s) or the full min_sleep_ms
+                    // (50ms, too slow for the nudge loop's 25ms window).
+                    // 5ms matches the nudge poll interval and caps the
+                    // scan rate at ~200/s during active workloads.
+                    sleep_ms = 5;
                 }
 
                 // Sleep with early wakeup support
