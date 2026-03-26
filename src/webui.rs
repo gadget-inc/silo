@@ -160,6 +160,8 @@ struct QueueTemplate {
     nav_active: &'static str,
     tenancy_enabled: bool,
     name: String,
+    max_concurrency: Option<i64>,
+    limit_type: Option<String>,
     holders: Vec<HolderRow>,
     requesters: Vec<RequesterRow>,
 }
@@ -885,11 +887,15 @@ async fn queue_handler(
 ) -> impl IntoResponse {
     let mut holders: Vec<HolderRow> = Vec::new();
     let mut requesters: Vec<RequesterRow> = Vec::new();
+    let mut max_concurrency: Option<i64> = None;
+    let mut limit_type: Option<String> = None;
+
+    let escaped_name = params.name.replace('\'', "''");
 
     // Query queue data from ALL shards via cluster query engine
     let sql = format!(
         "SELECT shard_id, tenant, task_id, job_id, entry_type, priority, timestamp_ms FROM queues WHERE queue_name = '{}'",
-        params.name.replace('\'', "''") // Basic SQL escaping
+        escaped_name
     );
 
     match state.query_engine.sql(&sql).await {
@@ -983,10 +989,42 @@ async fn queue_handler(
         }
     }
 
+    // Query concurrency limit info from queue_counts (works across local and remote shards)
+    let limit_sql = format!(
+        "SELECT max_concurrency, limit_type FROM queue_counts WHERE queue_name = '{}' LIMIT 1",
+        escaped_name
+    );
+
+    if let Ok(df) = state.query_engine.sql(&limit_sql).await
+        && let Ok(batches) = df.collect().await
+    {
+        for batch in &batches {
+            if batch.num_rows() > 0 {
+                if let Some(mc_col) = batch.column_by_name("max_concurrency").and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                }) && !mc_col.is_null(0)
+                {
+                    max_concurrency = Some(mc_col.value(0));
+                }
+                if let Some(lt_col) = batch.column_by_name("limit_type").and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::StringArray>()
+                }) && !lt_col.is_null(0)
+                {
+                    limit_type = Some(lt_col.value(0).to_string());
+                }
+                break;
+            }
+        }
+    }
+
     let template = QueueTemplate {
         nav_active: "queues",
         tenancy_enabled: state.config.tenancy.enabled,
         name: params.name,
+        max_concurrency,
+        limit_type,
         holders,
         requesters,
     };
