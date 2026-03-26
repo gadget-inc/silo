@@ -114,6 +114,14 @@ impl ShardQueryEngine {
         ));
         ctx.register_table("queue_counts", queue_counts_provider)?;
 
+        // Register tasks table for debugging the internal task queue
+        let tasks_schema = TasksScanner::base_schema();
+        let tasks_scanner: ScannerRef = Arc::new(TasksScanner {
+            shard: Arc::clone(&shard),
+        });
+        let tasks_provider = Arc::new(SiloTableProvider::new(tasks_schema, tasks_scanner));
+        ctx.register_table("tasks", tasks_provider)?;
+
         Ok(Self { ctx })
     }
 
@@ -2082,6 +2090,430 @@ impl Scan for QueueCountsScanner {
             Arc::clone(&projection),
             ReceiverStream::new(rx),
         ))
+    }
+}
+
+/// Scanner for the tasks table - reads task queue entries from a single shard.
+///
+/// This table exposes the internal task queue for debugging purposes. Performance may be
+/// poor for large datasets unless queries are carefully constructed. For best performance,
+/// filter by `task_group` and optionally a `start_time_ms` range, which mirrors the
+/// access pattern used by the task broker.
+///
+/// Schema: shard_id, tenant, task_group, start_time_ms, priority, job_id, attempt, variant_type
+pub struct TasksScanner {
+    pub(crate) shard: Arc<JobStoreShard>,
+}
+
+impl TasksScanner {
+    pub fn new(shard: Arc<JobStoreShard>) -> Self {
+        Self { shard }
+    }
+
+    pub fn base_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("shard_id", DataType::Utf8, false),
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("task_group", DataType::Utf8, false),
+            Field::new("start_time_ms", DataType::Int64, false),
+            Field::new("priority", DataType::UInt8, false),
+            Field::new("job_id", DataType::Utf8, false),
+            Field::new("attempt", DataType::UInt32, false),
+            Field::new("variant_type", DataType::Utf8, false),
+        ]))
+    }
+}
+
+impl std::fmt::Debug for TasksScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TasksScanner")
+    }
+}
+
+/// Scan strategy for the tasks table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TasksScanStrategy {
+    /// Scan a specific task group, optionally bounded by a time range.
+    /// This is the fast path matching the task broker's access pattern.
+    TaskGroupScan {
+        task_group: String,
+        start_time_lower: Option<i64>,
+        start_time_upper: Option<i64>,
+    },
+    /// Full scan across all task groups, optionally filtered by tenant (post-filter).
+    FullScan,
+}
+
+impl std::fmt::Display for TasksScanStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TasksScanStrategy::TaskGroupScan {
+                task_group,
+                start_time_lower,
+                start_time_upper,
+            } => {
+                write!(
+                    f,
+                    "TaskGroupScan(task_group={:?}, time_lower={:?}, time_upper={:?})",
+                    task_group, start_time_lower, start_time_upper
+                )
+            }
+            TasksScanStrategy::FullScan => write!(f, "FullScan"),
+        }
+    }
+}
+
+/// Parse filters into a TasksScanStrategy.
+pub fn parse_tasks_scan_strategy(filters: &[Expr]) -> TasksScanStrategy {
+    let mut task_group: Option<String> = None;
+    let mut time_lower: Option<i64> = None;
+    let mut time_upper: Option<i64> = None;
+
+    for f in filters {
+        if let Some((col, val)) = parse_eq_filter(f) {
+            if col == "task_group" {
+                task_group = Some(val);
+            }
+        } else if let Some((col, op, val)) = parse_i64_comparison_filter(f)
+            && col == "start_time_ms"
+        {
+            match op {
+                I64ComparisonOp::Eq => {
+                    time_lower = Some(val);
+                    time_upper = Some(val);
+                }
+                I64ComparisonOp::Gt => {
+                    time_lower = Some(val.saturating_add(1));
+                }
+                I64ComparisonOp::GtEq => {
+                    time_lower = Some(val);
+                }
+                I64ComparisonOp::Lt => {
+                    time_upper = Some(val.saturating_sub(1));
+                }
+                I64ComparisonOp::LtEq => {
+                    time_upper = Some(val);
+                }
+            }
+        }
+    }
+
+    if let Some(task_group) = task_group {
+        TasksScanStrategy::TaskGroupScan {
+            task_group,
+            start_time_lower: time_lower,
+            start_time_upper: time_upper,
+        }
+    } else {
+        TasksScanStrategy::FullScan
+    }
+}
+
+/// Classify task filters for pushdown.
+pub fn classify_tasks_filters(filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+    let unqualified_filters: Vec<Expr> = filters.iter().map(|f| unqualify_expr(f)).collect();
+    let strategy = parse_tasks_scan_strategy(&unqualified_filters);
+
+    filters
+        .iter()
+        .map(|f| {
+            let unqualified = unqualify_expr(f);
+            if let Some((col, _)) = parse_eq_filter(&unqualified) {
+                match strategy {
+                    TasksScanStrategy::TaskGroupScan { .. } if col == "task_group" => {
+                        TableProviderFilterPushDown::Exact
+                    }
+                    _ => TableProviderFilterPushDown::Inexact,
+                }
+            } else if let Some((col, ..)) = parse_i64_comparison_filter(&unqualified) {
+                match strategy {
+                    TasksScanStrategy::TaskGroupScan { .. } if col == "start_time_ms" => {
+                        TableProviderFilterPushDown::Exact
+                    }
+                    _ => TableProviderFilterPushDown::Inexact,
+                }
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        })
+        .collect()
+}
+
+fn variant_type_name(vt: crate::fb::silo::fb::TaskVariant) -> &'static str {
+    use crate::fb::silo::fb::TaskVariant;
+    match vt {
+        TaskVariant::RunAttempt => "RunAttempt",
+        TaskVariant::RequestTicket => "RequestTicket",
+        TaskVariant::CheckRateLimit => "CheckRateLimit",
+        TaskVariant::RefreshFloatingLimit => "RefreshFloatingLimit",
+        _ => "Unknown",
+    }
+}
+
+impl Scan for TasksScanner {
+    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+        let strategy = parse_tasks_scan_strategy(filters);
+        format!("tasks[{}], limit={:?}", strategy, limit)
+    }
+
+    fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+        classify_tasks_filters(filters)
+    }
+
+    fn scan(
+        &self,
+        projection: SchemaRef,
+        filters: &[Expr],
+        batch_size: usize,
+        limit: Option<usize>,
+    ) -> SendableRecordBatchStream {
+        let strategy = parse_tasks_scan_strategy(filters);
+        let shard = Arc::clone(&self.shard);
+        let proj = Arc::clone(&projection);
+        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(4);
+
+        tokio::spawn(async move {
+            // Determine scan range based on strategy
+            let (start, end) = match &strategy {
+                TasksScanStrategy::TaskGroupScan {
+                    task_group,
+                    start_time_lower,
+                    ..
+                } => {
+                    let start = if let Some(lower) = start_time_lower {
+                        // Encode a key with the lower time bound (priority=0, empty job_id, attempt=0)
+                        crate::keys::task_key(task_group, *lower, 0, "", 0)
+                    } else {
+                        crate::keys::task_group_prefix(task_group)
+                    };
+                    let end = crate::keys::end_bound(&crate::keys::task_group_prefix(task_group));
+                    (start, end)
+                }
+                TasksScanStrategy::FullScan => {
+                    let start = crate::keys::tasks_prefix();
+                    let end = crate::keys::end_bound(&start);
+                    (start, end)
+                }
+            };
+
+            // Extract upper time bound for early termination in TaskGroupScan
+            let time_upper = match &strategy {
+                TasksScanStrategy::TaskGroupScan {
+                    start_time_upper, ..
+                } => *start_time_upper,
+                _ => None,
+            };
+
+            let iter_result = shard.db().scan::<Vec<u8>, _>(start..end).await;
+            let mut iter = match iter_result {
+                Ok(i) => i,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::Execution(format!(
+                            "failed to scan tasks: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            let shard_id = shard.name().to_string();
+            let mut total_emitted: usize = 0;
+
+            // Collect rows in batches
+            loop {
+                if limit.is_some_and(|l| total_emitted >= l) {
+                    break;
+                }
+
+                let remaining = limit.map(|l| l - total_emitted).unwrap_or(batch_size);
+                let target = remaining.min(batch_size);
+
+                let mut shard_ids = Vec::with_capacity(target);
+                let mut tenants = Vec::with_capacity(target);
+                let mut task_groups = Vec::with_capacity(target);
+                let mut start_times = Vec::with_capacity(target);
+                let mut priorities = Vec::with_capacity(target);
+                let mut job_ids = Vec::with_capacity(target);
+                let mut attempts = Vec::with_capacity(target);
+                let mut variant_types = Vec::with_capacity(target);
+
+                let mut batch_count: usize = 0;
+
+                while batch_count < target {
+                    let kv = match iter.next().await {
+                        Ok(Some(kv)) => kv,
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(format!(
+                                    "task scan iteration error: {}",
+                                    e
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let Some(parsed) = crate::keys::parse_task_key(&kv.key) else {
+                        continue;
+                    };
+
+                    // Early termination: if we have an upper time bound and the key's
+                    // time exceeds it, stop scanning (keys are ordered by time within a group)
+                    if let Some(upper) = time_upper
+                        && parsed.start_time_ms > upper as u64
+                    {
+                        break;
+                    }
+
+                    // Decode the task value to get tenant and variant_type
+                    let decoded = match crate::codec::decode_task_validated(
+                        bytes::Bytes::copy_from_slice(&kv.value),
+                    ) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    shard_ids.push(shard_id.clone());
+                    tenants.push(decoded.tenant().to_string());
+                    task_groups.push(parsed.task_group.clone());
+                    start_times.push(parsed.start_time_ms as i64);
+                    priorities.push(parsed.priority);
+                    job_ids.push(parsed.job_id.clone());
+                    attempts.push(parsed.attempt);
+                    variant_types.push(variant_type_name(decoded.variant_type()).to_string());
+
+                    batch_count += 1;
+                }
+
+                if batch_count == 0 {
+                    break;
+                }
+
+                total_emitted += batch_count;
+
+                if proj.fields().is_empty() {
+                    match make_empty_projection_batch(&proj, batch_count) {
+                        Ok(batch) => {
+                            if tx.send(Ok(batch)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                    continue;
+                }
+
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj.fields().len());
+                for f in proj.fields() {
+                    let col: ArrayRef = match f.name().as_str() {
+                        "shard_id" => Arc::new(StringArray::from(shard_ids.clone())),
+                        "tenant" => Arc::new(StringArray::from(tenants.clone())),
+                        "task_group" => Arc::new(StringArray::from(task_groups.clone())),
+                        "start_time_ms" => Arc::new(Int64Array::from(start_times.clone())),
+                        "priority" => Arc::new(UInt8Array::from(priorities.clone())),
+                        "job_id" => Arc::new(StringArray::from(job_ids.clone())),
+                        "attempt" => Arc::new(UInt32Array::from(attempts.clone())),
+                        "variant_type" => Arc::new(StringArray::from(variant_types.clone())),
+                        other => {
+                            let _ = tx
+                                .send(Err(DataFusionError::Execution(format!(
+                                    "unknown tasks column: {}",
+                                    other
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+                    cols.push(col);
+                }
+
+                match RecordBatch::try_new(Arc::clone(&proj), cols) {
+                    Ok(batch) => {
+                        if tx.send(Ok(batch)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(DataFusionError::Execution(e.to_string())))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&projection),
+            ReceiverStream::new(rx),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum I64ComparisonOp {
+    Eq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+fn parse_i64_comparison_filter(expr: &Expr) -> Option<(String, I64ComparisonOp, i64)> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (&**left, &**right) {
+            (Expr::Column(c), Expr::Literal(s, _)) => i64_comparison_op(op)
+                .zip(literal_to_i64(s))
+                .map(|(cmp, value)| (c.flat_name().to_string(), cmp, value)),
+            (Expr::Literal(s, _), Expr::Column(c)) => inverted_i64_comparison_op(op)
+                .zip(literal_to_i64(s))
+                .map(|(cmp, value)| (c.flat_name().to_string(), cmp, value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn i64_comparison_op(op: &Operator) -> Option<I64ComparisonOp> {
+    match op {
+        Operator::Eq => Some(I64ComparisonOp::Eq),
+        Operator::Lt => Some(I64ComparisonOp::Lt),
+        Operator::LtEq => Some(I64ComparisonOp::LtEq),
+        Operator::Gt => Some(I64ComparisonOp::Gt),
+        Operator::GtEq => Some(I64ComparisonOp::GtEq),
+        _ => None,
+    }
+}
+
+fn inverted_i64_comparison_op(op: &Operator) -> Option<I64ComparisonOp> {
+    match op {
+        Operator::Eq => Some(I64ComparisonOp::Eq),
+        Operator::Lt => Some(I64ComparisonOp::Gt),
+        Operator::LtEq => Some(I64ComparisonOp::GtEq),
+        Operator::Gt => Some(I64ComparisonOp::Lt),
+        Operator::GtEq => Some(I64ComparisonOp::LtEq),
+        _ => None,
+    }
+}
+
+fn literal_to_i64(s: &datafusion::scalar::ScalarValue) -> Option<i64> {
+    use datafusion::scalar::ScalarValue;
+    match s {
+        ScalarValue::Int8(Some(v)) => Some(*v as i64),
+        ScalarValue::Int16(Some(v)) => Some(*v as i64),
+        ScalarValue::Int32(Some(v)) => Some(*v as i64),
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::UInt8(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt16(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt32(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt64(Some(v)) => i64::try_from(*v).ok(),
+        _ => None,
     }
 }
 

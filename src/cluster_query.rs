@@ -39,8 +39,8 @@ use crate::job_store_shard::JobStoreShard;
 use crate::pb::QueryArrowRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::query::{
-    JobsScanner, QueueCountsScanner, QueuesScanner, ScannerRef, TenantCountsScanner,
-    classify_jobs_filters, explain_dataframe,
+    JobsScanner, QueueCountsScanner, QueuesScanner, ScannerRef, TasksScanner, TenantCountsScanner,
+    classify_jobs_filters, classify_tasks_filters, explain_dataframe,
 };
 use crate::shard_range::ShardId;
 
@@ -124,12 +124,23 @@ impl ClusterQueryEngine {
         let queue_counts_schema = QueueCountsScanner::base_schema();
         let queue_counts_provider = Arc::new(ClusterTableProvider::new(
             queue_counts_schema,
-            factory,
-            coordinator,
+            factory.clone(),
+            coordinator.clone(),
             TableKind::QueueCounts,
-            auth_token,
+            auth_token.clone(),
         ));
         ctx.register_table("queue_counts", queue_counts_provider)?;
+
+        // Register cluster-wide tasks table for debugging the internal task queue
+        let tasks_schema = TasksScanner::base_schema();
+        let tasks_provider = Arc::new(ClusterTableProvider::new(
+            tasks_schema,
+            factory,
+            coordinator,
+            TableKind::Tasks,
+            auth_token,
+        ));
+        ctx.register_table("tasks", tasks_provider)?;
 
         Ok(Self { ctx })
     }
@@ -215,6 +226,7 @@ enum TableKind {
     Queues,
     TenantCounts,
     QueueCounts,
+    Tasks,
 }
 
 /// A TableProvider that spans multiple shards in the cluster.
@@ -322,6 +334,7 @@ impl TableProvider for ClusterTableProvider {
         // LIMIT pushdown by marking handled filters as Exact.
         match self.table_kind {
             TableKind::Jobs => Ok(classify_jobs_filters(filters)),
+            TableKind::Tasks => Ok(classify_tasks_filters(filters)),
             _ => Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]),
         }
     }
@@ -481,6 +494,7 @@ impl ExecutionPlan for ClusterExecutionPlan {
                         TableKind::QueueCounts => {
                             Arc::new(QueueCountsScanner::new(Arc::clone(&shard)))
                         }
+                        TableKind::Tasks => Arc::new(TasksScanner::new(Arc::clone(&shard))),
                     };
 
                     // Execute the scan - scanner handles projection via schema
@@ -591,6 +605,7 @@ async fn query_remote_shard_batches(
         TableKind::Queues => "queues",
         TableKind::TenantCounts => "tenant_counts",
         TableKind::QueueCounts => "queue_counts",
+        TableKind::Tasks => "tasks",
     };
 
     let sql = build_sql_query(table_name, filters, limit);

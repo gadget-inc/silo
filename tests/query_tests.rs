@@ -2,12 +2,12 @@ mod test_helpers;
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, Int64Array, StringArray, UInt8Array, UInt32Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::physical_plan::ExecutionPlan;
 use silo::job_store_shard::JobStoreShard;
-use silo::query::ShardQueryEngine;
+use silo::query::{ShardQueryEngine, TasksScanStrategy, parse_tasks_scan_strategy};
 use test_helpers::*;
 
 // Helper to extract string column values from batches
@@ -3766,4 +3766,549 @@ async fn sql_tenant_counts_count_star_preserves_row_count() {
             "tenant_counts should expose one row per tenant/status pair"
         );
     });
+}
+
+// ===== Tasks table tests =====
+
+/// Helper: enqueue a job into a specific task group and return the job ID
+async fn enqueue_job_in_group(
+    shard: &JobStoreShard,
+    id: &str,
+    priority: u8,
+    now: i64,
+    task_group: &str,
+) -> String {
+    shard
+        .enqueue(
+            "-",
+            Some(id.to_string()),
+            priority,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue")
+}
+
+#[silo::test]
+async fn tasks_table_basic_scan() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue jobs - each creates a RunAttempt task in the task queue
+    for id in ["t1", "t2", "t3"] {
+        enqueue_job_in_group(&shard, id, 10, now, "default").await;
+    }
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT job_id, task_group, variant_type FROM tasks ORDER BY job_id")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let job_ids = extract_string_column(&batches, 0);
+    assert_eq!(job_ids, vec!["t1", "t2", "t3"]);
+
+    let task_groups = extract_string_column(&batches, 1);
+    assert!(task_groups.iter().all(|g| g == "default"));
+
+    let variant_types = extract_string_column(&batches, 2);
+    assert!(variant_types.iter().all(|v| v == "RunAttempt"));
+}
+
+#[silo::test]
+async fn tasks_table_filter_by_task_group() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_in_group(&shard, "j1", 10, now, "group_a").await;
+    enqueue_job_in_group(&shard, "j2", 10, now, "group_b").await;
+    enqueue_job_in_group(&shard, "j3", 10, now, "group_a").await;
+    enqueue_job_in_group(&shard, "j4", 10, now, "group_c").await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT job_id FROM tasks WHERE task_group = 'group_a' ORDER BY job_id")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let job_ids = extract_string_column(&batches, 0);
+    assert_eq!(job_ids, vec!["j1", "j3"]);
+}
+
+#[silo::test]
+async fn tasks_table_filter_by_task_group_and_time_range() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let base_time = 1000000i64;
+
+    // Enqueue jobs at different times within the same task group
+    enqueue_job_in_group(&shard, "early", 10, base_time, "workers").await;
+    enqueue_job_in_group(&shard, "mid1", 10, base_time + 100, "workers").await;
+    enqueue_job_in_group(&shard, "mid2", 10, base_time + 200, "workers").await;
+    enqueue_job_in_group(&shard, "late", 10, base_time + 500, "workers").await;
+
+    // Also enqueue in a different group to ensure it's excluded
+    enqueue_job_in_group(&shard, "other", 10, base_time + 150, "other_group").await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    // Query with task_group + time range
+    let query = format!(
+        "SELECT job_id FROM tasks WHERE task_group = 'workers' AND start_time_ms >= {} AND start_time_ms <= {} ORDER BY job_id",
+        base_time + 50,
+        base_time + 300,
+    );
+    let batches = sql
+        .sql(&query)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let job_ids = extract_string_column(&batches, 0);
+    assert_eq!(job_ids, vec!["mid1", "mid2"]);
+}
+
+#[silo::test]
+async fn tasks_table_returns_all_columns() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = 5000000i64;
+
+    enqueue_job_in_group(&shard, "full_col_job", 42, now, "my_group").await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT shard_id, tenant, task_group, start_time_ms, priority, job_id, attempt, variant_type FROM tasks WHERE task_group = 'my_group'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1);
+
+    // shard_id
+    let shard_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(shard_ids.value(0), "test");
+
+    // tenant
+    let tenants = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(tenants.value(0), "-");
+
+    // task_group
+    let groups = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(groups.value(0), "my_group");
+
+    // start_time_ms
+    let times = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(times.value(0), now);
+
+    // priority
+    let priorities = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap();
+    assert_eq!(priorities.value(0), 42);
+
+    // job_id
+    let job_ids = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(job_ids.value(0), "full_col_job");
+
+    // attempt
+    let attempts = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert_eq!(attempts.value(0), 1);
+
+    // variant_type
+    let variants = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(variants.value(0), "RunAttempt");
+}
+
+#[silo::test]
+async fn tasks_table_empty_when_no_tasks() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT COUNT(*) as cnt FROM tasks")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 0);
+}
+
+#[silo::test]
+async fn tasks_table_count_by_task_group() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    for i in 0..5 {
+        enqueue_job_in_group(&shard, &format!("a{}", i), 10, now, "alpha").await;
+    }
+    for i in 0..3 {
+        enqueue_job_in_group(&shard, &format!("b{}", i), 10, now, "beta").await;
+    }
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql(
+            "SELECT task_group, COUNT(*) as cnt FROM tasks GROUP BY task_group ORDER BY task_group",
+        )
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let groups = extract_string_column(&batches, 0);
+    assert_eq!(groups, vec!["alpha", "beta"]);
+
+    let mut counts = Vec::new();
+    for batch in &batches {
+        let arr = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..arr.len() {
+            counts.push(arr.value(i));
+        }
+    }
+    assert_eq!(counts, vec![5, 3]);
+}
+
+#[silo::test]
+async fn tasks_table_tasks_disappear_after_dequeue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_in_group(&shard, "d1", 10, now, "default").await;
+    enqueue_job_in_group(&shard, "d2", 10, now, "default").await;
+
+    // Verify tasks exist before dequeue
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT COUNT(*) as cnt FROM tasks WHERE task_group = 'default'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let count_before = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count_before, 2);
+
+    // Dequeue one task (transitions it from task queue to leased state)
+    shard
+        .dequeue("worker1", "default", 1)
+        .await
+        .expect("dequeue");
+
+    // After dequeue, task is removed from the tasks table
+    let batches = sql
+        .sql("SELECT COUNT(*) as cnt FROM tasks WHERE task_group = 'default'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let count_after = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count_after, 1, "one task should remain after dequeuing one");
+}
+
+#[silo::test]
+async fn tasks_table_multiple_task_groups_isolation() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_in_group(&shard, "w1", 10, now, "workers").await;
+    enqueue_job_in_group(&shard, "w2", 10, now, "workers").await;
+    enqueue_job_in_group(&shard, "e1", 10, now, "emails").await;
+    enqueue_job_in_group(&shard, "c1", 10, now, "cron").await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    // Query workers group
+    let batches = sql
+        .sql("SELECT job_id FROM tasks WHERE task_group = 'workers' ORDER BY job_id")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(extract_string_column(&batches, 0), vec!["w1", "w2"]);
+
+    // Query emails group
+    let batches = sql
+        .sql("SELECT job_id FROM tasks WHERE task_group = 'emails' ORDER BY job_id")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(extract_string_column(&batches, 0), vec!["e1"]);
+
+    // Count all tasks across all groups
+    let batches = sql
+        .sql("SELECT COUNT(*) as cnt FROM tasks")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 4);
+}
+
+#[silo::test]
+async fn tasks_table_time_ordering_within_group() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let base = 2000000i64;
+
+    // Enqueue at different times - tasks should be ordered by start_time_ms within a group
+    enqueue_job_in_group(&shard, "late_job", 10, base + 300, "ordered").await;
+    enqueue_job_in_group(&shard, "early_job", 10, base + 100, "ordered").await;
+    enqueue_job_in_group(&shard, "mid_job", 10, base + 200, "ordered").await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT job_id, start_time_ms FROM tasks WHERE task_group = 'ordered' ORDER BY start_time_ms")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let job_ids = extract_string_column(&batches, 0);
+    assert_eq!(job_ids, vec!["early_job", "mid_job", "late_job"]);
+}
+
+#[silo::test]
+async fn tasks_table_with_limit() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    for i in 0..10 {
+        enqueue_job_in_group(&shard, &format!("lim{}", i), 10, now + i, "default").await;
+    }
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT job_id FROM tasks WHERE task_group = 'default' LIMIT 3")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let job_ids = extract_string_column(&batches, 0);
+    assert_eq!(job_ids.len(), 3);
+}
+
+// ===== Tasks table scan strategy tests =====
+
+#[silo::test]
+async fn tasks_scan_strategy_full_scan_no_filters() {
+    use datafusion::logical_expr::Expr;
+    let filters: Vec<Expr> = vec![];
+    let strategy = parse_tasks_scan_strategy(&filters);
+    assert_eq!(strategy, TasksScanStrategy::FullScan);
+}
+
+#[silo::test]
+async fn tasks_scan_strategy_task_group_only() {
+    use datafusion::logical_expr::{col, lit};
+    let filters = vec![col("task_group").eq(lit("workers"))];
+    let strategy = parse_tasks_scan_strategy(&filters);
+    assert_eq!(
+        strategy,
+        TasksScanStrategy::TaskGroupScan {
+            task_group: "workers".to_string(),
+            start_time_lower: None,
+            start_time_upper: None,
+        }
+    );
+}
+
+#[silo::test]
+async fn tasks_scan_strategy_task_group_with_time_range() {
+    use datafusion::logical_expr::{col, lit};
+    let filters = vec![
+        col("task_group").eq(lit("workers")),
+        col("start_time_ms").gt_eq(lit(1000i64)),
+        col("start_time_ms").lt_eq(lit(2000i64)),
+    ];
+    let strategy = parse_tasks_scan_strategy(&filters);
+    assert_eq!(
+        strategy,
+        TasksScanStrategy::TaskGroupScan {
+            task_group: "workers".to_string(),
+            start_time_lower: Some(1000),
+            start_time_upper: Some(2000),
+        }
+    );
+}
+
+// ===== Tasks table EXPLAIN tests =====
+
+/// Helper: extract the SiloExecutionPlan line from EXPLAIN output for tasks
+fn extract_tasks_silo_plan_line(explain: &str) -> String {
+    explain
+        .lines()
+        .find(|l| l.contains("SiloExecutionPlan:") && l.contains("tasks["))
+        .unwrap_or_else(|| panic!("No SiloExecutionPlan tasks line in EXPLAIN:\n{}", explain))
+        .trim()
+        .to_string()
+}
+
+#[silo::test]
+async fn explain_tasks_full_scan() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let explain = engine
+        .explain("SELECT * FROM tasks")
+        .await
+        .expect("explain");
+
+    let plan_line = extract_tasks_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("FullScan"),
+        "Expected FullScan strategy, got: {}",
+        plan_line
+    );
+}
+
+#[silo::test]
+async fn explain_tasks_task_group_scan() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let explain = engine
+        .explain("SELECT * FROM tasks WHERE task_group = 'workers'")
+        .await
+        .expect("explain");
+
+    let plan_line = extract_tasks_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains("TaskGroupScan(task_group=\"workers\""),
+        "Expected TaskGroupScan with task_group, got: {}",
+        plan_line
+    );
+}
+
+#[silo::test]
+async fn explain_tasks_task_group_with_time_range() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let explain = engine
+        .explain("SELECT * FROM tasks WHERE task_group = 'workers' AND start_time_ms >= 1000 AND start_time_ms <= 2000")
+        .await
+        .expect("explain");
+
+    let plan_line = extract_tasks_silo_plan_line(&explain);
+    assert!(
+        plan_line.contains(
+            "TaskGroupScan(task_group=\"workers\", time_lower=Some(1000), time_upper=Some(2000))"
+        ),
+        "Expected TaskGroupScan with time bounds, got: {}",
+        plan_line
+    );
+    // This is the optimized path: no FilterExec should appear for task_group or start_time_ms
+    // because they are pushed down as Exact
+    assert!(
+        !explain.contains("FilterExec"),
+        "Filters should be fully pushed down (no FilterExec), got:\n{}",
+        explain
+    );
+}
+
+#[silo::test]
+async fn explain_tasks_tenant_filter_not_pushed_down() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let explain = engine
+        .explain("SELECT * FROM tasks WHERE task_group = 'workers' AND tenant = '-'")
+        .await
+        .expect("explain");
+
+    let plan_line = extract_tasks_silo_plan_line(&explain);
+    // task_group is pushed down, but tenant is post-filtered
+    assert!(
+        plan_line.contains("TaskGroupScan"),
+        "Expected TaskGroupScan strategy, got: {}",
+        plan_line
+    );
+    // tenant filter should remain as a FilterExec since it's Inexact
+    assert!(
+        explain.contains("FilterExec"),
+        "Tenant filter should NOT be pushed down, expected FilterExec in:\n{}",
+        explain
+    );
 }
