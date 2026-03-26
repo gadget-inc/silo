@@ -1591,6 +1591,63 @@ export interface CompactShardResponse {
     status: string; // Status message describing the compaction result.
 }
 /**
+ * Request to get a shard's LSM tree / storage state from its owning node.
+ *
+ * @generated from protobuf message silo.v1.GetShardStorageInfoRequest
+ */
+export interface GetShardStorageInfoRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // The shard ID (UUID).
+}
+/**
+ * Information about a single sorted run in the LSM tree.
+ *
+ * @generated from protobuf message silo.v1.SortedRunInfo
+ */
+export interface SortedRunInfo {
+    /**
+     * @generated from protobuf field: uint32 id = 1
+     */
+    id: number; // Sorted run identifier.
+    /**
+     * @generated from protobuf field: uint64 sst_count = 2
+     */
+    sstCount: bigint; // Number of SSTs in this sorted run.
+    /**
+     * @generated from protobuf field: uint64 estimated_size = 3
+     */
+    estimatedSize: bigint; // Estimated total size in bytes.
+}
+/**
+ * Response containing the shard's LSM tree / storage state.
+ *
+ * @generated from protobuf message silo.v1.GetShardStorageInfoResponse
+ */
+export interface GetShardStorageInfoResponse {
+    /**
+     * @generated from protobuf field: uint64 l0_sst_count = 1
+     */
+    l0SstCount: bigint; // Number of L0 SSTs.
+    /**
+     * @generated from protobuf field: uint64 total_l0_size = 2
+     */
+    totalL0Size: bigint; // Total estimated size of L0 SSTs in bytes.
+    /**
+     * @generated from protobuf field: uint64 sorted_run_count = 3
+     */
+    sortedRunCount: bigint; // Number of sorted runs.
+    /**
+     * @generated from protobuf field: uint64 total_sorted_run_size = 4
+     */
+    totalSortedRunSize: bigint; // Total estimated size of sorted runs in bytes.
+    /**
+     * @generated from protobuf field: repeated silo.v1.SortedRunInfo sorted_runs = 5
+     */
+    sortedRuns: SortedRunInfo[]; // Details of each sorted run.
+}
+/**
  * Rate limiting algorithm for Gubernator-based limits.
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
@@ -6566,6 +6623,195 @@ class CompactShardResponse$Type extends MessageType<CompactShardResponse> {
  * @generated MessageType for protobuf message silo.v1.CompactShardResponse
  */
 export const CompactShardResponse = new CompactShardResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetShardStorageInfoRequest$Type extends MessageType<GetShardStorageInfoRequest> {
+    constructor() {
+        super("silo.v1.GetShardStorageInfoRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<GetShardStorageInfoRequest>): GetShardStorageInfoRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<GetShardStorageInfoRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetShardStorageInfoRequest): GetShardStorageInfoRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetShardStorageInfoRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetShardStorageInfoRequest
+ */
+export const GetShardStorageInfoRequest = new GetShardStorageInfoRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class SortedRunInfo$Type extends MessageType<SortedRunInfo> {
+    constructor() {
+        super("silo.v1.SortedRunInfo", [
+            { no: 1, name: "id", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
+            { no: 2, name: "sst_count", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 3, name: "estimated_size", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<SortedRunInfo>): SortedRunInfo {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.id = 0;
+        message.sstCount = 0n;
+        message.estimatedSize = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<SortedRunInfo>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: SortedRunInfo): SortedRunInfo {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 id */ 1:
+                    message.id = reader.uint32();
+                    break;
+                case /* uint64 sst_count */ 2:
+                    message.sstCount = reader.uint64().toBigInt();
+                    break;
+                case /* uint64 estimated_size */ 3:
+                    message.estimatedSize = reader.uint64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: SortedRunInfo, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 id = 1; */
+        if (message.id !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.id);
+        /* uint64 sst_count = 2; */
+        if (message.sstCount !== 0n)
+            writer.tag(2, WireType.Varint).uint64(message.sstCount);
+        /* uint64 estimated_size = 3; */
+        if (message.estimatedSize !== 0n)
+            writer.tag(3, WireType.Varint).uint64(message.estimatedSize);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.SortedRunInfo
+ */
+export const SortedRunInfo = new SortedRunInfo$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class GetShardStorageInfoResponse$Type extends MessageType<GetShardStorageInfoResponse> {
+    constructor() {
+        super("silo.v1.GetShardStorageInfoResponse", [
+            { no: 1, name: "l0_sst_count", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 2, name: "total_l0_size", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 3, name: "sorted_run_count", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 4, name: "total_sorted_run_size", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 5, name: "sorted_runs", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => SortedRunInfo }
+        ]);
+    }
+    create(value?: PartialMessage<GetShardStorageInfoResponse>): GetShardStorageInfoResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.l0SstCount = 0n;
+        message.totalL0Size = 0n;
+        message.sortedRunCount = 0n;
+        message.totalSortedRunSize = 0n;
+        message.sortedRuns = [];
+        if (value !== undefined)
+            reflectionMergePartial<GetShardStorageInfoResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: GetShardStorageInfoResponse): GetShardStorageInfoResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint64 l0_sst_count */ 1:
+                    message.l0SstCount = reader.uint64().toBigInt();
+                    break;
+                case /* uint64 total_l0_size */ 2:
+                    message.totalL0Size = reader.uint64().toBigInt();
+                    break;
+                case /* uint64 sorted_run_count */ 3:
+                    message.sortedRunCount = reader.uint64().toBigInt();
+                    break;
+                case /* uint64 total_sorted_run_size */ 4:
+                    message.totalSortedRunSize = reader.uint64().toBigInt();
+                    break;
+                case /* repeated silo.v1.SortedRunInfo sorted_runs */ 5:
+                    message.sortedRuns.push(SortedRunInfo.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: GetShardStorageInfoResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint64 l0_sst_count = 1; */
+        if (message.l0SstCount !== 0n)
+            writer.tag(1, WireType.Varint).uint64(message.l0SstCount);
+        /* uint64 total_l0_size = 2; */
+        if (message.totalL0Size !== 0n)
+            writer.tag(2, WireType.Varint).uint64(message.totalL0Size);
+        /* uint64 sorted_run_count = 3; */
+        if (message.sortedRunCount !== 0n)
+            writer.tag(3, WireType.Varint).uint64(message.sortedRunCount);
+        /* uint64 total_sorted_run_size = 4; */
+        if (message.totalSortedRunSize !== 0n)
+            writer.tag(4, WireType.Varint).uint64(message.totalSortedRunSize);
+        /* repeated silo.v1.SortedRunInfo sorted_runs = 5; */
+        for (let i = 0; i < message.sortedRuns.length; i++)
+            SortedRunInfo.internalBinaryWrite(message.sortedRuns[i], writer.tag(5, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.GetShardStorageInfoResponse
+ */
+export const GetShardStorageInfoResponse = new GetShardStorageInfoResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -6593,5 +6839,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ImportJobs", options: {}, I: ImportJobsRequest, O: ImportJobsResponse },
     { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse },
     { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse },
-    { name: "CompactShard", options: {}, I: CompactShardRequest, O: CompactShardResponse }
+    { name: "CompactShard", options: {}, I: CompactShardRequest, O: CompactShardResponse },
+    { name: "GetShardStorageInfo", options: {}, I: GetShardStorageInfoRequest, O: GetShardStorageInfoResponse }
 ]);

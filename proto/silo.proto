@@ -586,6 +586,27 @@ message CompactShardResponse {
   string status = 1; // Status message describing the compaction result.
 }
 
+// Request to get a shard's LSM tree / storage state from its owning node.
+message GetShardStorageInfoRequest {
+  string shard = 1; // The shard ID (UUID).
+}
+
+// Information about a single sorted run in the LSM tree.
+message SortedRunInfo {
+  uint32 id = 1;              // Sorted run identifier.
+  uint64 sst_count = 2;       // Number of SSTs in this sorted run.
+  uint64 estimated_size = 3;  // Estimated total size in bytes.
+}
+
+// Response containing the shard's LSM tree / storage state.
+message GetShardStorageInfoResponse {
+  uint64 l0_sst_count = 1;          // Number of L0 SSTs.
+  uint64 total_l0_size = 2;         // Total estimated size of L0 SSTs in bytes.
+  uint64 sorted_run_count = 3;      // Number of sorted runs.
+  uint64 total_sorted_run_size = 4;  // Total estimated size of sorted runs in bytes.
+  repeated SortedRunInfo sorted_runs = 5; // Details of each sorted run.
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -703,4 +724,9 @@ service Silo {
   // Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
   // This is useful for reclaiming space after bulk deletes or high job throughput.
   rpc CompactShard(CompactShardRequest) returns (CompactShardResponse);
+
+  // Get storage (LSM tree) information for a shard.
+  // Returns details about L0 SSTs, sorted runs, and sizes.
+  // The shard must be owned by this node.
+  rpc GetShardStorageInfo(GetShardStorageInfoRequest) returns (GetShardStorageInfoResponse);
 }

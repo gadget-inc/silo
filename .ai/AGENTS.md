@@ -157,6 +157,18 @@ If you're a cloud agent that needs to start background services:
 - `dev` or `process-compose up` starts etcd, gubernator, and two silo nodes with auto-reload
 - `just etcd` starts just etcd for simpler setups
 
+# WebUI: Cross-Shard RPC Pattern
+
+The web UI (`src/webui.rs`) must work correctly regardless of which node serves the HTTP request. **Never read shard-specific data directly from `ShardFactory`** (which only has locally-owned shards). Instead, always go through `ClusterClient` methods which handle local-vs-remote routing automatically.
+
+The pattern is:
+1. Add a gRPC RPC in `proto/silo.proto` for the data you need.
+2. Implement the server handler in `src/server.rs` (reads from the local `ShardFactory`).
+3. Add a routing method in `src/cluster_client.rs` that checks local first, then falls back to remote RPC.
+4. Call the `ClusterClient` method from the webui handler.
+
+Existing examples: `compact_shard`, `request_split`, `get_shard_storage_info`. Actions like split and compact already follow this pattern. Any new shard-specific data shown in the UI must also follow it.
+
 # Alloy Sigils
 
 We use text-based sigils to ensure that the invariants and assertions in the Alloy model have clear corresponding Rust code that enforces them. They look like `SILO-SOMETHING-123`.

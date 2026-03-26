@@ -184,6 +184,26 @@ pub struct LsmSortedRunInfo {
     pub estimated_size: u64,
 }
 
+impl From<LsmState> for crate::pb::GetShardStorageInfoResponse {
+    fn from(lsm: LsmState) -> Self {
+        Self {
+            l0_sst_count: lsm.l0_ssts.len() as u64,
+            total_l0_size: lsm.total_l0_size,
+            sorted_run_count: lsm.sorted_runs.len() as u64,
+            total_sorted_run_size: lsm.total_sorted_run_size,
+            sorted_runs: lsm
+                .sorted_runs
+                .iter()
+                .map(|sr| crate::pb::SortedRunInfo {
+                    id: sr.id,
+                    sst_count: sr.sst_count as u64,
+                    estimated_size: sr.estimated_size,
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<CodecError> for JobStoreShardError {
     fn from(e: CodecError) -> Self {
         JobStoreShardError::Codec(e.to_string())

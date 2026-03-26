@@ -247,7 +247,7 @@ struct ShardTemplate {
     split_phase: Option<String>,
     split_message: Option<String>,
     split_error: Option<String>,
-    /// LSM tree state (only available for locally-owned shards).
+    /// LSM tree state (fetched via RPC from shard owner).
     lsm_state: Option<LsmStateView>,
     /// Success/error messages for compact operations.
     compact_message: Option<String>,
@@ -1827,32 +1827,28 @@ async fn shard_handler(
         }
     });
 
-    // Read LSM tree state for locally-owned shards
-    let lsm_state = if let Some(shard) = state.factory.get(&shard_id) {
-        match shard.read_lsm_state().await {
-            Ok(lsm) => Some(LsmStateView {
-                l0_sst_count: lsm.l0_ssts.len(),
-                total_l0_size: format_byte_size(lsm.total_l0_size),
-                sorted_run_count: lsm.sorted_runs.len(),
-                total_sorted_run_size: format_byte_size(lsm.total_sorted_run_size),
-                total_size: format_byte_size(lsm.total_l0_size + lsm.total_sorted_run_size),
-                sorted_runs: lsm
-                    .sorted_runs
-                    .iter()
-                    .map(|sr| SortedRunView {
-                        id: sr.id,
-                        sst_count: sr.sst_count,
-                        estimated_size: format_byte_size(sr.estimated_size),
-                    })
-                    .collect(),
-            }),
-            Err(e) => {
-                warn!(shard_id = %params.id, error = %e, "failed to read LSM state");
-                None
-            }
+    // Read LSM tree state via cluster RPC (works for both local and remote shards)
+    let lsm_state = match state.cluster_client.get_shard_storage_info(&shard_id).await {
+        Ok(resp) => Some(LsmStateView {
+            l0_sst_count: resp.l0_sst_count as usize,
+            total_l0_size: format_byte_size(resp.total_l0_size),
+            sorted_run_count: resp.sorted_run_count as usize,
+            total_sorted_run_size: format_byte_size(resp.total_sorted_run_size),
+            total_size: format_byte_size(resp.total_l0_size + resp.total_sorted_run_size),
+            sorted_runs: resp
+                .sorted_runs
+                .iter()
+                .map(|sr| SortedRunView {
+                    id: sr.id,
+                    sst_count: sr.sst_count as usize,
+                    estimated_size: format_byte_size(sr.estimated_size),
+                })
+                .collect(),
+        }),
+        Err(e) => {
+            warn!(shard_id = %params.id, error = %e, "failed to read LSM state");
+            None
         }
-    } else {
-        None
     };
 
     let template = ShardTemplate {
