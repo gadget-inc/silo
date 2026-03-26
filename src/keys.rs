@@ -514,6 +514,16 @@ pub fn floating_limit_state_key(tenant: &str, queue_key: &str) -> Vec<u8> {
     encode_with_prefix(prefix::FLOATING_LIMIT, &(tenant, queue_key))
 }
 
+/// Prefix for scanning all floating limit states (cross-tenant).
+pub fn floating_limits_prefix() -> Vec<u8> {
+    vec![prefix::FLOATING_LIMIT]
+}
+
+/// Prefix for scanning all floating limit states for a tenant.
+pub fn floating_limits_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::FLOATING_LIMIT, &(tenant,))
+}
+
 /// Parsed floating limit state key components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFloatingLimitKey {
