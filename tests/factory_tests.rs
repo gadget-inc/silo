@@ -273,6 +273,77 @@ async fn clone_closed_shard_creates_copies() {
     );
 }
 
+#[silo::test]
+async fn clone_closed_shard_with_wal_creates_copies() {
+    let data_tmp = tempfile::tempdir().unwrap();
+    let wal_tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory_with_wal(&data_tmp, &wal_tmp);
+    let parent_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+
+    // Enqueue a job to the parent
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("cloned-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"cloned": true})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+
+    // Close parent (flushes WAL to object storage and removes WAL dir)
+    parent.close().await.expect("close parent");
+
+    // Clone the shard to both children — this should work even though
+    // the parent was originally opened with a separate WAL store
+    factory
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .await
+        .expect("clone closed shard with WAL");
+
+    // Open the left child and verify it has the same data
+    let left_child = factory
+        .open(&left_child_id, &ShardRange::full())
+        .await
+        .expect("open left child");
+
+    let left_counters = left_child
+        .get_counters()
+        .await
+        .expect("get left child counters");
+    assert_eq!(
+        left_counters.total_jobs, 1,
+        "left child should have the parent's job"
+    );
+
+    // Open the right child and verify it also has the data
+    let right_child = factory
+        .open(&right_child_id, &ShardRange::full())
+        .await
+        .expect("open right child");
+
+    let right_counters = right_child
+        .get_counters()
+        .await
+        .expect("get right child counters");
+    assert_eq!(
+        right_counters.total_jobs, 1,
+        "right child should have the parent's job"
+    );
+}
+
 // --- template path validation tests ---
 
 #[silo::test]
