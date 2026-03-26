@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
   SiloGRPCClient,
   JobStatus,
+  AttemptStatus,
   decodeBytes,
   GubernatorAlgorithm,
 } from "../src/client";
@@ -1551,6 +1552,234 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
         expect(regularLimit.key).toBe(regularKey);
         expect(regularLimit.maxConcurrency).toBe(3);
       }
+    });
+  });
+
+  describe("importJobs", () => {
+    it("imports a scheduled job with no attempts", async () => {
+      const tenant = "import-test-scheduled";
+      const jobId = `import-scheduled-${Date.now()}`;
+
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { imported: true },
+          priority: 20,
+          metadata: { source: "legacy-system" },
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe(jobId);
+      expect(results[0].success).toBe(true);
+      expect(results[0].status).toBe(JobStatus.Scheduled);
+
+      // Verify the job was actually created
+      const job = await client.getJob(jobId, tenant);
+      expect(job.id).toBe(jobId);
+      expect(job.priority).toBe(20);
+      expect(job.payload).toEqual({ imported: true });
+      expect(job.metadata?.source).toBe("legacy-system");
+      expect(job.status).toBe(JobStatus.Scheduled);
+    });
+
+    it("imports a job with historical succeeded attempt", async () => {
+      const tenant = "import-test-succeeded";
+      const jobId = `import-succeeded-${Date.now()}`;
+      const now = BigInt(Date.now());
+
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { task: "completed-migration" },
+          enqueueTimeMs: now - 60000n,
+          attempts: [
+            {
+              status: AttemptStatus.Succeeded,
+              startedAtMs: now - 50000n,
+              finishedAtMs: now - 40000n,
+              result: { output: "done" },
+            },
+          ],
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe(jobId);
+      expect(results[0].success).toBe(true);
+      expect(results[0].status).toBe(JobStatus.Succeeded);
+
+      // Verify the job has the historical attempt
+      const job = await client.getJob(jobId, tenant, {
+        includeAttempts: true,
+      });
+      expect(job.status).toBe(JobStatus.Succeeded);
+      expect(job.attempts).toHaveLength(1);
+      expect(job.attempts![0].status).toBe(AttemptStatus.Succeeded);
+      expect(job.attempts![0].result).toEqual({ output: "done" });
+    });
+
+    it("imports a job with historical failed attempts and retries remaining", async () => {
+      const tenant = "import-test-failed";
+      const jobId = `import-failed-${Date.now()}`;
+      const now = BigInt(Date.now());
+
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { task: "retried-task" },
+          enqueueTimeMs: now - 120000n,
+          retryPolicy: {
+            retryCount: 3,
+            initialIntervalMs: 1000n,
+            maxIntervalMs: 30000n,
+            backoffFactor: 2.0,
+            randomizeInterval: true,
+          },
+          attempts: [
+            {
+              status: AttemptStatus.Failed,
+              startedAtMs: now - 100000n,
+              finishedAtMs: now - 90000n,
+              errorCode: "TIMEOUT",
+              errorData: { detail: "request timed out" },
+            },
+            {
+              status: AttemptStatus.Failed,
+              startedAtMs: now - 80000n,
+              finishedAtMs: now - 70000n,
+              errorCode: "TIMEOUT",
+              errorData: { detail: "request timed out again" },
+            },
+          ],
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe(jobId);
+      expect(results[0].success).toBe(true);
+      // Job with failed attempts but retries remaining should be scheduled
+      expect(results[0].status).toBe(JobStatus.Scheduled);
+
+      const job = await client.getJob(jobId, tenant, {
+        includeAttempts: true,
+      });
+      expect(job.attempts).toHaveLength(2);
+      expect(job.attempts![0].status).toBe(AttemptStatus.Failed);
+      expect(job.attempts![0].errorCode).toBe("TIMEOUT");
+    });
+
+    it("imports multiple jobs in a batch", async () => {
+      const tenant = "import-test-batch";
+      const now = BigInt(Date.now());
+      const jobIds = [
+        `import-batch-1-${Date.now()}`,
+        `import-batch-2-${Date.now()}`,
+        `import-batch-3-${Date.now()}`,
+      ];
+
+      const results = await client.importJobs([
+        {
+          id: jobIds[0],
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { index: 0 },
+        },
+        {
+          id: jobIds[1],
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { index: 1 },
+          attempts: [
+            {
+              status: AttemptStatus.Succeeded,
+              startedAtMs: now - 5000n,
+              finishedAtMs: now - 1000n,
+              result: { completed: true },
+            },
+          ],
+        },
+        {
+          id: jobIds[2],
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { index: 2 },
+        },
+      ]);
+
+      expect(results).toHaveLength(3);
+      // Results should be in the same order as input
+      expect(results[0].id).toBe(jobIds[0]);
+      expect(results[1].id).toBe(jobIds[1]);
+      expect(results[2].id).toBe(jobIds[2]);
+
+      expect(results[0].success).toBe(true);
+      expect(results[1].success).toBe(true);
+      expect(results[2].success).toBe(true);
+
+      expect(results[0].status).toBe(JobStatus.Scheduled);
+      expect(results[1].status).toBe(JobStatus.Succeeded);
+      expect(results[2].status).toBe(JobStatus.Scheduled);
+    });
+
+    it("imports a job with a cancelled attempt", async () => {
+      const tenant = "import-test-cancelled";
+      const jobId = `import-cancelled-${Date.now()}`;
+      const now = BigInt(Date.now());
+
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { task: "was-cancelled" },
+          attempts: [
+            {
+              status: AttemptStatus.Cancelled,
+              startedAtMs: now - 30000n,
+              finishedAtMs: now - 20000n,
+            },
+          ],
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].success).toBe(true);
+    });
+
+    it("returns empty array for empty input", async () => {
+      const results = await client.importJobs([]);
+      expect(results).toEqual([]);
+    });
+
+    it("imports a job with limits", async () => {
+      const tenant = "import-test-limits";
+      const jobId = `import-limits-${Date.now()}`;
+
+      const results = await client.importJobs([
+        {
+          id: jobId,
+          tenant,
+          taskGroup: DEFAULT_TASK_GROUP,
+          payload: { data: "limited" },
+          limits: [
+            { type: "concurrency", key: "import-queue", maxConcurrency: 3 },
+          ],
+        },
+      ]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].success).toBe(true);
+
+      const job = await client.getJob(jobId, tenant);
+      expect(job.limits).toHaveLength(1);
+      expect(job.limits[0].type).toBe("concurrency");
     });
   });
 });
