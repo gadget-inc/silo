@@ -524,6 +524,11 @@ impl JobStoreShard {
         &self.db
     }
 
+    /// Get the total number of tasks in the broker buffer across all task groups.
+    pub fn broker_buffer_len(&self) -> usize {
+        self.brokers.buffer_len()
+    }
+
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {

@@ -138,10 +138,17 @@ impl TaskBroker {
         let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
 
         let mut inserted = 0;
+        let mut total_read = 0u64;
+        let mut skipped_future = 0u64;
+        let mut skipped_inflight = 0u64;
+        let mut skipped_tombstone = 0u64;
+        let mut skipped_already_buffered = 0u64;
+        let mut skipped_defunct = 0u64;
         while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
             let Ok(Some(kv)) = iter.next().await else {
                 break;
             };
+            total_read += 1;
 
             // Parse the task key to extract timestamp
             let Some(parsed_key) = parse_task_key(&kv.key) else {
@@ -150,6 +157,7 @@ impl TaskBroker {
 
             // Filter out future tasks
             if parsed_key.start_time_ms > now_ms as u64 {
+                skipped_future += 1;
                 continue;
             }
 
@@ -157,6 +165,7 @@ impl TaskBroker {
 
             // [SILO-SCAN-3] Skip inflight tasks
             if self.inflight.lock().unwrap().contains(&key_bytes) {
+                skipped_inflight += 1;
                 continue;
             }
 
@@ -172,6 +181,7 @@ impl TaskBroker {
                 }
             };
             if suppress_due_to_tombstone {
+                skipped_tombstone += 1;
                 continue;
             }
 
@@ -186,6 +196,7 @@ impl TaskBroker {
             if !self.range.contains_tenant(task_tenant) {
                 // Task is for a tenant outside our range - mark for deletion
                 defunct_keys.push(kv.key.to_vec());
+                skipped_defunct += 1;
                 debug!(
                     task_group = %parsed_key.task_group,
                     job_id = %parsed_key.job_id,
@@ -210,7 +221,25 @@ impl TaskBroker {
                 if inserted % 16 == 0 {
                     tokio::task::yield_now().await;
                 }
+            } else {
+                skipped_already_buffered += 1;
             }
+        }
+
+        if total_read > 0 {
+            tracing::info!(
+                task_group = %self.task_group,
+                total_read,
+                inserted,
+                skipped_future,
+                skipped_inflight,
+                skipped_tombstone,
+                skipped_already_buffered,
+                skipped_defunct,
+                buffer_len = self.buffer.len(),
+                tombstone_count = self.ack_tombstones.lock().unwrap().len(),
+                "scan_tasks breakdown"
+            );
         }
 
         // Delete defunct tasks from the database
@@ -298,10 +327,24 @@ impl TaskBroker {
                     sleep_ms = min_sleep_ms;
                 }
 
-                // Handle explicit scan requests with minimal sleep
+                // Handle explicit scan requests. When scan_requested is set
+                // (wakeup fired), use minimal sleep if we found tasks, or
+                // reset to min_sleep if we didn't. This prevents continuous
+                // enqueues from keeping the scanner spinning at 100+ scans/s
+                // (old behavior: always 1ms) while still keeping it responsive
+                // (won't exponentially back off to 2s during active workloads).
                 if broker.scan_requested.swap(false, Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
+                    if inserted > 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    // Wakeup arrived but scan found nothing new. Use a
+                    // short sleep instead of the 1ms fast-path (which
+                    // causes spinning at 100+/s) or the full min_sleep_ms
+                    // (50ms, too slow for the nudge loop's 25ms window).
+                    // 5ms matches the nudge poll interval and caps the
+                    // scan rate at ~200/s during active workloads.
+                    sleep_ms = 5;
                 }
 
                 // Sleep with early wakeup support
