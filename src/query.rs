@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::job::{JobStatus, JobView, Limit};
+use crate::job::{JobStatus, JobView};
 use crate::job_store_shard::{JobStoreShard, TenantStatusCounterScanRange};
 
 /// Shared utility to get the EXPLAIN plan for a query.
@@ -1948,8 +1948,6 @@ impl Scan for QueueCountsScanner {
             // and holder counts by scanning holder entries (bounded by concurrency limits)
             // queue_data: (tenant, queue) -> (holders, requesters)
             let mut queue_data: HashMap<(String, String), (i64, i64)> = HashMap::new();
-            // Track one sample task_id per (tenant, queue) for resolving fixed concurrency limits
-            let mut sample_task_ids: HashMap<(String, String), String> = HashMap::new();
 
             // Scan requester counters
             let requester_results = if let Some(ref tenant) = tenant_filter {
@@ -1997,10 +1995,10 @@ impl Scan for QueueCountsScanner {
                         Ok(Some(kv)) => {
                             if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key)
                             {
-                                let key = (parsed.tenant, parsed.queue);
-                                queue_data.entry(key.clone()).or_insert((0, 0)).0 += 1;
-                                // Keep one sample task_id for resolving fixed limits
-                                sample_task_ids.entry(key).or_insert(parsed.task_id);
+                                queue_data
+                                    .entry((parsed.tenant, parsed.queue))
+                                    .or_insert((0, 0))
+                                    .0 += 1;
                             }
                         }
                         Ok(None) => break,
@@ -2020,106 +2018,24 @@ impl Scan for QueueCountsScanner {
                 }
             }
 
-            // Scan floating limit states to get max_concurrency for floating queues
-            // floating_limits: (tenant, queue) -> current_max_concurrency
-            let mut floating_limits: HashMap<(String, String), i64> = HashMap::new();
-            {
-                let fl_start = match &tenant_filter {
-                    Some(t) => crate::keys::floating_limits_tenant_prefix(t),
-                    None => crate::keys::floating_limits_prefix(),
-                };
-                let fl_end = crate::keys::end_bound(&fl_start);
-
-                match shard.db().scan::<Vec<u8>, _>(fl_start..fl_end).await {
-                    Ok(mut iter) => loop {
-                        match iter.next().await {
-                            Ok(Some(kv)) => {
-                                if let Some(parsed) = crate::keys::parse_floating_limit_key(&kv.key)
-                                    && let Ok(state) =
-                                        crate::codec::decode_floating_limit_state(kv.value)
-                                {
-                                    floating_limits.insert(
-                                        (parsed.tenant, parsed.queue_key),
-                                        state.current_max_concurrency() as i64,
-                                    );
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "queue_counts: failed to scan floating limits");
-                                break;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "queue_counts: failed to start floating limits scan");
-                    }
-                }
-            }
-
-            // For queues without floating limits, resolve fixed concurrency from job info.
-            // We find a job_id by scanning the first concurrency request for each queue,
-            // or by looking up a leased task for a holder.
-            // limit_info: (tenant, queue) -> (max_concurrency, limit_type)
+            // Read concurrency limits from the in-memory cache (populated during
+            // enqueue, grant_next, and floating limit refresh — no DB scanning needed).
+            let cached_limits = shard.snapshot_queue_limits();
             let mut limit_info: HashMap<(String, String), (i64, &str)> = HashMap::new();
-            for key in queue_data.keys() {
-                if let Some(&max) = floating_limits.get(key) {
-                    limit_info.insert(key.clone(), (max, "floating"));
+            for cached in &cached_limits {
+                if let Some(ref t) = tenant_filter
+                    && cached.tenant != *t
+                {
                     continue;
                 }
-
-                // Try to find a job_id from the first concurrency request for this queue
-                let req_start = crate::keys::concurrency_request_prefix(&key.0, &key.1);
-                let req_end = crate::keys::end_bound(&req_start);
-                let mut job_id_opt = match shard.db().scan::<Vec<u8>, _>(req_start..req_end).await {
-                    Ok(mut iter) => match iter.next().await {
-                        Ok(Some(kv)) => {
-                            crate::keys::parse_concurrency_request_key(&kv.key).map(|p| p.job_id)
-                        }
-                        _ => None,
-                    },
-                    _ => None,
+                let lt = match cached.limit_type {
+                    crate::concurrency::ConcurrencyLimitType::Fixed => "fixed",
+                    crate::concurrency::ConcurrencyLimitType::Floating => "floating",
                 };
-
-                // Fallback: if no requests, look up the lease for a sample holder task
-                if job_id_opt.is_none()
-                    && let Some(task_id) = sample_task_ids.get(key)
-                {
-                    let lease_key = crate::keys::leased_task_key(task_id);
-                    if let Ok(Some(raw)) = shard.db().get(&lease_key).await
-                        && let Ok(decoded) = crate::codec::decode_lease(raw)
-                    {
-                        let jid = decoded.job_id();
-                        if !jid.is_empty() {
-                            job_id_opt = Some(jid.to_string());
-                        }
-                    }
-                }
-
-                if let Some(job_id) = job_id_opt {
-                    let job_key = crate::keys::job_info_key(&key.0, &job_id);
-                    if let Ok(Some(bytes)) = shard.db().get(&job_key).await
-                        && let Ok(view) = JobView::new(bytes)
-                    {
-                        for limit in view.limits() {
-                            match limit {
-                                Limit::Concurrency(cl) if cl.key == key.1 => {
-                                    limit_info
-                                        .insert(key.clone(), (cl.max_concurrency as i64, "fixed"));
-                                    break;
-                                }
-                                Limit::FloatingConcurrency(fl) if fl.key == key.1 => {
-                                    limit_info.insert(
-                                        key.clone(),
-                                        (fl.default_max_concurrency as i64, "floating"),
-                                    );
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
+                limit_info.insert(
+                    (cached.tenant.clone(), cached.queue.clone()),
+                    (cached.max_concurrency as i64, lt),
+                );
             }
 
             let shard_id = shard.name().to_string();

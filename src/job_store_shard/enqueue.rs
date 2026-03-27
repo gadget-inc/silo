@@ -482,6 +482,14 @@ impl JobStoreShard {
                         )
                         .await?;
 
+                    // Cache the resolved limit for the query system
+                    self.concurrency.cache_queue_limit(
+                        tenant,
+                        &cl.key,
+                        cl.max_concurrency,
+                        crate::concurrency::ConcurrencyLimitType::Fixed,
+                    );
+
                     if matches!(
                         record_grant_outcome(
                             outcome,
@@ -505,9 +513,10 @@ impl JobStoreShard {
                     let refresh_ready = JobStoreShard::floating_limit_refresh_ready(&state, now_ms);
 
                     // Try immediate grant using current max concurrency
+                    let current_max = state.current_max_concurrency();
                     let temp_cl = crate::job::ConcurrencyLimit {
                         key: fl.key.clone(),
-                        max_concurrency: state.current_max_concurrency(),
+                        max_concurrency: current_max,
                     };
 
                     let outcome = self
@@ -529,6 +538,14 @@ impl JobStoreShard {
                             skip_try_reserve,
                         )
                         .await?;
+
+                    // Cache the resolved floating limit for the query system
+                    self.concurrency.cache_queue_limit(
+                        tenant,
+                        &fl.key,
+                        current_max,
+                        crate::concurrency::ConcurrencyLimitType::Floating,
+                    );
 
                     let mut has_waiters =
                         matches!(outcome, Some(RequestTicketOutcome::TicketRequested { .. }));

@@ -504,6 +504,11 @@ impl JobStoreShard {
         &self.db
     }
 
+    /// Snapshot the in-memory concurrency limit cache for use by the query system.
+    pub fn snapshot_queue_limits(&self) -> Vec<crate::concurrency::CachedQueueLimit> {
+        self.concurrency.snapshot_queue_limits()
+    }
+
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {
