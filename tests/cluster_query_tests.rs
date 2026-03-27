@@ -1789,3 +1789,160 @@ async fn cluster_query_tenants_page_counts_all_scheduled_statuses() {
         scheduled_count + running_count
     );
 }
+
+// ===== Tasks table cluster query tests =====
+
+#[silo::test]
+async fn cluster_query_tasks_table_single_shard() {
+    let (_temps, factory, shard_map) = create_multi_shard_factory(1).await;
+    let now = now_ms();
+
+    let shard = get_shard(&factory, &shard_map, 0);
+    for id in ["t1", "t2", "t3"] {
+        shard
+            .enqueue(
+                "-",
+                Some(id.to_string()),
+                10,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
+        .await
+        .expect("create engine");
+
+    // Count tasks
+    let batches = query_collect(&engine, "SELECT COUNT(*) as cnt FROM tasks").await;
+    let counts = extract_i64_column(&batches, 0);
+    assert_eq!(counts, vec![3]);
+
+    // Query with task_group filter
+    let batches = query_collect(
+        &engine,
+        "SELECT job_id FROM tasks WHERE task_group = 'default' ORDER BY job_id",
+    )
+    .await;
+    let job_ids = extract_string_column(&batches, 0);
+    assert_eq!(job_ids, vec!["t1", "t2", "t3"]);
+}
+
+#[silo::test]
+async fn cluster_query_tasks_table_across_shards() {
+    let (_temps, factory, shard_map) = create_multi_shard_factory(3).await;
+    let now = now_ms();
+
+    // Find the shard that owns tenant "-" (based on tenant hash routing).
+    // Tasks are ephemeral and the broker deletes tasks for tenants outside
+    // the shard's range, so we must enqueue to the correct shard.
+    let owning_shard = shard_map
+        .shards()
+        .iter()
+        .find(|s| s.range.contains_tenant("-"))
+        .expect("some shard should own tenant '-'");
+    let shard = factory.get(&owning_shard.id).unwrap();
+
+    for id in ["task_a", "task_b", "task_c"] {
+        shard
+            .enqueue(
+                "-",
+                Some(id.to_string()),
+                10,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
+        .await
+        .expect("create engine");
+
+    // Count tasks across all shards (only the owning shard has data, but query spans all)
+    let batches = query_collect(&engine, "SELECT COUNT(*) as cnt FROM tasks").await;
+    let counts = extract_i64_column(&batches, 0);
+    let total: i64 = counts.iter().sum();
+    assert_eq!(total, 3, "Should see 3 tasks across cluster");
+
+    // Query with task_group filter across cluster
+    let batches = query_collect(
+        &engine,
+        "SELECT job_id FROM tasks WHERE task_group = 'default' ORDER BY job_id",
+    )
+    .await;
+    let job_ids = extract_string_column(&batches, 0);
+    assert_eq!(job_ids, vec!["task_a", "task_b", "task_c"]);
+}
+
+#[silo::test]
+async fn cluster_query_tasks_table_group_by_across_shards() {
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
+    let now = now_ms();
+
+    // Enqueue tasks into different groups on shard 0 (which owns tenant "-").
+    // Tasks are deleted by the broker on shards that don't own the tenant,
+    // so we enqueue all to the correct shard.
+    let shard0 = get_shard(&factory, &shard_map, 0);
+
+    for i in 0..3 {
+        shard0
+            .enqueue(
+                "-",
+                Some(format!("s0_a{}", i)),
+                10,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "alpha",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    for i in 0..2 {
+        shard0
+            .enqueue(
+                "-",
+                Some(format!("s0_b{}", i)),
+                10,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "beta",
+            )
+            .await
+            .expect("enqueue");
+    }
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
+        .await
+        .expect("create engine");
+
+    let batches = query_collect(
+        &engine,
+        "SELECT task_group, COUNT(*) as cnt FROM tasks GROUP BY task_group ORDER BY task_group",
+    )
+    .await;
+
+    let groups = extract_string_column(&batches, 0);
+    let counts = extract_i64_column(&batches, 1);
+
+    assert_eq!(groups, vec!["alpha", "beta"]);
+    assert_eq!(counts, vec![3, 2]);
+}

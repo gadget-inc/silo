@@ -80,7 +80,7 @@ Use `siloctl cluster info` to see all shards and their owners. If you know the t
 
 ## Tables
 
-Silo exposes three tables: `jobs`, `queues`, and `tenant_counts`.
+Silo exposes five tables: `jobs`, `tasks`, `queues`, `tenant_counts`, and `queue_counts`.
 
 ### `jobs` Table
 
@@ -100,6 +100,25 @@ The primary table containing all job data.
 | `current_attempt` | UInt32 (nullable) | Current attempt number (1-indexed). Present for `Waiting`/`Scheduled` jobs, null for `Running` and terminal statuses |
 | `next_attempt_starts_after_ms` | Int64 (nullable) | Unix timestamp in milliseconds when the next attempt is scheduled to start. Present for `Waiting`/`Scheduled` jobs, null otherwise |
 | `metadata` | Map&lt;String, String&gt; (nullable) | Key-value metadata attached to the job |
+
+### `tasks` Table
+
+Exposes the internal task execution queue for **debugging purposes**. Tasks are the ephemeral work items that drive job execution — they are created when jobs are enqueued and deleted when workers lease them.
+
+<Aside type="caution" title="Debugging only">
+This table scans the raw task queue storage. Performance may be poor for large datasets unless queries include a `task_group` filter, which enables an efficient key prefix scan matching the task broker's access pattern. For best results, always filter by `task_group` and optionally narrow by `start_time_ms`.
+</Aside>
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `shard_id` | String | UUID of the shard storing this task |
+| `tenant` | String | Tenant identifier |
+| `task_group` | String | Task group (worker routing key) |
+| `start_time_ms` | Int64 | Scheduled execution time in milliseconds |
+| `priority` | UInt8 | Task priority (0 = highest) |
+| `job_id` | String | The job this task belongs to |
+| `attempt` | UInt32 | Attempt number |
+| `variant_type` | String | Task type: `RunAttempt`, `RequestTicket`, `CheckRateLimit`, `RefreshFloatingLimit` |
 
 ### `queues` Table
 
@@ -130,6 +149,18 @@ Pre-computed per-tenant, per-status job counts. Backed by merge-operator counter
 `tenant_counts` is a sparse aggregation. It returns one row per `(tenant, status_kind)` pair with a positive count. Statuses with zero jobs are omitted rather than returned as `cnt = 0`, so a missing row should be interpreted as zero.
 
 For example, if a tenant has 12 `Scheduled` jobs and no `Running` jobs, `tenant_counts` returns a `Scheduled` row and no `Running` row.
+
+### `queue_counts` Table
+
+Pre-computed per-queue concurrency counters. Fast for checking queue utilization without scanning individual holder/requester entries.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `shard_id` | String | UUID of the shard |
+| `tenant` | String | Tenant identifier |
+| `queue_name` | String | Concurrency queue name |
+| `holders` | Int64 | Number of concurrency slots currently held |
+| `requesters` | Int64 | Number of tasks waiting for a slot |
 
 ## Status Values
 
@@ -303,6 +334,30 @@ GROUP BY queue_name
 ORDER BY waiting DESC
 ```
 
+### Debugging the Task Queue
+
+```sql
+-- Count pending tasks per task group
+SELECT task_group, COUNT(*) as count
+FROM tasks
+GROUP BY task_group
+ORDER BY count DESC
+
+-- Inspect tasks in a specific group within a time window (recommended pattern)
+SELECT job_id, start_time_ms, priority, variant_type
+FROM tasks
+WHERE task_group = 'emails'
+  AND start_time_ms >= 1700000000000
+  AND start_time_ms <= 1700001000000
+ORDER BY start_time_ms
+
+-- Find stuck internal tasks (non-RunAttempt tasks indicate concurrency/rate-limit waits)
+SELECT task_group, variant_type, COUNT(*) as count
+FROM tasks
+GROUP BY task_group, variant_type
+ORDER BY count DESC
+```
+
 ### Looking Up a Specific Job
 
 ```sql
@@ -349,6 +404,24 @@ SELECT * FROM jobs WHERE tenant = 'customer-123' AND array_contains(element_at(m
 
 -- Uses Status scan (priority 4)
 SELECT * FROM jobs WHERE tenant = 'customer-123' AND status_kind = 'Failed'
+```
+
+### Tasks table: always filter by task_group
+
+The `tasks` table performs best when filtered by `task_group`, which uses a key prefix scan matching the task broker's internal access pattern. Adding a `start_time_ms` range narrows the scan further with early termination.
+
+```sql
+-- Fast: scans only one task group's key range
+SELECT * FROM tasks WHERE task_group = 'emails' LIMIT 100
+
+-- Faster: scans a narrow time window within the group
+SELECT * FROM tasks
+WHERE task_group = 'emails'
+  AND start_time_ms >= 1700000000000
+  AND start_time_ms <= 1700001000000
+
+-- Slow: full scan across all task groups
+SELECT * FROM tasks
 ```
 
 ### Use LIMIT
