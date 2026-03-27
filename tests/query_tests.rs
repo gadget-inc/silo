@@ -4437,6 +4437,61 @@ async fn sql_queue_counts_fixed_concurrency_limit() {
 }
 
 #[silo::test]
+async fn sql_queue_counts_holders_only_no_requesters() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+        let queue = "holders-only-q";
+
+        // Enqueue 2 jobs with concurrency limit of 5 (well under capacity, no requesters)
+        for id in ["qc-ho1", "qc-ho2"] {
+            shard
+                .enqueue(
+                    "-",
+                    Some(id.to_string()),
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
+                    vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                        key: queue.to_string(),
+                        max_concurrency: 5,
+                    })],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        // Dequeue both — both get immediate grants since limit is 5
+        let result = shard.dequeue("w1", "default", 2).await.expect("dequeue");
+        assert_eq!(result.tasks.len(), 2);
+
+        let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+        let batches = sql
+            .sql("SELECT tenant, queue_name, holders, requesters, max_concurrency, limit_type FROM queue_counts WHERE queue_name = 'holders-only-q'")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+
+        let results = extract_queue_counts(&batches);
+        assert_eq!(results.len(), 1, "should have one queue row");
+        let (_, _, holders, requesters, max_conc, lt) = &results[0];
+        assert_eq!(*holders, 2, "should have 2 holders");
+        assert_eq!(*requesters, 0, "should have 0 requesters");
+        assert_eq!(
+            *max_conc,
+            Some(5),
+            "max_concurrency should be 5 from in-memory cache"
+        );
+        assert_eq!(lt.as_deref(), Some("fixed"), "limit_type should be 'fixed'");
+    });
+}
+
+#[silo::test]
 async fn sql_queue_counts_floating_concurrency_limit() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
