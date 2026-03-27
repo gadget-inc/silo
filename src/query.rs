@@ -1898,6 +1898,8 @@ impl QueueCountsScanner {
             Field::new("queue_name", DataType::Utf8, false),
             Field::new("holders", DataType::Int64, false),
             Field::new("requesters", DataType::Int64, false),
+            Field::new("max_concurrency", DataType::Int64, true),
+            Field::new("limit_type", DataType::Utf8, true),
         ]))
     }
 }
@@ -1944,6 +1946,7 @@ impl Scan for QueueCountsScanner {
         tokio::spawn(async move {
             // Collect requester counts from pre-computed counters (fast)
             // and holder counts by scanning holder entries (bounded by concurrency limits)
+            // queue_data: (tenant, queue) -> (holders, requesters)
             let mut queue_data: HashMap<(String, String), (i64, i64)> = HashMap::new();
 
             // Scan requester counters
@@ -2015,6 +2018,26 @@ impl Scan for QueueCountsScanner {
                 }
             }
 
+            // Read concurrency limits from the in-memory cache (populated during
+            // enqueue, grant_next, and floating limit refresh — no DB scanning needed).
+            let cached_limits = shard.snapshot_queue_limits();
+            let mut limit_info: HashMap<(String, String), (i64, &str)> = HashMap::new();
+            for cached in &cached_limits {
+                if let Some(ref t) = tenant_filter
+                    && cached.tenant != *t
+                {
+                    continue;
+                }
+                let lt = match cached.limit_type {
+                    crate::concurrency::ConcurrencyLimitType::Fixed => "fixed",
+                    crate::concurrency::ConcurrencyLimitType::Floating => "floating",
+                };
+                limit_info.insert(
+                    (cached.tenant.clone(), cached.queue.clone()),
+                    (cached.max_concurrency as i64, lt),
+                );
+            }
+
             let shard_id = shard.name().to_string();
             let entries: Vec<_> = queue_data.into_iter().collect();
             let n = entries.len();
@@ -2052,6 +2075,18 @@ impl Scan for QueueCountsScanner {
                     )),
                     "requesters" => Arc::new(Int64Array::from(
                         entries.iter().map(|(_, (_, r))| *r).collect::<Vec<_>>(),
+                    )),
+                    "max_concurrency" => Arc::new(Int64Array::from(
+                        entries
+                            .iter()
+                            .map(|(key, _)| limit_info.get(key).map(|(max, _)| *max))
+                            .collect::<Vec<_>>(),
+                    )),
+                    "limit_type" => Arc::new(StringArray::from(
+                        entries
+                            .iter()
+                            .map(|(key, _)| limit_info.get(key).map(|(_, lt)| *lt))
+                            .collect::<Vec<_>>(),
                     )),
                     other => {
                         let _ = tx
