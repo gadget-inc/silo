@@ -5478,8 +5478,8 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#5f1703652e05d792a9f9bb17b163a7e60100f397"
+version = "0.11.1"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=gadget#91aca69be4cfe7d2642aace000d374d8f088a70f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5524,17 +5524,19 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#5f1703652e05d792a9f9bb17b163a7e60100f397"
+version = "0.11.1"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=gadget#91aca69be4cfe7d2642aace000d374d8f088a70f"
 dependencies = [
  "chrono",
+ "log",
+ "serde",
  "tokio",
 ]
 
 [[package]]
 name = "slatedb-txn-obj"
-version = "0.10.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#5f1703652e05d792a9f9bb17b163a7e60100f397"
+version = "0.11.1"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=gadget#91aca69be4cfe7d2642aace000d374d8f088a70f"
 dependencies = [
  "async-trait",
  "bytes",

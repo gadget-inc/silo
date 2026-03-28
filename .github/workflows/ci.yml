@@ -127,7 +127,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: tmp/golden-bench-shard
-          key: golden-bench-shard-v1-${{ hashFiles('benches/bench_helpers.rs') }}
+          key: golden-bench-shard-v2-${{ hashFiles('benches/bench_helpers.rs') }}
       - name: Run throughput benchmark
         shell: bash
         run: cargo bench --bench job_shard_throughput
