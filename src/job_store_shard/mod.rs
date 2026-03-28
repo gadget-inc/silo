@@ -346,7 +346,7 @@ impl JobStoreShard {
                 .with_meta_cache(Some(meta_cache))
                 .build();
 
-            db_builder = db_builder.with_memory_cache(Arc::new(cache));
+            db_builder = db_builder.with_db_cache(Arc::new(cache));
         }
 
         let db = db_builder.build().await?;
@@ -550,7 +550,7 @@ impl JobStoreShard {
             .iter()
             .map(|sst| LsmSstInfo {
                 id: format!("{:?}", sst.id),
-                estimated_size: sst.info.index_offset + sst.info.index_len,
+                estimated_size: sst.estimate_size(),
             })
             .collect();
 
@@ -559,7 +559,7 @@ impl JobStoreShard {
             .iter()
             .map(|sr| LsmSortedRunInfo {
                 id: sr.id,
-                sst_count: sr.ssts.len(),
+                sst_count: sr.sst_views.len(),
                 estimated_size: sr.estimate_size(),
             })
             .collect();

@@ -185,7 +185,7 @@ impl JobStoreShard {
 
         // Commit the transaction
         match txn.commit().await {
-            Ok(()) => dst_events::confirm_write(write_op),
+            Ok(_) => dst_events::confirm_write(write_op),
             Err(e) => {
                 dst_events::cancel_write(write_op);
                 return Err(e.into());
