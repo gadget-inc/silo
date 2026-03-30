@@ -139,9 +139,9 @@ jobs:
         run: cargo run --package silo-autoscaler -- crd | kubectl apply -f -
       - name: Deploy test environment
         run: |
-          kubectl apply -f deploy/inttest/namespace.yaml
+          kubectl apply -f deploy/autoscaler-integration-test/namespace.yaml
           kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/silo-autoscaler-test --timeout=30s
-          kubectl apply -f deploy/inttest/
+          kubectl apply -f deploy/autoscaler-integration-test/
           kubectl -n silo-autoscaler-test rollout status statefulset/silo --timeout=180s
           kubectl -n silo-autoscaler-test rollout status deployment/silo-autoscaler --timeout=60s
       - name: Run autoscaler integration tests

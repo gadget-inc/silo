@@ -12,7 +12,7 @@
 //!
 //! Local development:
 //!   kubectl config use-context orbstack
-//!   kubectl apply -f deploy/inttest
+//!   kubectl apply -f deploy/autoscaler-integration-test
 //!   cargo test --package silo-autoscaler --test autoscaler_integration_tests -- --test-threads=1
 //!
 //! CI:
