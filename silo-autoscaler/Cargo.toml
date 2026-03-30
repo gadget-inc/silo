@@ -2,14 +2,14 @@
 name = "silo-autoscaler"
 version = "0.1.0"
 edition = "2024"
-description = "Kubernetes controller and admission webhook for safe Silo StatefulSet scaling"
+description = "Kubernetes controller for safe Silo StatefulSet scaling"
 
 [[bin]]
 name = "silo-autoscaler"
 path = "src/main.rs"
 
 [dependencies]
-kube = { version = "0.98", features = ["runtime", "client", "derive", "admission"] }
+kube = { version = "0.98", features = ["runtime", "client", "derive"] }
 k8s-openapi = { version = "0.24", features = ["v1_31"] }
 schemars = "0.8"
 serde = { version = "1.0", features = ["derive"] }
@@ -21,12 +21,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "1.0"
 anyhow = "1"
-axum = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.3", features = ["derive", "env"] }
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
-tokio-rustls = "0.26"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
-tower = "0.5"

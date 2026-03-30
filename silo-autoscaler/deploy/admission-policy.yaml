@@ -1,0 +1,30 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: silo-autoscaler-validation
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["silo.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["siloautoscalers"]
+  validations:
+    - expression: "object.spec.replicas >= 0"
+      message: "spec.replicas must be >= 0"
+    - expression: "object.spec.targetStatefulSet != ''"
+      message: "spec.targetStatefulSet must be non-empty"
+    - expression: "object.spec.clusterPrefix != ''"
+      message: "spec.clusterPrefix must be non-empty"
+    - expression: "!has(object.spec.orphanedLeaseGracePeriodSeconds) || object.spec.orphanedLeaseGracePeriodSeconds > 0"
+      message: "spec.orphanedLeaseGracePeriodSeconds must be positive"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: silo-autoscaler-validation-binding
+spec:
+  policyName: silo-autoscaler-validation
+  validationActions:
+    - Deny
