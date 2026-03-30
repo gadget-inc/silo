@@ -276,8 +276,11 @@ async fn recover_orphaned_pod(
         patch_statefulset_replicas(sts_api, &spec.target_stateful_set, recovery_replicas).await?;
     }
 
-    // Remove finalizer so the terminating pod can be fully deleted
-    // and the StatefulSet can recreate it
+    // Remove the finalizer so the old terminating pod can be fully deleted.
+    // The StatefulSet (now scaled up) will recreate the pod with the same
+    // ordinal and PVC, allowing silo to reclaim the leases and flush the WAL.
+    // The shard is already down at this point (container was SIGKILL'd), so
+    // removing the finalizer doesn't cause additional downtime.
     remove_finalizer(pod_api, pod_name).await?;
     Ok(())
 }
