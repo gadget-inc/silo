@@ -59,19 +59,14 @@ async function buildAndLoad(): Promise<void> {
 console.log("Building silo image inside OrbStack (aarch64-linux)...");
 await buildAndLoad();
 
-console.log("\nApplying Kubernetes manifests to OrbStack...");
-run("kubectl", ["--context", "orbstack", "apply", "-f", "deploy/local-test"]);
-
-console.log("\nRestarting StatefulSet...");
-run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "statefulset/silo"]);
-
 console.log("\nBuilding silo-autoscaler image...");
 run("docker", ["build", "-f", "silo-autoscaler/Dockerfile", "-t", "silo-autoscaler:latest", "."]);
 
-console.log("\nApplying silo-autoscaler manifests to OrbStack...");
-run("kubectl", ["--context", "orbstack", "apply", "-f", "deploy/local-autoscaler"]);
+console.log("\nApplying Kubernetes manifests to OrbStack...");
+run("kubectl", ["--context", "orbstack", "apply", "-f", "deploy/local-test"]);
 
-console.log("\nRestarting silo-autoscaler...");
+console.log("\nRestarting StatefulSet and autoscaler...");
+run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "statefulset/silo"]);
 run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "deployment/silo-autoscaler"]);
 
 console.log("\nDone. Pods:");

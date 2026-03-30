@@ -30,3 +30,52 @@ roleRef:
   kind: Role
   name: silo-coordinator
   apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: silo-autoscaler
+  namespace: silo-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: silo-autoscaler
+rules:
+  - apiGroups: ["silo.dev"]
+    resources: ["siloautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["silo.dev"]
+    resources: ["siloautoscalers/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["silo.dev"]
+    resources: ["siloautoscalers/scale"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: silo-autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: silo-autoscaler
+    namespace: silo-test
+roleRef:
+  kind: ClusterRole
+  name: silo-autoscaler
+  apiGroup: rbac.authorization.k8s.io
