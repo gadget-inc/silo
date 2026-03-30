@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: silo-autoscaler
+  namespace: silo-test
+  labels:
+    app: silo-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: silo-autoscaler
+  template:
+    metadata:
+      labels:
+        app: silo-autoscaler
+    spec:
+      serviceAccountName: silo-autoscaler
+      containers:
+        - name: controller
+          image: silo-autoscaler:latest
+          imagePullPolicy: Never
+          env:
+            - name: RUST_LOG
+              value: "info,silo_autoscaler=debug"
