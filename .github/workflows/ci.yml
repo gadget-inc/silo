@@ -113,6 +113,50 @@ jobs:
           name: k8s-test-logs
           path: k8s-test-debug.log
 
+  test-autoscaler:
+    name: SiloAutoscaler integration tests
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: silo-autoscaler-test
+      - name: Build silo image
+        run: |
+          nix build .#silo-docker -L
+          kind load image-archive result --name silo-autoscaler-test
+      - name: Build autoscaler image
+        run: |
+          docker build -f silo-autoscaler/Dockerfile -t silo-autoscaler:latest .
+          kind load docker-image silo-autoscaler:latest --name silo-autoscaler-test
+      - name: Install CRD
+        run: cargo run --package silo-autoscaler -- crd | kubectl apply -f -
+      - name: Deploy test environment
+        run: |
+          kubectl apply -f deploy/inttest/
+          # Wait for namespace to be ready, then re-apply for resources that raced
+          sleep 2
+          kubectl apply -f deploy/inttest/
+          kubectl -n silo-autoscaler-test rollout status statefulset/silo --timeout=120s
+          kubectl -n silo-autoscaler-test rollout status deployment/silo-autoscaler --timeout=60s
+      - name: Run autoscaler integration tests
+        shell: bash
+        env:
+          SILO_DEBUG_LOG_FILE: autoscaler-test-debug.log
+        run: cargo test --package silo-autoscaler --test autoscaler_integration_tests -- --test-threads=1
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoscaler-test-logs
+          path: autoscaler-test-debug.log
+
   benchmark:
     name: Run benchmarks
     runs-on: blacksmith-8vcpu-ubuntu-2404

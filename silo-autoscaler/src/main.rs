@@ -1,9 +1,3 @@
-mod controller;
-mod crd;
-mod error;
-mod orphan;
-mod validation;
-
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -26,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle CRD generation subcommand
     if let Some(Command::Crd) = args.command {
-        let crd = serde_yaml::to_string(&crd::crd_definition())?;
+        let crd = serde_yaml::to_string(&silo_autoscaler::crd::crd_definition())?;
         println!("{}", crd);
         return Ok(());
     }
@@ -45,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let client = kube::Client::try_default().await?;
 
     // Run controller (blocks until shutdown)
-    controller::run_controller(client).await?;
+    silo_autoscaler::controller::run_controller(client).await?;
 
     Ok(())
 }

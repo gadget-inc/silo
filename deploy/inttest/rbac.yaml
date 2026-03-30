@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: silo
+  namespace: silo-autoscaler-test
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: silo-autoscaler
+  namespace: silo-autoscaler-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: silo-coordinator
+  namespace: silo-autoscaler-test
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: silo-coordinator
+  namespace: silo-autoscaler-test
+subjects:
+  - kind: ServiceAccount
+    name: silo
+    namespace: silo-autoscaler-test
+roleRef:
+  kind: Role
+  name: silo-coordinator
+  apiGroup: rbac.authorization.k8s.io
