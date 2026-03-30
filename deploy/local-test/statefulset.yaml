@@ -75,6 +75,8 @@ spec:
     metadata:
       labels:
         app: silo
+      finalizers:
+        - silo.dev/safe-scaledown
     spec:
       serviceAccountName: silo
       terminationGracePeriodSeconds: 30

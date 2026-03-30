@@ -140,16 +140,7 @@ async fn reconcile(
         .await
         .map_err(|e| ReconcileError(format!("failed to list pods: {e}")))?;
 
-    // 3. Ensure all non-terminating pods have our finalizer
-    for pod in &pods.items {
-        if pod.metadata.deletion_timestamp.is_none() && !has_finalizer(pod) {
-            if let Some(pod_name) = &pod.metadata.name {
-                add_finalizer(&pod_api, pod_name).await?;
-            }
-        }
-    }
-
-    // 4. Handle terminating pods with our finalizer
+    // 3. Handle terminating pods with our finalizer
     let mut all_orphaned_leases: Vec<OrphanedLeaseInfo> = vec![];
     let mut recovery_needed = false;
     let mut has_terminating_pods = false;
@@ -289,20 +280,6 @@ fn is_pod_ready(pod: &Pod) -> bool {
         .is_some_and(|conditions| {
             conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True")
         })
-}
-
-async fn add_finalizer(pod_api: &Api<Pod>, pod_name: &str) -> Result<(), ReconcileError> {
-    let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": [FINALIZER_NAME]
-        }
-    });
-    pod_api
-        .patch(pod_name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-        .map_err(|e| ReconcileError(format!("failed to add finalizer to pod {pod_name}: {e}")))?;
-    debug!(pod = %pod_name, "added finalizer");
-    Ok(())
 }
 
 async fn remove_finalizer(pod_api: &Api<Pod>, pod_name: &str) -> Result<(), ReconcileError> {
