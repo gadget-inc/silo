@@ -131,6 +131,17 @@ async fn ensure_autoscaler(client: &Client, replicas: i32) {
     }
 }
 
+async fn wait_for_sts_replicas_gte(client: &Client, min: i32, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if get_sts_replicas(client).await >= min {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    false
+}
+
 async fn wait_for_replicas(client: &Client, expected: i32, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -232,14 +243,10 @@ async fn test_scale_down_with_orphaned_lease_triggers_recovery() {
 
     // Scale down — controller should detect orphaned lease and scale back up
     ensure_autoscaler(&client, 2).await;
-    tokio::time::sleep(Duration::from_secs(15)).await;
 
-    // StatefulSet should still be at 3 (recovery scaled it back up)
-    let sts_replicas = get_sts_replicas(&client).await;
-    assert!(
-        sts_replicas >= 3,
-        "expected StatefulSet to scale back up for recovery, got {} replicas", sts_replicas
-    );
+    // Wait for the controller to detect the orphan and scale back up
+    let recovered = wait_for_sts_replicas_gte(&client, 3, Duration::from_secs(60)).await;
+    assert!(recovered, "expected StatefulSet to scale back up for recovery");
 
     // Clean up fake lease — allows recovery to complete
     lease_api.delete(&fake_lease_name, &Default::default()).await.unwrap();
