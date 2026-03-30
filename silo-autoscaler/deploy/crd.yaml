@@ -1,0 +1,154 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: siloautoscalers.silo.dev
+spec:
+  group: silo.dev
+  names:
+    categories: []
+    kind: SiloAutoscaler
+    plural: siloautoscalers
+    shortNames: []
+    singular: siloautoscaler
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.replicas
+      name: Current
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SiloAutoscalerSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Spec for the SiloAutoscaler CRD.
+
+              The SiloAutoscaler manages safe scaling of a Silo StatefulSet by monitoring shard lease ownership and recovering from failed scale-down operations where pods were SIGKILL'd before flushing their WAL.
+            properties:
+              clusterPrefix:
+                description: Cluster prefix used by silo coordination for lease labels (silo.dev/cluster={prefix}).
+                type: string
+              orphanedLeaseGracePeriodSeconds:
+                default: 120
+                description: 'Seconds to wait after a scale-down before checking for orphaned leases. Default: 120 seconds.'
+                format: int64
+                type: integer
+              replicas:
+                description: Target replica count. An HPA can modify this via the /scale subresource.
+                format: int32
+                type: integer
+              targetStatefulSet:
+                description: Name of the StatefulSet to manage, in the same namespace.
+                type: string
+            required:
+            - clusterPrefix
+            - replicas
+            - targetStatefulSet
+            type: object
+          status:
+            description: Status of the SiloAutoscaler.
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                description: Standard Kubernetes-style conditions.
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              orphanedLeases:
+                default: []
+                description: Orphaned shard leases currently detected.
+                items:
+                  properties:
+                    detectedAt:
+                      type: string
+                    holderIdentity:
+                      type: string
+                    leaseName:
+                      type: string
+                    shardId:
+                      type: string
+                  required:
+                  - detectedAt
+                  - holderIdentity
+                  - leaseName
+                  - shardId
+                  type: object
+                type: array
+              phase:
+                default: ''
+                description: 'Current phase: Idle, ScalingUp, ScalingDown, RecoveringOrphans.'
+                type: string
+              replicas:
+                default: 0
+                description: Current replica count read from the StatefulSet.
+                format: int32
+                type: integer
+              scaleDownState:
+                description: State tracking for in-progress scale-down operations.
+                nullable: true
+                properties:
+                  maxRecoveryAttempts:
+                    description: Maximum recovery attempts before giving up.
+                    format: int32
+                    type: integer
+                  originalReplicas:
+                    description: The replica count before the scale-down started.
+                    format: int32
+                    type: integer
+                  recoveryAttempts:
+                    description: Number of scale-back-up recovery attempts so far.
+                    format: int32
+                    type: integer
+                  startedAt:
+                    description: When the scale-down was initiated (RFC 3339).
+                    type: string
+                  targetReplicas:
+                    description: The target replica count for the scale-down.
+                    format: int32
+                    type: integer
+                required:
+                - maxRecoveryAttempts
+                - originalReplicas
+                - recoveryAttempts
+                - startedAt
+                - targetReplicas
+                type: object
+            type: object
+        required:
+        - spec
+        title: SiloAutoscaler
+        type: object
+    served: true
+    storage: true
+    subresources:
+      scale:
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
+      status: {}
+
