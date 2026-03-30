@@ -30,6 +30,10 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch"]
+  # Pods (list, watch, and patch for finalizer management)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
   # Events (emit K8s events for operator visibility)
   - apiGroups: [""]
     resources: ["events"]

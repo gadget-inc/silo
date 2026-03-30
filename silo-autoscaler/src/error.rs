@@ -5,22 +5,13 @@ pub enum Error {
     #[error("Kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
 
-    #[error("Missing object key: {0}")]
-    MissingObjectKey(&'static str),
-
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-
-    #[error("StatefulSet {0} not found in namespace {1}")]
-    StatefulSetNotFound(String, String),
-
-    #[error("Invalid spec: {0}")]
-    InvalidSpec(String),
 }
 
 /// Wrapper for controller reconciler error reporting.
 /// kube::runtime::Controller requires the error type to be clone-friendly for metrics,
-/// so we wrap it in an Arc-based type.
+/// so we wrap it in a String-based type.
 #[derive(Debug, Clone)]
 pub struct ReconcileError(pub String);
 

@@ -3,18 +3,18 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::coordination::v1::Lease;
-use kube::api::{Api, Patch, PatchParams};
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::{Controller, watcher};
 use kube::Client;
 use tracing::{debug, error, info, warn};
 
-use crate::crd::{
-    AutoscalerCondition, ScaleDownState, SiloAutoscaler, SiloAutoscalerStatus,
-};
-use crate::error::{Error, ReconcileError};
+use crate::crd::{AutoscalerCondition, OrphanedLeaseInfo, SiloAutoscaler, SiloAutoscalerStatus};
+use crate::error::ReconcileError;
 use crate::orphan;
+
+const FINALIZER_NAME: &str = "silo.dev/safe-scaledown";
 
 pub struct Context {
     pub client: Client,
@@ -23,8 +23,7 @@ pub struct Context {
 /// Run the SiloAutoscaler controller loop.
 pub async fn run_controller(client: Client) -> anyhow::Result<()> {
     let autoscalers: Api<SiloAutoscaler> = Api::all(client.clone());
-    let statefulsets: Api<StatefulSet> = Api::all(client.clone());
-    let leases: Api<Lease> = Api::all(client.clone());
+    let pods: Api<Pod> = Api::all(client.clone());
 
     let ctx = Arc::new(Context {
         client: client.clone(),
@@ -34,31 +33,17 @@ pub async fn run_controller(client: Client) -> anyhow::Result<()> {
 
     Controller::new(autoscalers, watcher::Config::default())
         .watches(
-            statefulsets,
+            pods,
             watcher::Config::default(),
-            |sts| {
-                // Trigger reconcile for any SiloAutoscaler that might target this StatefulSet.
-                // We return the StatefulSet name as the object ref — the controller framework
-                // will match it against SiloAutoscaler objects. Since we can't easily do a
-                // reverse lookup here, we rely on periodic requeue as the primary mechanism
-                // and this watch as best-effort notification.
-                let ns = sts.metadata.namespace.clone().unwrap_or_default();
-                let name = sts.metadata.name.clone().unwrap_or_default();
-                debug!(
-                    namespace = %ns,
-                    statefulset = %name,
-                    "StatefulSet changed, will reconcile matching autoscalers"
-                );
-                // Return empty — periodic requeue handles reconciliation
-                std::iter::empty()
-            },
-        )
-        .watches(
-            leases,
-            watcher::Config::default().labels("silo.dev/type=shard"),
-            |lease| {
-                let ns = lease.metadata.namespace.clone().unwrap_or_default();
-                debug!(namespace = %ns, "shard lease changed");
+            |pod| {
+                // Trigger reconciliation when pods with our finalizer change.
+                // We return empty because we can't easily map pod → SiloAutoscaler.
+                // The short requeue interval (5s) during active operations handles this.
+                if has_finalizer(&pod) {
+                    let ns = pod.metadata.namespace.clone().unwrap_or_default();
+                    let name = pod.metadata.name.clone().unwrap_or_default();
+                    debug!(namespace = %ns, pod = %name, "finalizer pod changed");
+                }
                 std::iter::empty()
             },
         )
@@ -83,8 +68,8 @@ fn error_policy(
     error: &ReconcileError,
     _ctx: Arc<Context>,
 ) -> Action {
-    warn!(error = %error, "reconcile error, retrying in 30s");
-    Action::requeue(Duration::from_secs(30))
+    warn!(error = %error, "reconcile error, retrying in 15s");
+    Action::requeue(Duration::from_secs(15))
 }
 
 async fn reconcile(
@@ -96,18 +81,19 @@ async fn reconcile(
         .metadata
         .namespace
         .as_deref()
-        .ok_or_else(|| Error::MissingObjectKey("metadata.namespace"))?;
+        .ok_or_else(|| ReconcileError("missing metadata.namespace".into()))?;
     let name = obj
         .metadata
         .name
         .as_deref()
-        .ok_or_else(|| Error::MissingObjectKey("metadata.name"))?;
+        .ok_or_else(|| ReconcileError("missing metadata.name".into()))?;
     let spec = &obj.spec;
+    let desired = spec.replicas;
 
-    info!(
+    debug!(
         name = %name,
         namespace = %namespace,
-        desired_replicas = spec.replicas,
+        desired_replicas = desired,
         target_sts = %spec.target_stateful_set,
         "reconciling SiloAutoscaler"
     );
@@ -123,378 +109,214 @@ async fn reconcile(
                 "target StatefulSet not found"
             );
             update_status(
-                client,
-                namespace,
-                name,
-                0,
-                "Idle",
-                vec![],
-                None,
-                vec![make_condition(
-                    "Ready",
-                    "False",
-                    "StatefulSetNotFound",
-                    &format!("StatefulSet {} not found", spec.target_stateful_set),
-                )],
-            )
-            .await?;
+                client, namespace, name, 0, vec![], vec![
+                    make_condition("Ready", "False", "StatefulSetNotFound",
+                        &format!("StatefulSet {} not found", spec.target_stateful_set)),
+                ],
+            ).await?;
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
         Err(e) => return Err(e.into()),
     };
 
-    let current_replicas = sts
+    let sts_replicas = sts.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
+
+    // 2. List pods for this StatefulSet
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let label_selector = sts
         .spec
         .as_ref()
-        .and_then(|s| s.replicas)
-        .unwrap_or(0);
+        .and_then(|s| s.selector.match_labels.as_ref())
+        .map(|labels| {
+            labels
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let pods = pod_api
+        .list(&ListParams::default().labels(&label_selector))
+        .await
+        .map_err(|e| ReconcileError(format!("failed to list pods: {e}")))?;
 
-    let ready_replicas = sts
-        .status
-        .as_ref()
-        .and_then(|s| s.ready_replicas)
-        .unwrap_or(0);
-
-    // 2. Detect orphaned leases
-    let orphans = orphan::detect_orphaned_leases(
-        client,
-        namespace,
-        &spec.cluster_prefix,
-        &spec.target_stateful_set,
-        current_replicas,
-    )
-    .await?;
-
-    if !orphans.is_empty() {
-        info!(
-            name = %name,
-            orphan_count = orphans.len(),
-            "detected orphaned shard leases"
-        );
-    }
-
-    let desired = spec.replicas;
-
-    // 3. Determine scaling action
-    if desired == current_replicas && orphans.is_empty() {
-        // Steady state
-        debug!(name = %name, replicas = current_replicas, "steady state, no action needed");
-        update_status(
-            client,
-            namespace,
-            name,
-            current_replicas,
-            "Idle",
-            vec![],
-            None,
-            vec![make_condition("Ready", "True", "Idle", "replicas match desired count")],
-        )
-        .await?;
-        return Ok(Action::requeue(Duration::from_secs(60)));
-    }
-
-    if desired > current_replicas {
-        // Scale up: simple patch
-        info!(
-            name = %name,
-            current = current_replicas,
-            desired = desired,
-            "scaling up StatefulSet"
-        );
-        patch_statefulset_replicas(&sts_api, &spec.target_stateful_set, desired).await?;
-        update_status(
-            client,
-            namespace,
-            name,
-            current_replicas,
-            "ScalingUp",
-            orphans,
-            None,
-            vec![make_condition(
-                "Scaling",
-                "True",
-                "ScalingUp",
-                &format!("scaling from {} to {}", current_replicas, desired),
-            )],
-        )
-        .await?;
-        return Ok(Action::requeue(Duration::from_secs(15)));
-    }
-
-    if desired < current_replicas {
-        // Scale down: complex flow with orphan detection
-        let status = obj.status.as_ref();
-        let scale_down_state = status.and_then(|s| s.scale_down_state.as_ref());
-
-        return handle_scale_down(
-            client,
-            namespace,
-            name,
-            spec,
-            &sts_api,
-            current_replicas,
-            ready_replicas,
-            desired,
-            &orphans,
-            scale_down_state,
-        )
-        .await;
-    }
-
-    // desired == current_replicas but orphans exist — need recovery
-    if !orphans.is_empty() {
-        let status = obj.status.as_ref();
-        let scale_down_state = status.and_then(|s| s.scale_down_state.as_ref());
-        let recovery_attempts = scale_down_state.map(|s| s.recovery_attempts).unwrap_or(0);
-        let max_attempts = scale_down_state
-            .map(|s| s.max_recovery_attempts)
-            .unwrap_or(3);
-
-        if recovery_attempts >= max_attempts {
-            warn!(
-                name = %name,
-                attempts = recovery_attempts,
-                "max recovery attempts exceeded, orphaned leases remain"
-            );
-            update_status(
-                client,
-                namespace,
-                name,
-                current_replicas,
-                "Idle",
-                orphans,
-                None,
-                vec![make_condition(
-                    "OrphanedLeases",
-                    "True",
-                    "RecoveryFailed",
-                    "max recovery attempts exceeded, manual intervention required",
-                )],
-            )
-            .await?;
-            return Ok(Action::requeue(Duration::from_secs(60)));
+    // 3. Ensure all non-terminating pods have our finalizer
+    for pod in &pods.items {
+        if pod.metadata.deletion_timestamp.is_none() && !has_finalizer(pod) {
+            if let Some(pod_name) = &pod.metadata.name {
+                add_finalizer(&pod_api, pod_name).await?;
+            }
         }
+    }
 
-        let recovery_replicas = orphan::compute_recovery_replicas(&orphans, desired);
-        info!(
-            name = %name,
-            recovery_replicas = recovery_replicas,
-            orphan_count = orphans.len(),
-            "scaling up to recover orphaned shards"
-        );
-        patch_statefulset_replicas(&sts_api, &spec.target_stateful_set, recovery_replicas).await?;
+    // 4. Handle terminating pods with our finalizer
+    let mut all_orphaned_leases: Vec<OrphanedLeaseInfo> = vec![];
+    let mut recovery_needed = false;
+    let mut has_terminating_pods = false;
 
-        let sds = ScaleDownState {
-            original_replicas: current_replicas,
-            target_replicas: desired,
-            recovery_attempts: recovery_attempts + 1,
-            max_recovery_attempts: max_attempts,
-            started_at: scale_down_state
-                .map(|s| s.started_at.clone())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+    for pod in &pods.items {
+        if pod.metadata.deletion_timestamp.is_none() || !has_finalizer(pod) {
+            continue;
+        }
+        has_terminating_pods = true;
+
+        let pod_name = match &pod.metadata.name {
+            Some(n) => n.as_str(),
+            None => continue,
         };
-        update_status(
-            client,
-            namespace,
-            name,
-            current_replicas,
-            "RecoveringOrphans",
-            orphans,
-            Some(sds),
-            vec![make_condition(
-                "OrphanedLeases",
-                "True",
-                "Recovering",
-                "scaling up to recover orphaned shards",
-            )],
-        )
-        .await?;
-        return Ok(Action::requeue(Duration::from_secs(30)));
-    }
 
-    Ok(Action::requeue(Duration::from_secs(60)))
-}
-
-async fn handle_scale_down(
-    client: &Client,
-    namespace: &str,
-    name: &str,
-    spec: &crate::crd::SiloAutoscalerSpec,
-    sts_api: &Api<StatefulSet>,
-    current_replicas: i32,
-    _ready_replicas: i32,
-    desired: i32,
-    orphans: &[crate::crd::OrphanedLeaseInfo],
-    scale_down_state: Option<&ScaleDownState>,
-) -> Result<Action, ReconcileError> {
-    match scale_down_state {
-        None => {
-            // First time: initiate scale-down
-            info!(
-                name = %name,
-                current = current_replicas,
-                desired = desired,
-                "initiating scale-down"
-            );
-            patch_statefulset_replicas(sts_api, &spec.target_stateful_set, desired).await?;
-
-            let sds = ScaleDownState {
-                original_replicas: current_replicas,
-                target_replicas: desired,
-                recovery_attempts: 0,
-                max_recovery_attempts: 3,
-                started_at: chrono::Utc::now().to_rfc3339(),
-            };
-            update_status(
-                client,
-                namespace,
-                name,
-                current_replicas,
-                "ScalingDown",
-                orphans.to_vec(),
-                Some(sds),
-                vec![make_condition(
-                    "Scaling",
-                    "True",
-                    "ScalingDown",
-                    &format!("scaling from {} to {}", current_replicas, desired),
-                )],
-            )
-            .await?;
-
-            // Requeue after grace period to check for orphans
-            let grace = Duration::from_secs(spec.orphaned_lease_grace_period_seconds as u64);
-            Ok(Action::requeue(grace))
+        if !is_container_terminated(pod) {
+            debug!(pod = %pod_name, "container still running, waiting for flush");
+            continue;
         }
 
-        Some(sds) if !orphans.is_empty() && sds.recovery_attempts < sds.max_recovery_attempts => {
-            // Orphaned leases detected: scale back up to recover
-            let recovery_replicas = orphan::compute_recovery_replicas(orphans, desired);
+        // Container is dead — check if leases were released
+        let held_leases = orphan::leases_held_by_pod(
+            client, namespace, &spec.cluster_prefix, pod_name,
+        ).await?;
+
+        if held_leases.is_empty() {
+            // Clean shutdown: leases released, remove finalizer
+            info!(pod = %pod_name, "leases released, removing finalizer");
+            remove_finalizer(&pod_api, pod_name).await?;
+        } else {
+            // SIGKILL'd: leases still held, need recovery
+            let ordinal = orphan::extract_pod_ordinal(pod_name).unwrap_or(0);
+            let recovery_replicas = ordinal + 1;
+
             info!(
-                name = %name,
+                pod = %pod_name,
+                orphaned_leases = held_leases.len(),
                 recovery_replicas = recovery_replicas,
-                orphan_count = orphans.len(),
-                attempt = sds.recovery_attempts + 1,
-                "scaling back up to recover orphaned shards"
-            );
-            patch_statefulset_replicas(sts_api, &spec.target_stateful_set, recovery_replicas)
-                .await?;
-
-            let new_sds = ScaleDownState {
-                original_replicas: sds.original_replicas,
-                target_replicas: sds.target_replicas,
-                recovery_attempts: sds.recovery_attempts + 1,
-                max_recovery_attempts: sds.max_recovery_attempts,
-                started_at: sds.started_at.clone(),
-            };
-            update_status(
-                client,
-                namespace,
-                name,
-                current_replicas,
-                "RecoveringOrphans",
-                orphans.to_vec(),
-                Some(new_sds),
-                vec![make_condition(
-                    "OrphanedLeases",
-                    "True",
-                    "Recovering",
-                    &format!(
-                        "recovery attempt {}, scaling to {} replicas",
-                        sds.recovery_attempts + 1,
-                        recovery_replicas
-                    ),
-                )],
-            )
-            .await?;
-
-            Ok(Action::requeue(Duration::from_secs(30)))
-        }
-
-        Some(sds) if sds.recovery_attempts >= sds.max_recovery_attempts => {
-            // Max retries exceeded
-            warn!(
-                name = %name,
-                attempts = sds.recovery_attempts,
-                "max recovery attempts exceeded during scale-down"
-            );
-            update_status(
-                client,
-                namespace,
-                name,
-                current_replicas,
-                "Idle",
-                orphans.to_vec(),
-                None,
-                vec![make_condition(
-                    "OrphanedLeases",
-                    "True",
-                    "RecoveryFailed",
-                    "max recovery attempts exceeded, manual intervention required",
-                )],
-            )
-            .await?;
-            Ok(Action::requeue(Duration::from_secs(60)))
-        }
-
-        Some(_) if orphans.is_empty() => {
-            // Recovery succeeded: scale-down completed
-            info!(
-                name = %name,
-                desired = desired,
-                "scale-down recovery complete, no orphaned leases"
+                "orphaned leases detected, scaling up for recovery"
             );
 
-            // If the StatefulSet is still at the recovery replica count, scale down again
-            if current_replicas > desired {
-                info!(
-                    name = %name,
-                    current = current_replicas,
-                    desired = desired,
-                    "retrying scale-down after successful recovery"
-                );
-                patch_statefulset_replicas(sts_api, &spec.target_stateful_set, desired).await?;
-                // Keep the scale_down_state but requeue after grace period
-                let grace = Duration::from_secs(spec.orphaned_lease_grace_period_seconds as u64);
-                update_status(
-                    client,
-                    namespace,
-                    name,
-                    current_replicas,
-                    "ScalingDown",
-                    vec![],
-                    None,
-                    vec![make_condition(
-                        "Scaling",
-                        "True",
-                        "ScalingDown",
-                        &format!("retrying scale-down from {} to {}", current_replicas, desired),
-                    )],
-                )
-                .await?;
-                return Ok(Action::requeue(grace));
+            // Scale up to cover this pod's ordinal
+            if sts_replicas < recovery_replicas {
+                patch_statefulset_replicas(&sts_api, &spec.target_stateful_set, recovery_replicas).await?;
             }
 
-            update_status(
-                client,
-                namespace,
-                name,
-                current_replicas,
-                "Idle",
-                vec![],
-                None,
-                vec![make_condition("Ready", "True", "Idle", "scale-down complete")],
-            )
-            .await?;
-            Ok(Action::requeue(Duration::from_secs(60)))
-        }
+            // Remove finalizer so the terminating pod can be fully deleted
+            // and the StatefulSet can recreate it
+            remove_finalizer(&pod_api, pod_name).await?;
 
-        _ => {
-            // Waiting for state to converge
-            debug!(name = %name, "waiting for scale-down to converge");
-            Ok(Action::requeue(Duration::from_secs(15)))
+            all_orphaned_leases.extend(held_leases);
+            recovery_needed = true;
         }
     }
+
+    // 5. Apply desired replica count when safe
+    if !recovery_needed && !has_terminating_pods {
+        if sts_replicas > desired {
+            // Recovery just completed (sts has more replicas than desired).
+            // Check if all pods are ready before scaling back down.
+            let all_ready = pods.items.iter().all(|p| {
+                p.metadata.deletion_timestamp.is_none() && is_pod_ready(p)
+            });
+            if all_ready {
+                info!(
+                    name = %name,
+                    current = sts_replicas,
+                    desired = desired,
+                    "recovery complete, scaling back down"
+                );
+                patch_statefulset_replicas(&sts_api, &spec.target_stateful_set, desired).await?;
+            } else {
+                debug!(name = %name, "waiting for recovery pods to become ready");
+            }
+        } else if sts_replicas < desired {
+            info!(
+                name = %name,
+                current = sts_replicas,
+                desired = desired,
+                "scaling up"
+            );
+            patch_statefulset_replicas(&sts_api, &spec.target_stateful_set, desired).await?;
+        }
+    }
+
+    // 6. Update status
+    let conditions = if !all_orphaned_leases.is_empty() {
+        vec![make_condition(
+            "OrphanedLeases", "True", "Recovering",
+            &format!("{} orphaned leases, scaling up for recovery", all_orphaned_leases.len()),
+        )]
+    } else if sts_replicas != desired {
+        vec![make_condition(
+            "Ready", "False", "Scaling",
+            &format!("replicas: {} desired: {}", sts_replicas, desired),
+        )]
+    } else {
+        vec![make_condition("Ready", "True", "Idle", "replicas match desired count")]
+    };
+
+    update_status(client, namespace, name, sts_replicas, all_orphaned_leases, conditions).await?;
+
+    // 7. Requeue interval
+    let interval = if recovery_needed || has_terminating_pods {
+        5 // Fast poll during active operations
+    } else if sts_replicas != desired {
+        10
+    } else {
+        60
+    };
+    Ok(Action::requeue(Duration::from_secs(interval)))
+}
+
+fn has_finalizer(pod: &Pod) -> bool {
+    pod.metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|fin| fin == FINALIZER_NAME))
+}
+
+fn is_container_terminated(pod: &Pod) -> bool {
+    let statuses = match pod.status.as_ref().and_then(|s| s.container_statuses.as_ref()) {
+        Some(s) => s,
+        None => return true, // No container statuses means containers never ran or were evicted
+    };
+    statuses.iter().all(|cs| {
+        cs.state
+            .as_ref()
+            .is_some_and(|s| s.terminated.is_some())
+    })
+}
+
+fn is_pod_ready(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True")
+        })
+}
+
+async fn add_finalizer(pod_api: &Api<Pod>, pod_name: &str) -> Result<(), ReconcileError> {
+    let patch = serde_json::json!({
+        "metadata": {
+            "finalizers": [FINALIZER_NAME]
+        }
+    });
+    pod_api
+        .patch(pod_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(|e| ReconcileError(format!("failed to add finalizer to pod {pod_name}: {e}")))?;
+    debug!(pod = %pod_name, "added finalizer");
+    Ok(())
+}
+
+async fn remove_finalizer(pod_api: &Api<Pod>, pod_name: &str) -> Result<(), ReconcileError> {
+    let patch = serde_json::json!({
+        "metadata": {
+            "finalizers": []
+        }
+    });
+    pod_api
+        .patch(pod_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(|e| ReconcileError(format!("failed to remove finalizer from pod {pod_name}: {e}")))?;
+    debug!(pod = %pod_name, "removed finalizer");
+    Ok(())
 }
 
 async fn patch_statefulset_replicas(
@@ -508,35 +330,28 @@ async fn patch_statefulset_replicas(
         }
     });
     sts_api
-        .patch(
-            name,
-            &PatchParams::default(),
-            &Patch::Merge(&patch),
-        )
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map_err(|e| ReconcileError(format!("failed to patch StatefulSet replicas: {e}")))?;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn update_status(
     client: &Client,
     namespace: &str,
     name: &str,
     replicas: i32,
-    phase: &str,
-    orphaned_leases: Vec<crate::crd::OrphanedLeaseInfo>,
-    scale_down_state: Option<ScaleDownState>,
+    orphaned_leases: Vec<OrphanedLeaseInfo>,
     conditions: Vec<AutoscalerCondition>,
 ) -> Result<(), ReconcileError> {
     let autoscaler_api: Api<SiloAutoscaler> = Api::namespaced(client.clone(), namespace);
 
+    let orphaned_lease_count = orphaned_leases.len() as i32;
     let status = SiloAutoscalerStatus {
         replicas,
-        phase: phase.to_string(),
+        orphaned_lease_count,
         conditions,
         orphaned_leases,
-        scale_down_state,
     };
 
     let patch = serde_json::json!({

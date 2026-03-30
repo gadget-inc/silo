@@ -19,9 +19,9 @@ spec:
     - jsonPath: .status.replicas
       name: Current
       type: integer
-    - jsonPath: .status.phase
-      name: Phase
-      type: string
+    - jsonPath: .status.orphanedLeaseCount
+      name: Orphans
+      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -31,16 +31,11 @@ spec:
             description: |-
               Spec for the SiloAutoscaler CRD.
 
-              The SiloAutoscaler manages safe scaling of a Silo StatefulSet by monitoring shard lease ownership and recovering from failed scale-down operations where pods were SIGKILL'd before flushing their WAL.
+              The SiloAutoscaler manages safe scaling of a Silo StatefulSet by adding finalizers to pods and ensuring shard leases are cleanly released before allowing pod deletion to complete.
             properties:
               clusterPrefix:
                 description: Cluster prefix used by silo coordination for lease labels (silo.dev/cluster={prefix}).
                 type: string
-              orphanedLeaseGracePeriodSeconds:
-                default: 120
-                description: 'Seconds to wait after a scale-down before checking for orphaned leases. Default: 120 seconds.'
-                format: int64
-                type: integer
               replicas:
                 description: Target replica count. An HPA can modify this via the /scale subresource.
                 format: int32
@@ -80,6 +75,11 @@ spec:
                   - type
                   type: object
                 type: array
+              orphanedLeaseCount:
+                default: 0
+                description: Number of orphaned leases currently detected.
+                format: int32
+                type: integer
               orphanedLeases:
                 default: []
                 description: Orphaned shard leases currently detected.
@@ -100,45 +100,11 @@ spec:
                   - shardId
                   type: object
                 type: array
-              phase:
-                default: ''
-                description: 'Current phase: Idle, ScalingUp, ScalingDown, RecoveringOrphans.'
-                type: string
               replicas:
                 default: 0
                 description: Current replica count read from the StatefulSet.
                 format: int32
                 type: integer
-              scaleDownState:
-                description: State tracking for in-progress scale-down operations.
-                nullable: true
-                properties:
-                  maxRecoveryAttempts:
-                    description: Maximum recovery attempts before giving up.
-                    format: int32
-                    type: integer
-                  originalReplicas:
-                    description: The replica count before the scale-down started.
-                    format: int32
-                    type: integer
-                  recoveryAttempts:
-                    description: Number of scale-back-up recovery attempts so far.
-                    format: int32
-                    type: integer
-                  startedAt:
-                    description: When the scale-down was initiated (RFC 3339).
-                    type: string
-                  targetReplicas:
-                    description: The target replica count for the scale-down.
-                    format: int32
-                    type: integer
-                required:
-                - maxRecoveryAttempts
-                - originalReplicas
-                - recoveryAttempts
-                - startedAt
-                - targetReplicas
-                type: object
             type: object
         required:
         - spec
