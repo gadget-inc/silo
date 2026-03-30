@@ -98,7 +98,7 @@ async fn reconcile(
         "reconciling SiloAutoscaler"
     );
 
-    // 1. Read target StatefulSet
+    // Read target StatefulSet
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
     let sts = match sts_api.get(&spec.target_stateful_set).await {
         Ok(sts) => sts,
@@ -121,7 +121,7 @@ async fn reconcile(
 
     let sts_replicas = sts.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
 
-    // 2. List pods for this StatefulSet
+    // List pods for this StatefulSet
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
     let label_selector = sts
         .spec
@@ -140,7 +140,7 @@ async fn reconcile(
         .await
         .map_err(|e| ReconcileError(format!("failed to list pods: {e}")))?;
 
-    // 3. Handle terminating pods with our finalizer
+    // Handle terminating pods with our finalizer
     let mut all_orphaned_leases: Vec<OrphanedLeaseInfo> = vec![];
     let mut recovery_needed = false;
     let mut has_terminating_pods = false;
@@ -196,7 +196,7 @@ async fn reconcile(
         }
     }
 
-    // 5. Apply desired replica count when safe
+    // Apply desired replica count when safe
     if !recovery_needed && !has_terminating_pods {
         if sts_replicas > desired {
             // Recovery just completed (sts has more replicas than desired).
@@ -226,7 +226,7 @@ async fn reconcile(
         }
     }
 
-    // 6. Update status
+    // Update status
     let conditions = if !all_orphaned_leases.is_empty() {
         vec![make_condition(
             "OrphanedLeases", "True", "Recovering",
@@ -243,7 +243,7 @@ async fn reconcile(
 
     update_status(client, namespace, name, sts_replicas, all_orphaned_leases, conditions).await?;
 
-    // 7. Requeue interval
+    // Requeue interval
     let interval = if recovery_needed || has_terminating_pods {
         5 // Fast poll during active operations
     } else if sts_replicas != desired {
