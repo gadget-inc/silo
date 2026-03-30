@@ -20,10 +20,18 @@ spec:
         - name: controller
           image: silo-autoscaler:latest
           imagePullPolicy: Never
-          args: ["--disable-webhook"]
+          args: ["--webhook-port=8443"]
           ports:
             - containerPort: 8443
               name: webhook
           env:
             - name: RUST_LOG
               value: "info,silo_autoscaler=debug"
+          volumeMounts:
+            - name: webhook-certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: webhook-certs
+          secret:
+            secretName: silo-autoscaler-webhook-certs

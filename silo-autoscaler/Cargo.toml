@@ -24,3 +24,9 @@ anyhow = "1"
 axum = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.3", features = ["derive", "env"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+tower = "0.5"
