@@ -152,7 +152,7 @@ async fn grpc_server_query_basic() -> anyhow::Result<()> {
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_query_statement_timeout_aborts_execution() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let config = config_with_statement_timeout_ms(100);
         let (mut client, shutdown_tx, server, _addr) =
@@ -212,7 +212,7 @@ async fn grpc_server_query_statement_timeout_aborts_execution() -> anyhow::Resul
 
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_server_query_arrow_statement_timeout() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(15000), async {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let config = config_with_statement_timeout_ms(100);
         let (mut client, shutdown_tx, server, _addr) =

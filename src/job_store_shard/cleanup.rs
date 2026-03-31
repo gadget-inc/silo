@@ -401,7 +401,7 @@ impl JobStoreShard {
         let sources: Vec<SourceId> = manifest
             .l0
             .iter()
-            .map(|sst| SourceId::Sst(sst.id.unwrap_compacted_id()))
+            .map(|sst| SourceId::SstView(sst.sst.id.unwrap_compacted_id()))
             .chain(
                 manifest
                     .compacted
