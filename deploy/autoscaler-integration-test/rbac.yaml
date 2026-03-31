@@ -38,9 +38,10 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: silo-autoscaler-inttest
+  name: silo-autoscaler
+  namespace: silo-autoscaler-test
 rules:
   - apiGroups: ["silo.dev"]
     resources: ["siloautoscalers"]
@@ -68,14 +69,15 @@ rules:
     verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: silo-autoscaler-inttest
+  name: silo-autoscaler
+  namespace: silo-autoscaler-test
 subjects:
   - kind: ServiceAccount
     name: silo-autoscaler
     namespace: silo-autoscaler-test
 roleRef:
-  kind: ClusterRole
-  name: silo-autoscaler-inttest
+  kind: Role
+  name: silo-autoscaler
   apiGroup: rbac.authorization.k8s.io

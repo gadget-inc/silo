@@ -15,9 +15,18 @@ use crate::error::ReconcileError;
 use crate::orphan;
 
 const FINALIZER_NAME: &str = "silo.dev/safe-scaledown";
+const SA_NAMESPACE_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 
 pub struct Context {
     pub client: Client,
+}
+
+/// Read the namespace the controller is running in from the service account mount.
+/// Falls back to the NAMESPACE env var, then "default".
+fn detect_namespace() -> String {
+    std::fs::read_to_string(SA_NAMESPACE_PATH)
+        .or_else(|_| std::env::var("NAMESPACE"))
+        .unwrap_or_else(|_| "default".to_string())
 }
 
 /// Outcome of processing terminating pods during reconciliation.
@@ -44,28 +53,29 @@ impl TerminationStatus {
 }
 
 /// Run the SiloAutoscaler controller loop.
+///
+/// The controller is scoped to its own namespace, detected from the
+/// service account mount at `/var/run/secrets/kubernetes.io/serviceaccount/namespace`,
+/// the `NAMESPACE` env var, or falling back to `default`.
 pub async fn run_controller(client: Client) -> anyhow::Result<()> {
-    let autoscalers: Api<SiloAutoscaler> = Api::all(client.clone());
-    let pods: Api<Pod> = Api::all(client.clone());
+    let namespace = detect_namespace();
+    let autoscalers: Api<SiloAutoscaler> = Api::namespaced(client.clone(), &namespace);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
 
     let ctx = Arc::new(Context {
         client: client.clone(),
     });
 
-    info!("starting SiloAutoscaler controller");
+    info!(namespace = %namespace, "starting SiloAutoscaler controller");
 
     Controller::new(autoscalers, watcher::Config::default())
         .watches(
             pods,
             watcher::Config::default(),
-            |pod| {
-                if has_finalizer(&pod) {
-                    let ns = pod.metadata.namespace.clone().unwrap_or_default();
-                    let name = pod.metadata.name.clone().unwrap_or_default();
-                    debug!(namespace = %ns, pod = %name, "finalizer pod changed");
-                }
-                std::iter::empty()
-            },
+            // Pod changes don't directly map to a SiloAutoscaler name, so we return empty.
+            // The namespaced watch ensures we only track pods in our namespace, and the
+            // requeue interval (5s during active operations) drives convergence.
+            |_pod| std::iter::empty(),
         )
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
