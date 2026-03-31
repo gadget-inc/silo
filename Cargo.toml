@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "silo-macros", "silo-autoscaler"]
+
 [package]
 authors = ["Harry Brundage <harry@gadget.dev>"]
 edition = "2024"

@@ -2,22 +2,22 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: silo-config
-  namespace: silo-test
+  namespace: silo-autoscaler-test
 data:
   config.toml: |
     [server]
     grpc_addr = "0.0.0.0:50051"
-    auth_token = "${SILO_AUTH_TOKEN}"
+    auth_token = "inttest-token"
 
     [logging]
     format = "json"
 
     [coordination]
     backend = "k8s"
-    cluster_prefix = "silo-local-test"
+    cluster_prefix = "silo-inttest"
     lease_ttl_secs = 10
     initial_shard_count = 6
-    k8s_namespace = "silo-test"
+    k8s_namespace = "silo-autoscaler-test"
     advertised_grpc_addr = "${POD_IP}:50051"
     node_id = "${POD_NAME}"
 
@@ -25,12 +25,10 @@ data:
     enabled = true
 
     [webui]
-    enabled = true
-    addr = "0.0.0.0:50052"
+    enabled = false
 
     [metrics]
-    enabled = true
-    addr = "0.0.0.0:9090"
+    enabled = false
 
     [database]
     backend = "fs"
@@ -44,7 +42,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: silo
-  namespace: silo-test
+  namespace: silo-autoscaler-test
 spec:
   clusterIP: None
   selector:
@@ -53,18 +51,12 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
-    - name: webui
-      port: 50052
-      targetPort: 50052
-    - name: metrics
-      port: 9090
-      targetPort: 9090
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: silo
-  namespace: silo-test
+  namespace: silo-autoscaler-test
 spec:
   serviceName: silo
   replicas: 3
@@ -82,17 +74,13 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: silo
-          image: silo-dev:latest
+          image: silo:latest
           imagePullPolicy: Never
           command: ["silo"]
           args: ["-c", "/etc/silo/config.toml"]
           ports:
             - containerPort: 50051
               name: grpc
-            - containerPort: 50052
-              name: webui
-            - containerPort: 9090
-              name: metrics
           env:
             - name: POD_IP
               valueFrom:
@@ -102,11 +90,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: SILO_AUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: silo-auth
-                  key: token
             - name: RUST_LOG
               value: "info,silo::coordination=debug"
           volumeMounts:
@@ -133,7 +116,7 @@ spec:
             name: silo-config
         - name: shared-data
           hostPath:
-            path: /tmp/silo-test-shared
+            path: /tmp/silo-inttest-shared
             type: DirectoryOrCreate
         - name: wal-data
           emptyDir: {}

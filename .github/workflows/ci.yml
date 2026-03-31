@@ -113,6 +113,49 @@ jobs:
           name: k8s-test-logs
           path: k8s-test-debug.log
 
+  test-autoscaler:
+    name: SiloAutoscaler integration tests
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: silo-autoscaler-test
+      - name: Build silo image
+        run: |
+          nix build .#silo-docker -L
+          kind load image-archive result --name silo-autoscaler-test
+      - name: Build autoscaler image
+        run: |
+          nix build .#silo-autoscaler-docker -L
+          kind load image-archive result --name silo-autoscaler-test
+      - name: Install CRD
+        run: cargo run --package silo-autoscaler -- crd | kubectl apply -f -
+      - name: Deploy test environment
+        run: |
+          kubectl apply -f deploy/autoscaler-integration-test/namespace.yaml
+          kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/silo-autoscaler-test --timeout=30s
+          kubectl apply -f deploy/autoscaler-integration-test/
+          kubectl -n silo-autoscaler-test rollout status statefulset/silo --timeout=180s
+          kubectl -n silo-autoscaler-test rollout status deployment/silo-autoscaler --timeout=60s
+      - name: Run autoscaler integration tests
+        shell: bash
+        env:
+          SILO_DEBUG_LOG_FILE: autoscaler-test-debug.log
+        run: cargo test --package silo-autoscaler --test autoscaler_integration_tests -- --test-threads=1
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoscaler-test-logs
+          path: autoscaler-test-debug.log
+
   benchmark:
     name: Run benchmarks
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -275,9 +318,14 @@ jobs:
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build Docker image with Nix
+      - name: Build silo Docker image with Nix
         run: |
           nix build .#packages.${{ matrix.nix_system }}.silo-docker -L
+          docker load < result
+
+      - name: Build silo-autoscaler Docker image with Nix
+        run: |
+          nix build .#packages.${{ matrix.nix_system }}.silo-autoscaler-docker -L
           docker load < result
 
       - name: Push to Cachix
@@ -305,7 +353,7 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
-      - name: Tag and push image
+      - name: Tag and push silo image
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           sha=$(git rev-parse --short HEAD)
@@ -313,6 +361,18 @@ jobs:
           image_tag="${registry}/silo:sha-${sha}-${{ matrix.platform }}"
 
           docker tag silo:latest "${image_tag}"
+          docker push "${image_tag}"
+
+          echo "✅ Pushed: ${image_tag}"
+
+      - name: Tag and push silo-autoscaler image
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          registry="us-central1-docker.pkg.dev/gadget-core-production/core-production"
+          image_tag="${registry}/silo-autoscaler:sha-${sha}-${{ matrix.platform }}"
+
+          docker tag silo-autoscaler:latest "${image_tag}"
           docker push "${image_tag}"
 
           echo "✅ Pushed: ${image_tag}"
@@ -359,7 +419,21 @@ jobs:
 
           docker manifest push "${registry}/silo:latest"
 
+          docker manifest create "${registry}/silo-autoscaler:sha-${sha}" \
+              "${registry}/silo-autoscaler:sha-${sha}-amd64" \
+              "${registry}/silo-autoscaler:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-autoscaler:sha-${sha}"
+
+          docker manifest create "${registry}/silo-autoscaler:latest" \
+              "${registry}/silo-autoscaler:sha-${sha}-amd64" \
+              "${registry}/silo-autoscaler:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-autoscaler:latest"
+
           echo ""
           echo "✅ Successfully pushed multi-architecture Docker images:"
           echo "   - ${registry}/silo:sha-${sha}"
           echo "   - ${registry}/silo:latest"
+          echo "   - ${registry}/silo-autoscaler:sha-${sha}"
+          echo "   - ${registry}/silo-autoscaler:latest"

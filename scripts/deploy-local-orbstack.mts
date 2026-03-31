@@ -23,7 +23,7 @@ function run(cmd: string, args: string[]): void {
   }
 }
 
-async function buildAndLoad(): Promise<void> {
+async function nixBuildAndLoad(nixTarget: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const build = spawn(
       "docker",
@@ -35,7 +35,7 @@ async function buildAndLoad(): Promise<void> {
         "--workdir", "/workspace",
         "nixos/nix",
         "sh", "-c",
-        "echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf && IMAGE=$(nix build .#silo-docker-dev --no-link --print-out-paths) && cat \"$IMAGE\"",
+        `echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf && IMAGE=$(nix build .#${nixTarget} --no-link --print-out-paths) && cat "$IMAGE"`,
       ],
       { cwd: root, stdio: ["ignore", "pipe", "inherit"] }
     );
@@ -57,13 +57,17 @@ async function buildAndLoad(): Promise<void> {
 }
 
 console.log("Building silo image inside OrbStack (aarch64-linux)...");
-await buildAndLoad();
+await nixBuildAndLoad("silo-docker-dev");
+
+console.log("\nBuilding silo-autoscaler image inside OrbStack (aarch64-linux)...");
+await nixBuildAndLoad("silo-autoscaler-docker");
 
 console.log("\nApplying Kubernetes manifests to OrbStack...");
 run("kubectl", ["--context", "orbstack", "apply", "-f", "deploy/local-test"]);
 
-console.log("\nRestarting StatefulSet...");
+console.log("\nRestarting StatefulSet and autoscaler...");
 run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "statefulset/silo"]);
+run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "deployment/silo-autoscaler"]);
 
 console.log("\nDone. Pods:");
 run("kubectl", ["--context", "orbstack", "-n", "silo-test", "get", "pods"]);

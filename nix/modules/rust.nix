@@ -68,10 +68,26 @@
         cargoArtifacts = cargoArtifactsDebug;
         doCheck = false;
       });
+
+      # Autoscaler controller (standalone binary, no protobuf/flatbuffers needed)
+      autoscalerArgs = {
+        inherit src;
+        strictDeps = true;
+        # protobuf and flatbuffers are needed for workspace resolution even though
+        # the autoscaler crate doesn't use them directly
+        nativeBuildInputs = [ pkgs.protobuf pkgs.flatbuffers ];
+        cargoExtraArgs = "--package silo-autoscaler";
+      };
+      cargoArtifactsAutoscaler = craneLib.buildDepsOnly autoscalerArgs;
+      silo-autoscaler = craneLib.buildPackage (autoscalerArgs // {
+        cargoArtifacts = cargoArtifactsAutoscaler;
+        doCheck = false;
+      });
     in
     {
       packages.default = silo;
       packages.silo = silo;
       packages.silo-debug = silo-debug;
+      packages.silo-autoscaler = silo-autoscaler;
     };
 }

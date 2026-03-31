@@ -5450,6 +5450,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-autoscaler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "silo-macros"
 version = "0.1.0"
 dependencies = [
