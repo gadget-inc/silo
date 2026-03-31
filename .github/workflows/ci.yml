@@ -133,8 +133,8 @@ jobs:
           kind load image-archive result --name silo-autoscaler-test
       - name: Build autoscaler image
         run: |
-          docker build -f silo-autoscaler/Dockerfile -t silo-autoscaler:latest .
-          kind load docker-image silo-autoscaler:latest --name silo-autoscaler-test
+          nix build .#silo-autoscaler-docker -L
+          kind load image-archive result --name silo-autoscaler-test
       - name: Install CRD
         run: cargo run --package silo-autoscaler -- crd | kubectl apply -f -
       - name: Deploy test environment
@@ -318,9 +318,14 @@ jobs:
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build Docker image with Nix
+      - name: Build silo Docker image with Nix
         run: |
           nix build .#packages.${{ matrix.nix_system }}.silo-docker -L
+          docker load < result
+
+      - name: Build silo-autoscaler Docker image with Nix
+        run: |
+          nix build .#packages.${{ matrix.nix_system }}.silo-autoscaler-docker -L
           docker load < result
 
       - name: Push to Cachix
@@ -348,7 +353,7 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
-      - name: Tag and push image
+      - name: Tag and push silo image
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
           sha=$(git rev-parse --short HEAD)
@@ -356,6 +361,18 @@ jobs:
           image_tag="${registry}/silo:sha-${sha}-${{ matrix.platform }}"
 
           docker tag silo:latest "${image_tag}"
+          docker push "${image_tag}"
+
+          echo "✅ Pushed: ${image_tag}"
+
+      - name: Tag and push silo-autoscaler image
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          registry="us-central1-docker.pkg.dev/gadget-core-production/core-production"
+          image_tag="${registry}/silo-autoscaler:sha-${sha}-${{ matrix.platform }}"
+
+          docker tag silo-autoscaler:latest "${image_tag}"
           docker push "${image_tag}"
 
           echo "✅ Pushed: ${image_tag}"
@@ -402,7 +419,21 @@ jobs:
 
           docker manifest push "${registry}/silo:latest"
 
+          docker manifest create "${registry}/silo-autoscaler:sha-${sha}" \
+              "${registry}/silo-autoscaler:sha-${sha}-amd64" \
+              "${registry}/silo-autoscaler:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-autoscaler:sha-${sha}"
+
+          docker manifest create "${registry}/silo-autoscaler:latest" \
+              "${registry}/silo-autoscaler:sha-${sha}-amd64" \
+              "${registry}/silo-autoscaler:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-autoscaler:latest"
+
           echo ""
           echo "✅ Successfully pushed multi-architecture Docker images:"
           echo "   - ${registry}/silo:sha-${sha}"
           echo "   - ${registry}/silo:latest"
+          echo "   - ${registry}/silo-autoscaler:sha-${sha}"
+          echo "   - ${registry}/silo-autoscaler:latest"

@@ -84,6 +84,22 @@
           ];
         };
       };
+
+    packages.silo-autoscaler-docker = pkgs.dockerTools.buildLayeredImage {
+      name = "silo-autoscaler";
+      tag = "latest";
+
+      contents = [
+        self'.packages.silo-autoscaler
+        pkgs.cacert
+      ];
+
+      config = {
+        Entrypoint = [ "${self'.packages.silo-autoscaler}/bin/silo-autoscaler" ];
+        Env = [
+          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        ];
+      };
+    };
   };
 }
-
