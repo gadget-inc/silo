@@ -31,7 +31,7 @@ use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
     TextEncoder, core::Collector,
 };
-use slatedb::stats::StatRegistry;
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tokio::sync::broadcast;
 use tracing::{debug, error};
 
@@ -269,7 +269,7 @@ impl Metrics {
     /// Call this periodically (e.g., every second) to sync SlateDB's internal
     /// statistics to Prometheus metrics. Counter-type stats are tracked via deltas
     /// since Prometheus counters only support `inc_by()`, not `set()`.
-    pub fn update_slatedb_stats(&self, shard: &str, stats: &Arc<StatRegistry>) {
+    pub fn update_slatedb_stats(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
         // Counter-type stats: monotonically increasing in SlateDB
         let counter_mappings: &[(&str, &CounterVec)] = &[
             (slatedb::db_stats::GET_REQUESTS, &self.slatedb_get_requests),
@@ -343,11 +343,18 @@ impl Metrics {
             ),
         ];
 
+        let snapshot = recorder.snapshot();
+
         {
             let mut prev_values = self.slatedb_prev_values.lock().expect("lock poisoned");
             for (stat_name, counter) in counter_mappings {
-                if let Some(stat) = stats.lookup(stat_name) {
-                    let current = stat.get() as f64;
+                if let Some(metric) = snapshot.by_name(stat_name).first() {
+                    let current = match &metric.value {
+                        MetricValue::Counter(v) => *v as f64,
+                        MetricValue::Gauge(v) => *v as f64,
+                        MetricValue::UpDownCounter(v) => *v as f64,
+                        MetricValue::Histogram { .. } => continue,
+                    };
                     let key = (stat_name.to_string(), shard.to_string());
                     let prev = prev_values.get(&key).copied().unwrap_or(0.0);
                     if current > prev {
@@ -359,8 +366,14 @@ impl Metrics {
         }
 
         for (stat_name, gauge) in gauge_mappings {
-            if let Some(stat) = stats.lookup(stat_name) {
-                gauge.with_label_values(&[shard]).set(stat.get() as f64);
+            if let Some(metric) = snapshot.by_name(stat_name).first() {
+                let value = match &metric.value {
+                    MetricValue::Counter(v) => *v as f64,
+                    MetricValue::Gauge(v) => *v as f64,
+                    MetricValue::UpDownCounter(v) => *v as f64,
+                    MetricValue::Histogram { .. } => continue,
+                };
+                gauge.with_label_values(&[shard]).set(value);
             }
         }
     }

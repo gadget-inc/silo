@@ -28,6 +28,7 @@ use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
 use slatedb::Db;
+use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -107,6 +108,8 @@ pub struct JobStoreShard {
     db_path: String,
     /// The shard's tenant range, immutable after opening.
     range: ShardRange,
+    /// Metrics recorder for SlateDB, passed to DbBuilder and used for stats collection.
+    slatedb_metrics_recorder: Arc<DefaultMetricsRecorder>,
 }
 
 #[derive(Debug, Error)]
@@ -306,8 +309,10 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
         } = options;
 
+        let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
         let mut db_builder = slatedb::DbBuilder::new(db_path, store.clone())
-            .with_merge_operator(counters::counter_merge_operator());
+            .with_merge_operator(counters::counter_merge_operator())
+            .with_metrics_recorder(slatedb_metrics_recorder.clone());
 
         // Configure separate WAL object store if provided
         if let Some(wal) = wal_store {
@@ -380,6 +385,7 @@ impl JobStoreShard {
             store,
             db_path: db_path.to_string(),
             range: range.clone(),
+            slatedb_metrics_recorder,
         });
 
         // Periodically reconcile pending concurrency requests to self-heal from
@@ -524,10 +530,10 @@ impl JobStoreShard {
         &self.db
     }
 
-    /// Get the SlateDB metrics registry for this shard.
+    /// Get the SlateDB metrics recorder for this shard.
     /// Use this to collect storage-level statistics for observability.
-    pub fn slatedb_stats(&self) -> std::sync::Arc<slatedb::stats::StatRegistry> {
-        self.db.metrics()
+    pub fn slatedb_metrics_recorder(&self) -> &Arc<DefaultMetricsRecorder> {
+        &self.slatedb_metrics_recorder
     }
 
     /// Read LSM tree state from the SlateDB manifest.
