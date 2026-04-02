@@ -5424,6 +5424,7 @@ dependencies = [
  "serde_json",
  "silo-macros",
  "slatedb",
+ "slatedb-common",
  "storekey",
  "tempfile",
  "thiserror 1.0.69",
@@ -5499,7 +5500,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.11.1"
-source = "git+https://github.com/gadget-inc/slatedb.git?branch=gadget#91aca69be4cfe7d2642aace000d374d8f088a70f"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#801c1e111cf541d03c5905c25ed9043bc4cf904f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5545,7 +5546,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.11.1"
-source = "git+https://github.com/gadget-inc/slatedb.git?branch=gadget#91aca69be4cfe7d2642aace000d374d8f088a70f"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#801c1e111cf541d03c5905c25ed9043bc4cf904f"
 dependencies = [
  "chrono",
  "log",
@@ -5556,7 +5557,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.11.1"
-source = "git+https://github.com/gadget-inc/slatedb.git?branch=gadget#91aca69be4cfe7d2642aace000d374d8f088a70f"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#801c1e111cf541d03c5905c25ed9043bc4cf904f"
 dependencies = [
  "async-trait",
  "bytes",
