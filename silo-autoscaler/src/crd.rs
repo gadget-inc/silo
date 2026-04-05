@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
     kind = "SiloAutoscaler",
     namespaced,
     status = "SiloAutoscalerStatus",
-    scale = r#"{"specReplicasPath":".spec.replicas","statusReplicasPath":".status.replicas"}"#,
+    scale = r#"{"specReplicasPath":".spec.replicas","statusReplicasPath":".status.replicas","labelSelectorPath":".status.selector"}"#,
     printcolumn = r#"{"name":"Replicas","type":"integer","jsonPath":".spec.replicas"}"#,
     printcolumn = r#"{"name":"Current","type":"integer","jsonPath":".status.replicas"}"#,
     printcolumn = r#"{"name":"Orphans","type":"integer","jsonPath":".status.orphanedLeaseCount"}"#
@@ -51,6 +51,11 @@ pub struct SiloAutoscalerStatus {
     /// Orphaned shard leases currently detected.
     #[serde(default)]
     pub orphaned_leases: Vec<OrphanedLeaseInfo>,
+
+    /// Label selector string for the managed pods (e.g. "app=silo").
+    /// Used by the HPA via the /scale subresource's labelSelectorPath.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]

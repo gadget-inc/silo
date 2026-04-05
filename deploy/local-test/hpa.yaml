@@ -1,0 +1,19 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: silo-hpa
+  namespace: silo-test
+spec:
+  scaleTargetRef:
+    apiVersion: silo.dev/v1alpha1
+    kind: SiloAutoscaler
+    name: silo-autoscaler
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80

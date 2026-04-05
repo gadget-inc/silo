@@ -143,6 +143,7 @@ async fn reconcile(
                     make_condition("Ready", "False", "StatefulSetNotFound",
                         &format!("StatefulSet {} not found", spec.target_stateful_set)),
                 ],
+                "",
             ).await?;
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
@@ -153,18 +154,7 @@ async fn reconcile(
 
     // List pods for this StatefulSet
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let label_selector = sts
-        .spec
-        .as_ref()
-        .and_then(|s| s.selector.match_labels.as_ref())
-        .map(|labels| {
-            labels
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
+    let label_selector = label_selector_from_sts(&sts);
     let pods = pod_api
         .list(&ListParams::default().labels(&label_selector))
         .await
@@ -196,7 +186,7 @@ async fn reconcile(
     } else {
         vec![make_condition("Ready", "True", "Idle", "replicas match desired count")]
     };
-    update_status(client, namespace, name, sts_replicas, orphaned_leases, conditions).await?;
+    update_status(client, namespace, name, sts_replicas, orphaned_leases, conditions, &label_selector).await?;
 
     // Requeue interval
     let interval = requeue_interval(sts_replicas, desired, termination_active);
@@ -398,15 +388,22 @@ async fn update_status(
     replicas: i32,
     orphaned_leases: Vec<OrphanedLeaseInfo>,
     conditions: Vec<AutoscalerCondition>,
+    label_selector: &str,
 ) -> Result<(), ReconcileError> {
     let autoscaler_api: Api<SiloAutoscaler> = Api::namespaced(client.clone(), namespace);
 
     let orphaned_lease_count = orphaned_leases.len() as i32;
+    let selector = if label_selector.is_empty() {
+        None
+    } else {
+        Some(label_selector.to_string())
+    };
     let status = SiloAutoscalerStatus {
         replicas,
         orphaned_lease_count,
         conditions,
         orphaned_leases,
+        selector,
     };
 
     let patch = serde_json::json!({
@@ -425,6 +422,20 @@ async fn update_status(
         .map_err(|e| ReconcileError(format!("failed to update status: {e}")))?;
 
     Ok(())
+}
+
+fn label_selector_from_sts(sts: &StatefulSet) -> String {
+    sts.spec
+        .as_ref()
+        .and_then(|s| s.selector.match_labels.as_ref())
+        .map(|labels| {
+            labels
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
 }
 
 fn make_condition(
@@ -535,5 +546,46 @@ mod tests {
         assert_eq!(requeue_interval(3, 5, false), 10); // scaling
         assert_eq!(requeue_interval(3, 3, true), 5);   // termination active
         assert_eq!(requeue_interval(5, 3, true), 5);   // termination active overrides scaling
+    }
+
+    fn make_sts(match_labels: Option<std::collections::BTreeMap<String, String>>) -> StatefulSet {
+        use k8s_openapi::api::apps::v1::StatefulSetSpec;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+
+        StatefulSet {
+            spec: Some(StatefulSetSpec {
+                selector: LabelSelector {
+                    match_labels,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_label_selector_from_sts() {
+        let labels: std::collections::BTreeMap<String, String> =
+            [("app".to_string(), "silo-staging".to_string())].into();
+        let sts = make_sts(Some(labels));
+        assert_eq!(label_selector_from_sts(&sts), "app=silo-staging");
+    }
+
+    #[test]
+    fn test_label_selector_from_sts_empty() {
+        let sts = make_sts(None);
+        assert_eq!(label_selector_from_sts(&sts), "");
+    }
+
+    #[test]
+    fn test_label_selector_from_sts_multiple_labels() {
+        let labels: std::collections::BTreeMap<String, String> = [
+            ("app".to_string(), "silo".to_string()),
+            ("env".to_string(), "staging".to_string()),
+        ].into();
+        let sts = make_sts(Some(labels));
+        // BTreeMap is sorted by key
+        assert_eq!(label_selector_from_sts(&sts), "app=silo,env=staging");
     }
 }
