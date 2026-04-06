@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use kube::Client;
+use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 
 use silo_autoscaler::crd::{SiloAutoscaler, SiloAutoscalerSpec};
 
@@ -50,13 +50,20 @@ async fn get_sts_replicas(client: &Client) -> i32 {
 
 async fn get_ready_pod_count(client: &Client) -> i32 {
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace());
-    let pods = pod_api.list(&ListParams::default().labels("app=silo")).await.unwrap();
-    pods.items.iter().filter(|p| {
-        p.metadata.deletion_timestamp.is_none()
-            && p.status.as_ref()
-                .and_then(|s| s.conditions.as_ref())
-                .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
-    }).count() as i32
+    let pods = pod_api
+        .list(&ListParams::default().labels("app=silo"))
+        .await
+        .unwrap();
+    pods.items
+        .iter()
+        .filter(|p| {
+            p.metadata.deletion_timestamp.is_none()
+                && p.status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .is_some_and(|c| c.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+        })
+        .count() as i32
 }
 
 async fn get_autoscaler_status(client: &Client) -> (i32, i32) {
@@ -87,12 +94,17 @@ async fn setup(client: &Client, expected_replicas: i32) {
 
     // Clear finalizers on any stuck terminating pods
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &ns);
-    let pods = pod_api.list(&ListParams::default().labels("app=silo")).await.unwrap();
+    let pods = pod_api
+        .list(&ListParams::default().labels("app=silo"))
+        .await
+        .unwrap();
     for pod in &pods.items {
         if pod.metadata.deletion_timestamp.is_some() {
             if let Some(name) = &pod.metadata.name {
                 let patch = serde_json::json!({"metadata": {"finalizers": []}});
-                let _ = pod_api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)).await;
+                let _ = pod_api
+                    .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await;
             }
         }
     }
@@ -100,11 +112,14 @@ async fn setup(client: &Client, expected_replicas: i32) {
     // Restore StatefulSet to expected replicas
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
     let patch = serde_json::json!({"spec": {"replicas": expected_replicas}});
-    let _ = sts_api.patch(&sts_name(), &PatchParams::default(), &Patch::Merge(&patch)).await;
+    let _ = sts_api
+        .patch(&sts_name(), &PatchParams::default(), &Patch::Merge(&patch))
+        .await;
 
     assert!(
         wait_for_replicas(client, expected_replicas, Duration::from_secs(120)).await,
-        "setup: StatefulSet did not stabilize at {} replicas", expected_replicas
+        "setup: StatefulSet did not stabilize at {} replicas",
+        expected_replicas
     );
 }
 
@@ -112,18 +127,25 @@ async fn ensure_autoscaler(client: &Client, replicas: i32) {
     let ns = namespace();
     let api: Api<SiloAutoscaler> = Api::namespaced(client.clone(), &ns);
 
-    let sa = SiloAutoscaler::new(AUTOSCALER_NAME, SiloAutoscalerSpec {
-        replicas,
-        target_stateful_set: sts_name(),
-        cluster_prefix: cluster_prefix(),
-    });
+    let sa = SiloAutoscaler::new(
+        AUTOSCALER_NAME,
+        SiloAutoscalerSpec {
+            replicas,
+            target_stateful_set: sts_name(),
+            cluster_prefix: cluster_prefix(),
+        },
+    );
 
     match api.get(AUTOSCALER_NAME).await {
         Ok(_) => {
             let patch = serde_json::json!({"spec": {"replicas": replicas}});
-            api.patch(AUTOSCALER_NAME, &PatchParams::default(), &Patch::Merge(&patch))
-                .await
-                .unwrap();
+            api.patch(
+                AUTOSCALER_NAME,
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await
+            .unwrap();
         }
         Err(_) => {
             api.create(&PostParams::default(), &sa).await.unwrap();
@@ -162,7 +184,9 @@ async fn cleanup(client: &Client, restore_replicas: i32) {
 
     let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
     let patch = serde_json::json!({"spec": {"replicas": restore_replicas}});
-    let _ = sts_api.patch(&sts_name(), &PatchParams::default(), &Patch::Merge(&patch)).await;
+    let _ = sts_api
+        .patch(&sts_name(), &PatchParams::default(), &Patch::Merge(&patch))
+        .await;
 }
 
 #[tokio::test]
@@ -197,8 +221,13 @@ async fn test_scale_down() {
     );
 
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace());
-    let pods = pod_api.list(&ListParams::default().labels("app=silo")).await.unwrap();
-    let running: Vec<_> = pods.items.iter()
+    let pods = pod_api
+        .list(&ListParams::default().labels("app=silo"))
+        .await
+        .unwrap();
+    let running: Vec<_> = pods
+        .items
+        .iter()
         .filter(|p| p.metadata.deletion_timestamp.is_none())
         .collect();
     assert_eq!(running.len(), 2);
@@ -235,21 +264,33 @@ async fn test_scale_down_with_orphaned_lease_triggers_recovery() {
             "holderIdentity": highest_pod,
             "leaseDurationSeconds": 99999
         }
-    })).unwrap();
+    }))
+    .unwrap();
 
-    let _ = lease_api.delete(&fake_lease_name, &Default::default()).await;
+    let _ = lease_api
+        .delete(&fake_lease_name, &Default::default())
+        .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    lease_api.create(&PostParams::default(), &lease).await.unwrap();
+    lease_api
+        .create(&PostParams::default(), &lease)
+        .await
+        .unwrap();
 
     // Scale down — controller should detect orphaned lease and scale back up
     ensure_autoscaler(&client, 2).await;
 
     // Wait for the controller to detect the orphan and scale back up
     let recovered = wait_for_sts_replicas_gte(&client, 3, Duration::from_secs(60)).await;
-    assert!(recovered, "expected StatefulSet to scale back up for recovery");
+    assert!(
+        recovered,
+        "expected StatefulSet to scale back up for recovery"
+    );
 
     // Clean up fake lease — allows recovery to complete
-    lease_api.delete(&fake_lease_name, &Default::default()).await.unwrap();
+    lease_api
+        .delete(&fake_lease_name, &Default::default())
+        .await
+        .unwrap();
 
     // Wait for scale-down to complete
     assert!(

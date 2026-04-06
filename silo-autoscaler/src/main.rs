@@ -2,7 +2,10 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "silo-autoscaler", about = "Kubernetes controller for safe Silo StatefulSet scaling")]
+#[command(
+    name = "silo-autoscaler",
+    about = "Kubernetes controller for safe Silo StatefulSet scaling"
+)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -28,8 +31,9 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,silo_autoscaler=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,silo_autoscaler=debug")
+            }),
         )
         .json()
         .init();

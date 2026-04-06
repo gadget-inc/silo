@@ -15,10 +15,7 @@ pub async fn leases_held_by_pod(
     pod_name: &str,
 ) -> Result<Vec<OrphanedLeaseInfo>, Error> {
     let lease_api: Api<Lease> = Api::namespaced(client.clone(), namespace);
-    let label_selector = format!(
-        "silo.dev/type=shard,silo.dev/cluster={}",
-        cluster_prefix
-    );
+    let label_selector = format!("silo.dev/type=shard,silo.dev/cluster={}", cluster_prefix);
     let leases = lease_api
         .list(&ListParams::default().labels(&label_selector))
         .await?;

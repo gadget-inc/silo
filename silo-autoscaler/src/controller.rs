@@ -4,10 +4,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::Pod;
+use kube::Client;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::{Controller, watcher};
-use kube::Client;
 use tracing::{debug, error, info, warn};
 
 use crate::crd::{AutoscalerCondition, OrphanedLeaseInfo, SiloAutoscaler, SiloAutoscalerStatus};
@@ -36,7 +36,9 @@ enum TerminationStatus {
     /// At least one pod is still terminating (container running or awaiting finalizer removal).
     Pending,
     /// Recovery was triggered: orphaned leases were found on a SIGKILL'd pod.
-    Recovery { orphaned_leases: Vec<OrphanedLeaseInfo> },
+    Recovery {
+        orphaned_leases: Vec<OrphanedLeaseInfo>,
+    },
 }
 
 impl TerminationStatus {
@@ -93,19 +95,12 @@ pub async fn run_controller(client: Client) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn error_policy(
-    _obj: Arc<SiloAutoscaler>,
-    error: &ReconcileError,
-    _ctx: Arc<Context>,
-) -> Action {
+fn error_policy(_obj: Arc<SiloAutoscaler>, error: &ReconcileError, _ctx: Arc<Context>) -> Action {
     warn!(error = %error, "reconcile error, retrying in 15s");
     Action::requeue(Duration::from_secs(15))
 }
 
-async fn reconcile(
-    obj: Arc<SiloAutoscaler>,
-    ctx: Arc<Context>,
-) -> Result<Action, ReconcileError> {
+async fn reconcile(obj: Arc<SiloAutoscaler>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     let client = &ctx.client;
     let namespace = obj
         .metadata
@@ -139,12 +134,20 @@ async fn reconcile(
                 "target StatefulSet not found"
             );
             update_status(
-                client, namespace, name, 0, vec![], vec![
-                    make_condition("Ready", "False", "StatefulSetNotFound",
-                        &format!("StatefulSet {} not found", spec.target_stateful_set)),
-                ],
+                client,
+                namespace,
+                name,
+                0,
+                vec![],
+                vec![make_condition(
+                    "Ready",
+                    "False",
+                    "StatefulSetNotFound",
+                    &format!("StatefulSet {} not found", spec.target_stateful_set),
+                )],
                 "",
-            ).await?;
+            )
+            .await?;
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
         Err(e) => return Err(e.into()),
@@ -162,8 +165,15 @@ async fn reconcile(
 
     // Process any terminating pods, handling finalizer removal and recovery
     let termination_status = handle_terminating_pods(
-        client, namespace, &pod_api, &sts_api, &pods.items, spec, sts_replicas,
-    ).await?;
+        client,
+        namespace,
+        &pod_api,
+        &sts_api,
+        &pods.items,
+        spec,
+        sts_replicas,
+    )
+    .await?;
 
     // Only adjust replicas when no pods are mid-termination
     let termination_active = termination_status.is_active();
@@ -175,18 +185,39 @@ async fn reconcile(
     let orphaned_leases = termination_status.orphaned_leases();
     let conditions = if !orphaned_leases.is_empty() {
         vec![make_condition(
-            "OrphanedLeases", "True", "Recovering",
-            &format!("{} orphaned leases, scaling up for recovery", orphaned_leases.len()),
+            "OrphanedLeases",
+            "True",
+            "Recovering",
+            &format!(
+                "{} orphaned leases, scaling up for recovery",
+                orphaned_leases.len()
+            ),
         )]
     } else if sts_replicas != desired {
         vec![make_condition(
-            "Ready", "False", "Scaling",
+            "Ready",
+            "False",
+            "Scaling",
             &format!("replicas: {} desired: {}", sts_replicas, desired),
         )]
     } else {
-        vec![make_condition("Ready", "True", "Idle", "replicas match desired count")]
+        vec![make_condition(
+            "Ready",
+            "True",
+            "Idle",
+            "replicas match desired count",
+        )]
     };
-    update_status(client, namespace, name, sts_replicas, orphaned_leases, conditions, &label_selector).await?;
+    update_status(
+        client,
+        namespace,
+        name,
+        sts_replicas,
+        orphaned_leases,
+        conditions,
+        &label_selector,
+    )
+    .await?;
 
     // Requeue interval
     let interval = requeue_interval(sts_replicas, desired, termination_active);
@@ -228,17 +259,15 @@ async fn handle_terminating_pods(
         }
 
         // Container is dead — check if leases were released
-        let held_leases = orphan::leases_held_by_pod(
-            client, namespace, &spec.cluster_prefix, pod_name,
-        ).await?;
+        let held_leases =
+            orphan::leases_held_by_pod(client, namespace, &spec.cluster_prefix, pod_name).await?;
 
         if held_leases.is_empty() {
             info!(pod = %pod_name, "leases released, removing finalizer");
             remove_finalizer(pod_api, pod_name).await?;
         } else {
-            recover_orphaned_pod(
-                pod_api, sts_api, pod_name, &held_leases, spec, sts_replicas,
-            ).await?;
+            recover_orphaned_pod(pod_api, sts_api, pod_name, &held_leases, spec, sts_replicas)
+                .await?;
             orphaned_leases.extend(held_leases);
         }
     }
@@ -296,9 +325,9 @@ async fn apply_desired_replicas(
 ) -> Result<(), ReconcileError> {
     if sts_replicas > desired {
         // Recovery just completed — wait for all pods to be ready before scaling back down
-        let all_ready = pods.iter().all(|p| {
-            p.metadata.deletion_timestamp.is_none() && is_pod_ready(p)
-        });
+        let all_ready = pods
+            .iter()
+            .all(|p| p.metadata.deletion_timestamp.is_none() && is_pod_ready(p));
         if all_ready {
             info!(name = %name, current = sts_replicas, desired = desired, "recovery complete, scaling back down");
             patch_statefulset_replicas(sts_api, &spec.target_stateful_set, desired).await?;
@@ -330,15 +359,17 @@ fn has_finalizer(pod: &Pod) -> bool {
 }
 
 fn is_container_terminated(pod: &Pod) -> bool {
-    let statuses = match pod.status.as_ref().and_then(|s| s.container_statuses.as_ref()) {
+    let statuses = match pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+    {
         Some(s) => s,
         None => return true, // No container statuses means containers never ran or were evicted
     };
-    statuses.iter().all(|cs| {
-        cs.state
-            .as_ref()
-            .is_some_and(|s| s.terminated.is_some())
-    })
+    statuses
+        .iter()
+        .all(|cs| cs.state.as_ref().is_some_and(|s| s.terminated.is_some()))
 }
 
 fn is_pod_ready(pod: &Pod) -> bool {
@@ -346,7 +377,9 @@ fn is_pod_ready(pod: &Pod) -> bool {
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
         .is_some_and(|conditions| {
-            conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True")
+            conditions
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True")
         })
 }
 
@@ -359,7 +392,11 @@ async fn remove_finalizer(pod_api: &Api<Pod>, pod_name: &str) -> Result<(), Reco
     pod_api
         .patch(pod_name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
-        .map_err(|e| ReconcileError(format!("failed to remove finalizer from pod {pod_name}: {e}")))?;
+        .map_err(|e| {
+            ReconcileError(format!(
+                "failed to remove finalizer from pod {pod_name}: {e}"
+            ))
+        })?;
     debug!(pod = %pod_name, "removed finalizer");
     Ok(())
 }
@@ -517,7 +554,10 @@ mod tests {
         let running = make_pod("silo-0", vec![], false, true);
         let terminated = make_pod("silo-0", vec![], true, false);
         let no_status = Pod {
-            metadata: ObjectMeta { name: Some("silo-0".into()), ..Default::default() },
+            metadata: ObjectMeta {
+                name: Some("silo-0".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -531,7 +571,10 @@ mod tests {
         let ready = make_pod("silo-0", vec![], false, true);
         let not_ready = make_pod("silo-0", vec![], false, false);
         let no_status = Pod {
-            metadata: ObjectMeta { name: Some("silo-0".into()), ..Default::default() },
+            metadata: ObjectMeta {
+                name: Some("silo-0".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -544,8 +587,8 @@ mod tests {
     fn test_requeue_interval() {
         assert_eq!(requeue_interval(3, 3, false), 60); // steady state
         assert_eq!(requeue_interval(3, 5, false), 10); // scaling
-        assert_eq!(requeue_interval(3, 3, true), 5);   // termination active
-        assert_eq!(requeue_interval(5, 3, true), 5);   // termination active overrides scaling
+        assert_eq!(requeue_interval(3, 3, true), 5); // termination active
+        assert_eq!(requeue_interval(5, 3, true), 5); // termination active overrides scaling
     }
 
     fn make_sts(match_labels: Option<std::collections::BTreeMap<String, String>>) -> StatefulSet {
@@ -583,7 +626,8 @@ mod tests {
         let labels: std::collections::BTreeMap<String, String> = [
             ("app".to_string(), "silo".to_string()),
             ("env".to_string(), "staging".to_string()),
-        ].into();
+        ]
+        .into();
         let sts = make_sts(Some(labels));
         // BTreeMap is sorted by key
         assert_eq!(label_selector_from_sts(&sts), "app=silo,env=staging");
