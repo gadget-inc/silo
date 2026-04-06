@@ -57,7 +57,10 @@ mod tests {
             ..valid_spec()
         };
         let err = validate_spec(&spec).unwrap_err();
-        assert!(err.iter().any(|e| e.contains("spec.targetStatefulSet must be non-empty")));
+        assert!(
+            err.iter()
+                .any(|e| e.contains("spec.targetStatefulSet must be non-empty"))
+        );
     }
 
     #[test]
@@ -67,7 +70,10 @@ mod tests {
             ..valid_spec()
         };
         let err = validate_spec(&spec).unwrap_err();
-        assert!(err.iter().any(|e| e.contains("spec.clusterPrefix must be non-empty")));
+        assert!(
+            err.iter()
+                .any(|e| e.contains("spec.clusterPrefix must be non-empty"))
+        );
     }
 
     #[test]
