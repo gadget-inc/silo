@@ -160,18 +160,25 @@ impl ShardFactory {
                 let (resolved, db_path) =
                     Self::resolve_at_root(&template.backend, &template.path, &name)?;
 
-                // Configure separate WAL object store if specified
+                // Configure separate WAL object store if specified.
+                // Use resolve_at_root (same as the main store) so clone operations
+                // can copy WAL SSTs between parent and child shard paths.
                 let (wal_store, wal_close_config) = if let Some(wal_template) = &template.wal {
-                    let wal_path = wal_template
-                        .path
-                        .replace("%shard%", &name)
-                        .replace("{shard}", &name);
-                    let wal_resolved = resolve_object_store(&wal_template.backend, &wal_path)?;
+                    let (wal_resolved, _) = Self::resolve_at_root(
+                        &wal_template.backend,
+                        &wal_template.path,
+                        &name,
+                    )?;
 
-                    // Only set up WAL cleanup for local (Fs) storage backends
+                    // Only set up WAL cleanup for local (Fs) storage backends.
+                    // The cleanup path must be shard-specific (not the root).
                     let close_config = if wal_template.is_local_storage() {
+                        let wal_shard_path = wal_template
+                            .path
+                            .replace("%shard%", &name)
+                            .replace("{shard}", &name);
                         Some(crate::job_store_shard::WalCloseConfig {
-                            path: wal_resolved.root_path,
+                            path: wal_shard_path,
                             flush_on_close: template.apply_wal_on_close,
                         })
                     } else {
@@ -548,21 +555,35 @@ impl ShardFactory {
             &right_child_name,
         )?;
 
-        // Open a raw SlateDB database at the parent's path. The parent shard has been
-        // fully closed (data flushed, WAL cleaned up), so we don't need a WAL. We still
-        // need the merge operator because the parent may contain counter merge entries
-        // that haven't been fully compacted yet.
-        let db =
+        // Resolve the WAL store at root level if configured. Both the parent DB
+        // re-open and the Admin clone use the same root-level WAL store, matching
+        // how shards are originally opened via resolve_at_root.
+        let wal_root_store = if let Some(wal_template) = &self.template.wal {
+            let (wal_resolved, _) = Self::resolve_at_root(
+                &wal_template.backend,
+                &wal_template.path,
+                &parent_name,
+            )?;
+            Some(wal_resolved.store)
+        } else {
+            None
+        };
+
+        // Open a raw SlateDB database at the parent's path. We still need the merge
+        // operator because the parent may contain counter merge entries that haven't
+        // been fully compacted yet.
+        let mut db_builder =
             slatedb::DbBuilder::new(parent_db_path.as_str(), Arc::clone(&parent_resolved.store))
-                .with_merge_operator(crate::job_store_shard::counter_merge_operator())
-                .build()
-                .await
-                .map_err(|e| {
-                    ShardFactoryError::CloneError(format!(
-                        "failed to reopen parent DB for cloning: {}",
-                        e
-                    ))
-                })?;
+                .with_merge_operator(crate::job_store_shard::counter_merge_operator());
+        if let Some(ref wal_store) = wal_root_store {
+            db_builder = db_builder.with_wal_object_store(Arc::clone(wal_store));
+        }
+        let db = db_builder.build().await.map_err(|e| {
+            ShardFactoryError::CloneError(format!(
+                "failed to reopen parent DB for cloning: {}",
+                e
+            ))
+        })?;
 
         // Flush to ensure all data is in object storage before checkpointing
         db.flush().await.map_err(|e| {
@@ -591,12 +612,29 @@ impl ShardFactory {
             "created checkpoint for shard cloning (from closed parent)"
         );
 
+        // Resolve the WAL store at root level for cloning. The clone operation
+        // copies WAL SSTs from parent path to child path, so the store must be
+        // rooted above both shard directories (same pattern as the main store).
+        let wal_root_store = if let Some(wal_template) = &self.template.wal {
+            let (wal_resolved, _) = Self::resolve_at_root(
+                &wal_template.backend,
+                &wal_template.path,
+                &parent_name,
+            )?;
+            Some(wal_resolved.store)
+        } else {
+            None
+        };
+
         // Clone for left child
-        let left_admin = slatedb::admin::Admin::builder(
+        let mut left_builder = slatedb::admin::AdminBuilder::new(
             left_child_db_path.as_str(),
             Arc::clone(&parent_resolved.store),
-        )
-        .build();
+        );
+        if let Some(ref wal_store) = wal_root_store {
+            left_builder = left_builder.with_wal_object_store(Arc::clone(wal_store));
+        }
+        let left_admin = left_builder.build();
 
         left_admin
             .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
@@ -609,11 +647,14 @@ impl ShardFactory {
             })?;
 
         // Clone for right child
-        let right_admin = slatedb::admin::Admin::builder(
+        let mut right_builder = slatedb::admin::AdminBuilder::new(
             right_child_db_path.as_str(),
             Arc::clone(&parent_resolved.store),
-        )
-        .build();
+        );
+        if let Some(ref wal_store) = wal_root_store {
+            right_builder = right_builder.with_wal_object_store(Arc::clone(wal_store));
+        }
+        let right_admin = right_builder.build();
 
         right_admin
             .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
