@@ -4461,7 +4461,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -4494,7 +4494,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.106",
@@ -5500,7 +5500,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.11.1"
-source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#801c1e111cf541d03c5905c25ed9043bc4cf904f"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#fcc8a7e8b7148b6a83ec746d5b94fd0502e996fd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5546,7 +5546,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.11.1"
-source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#801c1e111cf541d03c5905c25ed9043bc4cf904f"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#fcc8a7e8b7148b6a83ec746d5b94fd0502e996fd"
 dependencies = [
  "chrono",
  "log",
@@ -5557,7 +5557,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.11.1"
-source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#801c1e111cf541d03c5905c25ed9043bc4cf904f"
+source = "git+https://github.com/gadget-inc/slatedb.git?branch=yo%2Fadd-read-only-wal-write-wal#fcc8a7e8b7148b6a83ec746d5b94fd0502e996fd"
 dependencies = [
  "async-trait",
  "bytes",

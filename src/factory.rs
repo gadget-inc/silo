@@ -551,18 +551,19 @@ impl ShardFactory {
         // Resolve separate WAL object stores if configured. Each shard (parent and
         // children) gets its own WAL store so that the clone's wal_object_store_uri
         // is correctly recorded in the manifest.
-        let resolve_wal_store = |shard_name: &str| -> Result<Option<Arc<dyn ObjectStore>>, ShardFactoryError> {
-            if let Some(wal_template) = &self.template.wal {
-                let wal_path = wal_template
-                    .path
-                    .replace("%shard%", shard_name)
-                    .replace("{shard}", shard_name);
-                let wal_resolved = resolve_object_store(&wal_template.backend, &wal_path)?;
-                Ok(Some(wal_resolved.store))
-            } else {
-                Ok(None)
-            }
-        };
+        let resolve_wal_store =
+            |shard_name: &str| -> Result<Option<Arc<dyn ObjectStore>>, ShardFactoryError> {
+                if let Some(wal_template) = &self.template.wal {
+                    let wal_path = wal_template
+                        .path
+                        .replace("%shard%", shard_name)
+                        .replace("{shard}", shard_name);
+                    let wal_resolved = resolve_object_store(&wal_template.backend, &wal_path)?;
+                    Ok(Some(wal_resolved.store))
+                } else {
+                    Ok(None)
+                }
+            };
         let parent_wal_store = resolve_wal_store(&parent_name)?;
         let left_child_wal_store = resolve_wal_store(&left_child_name)?;
         let right_child_wal_store = resolve_wal_store(&right_child_name)?;
@@ -578,15 +579,9 @@ impl ShardFactory {
         if let Some(wal) = &parent_wal_store {
             parent_db_builder = parent_db_builder.with_wal_object_store(Arc::clone(wal));
         }
-        let db = parent_db_builder
-                .build()
-                .await
-                .map_err(|e| {
-                    ShardFactoryError::CloneError(format!(
-                        "failed to reopen parent DB for cloning: {}",
-                        e
-                    ))
-                })?;
+        let db = parent_db_builder.build().await.map_err(|e| {
+            ShardFactoryError::CloneError(format!("failed to reopen parent DB for cloning: {}", e))
+        })?;
 
         // Flush to ensure all data is in object storage before checkpointing
         db.flush().await.map_err(|e| {
@@ -626,7 +621,11 @@ impl ShardFactory {
         let left_admin = left_admin_builder.build();
 
         left_admin
-            .create_clone(parent_db_path.as_str(), Some(checkpoint.id), parent_wal_store.clone())
+            .create_clone(
+                parent_db_path.as_str(),
+                Some(checkpoint.id),
+                parent_wal_store.clone(),
+            )
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(
@@ -646,7 +645,11 @@ impl ShardFactory {
         let right_admin = right_admin_builder.build();
 
         right_admin
-            .create_clone(parent_db_path.as_str(), Some(checkpoint.id), parent_wal_store)
+            .create_clone(
+                parent_db_path.as_str(),
+                Some(checkpoint.id),
+                parent_wal_store,
+            )
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(
