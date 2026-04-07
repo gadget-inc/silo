@@ -132,6 +132,10 @@ harness = false
 name = "task_scanner_profile"
 harness = false
 
+[[bench]]
+name = "compaction_filter_impact"
+harness = false
+
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"
