@@ -31,7 +31,7 @@ use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
     TextEncoder, core::Collector,
 };
-use slatedb::stats::StatRegistry;
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tokio::sync::broadcast;
 use tracing::{debug, error};
 
@@ -269,14 +269,15 @@ impl Metrics {
     /// Call this periodically (e.g., every second) to sync SlateDB's internal
     /// statistics to Prometheus metrics. Counter-type stats are tracked via deltas
     /// since Prometheus counters only support `inc_by()`, not `set()`.
-    pub fn update_slatedb_stats(&self, shard: &str, stats: &Arc<StatRegistry>) {
+    pub fn update_slatedb_stats(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
         // Counter-type stats: monotonically increasing in SlateDB
+        // REQUEST_COUNT uses an "op" label to distinguish get/scan/flush
+        let labeled_counter_mappings: &[(&str, &[(&str, &str)], &CounterVec)] = &[
+            (slatedb::db_stats::REQUEST_COUNT, &[("op", "get")], &self.slatedb_get_requests),
+            (slatedb::db_stats::REQUEST_COUNT, &[("op", "scan")], &self.slatedb_scan_requests),
+            (slatedb::db_stats::REQUEST_COUNT, &[("op", "flush")], &self.slatedb_flush_requests),
+        ];
         let counter_mappings: &[(&str, &CounterVec)] = &[
-            (slatedb::db_stats::GET_REQUESTS, &self.slatedb_get_requests),
-            (
-                slatedb::db_stats::SCAN_REQUESTS,
-                &self.slatedb_scan_requests,
-            ),
             (slatedb::db_stats::WRITE_OPS, &self.slatedb_write_ops),
             (
                 slatedb::db_stats::WRITE_BATCH_COUNT,
@@ -295,22 +296,18 @@ impl Metrics {
                 &self.slatedb_immutable_memtable_flushes,
             ),
             (
-                slatedb::db_stats::SST_FILTER_POSITIVES,
+                slatedb::db_stats::SST_FILTER_POSITIVE_COUNT,
                 &self.slatedb_sst_filter_positives,
             ),
             (
-                slatedb::db_stats::SST_FILTER_NEGATIVES,
+                slatedb::db_stats::SST_FILTER_NEGATIVE_COUNT,
                 &self.slatedb_sst_filter_negatives,
             ),
             (
-                slatedb::db_stats::SST_FILTER_FALSE_POSITIVES,
+                slatedb::db_stats::SST_FILTER_FALSE_POSITIVE_COUNT,
                 &self.slatedb_sst_filter_false_positives,
             ),
             ("compactor/bytes_compacted", &self.slatedb_bytes_compacted),
-            (
-                slatedb::db_stats::FLUSH_REQUESTS,
-                &self.slatedb_flush_requests,
-            ),
             ("dbcache/data_block_hit", &self.slatedb_cache_data_block_hit),
             (
                 "dbcache/data_block_miss",
@@ -343,24 +340,61 @@ impl Metrics {
             ),
         ];
 
+        let snapshot = recorder.snapshot();
+
         {
             let mut prev_values = self.slatedb_prev_values.lock().expect("lock poisoned");
-            for (stat_name, counter) in counter_mappings {
-                if let Some(stat) = stats.lookup(stat_name) {
-                    let current = stat.get() as f64;
-                    let key = (stat_name.to_string(), shard.to_string());
-                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
-                    if current > prev {
-                        counter.with_label_values(&[shard]).inc_by(current - prev);
+
+            // Helper to extract a numeric value from a metric
+            let extract_value = |metric: &slatedb_common::metrics::Metric| -> Option<f64> {
+                match &metric.value {
+                    MetricValue::Counter(v) => Some(*v as f64),
+                    MetricValue::Gauge(v) => Some(*v as f64),
+                    MetricValue::UpDownCounter(v) => Some(*v as f64),
+                    MetricValue::Histogram { .. } => None,
+                }
+            };
+
+            // Labeled counters (REQUEST_COUNT with op label)
+            for (stat_name, labels, counter) in labeled_counter_mappings {
+                if let Some(metric) = snapshot.by_name_and_labels(stat_name, labels) {
+                    if let Some(current) = extract_value(metric) {
+                        // Use stat_name + labels as key to distinguish get/scan/flush
+                        let label_suffix = labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",");
+                        let key = (format!("{stat_name}/{label_suffix}"), shard.to_string());
+                        let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                        if current > prev {
+                            counter.with_label_values(&[shard]).inc_by(current - prev);
+                        }
+                        prev_values.insert(key, current);
                     }
-                    prev_values.insert(key, current);
+                }
+            }
+
+            // Unlabeled counters
+            for (stat_name, counter) in counter_mappings {
+                if let Some(metric) = snapshot.by_name(stat_name).first() {
+                    if let Some(current) = extract_value(metric) {
+                        let key = (stat_name.to_string(), shard.to_string());
+                        let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                        if current > prev {
+                            counter.with_label_values(&[shard]).inc_by(current - prev);
+                        }
+                        prev_values.insert(key, current);
+                    }
                 }
             }
         }
 
         for (stat_name, gauge) in gauge_mappings {
-            if let Some(stat) = stats.lookup(stat_name) {
-                gauge.with_label_values(&[shard]).set(stat.get() as f64);
+            if let Some(metric) = snapshot.by_name(stat_name).first() {
+                let value = match &metric.value {
+                    MetricValue::Counter(v) => *v as f64,
+                    MetricValue::Gauge(v) => *v as f64,
+                    MetricValue::UpDownCounter(v) => *v as f64,
+                    MetricValue::Histogram { .. } => continue,
+                };
+                gauge.with_label_values(&[shard]).set(value);
             }
         }
     }

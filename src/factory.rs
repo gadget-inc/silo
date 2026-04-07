@@ -583,13 +583,13 @@ impl ShardFactory {
         db.put(sentinel_key.as_bytes(), b"").await.map_err(|e| {
             ShardFactoryError::CloneError(format!("failed to write clone sentinel: {}", e))
         })?;
-        db.flush().await.map_err(|e| {
-            ShardFactoryError::CloneError(format!("failed to flush after sentinel write: {}", e))
-        })?;
 
         // Create a single checkpoint shared by both children. Use no lifetime so
         // the checkpoint persists until the children have fully compacted away their
         // dependency on the parent's SSTs.
+        // CheckpointScope::All calls flush_wals() + flush_memtables() internally,
+        // which flushes the sentinel to L0 and advances replay_after_wal_id past
+        // all WAL SSTs. This ensures clones don't inherit a WAL gap.
         let checkpoint_options = slatedb::config::CheckpointOptions {
             lifetime: None,
             ..Default::default()
