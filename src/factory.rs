@@ -569,6 +569,24 @@ impl ShardFactory {
             ShardFactoryError::CloneError(format!("failed to flush before checkpoint: {}", e))
         })?;
 
+        // Write a sentinel key to force WAL advancement. This ensures
+        // replay_after_wal_id advances to next_wal_sst_id - 1, so clones
+        // don't inherit a WAL gap that references SSTs on the parent's
+        // (now gone) local WAL storage.
+        let sentinel_key = format!(
+            "clone_sentinel_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        db.put(sentinel_key.as_bytes(), b"").await.map_err(|e| {
+            ShardFactoryError::CloneError(format!("failed to write clone sentinel: {}", e))
+        })?;
+        db.flush().await.map_err(|e| {
+            ShardFactoryError::CloneError(format!("failed to flush after sentinel write: {}", e))
+        })?;
+
         // Create a single checkpoint shared by both children. Use no lifetime so
         // the checkpoint persists until the children have fully compacted away their
         // dependency on the parent's SSTs.
