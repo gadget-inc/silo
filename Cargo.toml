@@ -13,7 +13,7 @@ version = "0.2.0"
 [dependencies]
 clap = { version = "4.3.14", features = ["derive", "env"] }
 futures = "0.3"
-slatedb = { git = "https://github.com/slatedb/slatedb.git", branch = "main" }
+slatedb = { git = "https://github.com/slatedb/slatedb.git", branch = "main", features = ["compaction_filters"] }
 slatedb-common = { git = "https://github.com/slatedb/slatedb.git", branch = "main" }
 object_store = { version = "0.12", features = ["gcp"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

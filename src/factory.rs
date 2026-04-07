@@ -196,6 +196,7 @@ impl ShardFactory {
                         concurrency_reconcile_interval: Duration::from_millis(
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
+                        compaction_filter_supplier: None,
                     },
                     range.clone(),
                 )
