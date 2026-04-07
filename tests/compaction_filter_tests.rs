@@ -227,15 +227,42 @@ async fn compaction_filter_drops_old_completed_job_status_rows() {
     //         computes its cutoff at compaction time. ----
     tokio::time::sleep(RETENTION + Duration::from_millis(500)).await;
 
-    // ---- 5. Run a full manual compaction and wait for it to settle.
-    //         The slatedb fork on this branch notifies the writer's
-    //         memtable flusher inline when an embedded compaction
-    //         finishes, so the writer's in-memory state reflects the
-    //         post-compaction manifest by the time `run_full_compaction`
-    //         returns — no close/reopen needed. ----
+    // ---- 5. Run a full manual compaction and wait for it to settle. ----
     run_full_compaction_and_wait(&shard).await;
 
-    // ---- 6. The 3 completed JOB_STATUS rows should be gone. ----
+    // ---- 6. Close and reopen the shard before verifying.
+    //
+    // After a compaction completes, the slatedb writer's in-memory state
+    // doesn't immediately pick up the new sorted run — it polls the
+    // manifest from object storage on its `manifest_poll_interval`. Until
+    // that next poll, reads on the live shard still go through the
+    // pre-compaction state. Closing and reopening forces a fresh manifest
+    // read so the assertions exercise the post-compaction state. ----
+    let resolved_path = shard.db_path().to_string();
+    let resolved_store = shard.store().clone();
+    shard.close().await.expect("close mid-test");
+    let shard = JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &resolved_path,
+        OpenShardOptions {
+            store: resolved_store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
+            rate_limiter: MockGubernatorClient::new_arc(),
+            metrics: None,
+            concurrency_reconcile_interval: Duration::from_millis(5000),
+            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
+                RETENTION,
+            ))),
+        },
+        ShardRange::full(),
+    )
+    .await
+    .expect("reopen shard after compaction");
+
+    // ---- 7. The 3 completed JOB_STATUS rows should be gone. ----
     for id in &completed_ids {
         let key = job_status_key(TENANT, id);
         let raw = shard.db().get(key.as_slice()).await.expect("db.get");
@@ -322,10 +349,32 @@ async fn compaction_filter_keeps_recently_completed_jobs() {
 
     // Compact immediately — no sleep — so the completed row's
     // `changed_at_ms` is well within the 1-second retention window.
-    // The slatedb fork's inline compaction notification means the
-    // writer's in-memory state is up-to-date by the time
-    // run_full_compaction returns.
     run_full_compaction_and_wait(&shard).await;
+
+    // Close and reopen (see comment in the other test for why).
+    let resolved_path = shard.db_path().to_string();
+    let resolved_store = shard.store().clone();
+    shard.close().await.expect("close mid-test");
+    let shard = JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &resolved_path,
+        OpenShardOptions {
+            store: resolved_store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
+            rate_limiter: MockGubernatorClient::new_arc(),
+            metrics: None,
+            concurrency_reconcile_interval: Duration::from_millis(5000),
+            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
+                RETENTION,
+            ))),
+        },
+        ShardRange::full(),
+    )
+    .await
+    .expect("reopen shard after compaction");
 
     let key = job_status_key(TENANT, &job_id);
     let raw = shard
