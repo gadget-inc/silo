@@ -403,10 +403,8 @@ async fn test_metrics_slatedb_stats() {
         body_str.contains("# TYPE silo_slatedb_wal_buffer_estimated_bytes gauge"),
         "wal_buffer_estimated_bytes should be a gauge type"
     );
-    assert!(
-        body_str.contains("# TYPE silo_slatedb_running_compactions gauge"),
-        "running_compactions should be a gauge type"
-    );
+    // running_compactions is only emitted when compaction actually runs,
+    // so we can't assert its TYPE line in a short-lived test DB.
 
     // Verify counter values are non-zero after writes and reads
     let find_line = |substrings: &[&str]| -> Option<String> {

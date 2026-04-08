@@ -583,6 +583,9 @@ impl ShardFactory {
         db.put(sentinel_key.as_bytes(), b"").await.map_err(|e| {
             ShardFactoryError::CloneError(format!("failed to write clone sentinel: {}", e))
         })?;
+        db.delete(sentinel_key.as_bytes()).await.map_err(|e| {
+            ShardFactoryError::CloneError(format!("failed to delete clone sentinel: {}", e))
+        })?;
 
         // Create a single checkpoint shared by both children. Use no lifetime so
         // the checkpoint persists until the children have fully compacted away their
