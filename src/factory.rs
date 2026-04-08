@@ -548,40 +548,21 @@ impl ShardFactory {
             &right_child_name,
         )?;
 
-        // Resolve separate WAL object stores if configured. Each shard (parent and
-        // children) gets its own WAL store so that the clone's wal_object_store_uri
-        // is correctly recorded in the manifest.
-        let resolve_wal_store =
-            |shard_name: &str| -> Result<Option<Arc<dyn ObjectStore>>, ShardFactoryError> {
-                if let Some(wal_template) = &self.template.wal {
-                    let wal_path = wal_template
-                        .path
-                        .replace("%shard%", shard_name)
-                        .replace("{shard}", shard_name);
-                    let wal_resolved = resolve_object_store(&wal_template.backend, &wal_path)?;
-                    Ok(Some(wal_resolved.store))
-                } else {
-                    Ok(None)
-                }
-            };
-        let parent_wal_store = resolve_wal_store(&parent_name)?;
-        let left_child_wal_store = resolve_wal_store(&left_child_name)?;
-        let right_child_wal_store = resolve_wal_store(&right_child_name)?;
-
         // Open a raw SlateDB database at the parent's path. The parent shard has been
-        // fully closed (data flushed, WAL cleaned up), but we still need the WAL store
-        // configured so that slatedb can validate the wal_object_store_uri in the manifest.
-        // We still need the merge operator because the parent may contain counter merge
-        // entries that haven't been fully compacted yet.
-        let mut parent_db_builder =
+        // fully closed (data flushed, WAL cleaned up), so we don't need a WAL. We still
+        // need the merge operator because the parent may contain counter merge entries
+        // that haven't been fully compacted yet.
+        let db =
             slatedb::DbBuilder::new(parent_db_path.as_str(), Arc::clone(&parent_resolved.store))
-                .with_merge_operator(crate::job_store_shard::counter_merge_operator());
-        if let Some(wal) = &parent_wal_store {
-            parent_db_builder = parent_db_builder.with_wal_object_store(Arc::clone(wal));
-        }
-        let db = parent_db_builder.build().await.map_err(|e| {
-            ShardFactoryError::CloneError(format!("failed to reopen parent DB for cloning: {}", e))
-        })?;
+                .with_merge_operator(crate::job_store_shard::counter_merge_operator())
+                .build()
+                .await
+                .map_err(|e| {
+                    ShardFactoryError::CloneError(format!(
+                        "failed to reopen parent DB for cloning: {}",
+                        e
+                    ))
+                })?;
 
         // Flush to ensure all data is in object storage before checkpointing
         db.flush().await.map_err(|e| {
@@ -632,14 +613,11 @@ impl ShardFactory {
         );
 
         // Clone for left child
-        let mut left_admin_builder = slatedb::admin::Admin::builder(
+        let left_admin = slatedb::admin::Admin::builder(
             left_child_db_path.as_str(),
             Arc::clone(&parent_resolved.store),
-        );
-        if let Some(wal) = &left_child_wal_store {
-            left_admin_builder = left_admin_builder.with_wal_object_store(Arc::clone(wal));
-        }
-        let left_admin = left_admin_builder.build();
+        )
+        .build();
 
         left_admin
             .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
@@ -652,14 +630,11 @@ impl ShardFactory {
             })?;
 
         // Clone for right child
-        let mut right_admin_builder = slatedb::admin::Admin::builder(
+        let right_admin = slatedb::admin::Admin::builder(
             right_child_db_path.as_str(),
             Arc::clone(&parent_resolved.store),
-        );
-        if let Some(wal) = &right_child_wal_store {
-            right_admin_builder = right_admin_builder.with_wal_object_store(Arc::clone(wal));
-        }
-        let right_admin = right_admin_builder.build();
+        )
+        .build();
 
         right_admin
             .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
