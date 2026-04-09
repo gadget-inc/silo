@@ -273,6 +273,79 @@ async fn clone_closed_shard_creates_copies() {
     );
 }
 
+/// When the parent shard has a separate WAL configured, cloning should propagate
+/// WAL stores to the children so they can open without hitting
+/// "wal store reconfiguration unsupported".
+#[silo::test]
+async fn clone_closed_shard_with_split_wal() {
+    let data_tmp = tempfile::tempdir().unwrap();
+    let wal_tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory_with_wal(&data_tmp, &wal_tmp);
+    let parent_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+
+    // Write data so the shard has WAL activity
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("wal-test-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"wal": true})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+
+    // Close parent (clone_closed_shard expects it to be closed)
+    parent.close().await.expect("close parent");
+
+    // Clone the shard — this should succeed even with split WAL
+    factory
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .await
+        .expect("clone closed shard with WAL");
+
+    // Open the children — this is where "wal store reconfiguration unsupported"
+    // would occur if the clone didn't properly configure the WAL store
+    let left_child = factory
+        .open(&left_child_id, &ShardRange::full())
+        .await
+        .expect("open left child with WAL");
+
+    let left_counters = left_child
+        .get_counters()
+        .await
+        .expect("get left child counters");
+    assert_eq!(
+        left_counters.total_jobs, 1,
+        "left child should have the parent's job"
+    );
+
+    let right_child = factory
+        .open(&right_child_id, &ShardRange::full())
+        .await
+        .expect("open right child with WAL");
+
+    let right_counters = right_child
+        .get_counters()
+        .await
+        .expect("get right child counters");
+    assert_eq!(
+        right_counters.total_jobs, 1,
+        "right child should have the parent's job"
+    );
+}
+
 // --- template path validation tests ---
 
 #[silo::test]

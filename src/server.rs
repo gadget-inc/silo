@@ -2018,8 +2018,8 @@ where
 
                         // Collect SlateDB storage metrics for this shard
                         if let Some(ref m) = reaper_metrics {
-                            let stats = shard.slatedb_stats();
-                            m.update_slatedb_stats(&shard_id.to_string(), &stats);
+                            let recorder = shard.slatedb_metrics_recorder();
+                            m.update_slatedb_stats(&shard_id.to_string(), recorder);
                         }
                     }
                 }

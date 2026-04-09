@@ -363,12 +363,15 @@ async fn test_metrics_all_recording_methods() {
 async fn test_metrics_slatedb_stats() {
     let (metrics, _app) = create_metrics_router();
 
-    // Create a real SlateDB to get a StatRegistry with actual stats
+    // Create a real SlateDB with a metrics recorder
     let tmpdir = tempfile::tempdir().unwrap();
     let object_store = std::sync::Arc::new(
         object_store::local::LocalFileSystem::new_with_prefix(tmpdir.path()).unwrap(),
     );
-    let db = slatedb::Db::open(object_store::path::Path::from("test-db"), object_store)
+    let recorder = std::sync::Arc::new(slatedb_common::metrics::DefaultMetricsRecorder::new());
+    let db = slatedb::DbBuilder::new("test-db", object_store)
+        .with_metrics_recorder(recorder.clone())
+        .build()
         .await
         .unwrap();
 
@@ -377,8 +380,7 @@ async fn test_metrics_slatedb_stats() {
     db.put(b"key2", b"value2").await.unwrap();
     let _ = db.get(b"key1").await;
 
-    let stat_registry = db.metrics();
-    metrics.update_slatedb_stats("0", &stat_registry);
+    metrics.update_slatedb_stats("0", &recorder);
 
     let body_str = gather_metrics_text(&metrics);
 
@@ -401,10 +403,8 @@ async fn test_metrics_slatedb_stats() {
         body_str.contains("# TYPE silo_slatedb_wal_buffer_estimated_bytes gauge"),
         "wal_buffer_estimated_bytes should be a gauge type"
     );
-    assert!(
-        body_str.contains("# TYPE silo_slatedb_running_compactions gauge"),
-        "running_compactions should be a gauge type"
-    );
+    // running_compactions is only emitted when compaction actually runs,
+    // so we can't assert its TYPE line in a short-lived test DB.
 
     // Verify counter values are non-zero after writes and reads
     let find_line = |substrings: &[&str]| -> Option<String> {
@@ -443,14 +443,16 @@ async fn test_metrics_slatedb_counter_delta_tracking() {
     let object_store = std::sync::Arc::new(
         object_store::local::LocalFileSystem::new_with_prefix(tmpdir.path()).unwrap(),
     );
-    let db = slatedb::Db::open(object_store::path::Path::from("test-db"), object_store)
+    let recorder = std::sync::Arc::new(slatedb_common::metrics::DefaultMetricsRecorder::new());
+    let db = slatedb::DbBuilder::new("test-db", object_store)
+        .with_metrics_recorder(recorder.clone())
+        .build()
         .await
         .unwrap();
 
     // First batch of writes
     db.put(b"key1", b"value1").await.unwrap();
-    let stat_registry = db.metrics();
-    metrics.update_slatedb_stats("0", &stat_registry);
+    metrics.update_slatedb_stats("0", &recorder);
 
     let body1 = gather_metrics_text(&metrics);
     let write_ops_1 =
@@ -460,7 +462,7 @@ async fn test_metrics_slatedb_counter_delta_tracking() {
     // Second batch of writes — delta tracking should accumulate, not reset
     db.put(b"key2", b"value2").await.unwrap();
     db.put(b"key3", b"value3").await.unwrap();
-    metrics.update_slatedb_stats("0", &stat_registry);
+    metrics.update_slatedb_stats("0", &recorder);
 
     let body2 = gather_metrics_text(&metrics);
     let write_ops_2 =
@@ -473,7 +475,7 @@ async fn test_metrics_slatedb_counter_delta_tracking() {
     );
 
     // Calling update again without new writes should not change the counter
-    metrics.update_slatedb_stats("0", &stat_registry);
+    metrics.update_slatedb_stats("0", &recorder);
     let body3 = gather_metrics_text(&metrics);
     let write_ops_3 =
         extract_metric_value(&body3, &["silo_slatedb_write_ops_total", "shard=\"0\""]);
@@ -493,7 +495,10 @@ async fn test_metrics_slatedb_multiple_shards() {
     let object_store1 = std::sync::Arc::new(
         object_store::local::LocalFileSystem::new_with_prefix(tmpdir1.path()).unwrap(),
     );
-    let db1 = slatedb::Db::open(object_store::path::Path::from("test-db"), object_store1)
+    let recorder1 = std::sync::Arc::new(slatedb_common::metrics::DefaultMetricsRecorder::new());
+    let db1 = slatedb::DbBuilder::new("test-db", object_store1)
+        .with_metrics_recorder(recorder1.clone())
+        .build()
         .await
         .unwrap();
 
@@ -501,7 +506,10 @@ async fn test_metrics_slatedb_multiple_shards() {
     let object_store2 = std::sync::Arc::new(
         object_store::local::LocalFileSystem::new_with_prefix(tmpdir2.path()).unwrap(),
     );
-    let db2 = slatedb::Db::open(object_store::path::Path::from("test-db"), object_store2)
+    let recorder2 = std::sync::Arc::new(slatedb_common::metrics::DefaultMetricsRecorder::new());
+    let db2 = slatedb::DbBuilder::new("test-db", object_store2)
+        .with_metrics_recorder(recorder2.clone())
+        .build()
         .await
         .unwrap();
 
@@ -510,8 +518,8 @@ async fn test_metrics_slatedb_multiple_shards() {
     db2.put(b"b", b"2").await.unwrap();
     db2.put(b"c", b"3").await.unwrap();
 
-    metrics.update_slatedb_stats("shard-a", &db1.metrics());
-    metrics.update_slatedb_stats("shard-b", &db2.metrics());
+    metrics.update_slatedb_stats("shard-a", &recorder1);
+    metrics.update_slatedb_stats("shard-b", &recorder2);
 
     let body = gather_metrics_text(&metrics);
     let shard_a_writes = extract_metric_value(
