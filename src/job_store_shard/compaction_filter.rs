@@ -1,14 +1,27 @@
 //! SlateDB compaction filter that drops completed jobs older than a retention window.
 //!
-//! During compaction, every job-status row is inspected. If a status decodes to a
-//! terminal state (Succeeded, Failed, or Cancelled) and its `changed_at_ms` is older
-//! than the configured retention cutoff, the row is replaced with a tombstone so that
-//! older versions in lower sorted runs are also shadowed and eventually reclaimed.
+//! During compaction, the filter inspects rows across multiple key prefixes:
 //!
-//! Only `JOB_STATUS` rows are considered: that prefix is the canonical "is this job
-//! completed?" record, and the value contains the timestamp directly so the decision
-//! can be made from the row alone (no out-of-band lookups, which the compaction filter
-//! API does not allow).
+//! - **JOB_STATUS (0x02):** If a status decodes to terminal (Succeeded, Failed,
+//!   or Cancelled) and its `changed_at_ms` is older than the configured retention
+//!   cutoff, the row is tombstoned and the `job_id` is recorded in an in-memory
+//!   set for use by later prefixes.
+//!
+//! - **IDX_STATUS_TIME (0x03):** The key itself encodes the status string and
+//!   timestamp. If the status is terminal and the timestamp is older than the
+//!   cutoff, the row is tombstoned (no value decode or set lookup needed).
+//!
+//! - **IDX_METADATA (0x04), ATTEMPT (0x07), JOB_CANCELLED (0x0A):** The key
+//!   encodes the `job_id`. If the `job_id` is in the purged set (populated from
+//!   JOB_STATUS rows earlier in the same compaction pass), the row is tombstoned.
+//!   This works because keys are sorted by prefix and 0x02 < 0x04 < 0x07 < 0x0A,
+//!   so the set is fully populated before these prefixes are reached.
+//!
+//! **Not handled:** JOB_INFO (0x01) sorts *before* JOB_STATUS, so the filter
+//! can't know a job's terminal status when processing JOB_INFO rows. Those are
+//! left for a separate scan-based cleanup.
+
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use slatedb::{
@@ -20,27 +33,55 @@ use tracing::{debug, warn};
 
 use crate::codec::decode_job_status_owned;
 use crate::job_store_shard::helpers::now_epoch_ms;
-use crate::keys::prefix;
+use crate::keys::{
+    self, parse_attempt_key, parse_job_cancelled_key, parse_job_status_key,
+    parse_metadata_index_key, parse_status_time_index_key, prefix,
+};
 
 /// Retain completed jobs for 7 days before allowing the compaction filter to drop them.
 pub const COMPLETED_JOB_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// A compaction filter that drops completed (terminal) job-status rows older than
-/// `retention`.
+/// Terminal status strings as stored in IDX_STATUS_TIME keys.
+const TERMINAL_STATUSES: &[&str] = &["Succeeded", "Failed", "Cancelled"];
+
+/// A compaction filter that drops completed (terminal) job data older than
+/// `retention` across multiple key prefixes.
 pub struct CompletedJobCompactionFilter {
     /// Wall-clock cutoff (epoch ms). Rows with `changed_at_ms < cutoff_ms` and a
     /// terminal status are dropped.
     cutoff_ms: i64,
-    /// Number of rows tombstoned in this compaction job (for diagnostics).
-    dropped: u64,
+    /// Set of `job_id`s whose JOB_STATUS rows were tombstoned in this
+    /// compaction pass. Used to decide on IDX_METADATA, ATTEMPT, and
+    /// JOB_CANCELLED rows (which don't carry status information in their
+    /// values, only in their keys via job_id).
+    purged_job_ids: HashSet<String>,
+    /// Per-prefix tombstone counts for diagnostics.
+    dropped_status: u64,
+    dropped_idx_status_time: u64,
+    dropped_idx_metadata: u64,
+    dropped_attempt: u64,
+    dropped_job_cancelled: u64,
 }
 
 impl CompletedJobCompactionFilter {
     fn new(cutoff_ms: i64) -> Self {
         Self {
             cutoff_ms,
-            dropped: 0,
+            purged_job_ids: HashSet::new(),
+            dropped_status: 0,
+            dropped_idx_status_time: 0,
+            dropped_idx_metadata: 0,
+            dropped_attempt: 0,
+            dropped_job_cancelled: 0,
         }
+    }
+
+    fn total_dropped(&self) -> u64 {
+        self.dropped_status
+            + self.dropped_idx_status_time
+            + self.dropped_idx_metadata
+            + self.dropped_attempt
+            + self.dropped_job_cancelled
     }
 }
 
@@ -50,49 +91,107 @@ impl CompactionFilter for CompletedJobCompactionFilter {
         &mut self,
         entry: &RowEntry,
     ) -> Result<CompactionFilterDecision, CompactionFilterError> {
-        // Only consider JOB_STATUS rows. Every other prefix (job info, indexes,
-        // attempts, counters, ...) is left untouched.
-        if entry.key.first() != Some(&prefix::JOB_STATUS) {
+        let Some(&pfx) = entry.key.first() else {
+            return Ok(CompactionFilterDecision::Keep);
+        };
+
+        // Tombstones and merge operands carry no decodable payload; leave
+        // them alone so the compactor can resolve them normally.
+        if matches!(
+            entry.value,
+            ValueDeletable::Merge(_) | ValueDeletable::Tombstone
+        ) {
             return Ok(CompactionFilterDecision::Keep);
         }
 
-        // Tombstones and merge operands carry no decodable JobStatus payload; leave
-        // them alone so the compactor can resolve them normally.
-        let value_bytes = match &entry.value {
-            ValueDeletable::Value(bytes) => bytes,
-            ValueDeletable::Merge(_) | ValueDeletable::Tombstone => {
-                return Ok(CompactionFilterDecision::Keep);
-            }
-        };
+        match pfx {
+            // ── JOB_STATUS (0x02): decode value, check terminal + old ──
+            prefix::JOB_STATUS => {
+                let value_bytes = match &entry.value {
+                    ValueDeletable::Value(bytes) => bytes,
+                    _ => return Ok(CompactionFilterDecision::Keep),
+                };
 
-        let status = match decode_job_status_owned(value_bytes) {
-            Ok(status) => status,
-            Err(e) => {
-                // A row we cannot decode is not safe to drop; log and keep it.
-                warn!(
-                    error = %e,
-                    "compaction filter: failed to decode job status, keeping row"
-                );
-                return Ok(CompactionFilterDecision::Keep);
-            }
-        };
+                let status = match decode_job_status_owned(value_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "compaction filter: failed to decode job status, keeping row");
+                        return Ok(CompactionFilterDecision::Keep);
+                    }
+                };
 
-        if status.is_terminal() && status.changed_at_ms < self.cutoff_ms {
-            self.dropped += 1;
-            // Use Tombstone (rather than Drop) so older non-terminal versions of this
-            // key in lower sorted runs are shadowed and cannot resurrect.
-            return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                if status.is_terminal() && status.changed_at_ms < self.cutoff_ms {
+                    // Record the job_id so we can drop related rows in
+                    // later prefixes (0x04, 0x07, 0x0A).
+                    if let Some(parsed) = parse_job_status_key(&entry.key) {
+                        self.purged_job_ids.insert(parsed.job_id);
+                    }
+                    self.dropped_status += 1;
+                    return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                }
+            }
+
+            // ── IDX_STATUS_TIME (0x03): self-contained, key has status + ts ──
+            prefix::IDX_STATUS_TIME => {
+                if let Some(parsed) = parse_status_time_index_key(&entry.key) {
+                    if TERMINAL_STATUSES.contains(&parsed.status.as_str())
+                        && parsed.changed_at_ms() < self.cutoff_ms
+                    {
+                        self.dropped_idx_status_time += 1;
+                        return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                    }
+                }
+            }
+
+            // ── IDX_METADATA (0x04): check job_id against purged set ──
+            prefix::IDX_METADATA => {
+                if let Some(parsed) = parse_metadata_index_key(&entry.key) {
+                    if self.purged_job_ids.contains(&parsed.job_id) {
+                        self.dropped_idx_metadata += 1;
+                        return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                    }
+                }
+            }
+
+            // ── ATTEMPT (0x07): check job_id against purged set ──
+            prefix::ATTEMPT => {
+                if let Some(parsed) = parse_attempt_key(&entry.key) {
+                    if self.purged_job_ids.contains(&parsed.job_id) {
+                        self.dropped_attempt += 1;
+                        return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                    }
+                }
+            }
+
+            // ── JOB_CANCELLED (0x0A): check job_id against purged set ──
+            prefix::JOB_CANCELLED => {
+                if let Some(parsed) = parse_job_cancelled_key(&entry.key) {
+                    if self.purged_job_ids.contains(&parsed.job_id) {
+                        self.dropped_job_cancelled += 1;
+                        return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                    }
+                }
+            }
+
+            _ => {}
         }
 
         Ok(CompactionFilterDecision::Keep)
     }
 
     async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
-        if self.dropped > 0 {
+        let total = self.total_dropped();
+        if total > 0 {
             debug!(
-                dropped = self.dropped,
+                total,
+                status = self.dropped_status,
+                idx_status_time = self.dropped_idx_status_time,
+                idx_metadata = self.dropped_idx_metadata,
+                attempt = self.dropped_attempt,
+                job_cancelled = self.dropped_job_cancelled,
+                purged_jobs = self.purged_job_ids.len(),
                 cutoff_ms = self.cutoff_ms,
-                "compaction filter: tombstoned completed job-status rows"
+                "compaction filter: tombstoned rows for completed jobs"
             );
         }
         Ok(())
@@ -134,7 +233,7 @@ mod tests {
     use super::*;
     use crate::codec::encode_job_status;
     use crate::job::{JobStatus, JobStatusKind};
-    use crate::keys::job_status_key;
+    use crate::keys::{attempt_key, idx_metadata_key, idx_status_time_key, job_status_key};
     use slatedb::bytes::Bytes;
 
     fn row(key: Vec<u8>, value: Bytes) -> RowEntry {
@@ -153,6 +252,14 @@ mod tests {
         row(job_status_key("tenant-1", "job-1"), Bytes::from(bytes))
     }
 
+    fn status_row_with_id(job_id: &str, kind: JobStatusKind, changed_at_ms: i64) -> RowEntry {
+        let status = JobStatus::new(kind, changed_at_ms, None, None);
+        let bytes = encode_job_status(&status);
+        row(job_status_key("tenant-1", job_id), Bytes::from(bytes))
+    }
+
+    // ── JOB_STATUS tests (existing) ──
+
     #[tokio::test]
     async fn drops_old_completed_status() {
         let now = now_epoch_ms();
@@ -165,7 +272,7 @@ mod tests {
             decision,
             CompactionFilterDecision::Modify(ValueDeletable::Tombstone)
         );
-        assert_eq!(filter.dropped, 1);
+        assert_eq!(filter.dropped_status, 1);
     }
 
     #[tokio::test]
@@ -177,7 +284,7 @@ mod tests {
         let recent = status_row(JobStatusKind::Failed, cutoff + 1);
         let decision = filter.filter(&recent).await.unwrap();
         assert_eq!(decision, CompactionFilterDecision::Keep);
-        assert_eq!(filter.dropped, 0);
+        assert_eq!(filter.dropped_status, 0);
     }
 
     #[tokio::test]
@@ -200,6 +307,122 @@ mod tests {
             Bytes::from_static(b"opaque"),
         );
         let decision = filter.filter(&job_info).await.unwrap();
+        assert_eq!(decision, CompactionFilterDecision::Keep);
+    }
+
+    // ── IDX_STATUS_TIME tests (self-contained, no set needed) ──
+
+    #[tokio::test]
+    async fn drops_old_terminal_idx_status_time() {
+        let cutoff = now_epoch_ms() - 1_000;
+        let mut filter = CompletedJobCompactionFilter::new(cutoff);
+
+        let old_ts = cutoff - 500;
+        let key = idx_status_time_key("tenant-1", "Succeeded", old_ts, "job-1");
+        let entry = row(key, Bytes::from_static(b""));
+        let decision = filter.filter(&entry).await.unwrap();
+        assert_eq!(
+            decision,
+            CompactionFilterDecision::Modify(ValueDeletable::Tombstone)
+        );
+        assert_eq!(filter.dropped_idx_status_time, 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_recent_terminal_idx_status_time() {
+        let cutoff = now_epoch_ms() - 1_000;
+        let mut filter = CompletedJobCompactionFilter::new(cutoff);
+
+        let recent_ts = cutoff + 500;
+        let key = idx_status_time_key("tenant-1", "Failed", recent_ts, "job-1");
+        let entry = row(key, Bytes::from_static(b""));
+        let decision = filter.filter(&entry).await.unwrap();
+        assert_eq!(decision, CompactionFilterDecision::Keep);
+    }
+
+    #[tokio::test]
+    async fn keeps_non_terminal_idx_status_time() {
+        let cutoff = now_epoch_ms() - 1_000;
+        let mut filter = CompletedJobCompactionFilter::new(cutoff);
+
+        let old_ts = cutoff - 500;
+        let key = idx_status_time_key("tenant-1", "Scheduled", old_ts, "job-1");
+        let entry = row(key, Bytes::from_static(b""));
+        let decision = filter.filter(&entry).await.unwrap();
+        assert_eq!(decision, CompactionFilterDecision::Keep);
+    }
+
+    // ── ATTEMPT tests (set-based) ──
+
+    #[tokio::test]
+    async fn drops_attempt_for_purged_job() {
+        let cutoff = now_epoch_ms() - 1_000;
+        let mut filter = CompletedJobCompactionFilter::new(cutoff);
+
+        // First, feed a terminal JOB_STATUS row to populate the purged set.
+        let status = status_row_with_id("purged-job", JobStatusKind::Succeeded, cutoff - 100);
+        filter.filter(&status).await.unwrap();
+        assert!(filter.purged_job_ids.contains("purged-job"));
+
+        // Now feed an ATTEMPT row with the same job_id.
+        let attempt = row(
+            attempt_key("tenant-1", "purged-job", 0),
+            Bytes::from_static(b"attempt-data"),
+        );
+        let decision = filter.filter(&attempt).await.unwrap();
+        assert_eq!(
+            decision,
+            CompactionFilterDecision::Modify(ValueDeletable::Tombstone)
+        );
+        assert_eq!(filter.dropped_attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_attempt_for_non_purged_job() {
+        let cutoff = now_epoch_ms() - 1_000;
+        let mut filter = CompletedJobCompactionFilter::new(cutoff);
+
+        let attempt = row(
+            attempt_key("tenant-1", "some-active-job", 0),
+            Bytes::from_static(b"attempt-data"),
+        );
+        let decision = filter.filter(&attempt).await.unwrap();
+        assert_eq!(decision, CompactionFilterDecision::Keep);
+    }
+
+    // ── IDX_METADATA tests (set-based) ──
+
+    #[tokio::test]
+    async fn drops_metadata_for_purged_job() {
+        let cutoff = now_epoch_ms() - 1_000;
+        let mut filter = CompletedJobCompactionFilter::new(cutoff);
+
+        // Populate set.
+        let status = status_row_with_id("purged-job", JobStatusKind::Failed, cutoff - 100);
+        filter.filter(&status).await.unwrap();
+
+        let meta = row(
+            idx_metadata_key("tenant-1", "queue", "billing", "purged-job"),
+            Bytes::from_static(b""),
+        );
+        let decision = filter.filter(&meta).await.unwrap();
+        assert_eq!(
+            decision,
+            CompactionFilterDecision::Modify(ValueDeletable::Tombstone)
+        );
+        assert_eq!(filter.dropped_idx_metadata, 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_metadata_for_non_purged_job() {
+        let cutoff = now_epoch_ms() - 1_000;
+        let mut filter = CompletedJobCompactionFilter::new(cutoff);
+
+        let meta = row(
+            idx_metadata_key("tenant-1", "queue", "billing", "active-job"),
+            Bytes::from_static(b""),
+        );
+        let decision = filter.filter(&meta).await.unwrap();
         assert_eq!(decision, CompactionFilterDecision::Keep);
     }
 }
