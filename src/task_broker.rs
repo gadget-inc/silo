@@ -227,7 +227,7 @@ impl TaskBroker {
         }
 
         if total_read > 0 {
-            tracing::info!(
+            tracing::debug!(
                 task_group = %self.task_group,
                 total_read,
                 inserted,
@@ -338,13 +338,18 @@ impl TaskBroker {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         continue;
                     }
-                    // Wakeup arrived but scan found nothing new. Use a
-                    // short sleep instead of the 1ms fast-path (which
+                    // Wakeup arrived but scan found nothing new. Sleep a
+                    // short duration instead of the 1ms fast-path (which
                     // causes spinning at 100+/s) or the full min_sleep_ms
                     // (50ms, too slow for the nudge loop's 25ms window).
                     // 5ms matches the nudge poll interval and caps the
                     // scan rate at ~200/s during active workloads.
-                    sleep_ms = 5;
+                    // We must `continue` here to skip the `tokio::select!`
+                    // below — wakeup() also calls notify_one(), so the
+                    // stored permit would resolve notified() immediately,
+                    // defeating the sleep entirely.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
                 }
 
                 // Sleep with early wakeup support
