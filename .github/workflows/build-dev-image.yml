@@ -11,15 +11,21 @@ on:
 
 jobs:
   build-docker-dev:
-    name: Build and push Docker dev image
-    runs-on: ubuntu-latest-l
+    name: Build and push Docker dev image (${{ matrix.platform }})
+    strategy:
+      matrix:
+        platform: [amd64, arm64]
+        include:
+          - platform: amd64
+            runner: ubuntu-latest-l
+            nix_system: x86_64-linux
+          - platform: arm64
+            runner: ubuntu-latest-l-arm
+            nix_system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: "read"
       id-token: "write"
-    outputs:
-      image-tag: ${{ steps.push.outputs.image-tag }}
-      image-sha-tag: ${{ steps.push.outputs.image-sha-tag }}
-      full-image-sha: ${{ steps.push.outputs.full-image-sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,7 +37,7 @@ jobs:
 
       - name: Build Docker dev image with Nix
         run: |
-          nix build .#packages.x86_64-linux.silo-docker-dev -L
+          nix build .#packages.${{ matrix.nix_system }}.silo-docker-dev -L
           docker load < result
 
       - name: Authenticate gcloud
@@ -53,31 +59,59 @@ jobs:
 
       - name: Tag and push image
         if: ${{ inputs.push }}
-        id: push
         run: |
           sha=$(git rev-parse --short HEAD)
           registry="us-central1-docker.pkg.dev/gadget-core-production/core-production/silo"
+          image_tag="${registry}/silo-dev:sha-${sha}-${{ matrix.platform }}"
 
-          sha_image="${registry}/silo-dev:sha-${sha}"
-          latest_image="${registry}/silo-dev:latest"
+          docker tag silo-dev:latest "${image_tag}"
+          docker push "${image_tag}"
 
-          echo "🏷️  Tagging images..."
-          docker tag silo-dev:latest "${sha_image}"
-          docker tag silo-dev:latest "${latest_image}"
+          echo "✅ Pushed: ${image_tag}"
 
-          echo "📤 Pushing SHA-tagged image..."
-          docker push "${sha_image}"
+  merge-docker-dev-manifests:
+    name: Merge Docker dev manifests
+    needs: build-docker-dev
+    if: ${{ inputs.push }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: "read"
+      id-token: "write"
+    steps:
+      - name: Authenticate gcloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ vars.GCLOUD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCLOUD_SERVICE_ACCOUNT_EMAIL }}
 
-          echo "📤 Pushing latest tag..."
-          docker push "${latest_image}"
+      - name: Login to Google Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Merge images into multi-architecture manifest
+        run: |
+          sha="${{ github.sha }}"
+          sha="${sha:0:7}"
+          registry="us-central1-docker.pkg.dev/gadget-core-production/core-production/silo"
+
+          docker manifest create "${registry}/silo-dev:sha-${sha}" \
+              "${registry}/silo-dev:sha-${sha}-amd64" \
+              "${registry}/silo-dev:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-dev:sha-${sha}"
+
+          docker manifest create "${registry}/silo-dev:latest" \
+              "${registry}/silo-dev:sha-${sha}-amd64" \
+              "${registry}/silo-dev:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-dev:latest"
 
           echo ""
-          echo "✅ Successfully pushed Docker images:"
-          echo "   - ${sha_image}"
-          echo "   - ${latest_image}"
-          echo ""
-
-          # Set outputs for GitHub Actions UI
-          echo "image-tag=sha-${sha}" >> $GITHUB_OUTPUT
-          echo "image-sha-tag=sha-${sha}" >> $GITHUB_OUTPUT
-          echo "full-image-sha=${sha_image}" >> $GITHUB_OUTPUT
+          echo "✅ Successfully pushed multi-architecture Docker dev images:"
+          echo "   - ${registry}/silo-dev:sha-${sha}"
+          echo "   - ${registry}/silo-dev:latest"
