@@ -1,9 +1,10 @@
 //! Integration test for the slatedb `CompletedJobCompactionFilter`.
 //!
-//! Verifies end-to-end that, after a manual full compaction, JOB_STATUS rows
-//! for jobs that have been driven to a terminal state and are older than the
-//! filter retention window are removed from the LSM tree, while non-terminal
-//! rows survive.
+//! Verifies end-to-end that, after a manual full compaction, rows for jobs
+//! that have been driven to a terminal state and are older than the filter
+//! retention window are removed across all handled prefixes (JOB_STATUS,
+//! IDX_STATUS_TIME, IDX_METADATA, ATTEMPT, JOB_CANCELLED), while
+//! non-terminal rows survive.
 
 mod test_helpers;
 
@@ -11,7 +12,7 @@ use silo::gubernator::MockGubernatorClient;
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::compaction_filter::CompletedJobCompactionFilterSupplier;
 use silo::job_store_shard::{JobStoreShard, OpenShardOptions};
-use silo::keys::job_status_key;
+use silo::keys::{attempt_key, idx_metadata_key, job_status_key};
 use silo::settings::Backend;
 use silo::shard_range::ShardRange;
 use silo::storage::resolve_object_store;
@@ -20,32 +21,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use test_helpers::{count_job_status_keys, fast_flush_slatedb_settings, now_ms};
+use test_helpers::{
+    count_job_status_keys, count_status_time_index_keys, count_with_binary_prefix,
+    fast_flush_slatedb_settings, now_ms,
+};
 
 const TENANT: &str = "test-tenant";
 const TASK_GROUP: &str = "";
 const RETENTION: Duration = Duration::from_secs(1);
 
+/// Metadata attached to completed jobs so IDX_METADATA rows are created.
+const META_KEY: &str = "queue";
+const META_VALUE: &str = "billing";
+
 /// Open a temp shard with a 1-second compaction filter retention and the
 /// size-tiered scheduler suppressed so manual compaction is the only
-/// compaction that runs. This makes the test deterministic — the filter
-/// only fires when we explicitly trigger compaction.
+/// compaction that runs.
 async fn open_shard_with_short_retention() -> (tempfile::TempDir, Arc<JobStoreShard>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let resolved = resolve_object_store(&Backend::Fs, tmp.path().to_string_lossy().as_ref())
         .expect("resolve fs object store");
 
-    // `min_compaction_sources = 1_000_000` is unreachable so the size-tiered
-    // scheduler never proposes a compaction on its own. The compactor still
-    // polls the .compactions file for manually-submitted work, so our
-    // explicit `run_full_compaction()` is what drives the filter.
     let mut scheduler_options: HashMap<String, String> = HashMap::new();
     scheduler_options.insert("min_compaction_sources".to_string(), "1000000".to_string());
 
     let mut settings = fast_flush_slatedb_settings();
     settings.compactor_options = Some(slatedb::config::CompactorOptions {
-        // Short poll so the manually-submitted compaction is picked up
-        // promptly without making the test wait seconds.
         poll_interval: Duration::from_millis(100),
         scheduler_options,
         ..slatedb::config::CompactorOptions::default()
@@ -74,9 +75,39 @@ async fn open_shard_with_short_retention() -> (tempfile::TempDir, Arc<JobStoreSh
     (tmp, shard)
 }
 
-/// Drive `run_full_compaction()` and poll the manifest until the LSM has
-/// been merged into a single sorted run with no L0 SSTs (or until the
-/// deadline expires, in which case we panic with the manifest state).
+/// Close the shard and reopen it so reads come from on-disk state.
+///
+/// After a compaction completes, the slatedb writer's in-memory state
+/// doesn't immediately pick up the new sorted run — it polls the manifest
+/// from object storage on its `manifest_poll_interval`. Closing and
+/// reopening forces a fresh manifest read.
+async fn reopen_shard(shard: Arc<JobStoreShard>) -> Arc<JobStoreShard> {
+    let path = shard.db_path().to_string();
+    let store = shard.store().clone();
+    shard.close().await.expect("close mid-test");
+    JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &path,
+        OpenShardOptions {
+            store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
+            rate_limiter: MockGubernatorClient::new_arc(),
+            metrics: None,
+            concurrency_reconcile_interval: Duration::from_millis(5000),
+            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
+                RETENTION,
+            ))),
+        },
+        ShardRange::full(),
+    )
+    .await
+    .expect("reopen shard")
+}
+
+/// Drive `run_full_compaction()` and poll the manifest until settled.
 async fn run_full_compaction_and_wait(shard: &JobStoreShard) {
     use slatedb::admin::AdminBuilder;
 
@@ -108,17 +139,15 @@ async fn run_full_compaction_and_wait(shard: &JobStoreShard) {
 }
 
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compaction_filter_drops_old_completed_job_status_rows() {
+async fn compaction_filter_drops_all_related_rows_for_old_completed_jobs() {
     let (_tmp, shard) = open_shard_with_short_retention().await;
 
     let now = now_ms();
-    // Far enough in the future that these jobs aren't dequeueable during
-    // the test, so they stay in Scheduled state.
     let far_future = now + 60 * 60 * 1000;
+    let metadata = Some(vec![(META_KEY.to_string(), META_VALUE.to_string())]);
 
-    // ---- 1. Enqueue 3 jobs we'll drive to Succeeded, and 2 we'll leave
-    //         in Scheduled. Use deterministic IDs so we can rebuild the
-    //         JOB_STATUS keys for direct db.get assertions later. ----
+    // ---- 1. Enqueue 3 completed candidates (with metadata) and 2
+    //         scheduled candidates (also with metadata, for comparison). ----
     let completed_ids: Vec<String> = (0..3).map(|i| format!("completed-job-{i}")).collect();
     let scheduled_ids: Vec<String> = (0..2).map(|i| format!("scheduled-job-{i}")).collect();
 
@@ -132,7 +161,7 @@ async fn compaction_filter_drops_old_completed_job_status_rows() {
                 None,
                 Vec::new(),
                 vec![],
-                None,
+                metadata.clone(),
                 TASK_GROUP,
             )
             .await
@@ -148,16 +177,14 @@ async fn compaction_filter_drops_old_completed_job_status_rows() {
                 None,
                 Vec::new(),
                 vec![],
-                None,
+                metadata.clone(),
                 TASK_GROUP,
             )
             .await
             .expect("enqueue scheduled candidate");
     }
 
-    // ---- 2. Drive the completed candidates to terminal Succeeded.
-    //         The far-future scheduled jobs are not dequeueable yet, so
-    //         only the 3 completed candidates come back. ----
+    // ---- 2. Drive the 3 completed candidates to terminal Succeeded. ----
     let mut total_completed = 0usize;
     let dequeue_deadline = Instant::now() + Duration::from_secs(5);
     while total_completed < completed_ids.len() {
@@ -176,138 +203,107 @@ async fn compaction_filter_drops_old_completed_job_status_rows() {
         if result.tasks.is_empty() {
             assert!(
                 Instant::now() < dequeue_deadline,
-                "timed out waiting to dequeue {} completed candidates",
-                completed_ids.len()
+                "timed out waiting to dequeue completed candidates",
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
-    // ---- 3. Pre-compaction sanity: all 5 JOB_STATUS rows are present and
-    //         decode to the expected terminality. ----
-    let count_before = count_job_status_keys(shard.db()).await;
-    assert_eq!(
-        count_before, 5,
-        "expected 5 JOB_STATUS rows before compaction (3 succeeded + 2 scheduled)"
-    );
+    // ---- 3. Pre-compaction sanity checks. ----
+    assert_eq!(count_job_status_keys(shard.db()).await, 5);
+    // 5 jobs × 1 metadata entry each = 5 IDX_METADATA rows
+    assert_eq!(count_with_binary_prefix(shard.db(), &[0x04]).await, 5);
+    // 3 completed jobs have 1 attempt each
+    assert_eq!(count_with_binary_prefix(shard.db(), &[0x07]).await, 3);
+    // IDX_STATUS_TIME: 3 Succeeded + 2 Scheduled = 5 (each job has
+    // exactly one IDX_STATUS_TIME entry for its current status because
+    // the lifecycle writes: Scheduled → delete old idx + write new Running idx
+    // → delete old idx + write new Succeeded idx)
+    assert_eq!(count_status_time_index_keys(shard.db()).await, 5);
 
-    for id in &completed_ids {
-        let key = job_status_key(TENANT, id);
-        let raw = shard
-            .db()
-            .get(key.as_slice())
-            .await
-            .expect("db.get")
-            .unwrap_or_else(|| panic!("missing JOB_STATUS for completed job {id} pre-compaction"));
-        let status = silo::codec::decode_job_status_owned(&raw).expect("decode job status");
-        assert!(
-            status.is_terminal(),
-            "expected job {id} to be terminal pre-compaction, got {:?}",
-            status.kind
-        );
-    }
-    for id in &scheduled_ids {
-        let key = job_status_key(TENANT, id);
-        let raw = shard
-            .db()
-            .get(key.as_slice())
-            .await
-            .expect("db.get")
-            .unwrap_or_else(|| panic!("missing JOB_STATUS for scheduled job {id} pre-compaction"));
-        let status = silo::codec::decode_job_status_owned(&raw).expect("decode job status");
-        assert!(
-            !status.is_terminal(),
-            "expected job {id} to be non-terminal pre-compaction, got {:?}",
-            status.kind
-        );
-    }
-
-    // ---- 4. Sleep past the retention cutoff so the completed rows'
-    //         `changed_at_ms` is older than `RETENTION` when the filter
-    //         computes its cutoff at compaction time. ----
+    // ---- 4. Sleep past retention cutoff. ----
     tokio::time::sleep(RETENTION + Duration::from_millis(500)).await;
 
-    // ---- 5. Run a full manual compaction and wait for it to settle. ----
+    // ---- 5. Compact and reopen. ----
     run_full_compaction_and_wait(&shard).await;
+    let shard = reopen_shard(shard).await;
 
-    // ---- 6. Close and reopen the shard before verifying.
-    //
-    // After a compaction completes, the slatedb writer's in-memory state
-    // doesn't immediately pick up the new sorted run — it polls the
-    // manifest from object storage on its `manifest_poll_interval`. Until
-    // that next poll, reads on the live shard still go through the
-    // pre-compaction state. Closing and reopening forces a fresh manifest
-    // read so the assertions exercise the post-compaction state. ----
-    let resolved_path = shard.db_path().to_string();
-    let resolved_store = shard.store().clone();
-    shard.close().await.expect("close mid-test");
-    let shard = JobStoreShard::open_with_resolved_store(
-        "test".to_string(),
-        &resolved_path,
-        OpenShardOptions {
-            store: resolved_store,
-            wal_store: None,
-            wal_close_config: None,
-            slatedb_settings: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
-            rate_limiter: MockGubernatorClient::new_arc(),
-            metrics: None,
-            concurrency_reconcile_interval: Duration::from_millis(5000),
-            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
-                RETENTION,
-            ))),
-        },
-        ShardRange::full(),
-    )
-    .await
-    .expect("reopen shard after compaction");
-
-    // ---- 7. The 3 completed JOB_STATUS rows should be gone. ----
+    // ---- 6. JOB_STATUS: 3 completed gone, 2 scheduled remain. ----
     for id in &completed_ids {
         let key = job_status_key(TENANT, id);
         let raw = shard.db().get(key.as_slice()).await.expect("db.get");
         assert!(
             raw.is_none(),
-            "expected JOB_STATUS for completed job {id} to be tombstoned by the compaction filter, got {:?}",
-            raw
+            "JOB_STATUS for completed job {id} should be tombstoned"
         );
     }
-
-    // ---- 7. The 2 scheduled JOB_STATUS rows should still be present. ----
     for id in &scheduled_ids {
-        let key = job_status_key(TENANT, id);
         let raw = shard
             .db()
-            .get(key.as_slice())
+            .get(job_status_key(TENANT, id).as_slice())
             .await
-            .expect("db.get")
-            .unwrap_or_else(|| {
-                panic!("expected JOB_STATUS for scheduled job {id} to survive compaction")
-            });
-        let status = silo::codec::decode_job_status_owned(&raw).expect("decode job status");
+            .expect("db.get");
         assert!(
-            !status.is_terminal(),
-            "scheduled job {id} should still be non-terminal after compaction, got {:?}",
-            status.kind
+            raw.is_some(),
+            "JOB_STATUS for scheduled job {id} should survive"
         );
     }
+    assert_eq!(count_job_status_keys(shard.db()).await, 2);
 
-    let count_after = count_job_status_keys(shard.db()).await;
+    // ---- 7. IDX_STATUS_TIME: only the 2 Scheduled entries remain. ----
     assert_eq!(
-        count_after, 2,
-        "expected 2 JOB_STATUS rows to survive compaction (the 2 scheduled jobs)"
+        count_status_time_index_keys(shard.db()).await,
+        2,
+        "expected 2 IDX_STATUS_TIME rows (the 2 scheduled jobs)"
+    );
+
+    // ---- 8. ATTEMPT: all 3 attempt rows for completed jobs are gone. ----
+    for id in &completed_ids {
+        let key = attempt_key(TENANT, id, 1);
+        let raw = shard.db().get(key.as_slice()).await.expect("db.get");
+        assert!(
+            raw.is_none(),
+            "ATTEMPT for completed job {id} should be tombstoned"
+        );
+    }
+    assert_eq!(
+        count_with_binary_prefix(shard.db(), &[0x07]).await,
+        0,
+        "no attempt rows should survive (scheduled jobs have no attempts)"
+    );
+
+    // ---- 9. IDX_METADATA: completed jobs' metadata gone, scheduled
+    //         jobs' metadata remains. ----
+    for id in &completed_ids {
+        let key = idx_metadata_key(TENANT, META_KEY, META_VALUE, id);
+        let raw = shard.db().get(key.as_slice()).await.expect("db.get");
+        assert!(
+            raw.is_none(),
+            "IDX_METADATA for completed job {id} should be tombstoned"
+        );
+    }
+    for id in &scheduled_ids {
+        let key = idx_metadata_key(TENANT, META_KEY, META_VALUE, id);
+        let raw = shard.db().get(key.as_slice()).await.expect("db.get");
+        assert!(
+            raw.is_some(),
+            "IDX_METADATA for scheduled job {id} should survive"
+        );
+    }
+    assert_eq!(
+        count_with_binary_prefix(shard.db(), &[0x04]).await,
+        2,
+        "only the 2 scheduled jobs' metadata should survive"
     );
 
     shard.close().await.expect("close");
 }
 
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compaction_filter_keeps_recently_completed_jobs() {
-    // Sanity check the inverse: if a job is completed but the retention
-    // hasn't elapsed yet at compaction time, the filter must keep it.
-    // Otherwise we'd be silently dropping fresh completions.
+async fn compaction_filter_keeps_all_rows_for_recently_completed_jobs() {
     let (_tmp, shard) = open_shard_with_short_retention().await;
     let now = now_ms();
+    let metadata = Some(vec![(META_KEY.to_string(), META_VALUE.to_string())]);
 
     let job_id = "fresh-job".to_string();
     shard
@@ -319,7 +315,7 @@ async fn compaction_filter_keeps_recently_completed_jobs() {
             None,
             Vec::new(),
             vec![],
-            None,
+            metadata,
             TASK_GROUP,
         )
         .await
@@ -347,47 +343,47 @@ async fn compaction_filter_keeps_recently_completed_jobs() {
         }
     }
 
-    // Compact immediately — no sleep — so the completed row's
-    // `changed_at_ms` is well within the 1-second retention window.
+    // Compact immediately (no sleep) — job is within retention.
     run_full_compaction_and_wait(&shard).await;
+    let shard = reopen_shard(shard).await;
 
-    // Close and reopen (see comment in the other test for why).
-    let resolved_path = shard.db_path().to_string();
-    let resolved_store = shard.store().clone();
-    shard.close().await.expect("close mid-test");
-    let shard = JobStoreShard::open_with_resolved_store(
-        "test".to_string(),
-        &resolved_path,
-        OpenShardOptions {
-            store: resolved_store,
-            wal_store: None,
-            wal_close_config: None,
-            slatedb_settings: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
-            rate_limiter: MockGubernatorClient::new_arc(),
-            metrics: None,
-            concurrency_reconcile_interval: Duration::from_millis(5000),
-            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
-                RETENTION,
-            ))),
-        },
-        ShardRange::full(),
-    )
-    .await
-    .expect("reopen shard after compaction");
-
-    let key = job_status_key(TENANT, &job_id);
+    // JOB_STATUS survives.
     let raw = shard
         .db()
-        .get(key.as_slice())
+        .get(job_status_key(TENANT, &job_id).as_slice())
         .await
         .expect("db.get")
-        .expect("recently-completed JOB_STATUS row should survive immediate compaction");
+        .expect("JOB_STATUS should survive");
     let status = silo::codec::decode_job_status_owned(&raw).expect("decode");
+    assert!(status.is_terminal());
+
+    // IDX_STATUS_TIME survives.
+    assert_eq!(
+        count_status_time_index_keys(shard.db()).await,
+        1,
+        "IDX_STATUS_TIME should survive for recently completed job"
+    );
+
+    // ATTEMPT survives.
+    let raw = shard
+        .db()
+        .get(attempt_key(TENANT, &job_id, 1).as_slice())
+        .await
+        .expect("db.get");
     assert!(
-        status.is_terminal(),
-        "expected fresh job to still be terminal after compaction, got {:?}",
-        status.kind
+        raw.is_some(),
+        "ATTEMPT should survive for recently completed job"
+    );
+
+    // IDX_METADATA survives.
+    let raw = shard
+        .db()
+        .get(idx_metadata_key(TENANT, META_KEY, META_VALUE, &job_id).as_slice())
+        .await
+        .expect("db.get");
+    assert!(
+        raw.is_some(),
+        "IDX_METADATA should survive for recently completed job"
     );
 
     shard.close().await.expect("close");
