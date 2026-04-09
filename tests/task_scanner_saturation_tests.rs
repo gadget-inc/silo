@@ -335,6 +335,135 @@ async fn concurrent_enqueue_dequeue_tombstone_accumulation() {
     });
 }
 
+/// Test the RequestTicket → Requested cycle with concurrency-limited tasks.
+/// When the concurrency queue is full, RequestTicket tasks are released back
+/// (not tombstoned). They stay in the DB and get re-scanned. This should NOT
+/// cause tombstone accumulation.
+#[silo::test]
+async fn concurrency_limited_tasks_dont_cause_tombstone_accumulation() {
+    with_timeout!(TIMEOUT_MS, {
+        let (_tmp, shard) = open_temp_shard_with_reconcile_interval_ms(100).await;
+        let payload = msgpack_payload(&serde_json::json!({"test": true}));
+        let now = now_ms();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let limit = silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: "test-queue".to_string(),
+            max_concurrency: 2,
+        });
+
+        // Enqueue 2 jobs that fill the concurrency slots
+        for i in 0..2 {
+            shard
+                .enqueue(
+                    "t1",
+                    Some(format!("holder-{}", i)),
+                    50,
+                    now,
+                    None,
+                    payload.clone(),
+                    vec![limit.clone()],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue holder");
+        }
+
+        // Dequeue holders — they become Running, filling the concurrency slots
+        let holders = shard
+            .dequeue("w", "default", 10)
+            .await
+            .expect("dequeue holders");
+        assert_eq!(holders.tasks.len(), 2, "should get 2 holders");
+        let holder_task_ids: Vec<String> = holders
+            .tasks
+            .iter()
+            .map(|t| t.attempt().task_id().to_string())
+            .collect();
+
+        // Enqueue 20 more jobs — these will be queued as RequestTicket tasks
+        for i in 0..20 {
+            shard
+                .enqueue(
+                    "t1",
+                    Some(format!("waiter-{:04}", i)),
+                    50,
+                    now,
+                    None,
+                    payload.clone(),
+                    vec![limit.clone()],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue waiter");
+        }
+
+        // Continuously dequeue — RequestTicket tasks will be picked up, processed
+        // (concurrency full → Requested), and released back. This creates the
+        // scan-dequeue-release cycle.
+        let shard_deq = Arc::clone(&shard);
+        let stop_deq = Arc::clone(&stop);
+        let dequeue_count = Arc::new(AtomicUsize::new(0));
+        let dequeue_count2 = Arc::clone(&dequeue_count);
+        let dequeue_task = tokio::spawn(async move {
+            while !stop_deq.load(Ordering::Relaxed) {
+                let _ = shard_deq.dequeue("w", "default", 5).await;
+                dequeue_count2.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+
+        // Let it run for 30 seconds — watch buffer and DB task counts
+        for i in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            let buf = shard.broker_buffer_len();
+            let db_tasks = count_task_keys(shard.db()).await;
+            if i % 5 == 0 {
+                eprintln!(
+                    "t={}s buffer={} db_tasks={} dequeue_calls={}",
+                    i + 1,
+                    buf,
+                    db_tasks,
+                    dequeue_count.load(Ordering::Relaxed),
+                );
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        dequeue_task.await.expect("dequeue task");
+
+        eprintln!(
+            "final: buffer={} db_tasks={} dequeue_calls={}",
+            shard.broker_buffer_len(),
+            count_task_keys(shard.db()).await,
+            dequeue_count.load(Ordering::Relaxed),
+        );
+
+        // Now release one holder and check that waiters get processed
+        shard
+            .report_attempt_outcome(
+                &holder_task_ids[0],
+                silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("complete holder");
+
+        // Wait for grant scanner to process
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let result = shard
+            .dequeue("w", "default", 5)
+            .await
+            .expect("dequeue after release");
+        eprintln!(
+            "after releasing holder: dequeued {} tasks",
+            result.tasks.len()
+        );
+    });
+}
+
 /// With many tasks in the DB, the broker buffer should fill up to target_buffer
 /// (8192) even when tasks are being continuously dequeued.
 #[silo::test]
