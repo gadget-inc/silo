@@ -334,6 +334,22 @@ impl ConcurrencyCounts {
     }
 }
 
+/// The type of concurrency limit for a queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyLimitType {
+    Fixed,
+    Floating,
+}
+
+/// Cached concurrency limit info for a queue.
+#[derive(Debug, Clone)]
+pub struct CachedQueueLimit {
+    pub tenant: String,
+    pub queue: String,
+    pub max_concurrency: u32,
+    pub limit_type: ConcurrencyLimitType,
+}
+
 /// High-level concurrency manager with a background grant scanner.
 ///
 /// The grant scanner is a single background task that processes all pending grants.
@@ -347,6 +363,9 @@ pub struct ConcurrencyManager {
     pending_grants: Mutex<BTreeMap<Vec<u8>, (String, String, u32)>>,
     grant_notify: tokio::sync::Notify,
     grant_running: AtomicBool,
+    /// In-memory cache of resolved concurrency limits per queue.
+    /// Key: concurrency_counts_key(tenant, queue). Populated during enqueue and grant_next.
+    limit_cache: Mutex<HashMap<Vec<u8>, CachedQueueLimit>>,
 }
 
 impl Default for ConcurrencyManager {
@@ -362,6 +381,7 @@ impl ConcurrencyManager {
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
+            limit_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -369,11 +389,45 @@ impl ConcurrencyManager {
         &self.counts
     }
 
-    async fn resolve_queue_capacity(db: &Db, tenant: &str, queue: &str, view: &JobView) -> usize {
+    /// Cache the resolved concurrency limit for a queue. Called during enqueue and grant_next
+    /// so that the query system can read limits without scanning the DB.
+    pub fn cache_queue_limit(
+        &self,
+        tenant: &str,
+        queue: &str,
+        max_concurrency: u32,
+        limit_type: ConcurrencyLimitType,
+    ) {
+        let key = concurrency_counts_key(tenant, queue);
+        let mut cache = self.limit_cache.lock().unwrap();
+        cache.insert(
+            key,
+            CachedQueueLimit {
+                tenant: tenant.to_string(),
+                queue: queue.to_string(),
+                max_concurrency,
+                limit_type,
+            },
+        );
+    }
+
+    /// Snapshot the current limit cache for use by the query system.
+    /// Returns a vec of all cached queue limits.
+    pub fn snapshot_queue_limits(&self) -> Vec<CachedQueueLimit> {
+        let cache = self.limit_cache.lock().unwrap();
+        cache.values().cloned().collect()
+    }
+
+    async fn resolve_queue_capacity(
+        db: &Db,
+        tenant: &str,
+        queue: &str,
+        view: &JobView,
+    ) -> (usize, ConcurrencyLimitType) {
         for limit in view.limits() {
             match limit {
                 Limit::Concurrency(cl) if cl.key == queue => {
-                    return cl.max_concurrency as usize;
+                    return (cl.max_concurrency as usize, ConcurrencyLimitType::Fixed);
                 }
                 Limit::FloatingConcurrency(fl) if fl.key == queue => {
                     let state_key = floating_limit_state_key(tenant, queue);
@@ -384,12 +438,15 @@ impl ConcurrencyManager {
                         },
                         _ => None,
                     };
-                    return state_capacity.unwrap_or(fl.default_max_concurrency as usize);
+                    return (
+                        state_capacity.unwrap_or(fl.default_max_concurrency as usize),
+                        ConcurrencyLimitType::Floating,
+                    );
                 }
                 _ => {}
             }
         }
-        1
+        (1, ConcurrencyLimitType::Fixed)
     }
 
     /// Handle concurrency for a new job enqueue.
@@ -527,7 +584,10 @@ impl ConcurrencyManager {
             return Ok(RequestTicketTaskOutcome::JobMissing);
         };
 
-        let max_allowed = Self::resolve_queue_capacity(db, tenant, queue, view).await;
+        let (max_allowed, limit_type) = Self::resolve_queue_capacity(db, tenant, queue, view).await;
+
+        // Cache the resolved limit for the query system
+        self.cache_queue_limit(tenant, queue, max_allowed as u32, limit_type);
 
         // Atomically check and reserve the slot to prevent TOCTOU races
         if !self
@@ -717,7 +777,7 @@ impl ConcurrencyManager {
 
         let mut granted_count = 0u32;
         let mut granted_task_groups: Vec<String> = Vec::new();
-        let mut max_concurrency: Option<usize> = None;
+        let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
 
         while granted_count < count {
             let kv = match iter.next().await {
@@ -834,23 +894,26 @@ impl ConcurrencyManager {
             let request_id = parsed_req.request_id();
 
             // Get max_concurrency (cached per queue from first successful lookup)
-            let limit = match max_concurrency {
-                Some(l) => l,
+            let (limit, limit_type) = match max_concurrency {
+                Some((l, lt)) => (l, lt),
                 None => {
                     let job_key = crate::keys::job_info_key(tenant, job_id_str);
-                    let l = match db.get(&job_key).await {
+                    let (l, lt) = match db.get(&job_key).await {
                         Ok(Some(bytes)) => match JobView::new(bytes) {
                             Ok(view) => {
                                 Self::resolve_queue_capacity(db, tenant, queue, &view).await
                             }
-                            Err(_) => 1,
+                            Err(_) => (1, ConcurrencyLimitType::Fixed),
                         },
-                        _ => 1,
+                        _ => (1, ConcurrencyLimitType::Fixed),
                     };
-                    max_concurrency = Some(l);
-                    l
+                    // Cache the resolved limit for the query system
+                    self.cache_queue_limit(tenant, queue, l as u32, lt);
+                    max_concurrency = Some((l, lt));
+                    (l, lt)
                 }
             };
+            let _ = limit_type; // used for caching above
 
             // [SILO-GRANT-1] Pre: Queue has capacity — try to atomically reserve a slot
             if !self

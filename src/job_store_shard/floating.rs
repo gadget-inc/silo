@@ -207,6 +207,14 @@ impl JobStoreShard {
 
         self.db.write(batch).await?;
 
+        // Update the in-memory limit cache
+        self.concurrency.cache_queue_limit(
+            tenant,
+            queue_key,
+            new_max_concurrency,
+            crate::concurrency::ConcurrencyLimitType::Floating,
+        );
+
         tracing::debug!(
             queue_key = %queue_key,
             new_max_concurrency = new_max_concurrency,

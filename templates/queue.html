@@ -8,7 +8,33 @@
         <a href="/queues" class="text-zinc-400 hover:text-zinc-200">←</a>
         <h1 class="text-xl font-bold text-zinc-100">Queue: {{ name }}</h1>
     </div>
-    
+
+    <!-- Concurrency Limit Info -->
+    <div class="bg-zinc-800 border border-zinc-700 px-4 py-3 flex items-center gap-6">
+        <div class="text-sm text-zinc-400">
+            Concurrency Limit:
+            {% if max_concurrency.is_some() %}
+            <span class="text-zinc-100 font-semibold">{{ max_concurrency.unwrap() }}</span>
+            {% else %}
+            <span class="text-zinc-500">unknown</span>
+            {% endif %}
+        </div>
+        <div class="text-sm text-zinc-400">
+            Type:
+            {% if limit_type.is_some() %}
+            <span class="text-zinc-100 font-semibold">{{ limit_type.as_ref().unwrap() }}</span>
+            {% else %}
+            <span class="text-zinc-500">unknown</span>
+            {% endif %}
+        </div>
+        {% if max_concurrency.is_some() %}
+        <div class="text-sm text-zinc-400">
+            Utilization:
+            <span class="text-zinc-100 font-semibold">{{ holders.len() }} / {{ max_concurrency.unwrap() }}</span>
+        </div>
+        {% endif %}
+    </div>
+
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <!-- Holders Card -->
         <div class="bg-zinc-800 border border-zinc-700  overflow-hidden">

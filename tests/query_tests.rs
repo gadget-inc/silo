@@ -4312,3 +4312,376 @@ async fn explain_tasks_tenant_filter_not_pushed_down() {
         explain
     );
 }
+
+// ---- queue_counts table regression tests ----
+
+/// Helper to extract queue_counts results from batches
+fn extract_queue_counts(
+    batches: &[RecordBatch],
+) -> Vec<(String, String, i64, i64, Option<i64>, Option<String>)> {
+    let mut results = Vec::new();
+    for batch in batches {
+        let tenants = batch
+            .column_by_name("tenant")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let queues = batch
+            .column_by_name("queue_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let holders = batch
+            .column_by_name("holders")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let requesters = batch
+            .column_by_name("requesters")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let max_conc = batch
+            .column_by_name("max_concurrency")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let limit_types = batch
+            .column_by_name("limit_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            results.push((
+                tenants.value(i).to_string(),
+                queues.value(i).to_string(),
+                holders.value(i),
+                requesters.value(i),
+                if max_conc.is_null(i) {
+                    None
+                } else {
+                    Some(max_conc.value(i))
+                },
+                if limit_types.is_null(i) {
+                    None
+                } else {
+                    Some(limit_types.value(i).to_string())
+                },
+            ));
+        }
+    }
+    results
+}
+
+#[silo::test]
+async fn sql_queue_counts_fixed_concurrency_limit() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+        let queue = "fixed-q";
+
+        // Enqueue 3 jobs with fixed concurrency limit of 2
+        for id in ["qc-f1", "qc-f2", "qc-f3"] {
+            shard
+                .enqueue(
+                    "-",
+                    Some(id.to_string()),
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
+                    vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                        key: queue.to_string(),
+                        max_concurrency: 2,
+                    })],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        // Dequeue 2 jobs to fill concurrency slots
+        let result = shard.dequeue("w1", "default", 2).await.expect("dequeue");
+        assert_eq!(
+            result.tasks.len(),
+            2,
+            "should dequeue 2 jobs (concurrency limit)"
+        );
+
+        let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+        let batches = sql
+            .sql("SELECT tenant, queue_name, holders, requesters, max_concurrency, limit_type FROM queue_counts WHERE queue_name = 'fixed-q'")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+
+        let results = extract_queue_counts(&batches);
+        assert_eq!(results.len(), 1, "should have one queue row");
+        let (tenant, qname, holders, requesters, max_conc, lt) = &results[0];
+        assert_eq!(tenant, "-");
+        assert_eq!(qname, "fixed-q");
+        assert_eq!(*holders, 2, "should have 2 holders");
+        assert_eq!(*requesters, 1, "should have 1 requester");
+        assert_eq!(*max_conc, Some(2), "max_concurrency should be 2");
+        assert_eq!(lt.as_deref(), Some("fixed"), "limit_type should be 'fixed'");
+    });
+}
+
+#[silo::test]
+async fn sql_queue_counts_holders_only_no_requesters() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+        let queue = "holders-only-q";
+
+        // Enqueue 2 jobs with concurrency limit of 5 (well under capacity, no requesters)
+        for id in ["qc-ho1", "qc-ho2"] {
+            shard
+                .enqueue(
+                    "-",
+                    Some(id.to_string()),
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
+                    vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                        key: queue.to_string(),
+                        max_concurrency: 5,
+                    })],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        // Dequeue both — both get immediate grants since limit is 5
+        let result = shard.dequeue("w1", "default", 2).await.expect("dequeue");
+        assert_eq!(result.tasks.len(), 2);
+
+        let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+        let batches = sql
+            .sql("SELECT tenant, queue_name, holders, requesters, max_concurrency, limit_type FROM queue_counts WHERE queue_name = 'holders-only-q'")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+
+        let results = extract_queue_counts(&batches);
+        assert_eq!(results.len(), 1, "should have one queue row");
+        let (_, _, holders, requesters, max_conc, lt) = &results[0];
+        assert_eq!(*holders, 2, "should have 2 holders");
+        assert_eq!(*requesters, 0, "should have 0 requesters");
+        assert_eq!(
+            *max_conc,
+            Some(5),
+            "max_concurrency should be 5 from in-memory cache"
+        );
+        assert_eq!(lt.as_deref(), Some("fixed"), "limit_type should be 'fixed'");
+    });
+}
+
+#[silo::test]
+async fn sql_queue_counts_floating_concurrency_limit() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+        let queue = "float-q";
+
+        // Enqueue 2 jobs with floating concurrency limit (default max = 1)
+        for id in ["qc-fl1", "qc-fl2"] {
+            shard
+                .enqueue(
+                    "-",
+                    Some(id.to_string()),
+                    10u8,
+                    now,
+                    None,
+                    test_helpers::msgpack_payload(&serde_json::json!({})),
+                    vec![silo::job::Limit::FloatingConcurrency(
+                        silo::job::FloatingConcurrencyLimit {
+                            key: queue.to_string(),
+                            default_max_concurrency: 1,
+                            refresh_interval_ms: 60_000,
+                            metadata: vec![],
+                        },
+                    )],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        // Dequeue 1 job to fill the single slot
+        let result = shard.dequeue("w1", "default", 1).await.expect("dequeue");
+        assert_eq!(
+            result.tasks.len(),
+            1,
+            "should dequeue 1 job (floating limit default=1)"
+        );
+
+        let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+        let batches = sql
+            .sql("SELECT tenant, queue_name, holders, requesters, max_concurrency, limit_type FROM queue_counts WHERE queue_name = 'float-q'")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+
+        let results = extract_queue_counts(&batches);
+        assert_eq!(results.len(), 1, "should have one queue row");
+        let (tenant, qname, holders, requesters, max_conc, lt) = &results[0];
+        assert_eq!(tenant, "-");
+        assert_eq!(qname, "float-q");
+        assert_eq!(*holders, 1, "should have 1 holder");
+        assert_eq!(*requesters, 1, "should have 1 requester");
+        assert_eq!(*max_conc, Some(1), "max_concurrency should be 1 (default)");
+        assert_eq!(
+            lt.as_deref(),
+            Some("floating"),
+            "limit_type should be 'floating'"
+        );
+    });
+}
+
+#[silo::test]
+async fn sql_queue_counts_multiple_queues() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+
+        // Create a fixed concurrency queue
+        shard
+            .enqueue(
+                "-",
+                Some("mq-fixed".to_string()),
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: "q-fixed".to_string(),
+                    max_concurrency: 5,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue fixed");
+
+        // Create a floating concurrency queue
+        shard
+            .enqueue(
+                "-",
+                Some("mq-float".to_string()),
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                vec![silo::job::Limit::FloatingConcurrency(
+                    silo::job::FloatingConcurrencyLimit {
+                        key: "q-float".to_string(),
+                        default_max_concurrency: 10,
+                        refresh_interval_ms: 60_000,
+                        metadata: vec![],
+                    },
+                )],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue floating");
+
+        // Dequeue both
+        let result = shard.dequeue("w1", "default", 2).await.expect("dequeue");
+        assert_eq!(result.tasks.len(), 2);
+
+        let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+        let batches = sql
+            .sql("SELECT queue_name, holders, max_concurrency, limit_type FROM queue_counts ORDER BY queue_name")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+
+        let results = extract_queue_counts_partial(&batches);
+        assert_eq!(results.len(), 2, "should have two queue rows");
+
+        // Sort by queue name for deterministic assertion
+        let fixed = results.iter().find(|(q, _, _, _)| q == "q-fixed");
+        let float = results.iter().find(|(q, _, _, _)| q == "q-float");
+
+        let (_, holders, max_conc, lt) = fixed.expect("should have q-fixed");
+        assert_eq!(*holders, 1);
+        assert_eq!(*max_conc, Some(5));
+        assert_eq!(lt.as_deref(), Some("fixed"));
+
+        let (_, holders, max_conc, lt) = float.expect("should have q-float");
+        assert_eq!(*holders, 1);
+        assert_eq!(*max_conc, Some(10));
+        assert_eq!(lt.as_deref(), Some("floating"));
+    });
+}
+
+/// Helper for the multi-queue test that only extracts queue_name, holders, max_concurrency, limit_type
+fn extract_queue_counts_partial(
+    batches: &[RecordBatch],
+) -> Vec<(String, i64, Option<i64>, Option<String>)> {
+    let mut results = Vec::new();
+    for batch in batches {
+        let queues = batch
+            .column_by_name("queue_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let holders = batch
+            .column_by_name("holders")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let max_conc = batch
+            .column_by_name("max_concurrency")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let limit_types = batch
+            .column_by_name("limit_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            results.push((
+                queues.value(i).to_string(),
+                holders.value(i),
+                if max_conc.is_null(i) {
+                    None
+                } else {
+                    Some(max_conc.value(i))
+                },
+                if limit_types.is_null(i) {
+                    None
+                } else {
+                    Some(limit_types.value(i).to_string())
+                },
+            ));
+        }
+    }
+    results
+}

@@ -219,6 +219,47 @@ async fn main() {
 
     println!();
 
+    // --- Queue Counts Queries (WebUI queue_counts table) ---
+    println!("--- Queue Counts Queries (queue_counts table with max_concurrency) ---");
+
+    let r = bench_query(&engine, "queue_counts_all", "SELECT * FROM queue_counts").await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "queue_counts_by_tenant",
+        &format!(
+            "SELECT * FROM queue_counts WHERE tenant = '{}'",
+            BENCH_DEEP_QUEUE_TENANT
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "queue_counts_by_queue_name",
+        &format!(
+            "SELECT * FROM queue_counts WHERE queue_name = '{}'",
+            DEEP_QUEUE_KEY
+        ),
+    )
+    .await;
+    r.print();
+
+    let r = bench_query(
+        &engine,
+        "queue_counts_limit_only",
+        &format!(
+            "SELECT max_concurrency, limit_type FROM queue_counts WHERE queue_name = '{}' LIMIT 1",
+            DEEP_QUEUE_KEY
+        ),
+    )
+    .await;
+    r.print();
+
+    println!();
+
     shard.close().await.expect("close shard");
     println!("Done.");
 }
