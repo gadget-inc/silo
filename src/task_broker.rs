@@ -227,7 +227,7 @@ impl TaskBroker {
         }
 
         if total_read > 0 {
-            tracing::debug!(
+            tracing::info!(
                 task_group = %self.task_group,
                 total_read,
                 inserted,
