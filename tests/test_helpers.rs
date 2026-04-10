@@ -74,6 +74,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             rate_limiter,
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
+            compaction_filter_retention: None,
         },
         ShardRange::full(),
     )
