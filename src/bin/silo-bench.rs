@@ -5,7 +5,7 @@
 //! rate of task execution in real-time.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -609,9 +609,7 @@ async fn compaction_worker_loop(
                 }
             }
             Err(e) => {
-                if let Some(needs_backoff) =
-                    client.handle_routing_error(&e, &target_shard).await
-                {
+                if let Some(needs_backoff) = client.handle_routing_error(&e, &target_shard).await {
                     if needs_backoff {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
@@ -825,7 +823,10 @@ async fn compaction_loop(
             }
         }
         CompactionStrategy::OneShot => {
-            info!(warmup_secs = warmup_secs, "Warming up before one-shot compaction");
+            info!(
+                warmup_secs = warmup_secs,
+                "Warming up before one-shot compaction"
+            );
             tokio::time::sleep(Duration::from_secs(warmup_secs)).await;
             if !running.load(Ordering::Relaxed) {
                 return;
@@ -838,7 +839,10 @@ async fn compaction_loop(
             info!("One-shot compaction complete, continuing benchmark");
         }
         CompactionStrategy::Repeated => {
-            info!(warmup_secs = warmup_secs, "Warming up before repeated compaction");
+            info!(
+                warmup_secs = warmup_secs,
+                "Warming up before repeated compaction"
+            );
             tokio::time::sleep(Duration::from_secs(warmup_secs)).await;
             while running.load(Ordering::Relaxed) {
                 compaction_state.store(COMPACTION_IN_PROGRESS, Ordering::Relaxed);
@@ -1022,7 +1026,10 @@ async fn run_compaction_bench(
             lease_p99_us = lease_stats.p99.as_micros(),
             compaction_state = state_str,
             l0_sst_count = storage_info.as_ref().map(|i| i.l0_sst_count).unwrap_or(0),
-            sorted_run_count = storage_info.as_ref().map(|i| i.sorted_run_count).unwrap_or(0),
+            sorted_run_count = storage_info
+                .as_ref()
+                .map(|i| i.sorted_run_count)
+                .unwrap_or(0),
             "Compaction benchmark progress"
         );
 
