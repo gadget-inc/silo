@@ -39,7 +39,6 @@ use bench_helpers::{BenchResult, format_duration};
 
 use silo::gubernator::NullGubernatorClient;
 use silo::job_attempt::AttemptOutcome;
-use silo::job_store_shard::compaction_filter::CompletedJobCompactionFilterSupplier;
 use silo::job_store_shard::{JobStoreShard, OpenShardOptions};
 use silo::settings::Backend;
 use silo::shard_range::ShardRange;
@@ -286,9 +285,7 @@ async fn open_bench_shard(
             concurrency_reconcile_interval: Duration::from_millis(
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
             ),
-            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
-                cfg.filter_retention,
-            ))),
+            compaction_filter_retention: Some(cfg.filter_retention),
         },
         ShardRange::full(),
     )

@@ -10,9 +10,8 @@ mod test_helpers;
 
 use silo::gubernator::MockGubernatorClient;
 use silo::job_attempt::AttemptOutcome;
-use silo::job_store_shard::compaction_filter::CompletedJobCompactionFilterSupplier;
 use silo::job_store_shard::{JobStoreShard, OpenShardOptions};
-use silo::keys::{attempt_key, idx_metadata_key, job_status_key};
+use silo::keys::{attempt_key, idx_metadata_key, job_info_key, job_status_key};
 use silo::settings::Backend;
 use silo::shard_range::ShardRange;
 use silo::storage::resolve_object_store;
@@ -22,8 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use test_helpers::{
-    count_job_status_keys, count_status_time_index_keys, count_with_binary_prefix,
-    fast_flush_slatedb_settings, now_ms,
+    count_job_info_keys, count_job_status_keys, count_status_time_index_keys,
+    count_with_binary_prefix, fast_flush_slatedb_settings, now_ms,
 };
 
 const TENANT: &str = "test-tenant";
@@ -64,9 +63,7 @@ async fn open_shard_with_short_retention() -> (tempfile::TempDir, Arc<JobStoreSh
             rate_limiter: MockGubernatorClient::new_arc(),
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(5000),
-            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
-                RETENTION,
-            ))),
+            compaction_filter_retention: Some(RETENTION),
         },
         ShardRange::full(),
     )
@@ -97,9 +94,7 @@ async fn reopen_shard(shard: Arc<JobStoreShard>) -> Arc<JobStoreShard> {
             rate_limiter: MockGubernatorClient::new_arc(),
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(5000),
-            compaction_filter_supplier: Some(Arc::new(CompletedJobCompactionFilterSupplier::new(
-                RETENTION,
-            ))),
+            compaction_filter_retention: Some(RETENTION),
         },
         ShardRange::full(),
     )
@@ -210,6 +205,7 @@ async fn compaction_filter_drops_all_related_rows_for_old_completed_jobs() {
     }
 
     // ---- 3. Pre-compaction sanity checks. ----
+    assert_eq!(count_job_info_keys(shard.db()).await, 5);
     assert_eq!(count_job_status_keys(shard.db()).await, 5);
     // 5 jobs × 1 metadata entry each = 5 IDX_METADATA rows
     assert_eq!(count_with_binary_prefix(shard.db(), &[0x04]).await, 5);
@@ -228,7 +224,29 @@ async fn compaction_filter_drops_all_related_rows_for_old_completed_jobs() {
     run_full_compaction_and_wait(&shard).await;
     let shard = reopen_shard(shard).await;
 
-    // ---- 6. JOB_STATUS: 3 completed gone, 2 scheduled remain. ----
+    // ---- 6. JOB_INFO: 3 completed gone, 2 scheduled remain. ----
+    for id in &completed_ids {
+        let key = job_info_key(TENANT, id);
+        let raw = shard.db().get(key.as_slice()).await.expect("db.get");
+        assert!(
+            raw.is_none(),
+            "JOB_INFO for completed job {id} should be tombstoned"
+        );
+    }
+    for id in &scheduled_ids {
+        let raw = shard
+            .db()
+            .get(job_info_key(TENANT, id).as_slice())
+            .await
+            .expect("db.get");
+        assert!(
+            raw.is_some(),
+            "JOB_INFO for scheduled job {id} should survive"
+        );
+    }
+    assert_eq!(count_job_info_keys(shard.db()).await, 2);
+
+    // ---- 7. JOB_STATUS: 3 completed gone, 2 scheduled remain. ----
     for id in &completed_ids {
         let key = job_status_key(TENANT, id);
         let raw = shard.db().get(key.as_slice()).await.expect("db.get");
@@ -250,14 +268,14 @@ async fn compaction_filter_drops_all_related_rows_for_old_completed_jobs() {
     }
     assert_eq!(count_job_status_keys(shard.db()).await, 2);
 
-    // ---- 7. IDX_STATUS_TIME: only the 2 Scheduled entries remain. ----
+    // ---- 8. IDX_STATUS_TIME: only the 2 Scheduled entries remain. ----
     assert_eq!(
         count_status_time_index_keys(shard.db()).await,
         2,
         "expected 2 IDX_STATUS_TIME rows (the 2 scheduled jobs)"
     );
 
-    // ---- 8. ATTEMPT: all 3 attempt rows for completed jobs are gone. ----
+    // ---- 9. ATTEMPT: all 3 attempt rows for completed jobs are gone. ----
     for id in &completed_ids {
         let key = attempt_key(TENANT, id, 1);
         let raw = shard.db().get(key.as_slice()).await.expect("db.get");
@@ -272,7 +290,7 @@ async fn compaction_filter_drops_all_related_rows_for_old_completed_jobs() {
         "no attempt rows should survive (scheduled jobs have no attempts)"
     );
 
-    // ---- 9. IDX_METADATA: completed jobs' metadata gone, scheduled
+    // ---- 10. IDX_METADATA: completed jobs' metadata gone, scheduled
     //         jobs' metadata remains. ----
     for id in &completed_ids {
         let key = idx_metadata_key(TENANT, META_KEY, META_VALUE, id);
@@ -346,6 +364,17 @@ async fn compaction_filter_keeps_all_rows_for_recently_completed_jobs() {
     // Compact immediately (no sleep) — job is within retention.
     run_full_compaction_and_wait(&shard).await;
     let shard = reopen_shard(shard).await;
+
+    // JOB_INFO survives.
+    let raw = shard
+        .db()
+        .get(job_info_key(TENANT, &job_id).as_slice())
+        .await
+        .expect("db.get");
+    assert!(
+        raw.is_some(),
+        "JOB_INFO should survive for recently completed job"
+    );
 
     // JOB_STATUS survives.
     let raw = shard

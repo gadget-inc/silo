@@ -77,11 +77,11 @@ pub struct OpenShardOptions {
     pub metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     pub concurrency_reconcile_interval: Duration,
-    /// Optional override for the slatedb compaction filter supplier.
-    /// When `None`, the production default
-    /// (`CompletedJobCompactionFilterSupplier::default()`, 7-day retention)
-    /// is used. Benches use this to install a shorter retention window.
-    pub compaction_filter_supplier: Option<Arc<dyn slatedb::CompactionFilterSupplier>>,
+    /// Retention window for the compaction filter that purges completed
+    /// jobs. When `None`, uses the production default (7 days). Benches
+    /// and tests pass a shorter duration (e.g. 1 second or 30 seconds)
+    /// so the filter fires within the test/bench run.
+    pub compaction_filter_retention: Option<Duration>,
 }
 
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
@@ -277,7 +277,7 @@ impl JobStoreShard {
                 concurrency_reconcile_interval: Duration::from_millis(
                     crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
                 ),
-                compaction_filter_supplier: None,
+                compaction_filter_retention: None,
             },
             range,
         )
@@ -314,7 +314,7 @@ impl JobStoreShard {
             rate_limiter,
             metrics,
             concurrency_reconcile_interval,
-            compaction_filter_supplier,
+            compaction_filter_retention,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -325,12 +325,19 @@ impl JobStoreShard {
         // exposes the supplier through `CompactorBuilder::with_compaction_filter_supplier`.
         // The merge operator is set both on the DbBuilder (for memtable merges) and
         // on the CompactorBuilder (for compaction-time merges).
-        let filter_supplier = compaction_filter_supplier.unwrap_or_else(|| {
-            Arc::new(compaction_filter::CompletedJobCompactionFilterSupplier::default())
-        });
+        // Build the compaction filter supplier. We always create it
+        // internally (rather than accepting a supplier from the caller) so
+        // we can call `set_db` after the DB is opened — the filter needs a
+        // live DB handle for JOB_INFO point lookups.
+        let retention =
+            compaction_filter_retention.unwrap_or(compaction_filter::COMPLETED_JOB_RETENTION);
+        let filter_supplier =
+            Arc::new(compaction_filter::CompletedJobCompactionFilterSupplier::new(retention));
         let mut compactor_builder = slatedb::CompactorBuilder::new(db_path, store.clone())
             .with_merge_operator(counters::counter_merge_operator())
-            .with_compaction_filter_supplier(filter_supplier);
+            .with_compaction_filter_supplier(
+                Arc::clone(&filter_supplier) as Arc<dyn slatedb::CompactionFilterSupplier>
+            );
 
         let mut db_builder = slatedb::DbBuilder::new(db_path, store.clone())
             .with_merge_operator(counters::counter_merge_operator())
@@ -388,6 +395,11 @@ impl JobStoreShard {
 
         let db = db_builder.build().await?;
         let db = Arc::new(db);
+
+        // Give the compaction filter supplier a handle to the live DB so
+        // it can do point lookups for JOB_INFO rows during compaction.
+        filter_supplier.set_db(&db);
+
         let concurrency = Arc::new(ConcurrencyManager::new());
 
         // Note: concurrency counts are hydrated lazily on first access to each queue.
