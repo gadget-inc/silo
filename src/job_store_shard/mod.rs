@@ -608,6 +608,22 @@ impl JobStoreShard {
             .await;
     }
 
+    /// Directly process pending concurrency grants for a single queue.
+    ///
+    /// Bypasses the background grant scanner and processes `count` grants synchronously.
+    /// Intended for benchmarking the grant processing hot path.
+    pub async fn process_concurrency_grants(
+        &self,
+        tenant: &str,
+        queue: &str,
+        count: u32,
+    ) -> Vec<String> {
+        let range = self.get_range();
+        self.concurrency
+            .process_grants(self.db.as_ref(), &range, tenant, queue, count)
+            .await
+    }
+
     /// Fetch a job by id as a zero-copy archived view.
     pub async fn get_job(
         &self,
