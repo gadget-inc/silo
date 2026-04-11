@@ -202,8 +202,8 @@ impl JobStoreShard {
 
             // Commit durable state — write_with_options with await_durable:true blocks
             // until the WAL is flushed to object storage, so no separate flush is needed.
-            if !state.batch.is_empty() {
-                if let Err(e) = self
+            if !state.batch.is_empty()
+                && let Err(e) = self
                     .db
                     .write_with_options(
                         state.batch,
@@ -212,16 +212,15 @@ impl JobStoreShard {
                         },
                     )
                     .await
-                {
-                    dst_events::cancel_write(write_op);
-                    // Rollback all grants made during this iteration
-                    for (tenant, queue, task_id) in &grants_to_rollback {
-                        self.concurrency.rollback_grant(tenant, queue, task_id);
-                    }
-                    // Put back all claimed entries since we didn't lease them durably
-                    self.brokers.requeue(claimed);
-                    return Err(JobStoreShardError::Slate(e));
+            {
+                dst_events::cancel_write(write_op);
+                // Rollback all grants made during this iteration
+                for (tenant, queue, task_id) in &grants_to_rollback {
+                    self.concurrency.rollback_grant(tenant, queue, task_id);
                 }
+                // Put back all claimed entries since we didn't lease them durably
+                self.brokers.requeue(claimed);
+                return Err(JobStoreShardError::Slate(e));
             }
             dst_events::confirm_write(write_op);
 
