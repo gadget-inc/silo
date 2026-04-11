@@ -608,6 +608,19 @@ impl JobStoreShard {
             .await;
     }
 
+    /// Get the in-memory concurrency holder count for a queue.
+    pub fn concurrency_holder_count(&self, tenant: &str, queue: &str) -> usize {
+        self.concurrency.counts().holder_count(tenant, queue)
+    }
+
+    /// Stop the background grant scanner without closing the shard.
+    ///
+    /// Intended for benchmarking — prevents the background scanner from racing
+    /// with manual `process_concurrency_grants` calls.
+    pub fn stop_grant_scanner(&self) {
+        self.concurrency.stop_grant_scanner();
+    }
+
     /// Directly process pending concurrency grants for a single queue.
     ///
     /// Bypasses the background grant scanner and processes `count` grants synchronously.
