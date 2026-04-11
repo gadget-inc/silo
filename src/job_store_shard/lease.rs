@@ -365,7 +365,10 @@ impl JobStoreShard {
         // Scan all lease keys using the binary prefix
         let start = crate::keys::leases_prefix();
         let end = crate::keys::end_bound(&start);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter: DbIterator = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
 
         let now_ms = now_epoch_ms();
         let mut reaped: usize = 0;

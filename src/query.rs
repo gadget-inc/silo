@@ -1459,7 +1459,10 @@ impl Scan for QueuesScanner {
                     Ok(None) => {
                         let prefix = crate::keys::concurrency_request_prefix(&tenant, &queue);
                         let end = crate::keys::end_bound(&prefix);
-                        let mut iter = match db.scan::<Vec<u8>, _>(prefix..=end).await {
+                        let mut iter = match db
+                            .scan_with_options::<Vec<u8>, _>(prefix..=end, &crate::scan_options())
+                            .await
+                        {
                             Ok(iter) => iter,
                             Err(e) => {
                                 let _ = tx
@@ -1565,7 +1568,13 @@ impl Scan for QueuesScanner {
             };
             let holders_end = crate::keys::end_bound(&holders_start);
 
-            if let Ok(mut iter) = db.scan::<Vec<u8>, _>(holders_start..=holders_end).await {
+            if let Ok(mut iter) = db
+                .scan_with_options::<Vec<u8>, _>(
+                    holders_start..=holders_end,
+                    &crate::scan_options(),
+                )
+                .await
+            {
                 while let Ok(Some(kv)) = iter.next().await {
                     if limit.is_some_and(|l| entries.len() >= l) {
                         break;
@@ -1600,7 +1609,13 @@ impl Scan for QueuesScanner {
             };
             let requests_end = crate::keys::end_bound(&requests_start);
 
-            if let Ok(mut iter) = db.scan::<Vec<u8>, _>(requests_start..=requests_end).await {
+            if let Ok(mut iter) = db
+                .scan_with_options::<Vec<u8>, _>(
+                    requests_start..=requests_end,
+                    &crate::scan_options(),
+                )
+                .await
+            {
                 while let Ok(Some(kv)) = iter.next().await {
                     if limit.is_some_and(|l| entries.len() >= l) {
                         break;
@@ -1995,7 +2010,7 @@ impl Scan for QueueCountsScanner {
 
             match shard
                 .db()
-                .scan::<Vec<u8>, _>(holders_start..holders_end)
+                .scan_with_options::<Vec<u8>, _>(holders_start..holders_end, &crate::scan_options())
                 .await
             {
                 Ok(mut iter) => loop {
@@ -2339,7 +2354,10 @@ impl Scan for TasksScanner {
                 _ => None,
             };
 
-            let iter_result = shard.db().scan::<Vec<u8>, _>(start..end).await;
+            let iter_result = shard
+                .db()
+                .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+                .await;
             let mut iter = match iter_result {
                 Ok(i) => i,
                 Err(e) => {

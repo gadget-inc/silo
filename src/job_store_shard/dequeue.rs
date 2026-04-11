@@ -202,8 +202,8 @@ impl JobStoreShard {
 
             // Commit durable state — write_with_options with await_durable:true blocks
             // until the WAL is flushed to object storage, so no separate flush is needed.
-            if !state.batch.is_empty() {
-                if let Err(e) = self
+            if !state.batch.is_empty()
+                && let Err(e) = self
                     .db
                     .write_with_options(
                         state.batch,
@@ -212,16 +212,15 @@ impl JobStoreShard {
                         },
                     )
                     .await
-                {
-                    dst_events::cancel_write(write_op);
-                    // Rollback all grants made during this iteration
-                    for (tenant, queue, task_id) in &grants_to_rollback {
-                        self.concurrency.rollback_grant(tenant, queue, task_id);
-                    }
-                    // Put back all claimed entries since we didn't lease them durably
-                    self.brokers.requeue(claimed);
-                    return Err(JobStoreShardError::Slate(e));
+            {
+                dst_events::cancel_write(write_op);
+                // Rollback all grants made during this iteration
+                for (tenant, queue, task_id) in &grants_to_rollback {
+                    self.concurrency.rollback_grant(tenant, queue, task_id);
                 }
+                // Put back all claimed entries since we didn't lease them durably
+                self.brokers.requeue(claimed);
+                return Err(JobStoreShardError::Slate(e));
             }
             dst_events::confirm_write(write_op);
 
@@ -736,7 +735,10 @@ impl JobStoreShard {
         // Scan tasks under tasks/{task_group}/ using binary storekey encoding
         let start = crate::keys::task_group_prefix(task_group);
         let end = crate::keys::end_bound(&start);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter: DbIterator = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
 
         let mut tasks: Vec<Task> = Vec::with_capacity(max_tasks);
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(max_tasks);

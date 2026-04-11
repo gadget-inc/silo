@@ -400,35 +400,35 @@ impl Metrics {
                 .iter()
                 .chain(labeled_counter_mappings_cache.iter())
             {
-                if let Some(metric) = snapshot.by_name_and_labels(stat_name, labels) {
-                    if let Some(current) = extract_value(metric) {
-                        // Use stat_name + labels as key to distinguish get/scan/flush
-                        let label_suffix = labels
-                            .iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let key = (format!("{stat_name}/{label_suffix}"), shard.to_string());
-                        let prev = prev_values.get(&key).copied().unwrap_or(0.0);
-                        if current > prev {
-                            counter.with_label_values(&[shard]).inc_by(current - prev);
-                        }
-                        prev_values.insert(key, current);
+                if let Some(metric) = snapshot.by_name_and_labels(stat_name, labels)
+                    && let Some(current) = extract_value(metric)
+                {
+                    // Use stat_name + labels as key to distinguish get/scan/flush
+                    let label_suffix = labels
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let key = (format!("{stat_name}/{label_suffix}"), shard.to_string());
+                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                    if current > prev {
+                        counter.with_label_values(&[shard]).inc_by(current - prev);
                     }
+                    prev_values.insert(key, current);
                 }
             }
 
             // Unlabeled counters
             for (stat_name, counter) in counter_mappings {
-                if let Some(metric) = snapshot.by_name(stat_name).first() {
-                    if let Some(current) = extract_value(metric) {
-                        let key = (stat_name.to_string(), shard.to_string());
-                        let prev = prev_values.get(&key).copied().unwrap_or(0.0);
-                        if current > prev {
-                            counter.with_label_values(&[shard]).inc_by(current - prev);
-                        }
-                        prev_values.insert(key, current);
+                if let Some(metric) = snapshot.by_name(stat_name).first()
+                    && let Some(current) = extract_value(metric)
+                {
+                    let key = (stat_name.to_string(), shard.to_string());
+                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                    if current > prev {
+                        counter.with_label_values(&[shard]).inc_by(current - prev);
                     }
+                    prev_values.insert(key, current);
                 }
             }
         }
