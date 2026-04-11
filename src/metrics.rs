@@ -80,6 +80,8 @@ pub struct Metrics {
     broker_inflight_size: GaugeVec,
     broker_scan_duration: HistogramVec,
     broker_scans_total: CounterVec,
+    broker_scan_tasks_read: CounterVec,
+    broker_tombstone_count: GaugeVec,
 
     // Poll metrics
     polls_total: CounterVec,
@@ -214,6 +216,38 @@ impl Metrics {
             .with_label_values(&[shard])
             .observe(duration_secs);
         self.broker_scans_total.with_label_values(&[shard]).inc();
+    }
+
+    pub fn record_broker_scan_tasks(
+        &self,
+        shard: &str,
+        task_group: &str,
+        inserted: u64,
+        skipped_future: u64,
+        skipped_inflight: u64,
+        skipped_tombstone: u64,
+        skipped_already_buffered: u64,
+        skipped_defunct: u64,
+    ) {
+        for (outcome, count) in [
+            ("inserted", inserted),
+            ("skipped_future", skipped_future),
+            ("skipped_inflight", skipped_inflight),
+            ("skipped_tombstone", skipped_tombstone),
+            ("skipped_already_buffered", skipped_already_buffered),
+            ("skipped_defunct", skipped_defunct),
+        ] {
+            self.broker_scan_tasks_read
+                .with_label_values(&[shard, task_group, outcome])
+                .inc_by(count as f64);
+        }
+    }
+
+    /// Update the number of ack tombstones for a shard and task group.
+    pub fn set_broker_tombstone_count(&self, shard: &str, task_group: &str, count: u64) {
+        self.broker_tombstone_count
+            .with_label_values(&[shard, task_group])
+            .set(count as f64);
     }
 
     /// Record a poll (lease_tasks call) for a shard.
@@ -596,6 +630,28 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let broker_scan_tasks_read = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_broker_scan_tasks_read_total",
+                "Total tasks read during broker scans, broken down by outcome",
+            ),
+            &["shard", "task_group", "outcome"],
+        )?,
+    );
+
+    let broker_tombstone_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_broker_tombstone_count",
+                "Number of ack tombstones held by the broker",
+            ),
+            &["shard", "task_group"],
+        )?,
+    );
+
     // Poll metrics
     let polls_total = register(
         &registry,
@@ -947,6 +1003,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_inflight_size,
         broker_scan_duration,
         broker_scans_total,
+        broker_scan_tasks_read,
+        broker_tombstone_count,
         polls_total,
         poll_duration,
         task_leases_active,
