@@ -23,8 +23,11 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use prometheus::{
@@ -33,6 +36,7 @@ use prometheus::{
 };
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tokio::sync::broadcast;
+use tower::{Layer, Service};
 use tracing::{debug, error};
 
 /// Default histogram buckets for request latencies (in seconds)
@@ -400,35 +404,35 @@ impl Metrics {
                 .iter()
                 .chain(labeled_counter_mappings_cache.iter())
             {
-                if let Some(metric) = snapshot.by_name_and_labels(stat_name, labels) {
-                    if let Some(current) = extract_value(metric) {
-                        // Use stat_name + labels as key to distinguish get/scan/flush
-                        let label_suffix = labels
-                            .iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let key = (format!("{stat_name}/{label_suffix}"), shard.to_string());
-                        let prev = prev_values.get(&key).copied().unwrap_or(0.0);
-                        if current > prev {
-                            counter.with_label_values(&[shard]).inc_by(current - prev);
-                        }
-                        prev_values.insert(key, current);
+                if let Some(metric) = snapshot.by_name_and_labels(stat_name, labels)
+                    && let Some(current) = extract_value(metric)
+                {
+                    // Use stat_name + labels as key to distinguish get/scan/flush
+                    let label_suffix = labels
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let key = (format!("{stat_name}/{label_suffix}"), shard.to_string());
+                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                    if current > prev {
+                        counter.with_label_values(&[shard]).inc_by(current - prev);
                     }
+                    prev_values.insert(key, current);
                 }
             }
 
             // Unlabeled counters
             for (stat_name, counter) in counter_mappings {
-                if let Some(metric) = snapshot.by_name(stat_name).first() {
-                    if let Some(current) = extract_value(metric) {
-                        let key = (stat_name.to_string(), shard.to_string());
-                        let prev = prev_values.get(&key).copied().unwrap_or(0.0);
-                        if current > prev {
-                            counter.with_label_values(&[shard]).inc_by(current - prev);
-                        }
-                        prev_values.insert(key, current);
+                if let Some(metric) = snapshot.by_name(stat_name).first()
+                    && let Some(current) = extract_value(metric)
+                {
+                    let key = (stat_name.to_string(), shard.to_string());
+                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                    if current > prev {
+                        counter.with_label_values(&[shard]).inc_by(current - prev);
                     }
+                    prev_values.insert(key, current);
                 }
             }
         }
@@ -1028,4 +1032,95 @@ pub async fn run_metrics_server(
         .await?;
 
     Ok(())
+}
+
+/// Tower layer that records `silo_grpc_requests_total` and
+/// `silo_grpc_request_duration_seconds` for every gRPC request.
+///
+/// When metrics are `None` the layer is a no-op passthrough.
+#[derive(Clone)]
+pub struct GrpcMetricsLayer {
+    metrics: Option<Metrics>,
+}
+
+impl GrpcMetricsLayer {
+    pub fn new(metrics: Option<Metrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl<S> Layer<S> for GrpcMetricsLayer {
+    type Service = GrpcMetricsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GrpcMetricsService {
+            inner,
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+/// Tower service that wraps an inner service and records gRPC metrics.
+#[derive(Clone)]
+pub struct GrpcMetricsService<S> {
+    inner: S,
+    metrics: Option<Metrics>,
+}
+
+type HttpRequest<T> = tonic::codegen::http::Request<T>;
+type HttpResponse<T> = tonic::codegen::http::Response<T>;
+
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for GrpcMetricsService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = HttpResponse<ResBody>> + Clone + Send + 'static,
+    <S as Service<HttpRequest<ReqBody>>>::Future: Send + 'static,
+    <S as Service<HttpRequest<ReqBody>>>::Error: Send + 'static,
+    ReqBody: Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = HttpResponse<ResBody>;
+    type Error = <S as Service<HttpRequest<ReqBody>>>::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        let metrics = self.metrics.clone();
+        // Extract method name before req is moved into the inner call.
+        // The path string is borrowed from the request URI so we only allocate
+        // when metrics are enabled.
+        let method = if metrics.is_some() {
+            let path = req.uri().path();
+            Some(
+                path.rsplit_once('/')
+                    .map(|(_, m)| m.to_owned())
+                    .unwrap_or_else(|| path.to_owned()),
+            )
+        } else {
+            None
+        };
+        // Clone a fresh service for future poll_ready calls, then swap so we
+        // use the already-ready instance for this call.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move {
+            let start = std::time::Instant::now();
+            let result = inner.call(req).await;
+            if let Some(ref m) = metrics {
+                let method = method.as_deref().unwrap_or("unknown");
+                let duration = start.elapsed().as_secs_f64();
+                let status = match &result {
+                    Ok(resp) => tonic::Status::from_header_map(resp.headers())
+                        .map_or(tonic::Code::Ok, |s| s.code())
+                        .description(),
+                    Err(_) => "INTERNAL",
+                };
+                m.record_grpc_request(method, status);
+                m.record_grpc_duration(method, duration);
+            }
+            result
+        })
+    }
 }

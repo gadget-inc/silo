@@ -2047,6 +2047,7 @@ where
         // evicted streams cause RST_STREAM with code 5 (STREAM_CLOSED)
         // on late frames, which surfaces as gRPC INTERNAL errors.
         .http2_max_pending_accept_reset_streams(Some(1000))
+        .layer(crate::metrics::GrpcMetricsLayer::new(metrics.clone()))
         .add_service(health_service)
         .add_service(reflection_service)
         .add_service(server)
