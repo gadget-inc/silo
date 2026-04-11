@@ -1034,6 +1034,30 @@ pub async fn run_metrics_server(
     Ok(())
 }
 
+/// Map a tonic status code to a short uppercase label matching the gRPC spec
+/// (e.g. "OK", "NOT_FOUND", "INTERNAL").
+fn grpc_code_label(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "OK",
+        tonic::Code::Cancelled => "CANCELLED",
+        tonic::Code::Unknown => "UNKNOWN",
+        tonic::Code::InvalidArgument => "INVALID_ARGUMENT",
+        tonic::Code::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        tonic::Code::NotFound => "NOT_FOUND",
+        tonic::Code::AlreadyExists => "ALREADY_EXISTS",
+        tonic::Code::PermissionDenied => "PERMISSION_DENIED",
+        tonic::Code::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        tonic::Code::FailedPrecondition => "FAILED_PRECONDITION",
+        tonic::Code::Aborted => "ABORTED",
+        tonic::Code::OutOfRange => "OUT_OF_RANGE",
+        tonic::Code::Unimplemented => "UNIMPLEMENTED",
+        tonic::Code::Internal => "INTERNAL",
+        tonic::Code::Unavailable => "UNAVAILABLE",
+        tonic::Code::DataLoss => "DATA_LOSS",
+        tonic::Code::Unauthenticated => "UNAUTHENTICATED",
+    }
+}
+
 /// Tower layer that records `silo_grpc_requests_total` and
 /// `silo_grpc_request_duration_seconds` for every gRPC request.
 ///
@@ -1111,12 +1135,12 @@ where
             if let Some(ref m) = metrics {
                 let method = method.as_deref().unwrap_or("unknown");
                 let duration = start.elapsed().as_secs_f64();
-                let status = match &result {
+                let code = match &result {
                     Ok(resp) => tonic::Status::from_header_map(resp.headers())
-                        .map_or(tonic::Code::Ok, |s| s.code())
-                        .description(),
-                    Err(_) => "INTERNAL",
+                        .map_or(tonic::Code::Ok, |s| s.code()),
+                    Err(_) => tonic::Code::Internal,
                 };
+                let status = grpc_code_label(code);
                 m.record_grpc_request(method, status);
                 m.record_grpc_duration(method, duration);
             }
