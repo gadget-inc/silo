@@ -32,7 +32,9 @@ async fn scan_collect<T>(
         return Ok(Vec::new());
     }
 
-    let mut iter = db.scan::<Vec<u8>, _>(start..end).await?;
+    let mut iter = db
+        .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+        .await?;
     let capacity = limit.unwrap_or(1024).min(1024);
     let mut out = Vec::with_capacity(capacity);
 
@@ -299,7 +301,10 @@ impl JobStoreShard {
         }
         let start = job_info_prefix(tenant);
         let end = end_bound(&start);
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
         let capacity = limit.unwrap_or(1024).min(1024);
         let mut out = Vec::with_capacity(capacity);
         loop {
@@ -328,7 +333,10 @@ impl JobStoreShard {
         }
         let start = jobs_prefix();
         let end = end_bound(&start);
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
         let capacity = limit.unwrap_or(1024).min(1024);
         let mut out = Vec::with_capacity(capacity);
         loop {
@@ -358,7 +366,10 @@ impl JobStoreShard {
         }
         let start = job_status_prefix(tenant);
         let end = end_bound(&start);
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
         let capacity = limit.unwrap_or(1024).min(1024);
         let mut out = Vec::with_capacity(capacity);
         loop {
@@ -390,7 +401,10 @@ impl JobStoreShard {
         }
         let start = jobs_status_prefix();
         let end = end_bound(&start);
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
         let capacity = limit.unwrap_or(1024).min(1024);
         let mut out = Vec::with_capacity(capacity);
         loop {

@@ -144,7 +144,9 @@ impl ConcurrencyCounts {
         // Scan holders for this specific tenant/queue using the queue prefix
         let start = concurrency_holders_queue_prefix(tenant, queue);
         let end = end_bound(&start);
-        let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter: DbIterator = db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
 
         let mut task_ids = Vec::new();
         loop {
@@ -692,7 +694,10 @@ impl ConcurrencyManager {
     pub async fn reconcile_pending_requests(&self, db: &Db, range: &ShardRange) {
         let start = concurrency_requests_prefix();
         let end = end_bound(&start);
-        let mut iter = match db.scan::<Vec<u8>, _>(start..end).await {
+        let mut iter = match db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await
+        {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(
@@ -767,7 +772,10 @@ impl ConcurrencyManager {
         // [SILO-GRANT-2] Pre: Scan for pending requests for this queue
         let start = concurrency_request_prefix(tenant, queue);
         let end_key = end_bound(&start);
-        let mut iter = match db.scan::<Vec<u8>, _>(start..end_key).await {
+        let mut iter = match db
+            .scan_with_options::<Vec<u8>, _>(start..end_key, &crate::scan_options())
+            .await
+        {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(error = %e, "grant scanner: failed to scan requests");

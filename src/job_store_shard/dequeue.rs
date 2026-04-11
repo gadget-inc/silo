@@ -735,7 +735,10 @@ impl JobStoreShard {
         // Scan tasks under tasks/{task_group}/ using binary storekey encoding
         let start = crate::keys::task_group_prefix(task_group);
         let end = crate::keys::end_bound(&start);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter: DbIterator = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
 
         let mut tasks: Vec<Task> = Vec::with_capacity(max_tasks);
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(max_tasks);

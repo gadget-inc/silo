@@ -41,3 +41,14 @@ pub mod pb {
 }
 pub mod server;
 pub mod siloctl;
+
+/// Default scan options for all silo scans.
+///
+/// SlateDB defaults `cache_blocks` to `false` for scans to avoid cache pollution
+/// from large sequential reads. However, silo's scans are repeated, short-range
+/// prefix scans over the same SSTs, so caching SST indexes (and data blocks) is
+/// critical — without it, every scan re-parses the full flatbuffer SST index,
+/// which dominates CPU under load.
+pub fn scan_options() -> slatedb::config::ScanOptions {
+    slatedb::config::ScanOptions::default().with_cache_blocks(true)
+}

@@ -130,7 +130,11 @@ impl TaskBroker {
         let start = task_group_prefix(&self.task_group);
         let end = end_bound(&start);
 
-        let Ok(mut iter) = self.db.scan::<Vec<u8>, _>(start..end).await else {
+        let Ok(mut iter) = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await
+        else {
             return 0;
         };
 
