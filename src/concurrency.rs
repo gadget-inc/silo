@@ -747,10 +747,8 @@ impl ConcurrencyManager {
 
     /// Process pending grant requests for a single (tenant, queue).
     /// Scans up to `count` pending requests and grants those for which capacity exists.
-    /// Returns true if any grants were made.
-    /// Process pending grant requests for a single (tenant, queue).
     /// Returns the task groups that received grants.
-    async fn process_grants(
+    pub async fn process_grants(
         &self,
         db: &Db,
         range: &ShardRange,

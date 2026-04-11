@@ -295,6 +295,133 @@ async fn bench_concurrency_reconcile_once(metadata: &GoldenShardMetadata) {
     println!();
 }
 
+async fn bench_process_grants_small(metadata: &GoldenShardMetadata) {
+    println!("--- process_grants (5 grants from 20K waiters) ---");
+    let (_guard, shard) = clone_golden_shard("grants-small", metadata).await;
+
+    // Free up 5 slots by releasing 5 holders
+    for task_id in &metadata.deep_queue_holder_task_ids {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: Vec::new() })
+            .await
+            .expect("report outcome on holder");
+    }
+
+    let r = bench_op("process_grants(5)", 0, 1, || {
+        let shard = Arc::clone(&shard);
+        async move {
+            let granted = shard
+                .process_concurrency_grants(BENCH_DEEP_QUEUE_TENANT, DEEP_QUEUE_KEY, 5)
+                .await;
+            assert_eq!(granted.len(), 5, "expected 5 grants");
+        }
+    })
+    .await;
+    r.print();
+
+    shard.close().await.expect("close");
+    println!();
+}
+
+async fn bench_process_grants_medium(metadata: &GoldenShardMetadata) {
+    println!("--- process_grants (50 grants from 20K waiters) ---");
+    let (_guard, shard) = clone_golden_shard("grants-medium", metadata).await;
+
+    // Free up 50 slots by raising the concurrency limit:
+    // Release all 5 holders, then process 50 grants (5 slots freed + capacity for more)
+    for task_id in &metadata.deep_queue_holder_task_ids {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: Vec::new() })
+            .await
+            .expect("report outcome on holder");
+    }
+
+    // Enqueue a new job with a higher concurrency limit so process_grants can grant 50
+    let now = now_ms();
+    let higher_limit = Limit::Concurrency(ConcurrencyLimit {
+        key: DEEP_QUEUE_KEY.to_string(),
+        max_concurrency: 100,
+    });
+    shard
+        .enqueue(
+            BENCH_DEEP_QUEUE_TENANT,
+            Some("grants-medium-raiser".to_string()),
+            50,
+            now,
+            None,
+            vec![1, 2, 3],
+            vec![higher_limit],
+            None,
+            "",
+        )
+        .await
+        .expect("enqueue to raise limit");
+
+    let r = bench_op("process_grants(50)", 0, 1, || {
+        let shard = Arc::clone(&shard);
+        async move {
+            let granted = shard
+                .process_concurrency_grants(BENCH_DEEP_QUEUE_TENANT, DEEP_QUEUE_KEY, 50)
+                .await;
+            assert_eq!(granted.len(), 50, "expected 50 grants");
+        }
+    })
+    .await;
+    r.print();
+
+    shard.close().await.expect("close");
+    println!();
+}
+
+async fn bench_process_grants_large(metadata: &GoldenShardMetadata) {
+    println!("--- process_grants (500 grants from 20K waiters) ---");
+    let (_guard, shard) = clone_golden_shard("grants-large", metadata).await;
+
+    // Release all holders
+    for task_id in &metadata.deep_queue_holder_task_ids {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: Vec::new() })
+            .await
+            .expect("report outcome on holder");
+    }
+
+    // Raise the limit high enough to grant 500
+    let now = now_ms();
+    let higher_limit = Limit::Concurrency(ConcurrencyLimit {
+        key: DEEP_QUEUE_KEY.to_string(),
+        max_concurrency: 1000,
+    });
+    shard
+        .enqueue(
+            BENCH_DEEP_QUEUE_TENANT,
+            Some("grants-large-raiser".to_string()),
+            50,
+            now,
+            None,
+            vec![1, 2, 3],
+            vec![higher_limit],
+            None,
+            "",
+        )
+        .await
+        .expect("enqueue to raise limit");
+
+    let r = bench_op("process_grants(500)", 0, 1, || {
+        let shard = Arc::clone(&shard);
+        async move {
+            let granted = shard
+                .process_concurrency_grants(BENCH_DEEP_QUEUE_TENANT, DEEP_QUEUE_KEY, 500)
+                .await;
+            assert_eq!(granted.len(), 500, "expected 500 grants");
+        }
+    })
+    .await;
+    r.print();
+
+    shard.close().await.expect("close");
+    println!();
+}
+
 async fn bench_cancel_no_limit(metadata: &GoldenShardMetadata) {
     println!("--- cancel_job (no limits) ---");
     let (_guard, shard) = clone_golden_shard("cancel-no-limit", metadata).await;
@@ -552,6 +679,9 @@ async fn main() {
     bench_dequeue_no_limit(&metadata).await;
     bench_dequeue_heavy_concurrency(&metadata).await;
     bench_concurrency_reconcile_once(&metadata).await;
+    bench_process_grants_small(&metadata).await;
+    bench_process_grants_medium(&metadata).await;
+    bench_process_grants_large(&metadata).await;
     bench_cancel_no_limit(&metadata).await;
     bench_cancel_with_concurrency(&metadata).await;
     bench_expedite_scheduled(&metadata).await;
