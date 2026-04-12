@@ -612,6 +612,7 @@ pub async fn clone_golden_shard(
             concurrency_reconcile_interval: Duration::from_millis(
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
             ),
+            compaction_filter_retention: None,
         },
         ShardRange::full(),
     )
