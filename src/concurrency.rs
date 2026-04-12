@@ -804,11 +804,7 @@ impl ConcurrencyManager {
         let mut scanned: Vec<ScannedRequest> = Vec::new();
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
 
-        // Scan up to 2x count to have enough candidates after filtering stale ones,
-        // capped to avoid issuing too many concurrent status reads in phase 2.
-        let scan_limit = (count as usize).saturating_mul(2).min(512);
-
-        while scanned.len() < scan_limit {
+        while scanned.len() < count as usize {
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
                 Ok(None) => break,
