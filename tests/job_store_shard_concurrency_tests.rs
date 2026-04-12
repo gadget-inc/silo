@@ -1,10 +1,11 @@
 mod test_helpers;
 
-use silo::codec::decode_task;
+use silo::codec::{decode_task, encode_concurrency_action};
 use silo::job::Limit;
 use silo::job_attempt::AttemptOutcome;
 use silo::keys::concurrency_holder_key;
 use silo::retry::RetryPolicy;
+use silo::task::ConcurrencyAction;
 use silo::task::Task;
 use std::collections::HashSet;
 use std::sync::{
@@ -1569,4 +1570,267 @@ async fn retry_with_concurrent_jobs_respects_limit() {
         0,
         "No holders should remain after all jobs complete"
     );
+}
+
+/// Tests that process_grants skips stale requests and continues scanning to
+/// fulfill the requested count from valid requests behind them.
+#[silo::test]
+async fn grant_scanner_skips_stale_requests_and_grants_valid_ones() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "stale-skip-q";
+    let tenant = "stale-skip-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 3,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Fill the 3 concurrency slots with holders, then enqueue 3 more as waiters
+    let mut holder_tasks = Vec::new();
+    for i in 0..3 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("holder-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..3 {
+        let tasks = shard.dequeue("w", "tg", 1).await.unwrap().tasks;
+        holder_tasks.push(tasks[0].attempt().task_id().to_string());
+    }
+
+    // Enqueue 3 legitimate waiters (queue at capacity 3/3, so these become requests)
+    for i in 0..3 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("valid-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+
+    // Inject 5 stale requests with earlier start_time so they sort BEFORE the valid ones.
+    // These reference job IDs that don't exist, so they'll be detected as stale.
+    for i in 0..5 {
+        let stale_action = ConcurrencyAction::EnqueueTask {
+            start_time_ms: 0,
+            priority: 50,
+            job_id: format!("nonexistent-job-{}", i),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            task_group: "tg".to_string(),
+        };
+        let key = silo::keys::concurrency_request_key(
+            tenant,
+            queue,
+            0,
+            50,
+            &format!("nonexistent-job-{}", i),
+            1,
+            &format!("stale{:04}", i),
+        );
+        let val = encode_concurrency_action(&stale_action);
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(&key, &val);
+        shard.db().write(batch).await.unwrap();
+    }
+
+    assert_eq!(count_concurrency_requests(shard.db()).await, 8); // 5 stale + 3 valid
+
+    // Release all holders to free capacity
+    for task_id in &holder_tasks {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .unwrap();
+    }
+
+    // Ask for 3 grants — should skip all 5 stale, then grant all 3 valid
+    let granted = shard.process_concurrency_grants(tenant, queue, 3).await;
+    assert_eq!(
+        granted.len(),
+        3,
+        "should grant all 3 valid requests despite 5 stale ones ahead of them"
+    );
+
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "all requests (stale + granted) should be removed"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 3);
+}
+
+/// Tests that when all scanned requests are stale and no valid requests exist,
+/// process_grants returns zero grants and cleans up the stale entries.
+#[silo::test]
+async fn grant_scanner_handles_all_stale_requests() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "all-stale-q";
+    let tenant = "all-stale-tenant";
+
+    shard.stop_grant_scanner();
+
+    // Inject 5 stale requests (no real jobs behind them)
+    for i in 0..5 {
+        let stale_action = ConcurrencyAction::EnqueueTask {
+            start_time_ms: 0,
+            priority: 50,
+            job_id: format!("ghost-{}", i),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            task_group: "tg".to_string(),
+        };
+        let key = silo::keys::concurrency_request_key(
+            tenant,
+            queue,
+            0,
+            50,
+            &format!("ghost-{}", i),
+            1,
+            &format!("s{:04}", i),
+        );
+        let val = encode_concurrency_action(&stale_action);
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(&key, &val);
+        shard.db().write(batch).await.unwrap();
+    }
+
+    assert_eq!(count_concurrency_requests(shard.db()).await, 5);
+
+    let granted = shard.process_concurrency_grants(tenant, queue, 3).await;
+    assert_eq!(granted.len(), 0, "no valid requests to grant");
+
+    // All stale requests should still be cleaned up
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "stale requests should be deleted even when no grants are made"
+    );
+}
+
+/// Tests that stale requests interleaved with valid ones are handled correctly:
+/// the grant scanner should skip stale ones and keep scanning to find valid ones.
+#[silo::test]
+async fn grant_scanner_interleaved_stale_and_valid_requests() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "interleave-q";
+    let tenant = "interleave-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 5,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Fill all 5 slots with holders
+    let mut holder_tasks = Vec::new();
+    for i in 0..5 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("holder-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..5 {
+        let tasks = shard.dequeue("w", "tg", 1).await.unwrap().tasks;
+        holder_tasks.push(tasks[0].attempt().task_id().to_string());
+    }
+
+    // Enqueue 5 valid waiters (capacity 5/5, these become requests)
+    for i in 0..5 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("real-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+
+    // Inject 10 stale requests with earlier start_time so they sort before valid ones
+    for i in 0..10 {
+        let stale_action = ConcurrencyAction::EnqueueTask {
+            start_time_ms: now - 1000 + i,
+            priority: 50,
+            job_id: format!("phantom-{}", i),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            task_group: "tg".to_string(),
+        };
+        let key = silo::keys::concurrency_request_key(
+            tenant,
+            queue,
+            now - 1000 + i,
+            50,
+            &format!("phantom-{}", i),
+            1,
+            &format!("x{:04}", i),
+        );
+        let val = encode_concurrency_action(&stale_action);
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(&key, &val);
+        shard.db().write(batch).await.unwrap();
+    }
+
+    assert_eq!(count_concurrency_requests(shard.db()).await, 15); // 10 stale + 5 valid
+
+    // Release all holders to free capacity
+    for task_id in &holder_tasks {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .unwrap();
+    }
+
+    // Ask for 5 grants — should skip 10 stale, grant 5 valid
+    let granted = shard.process_concurrency_grants(tenant, queue, 5).await;
+    assert_eq!(
+        granted.len(),
+        5,
+        "should grant 5 valid requests despite 10 stale ones interleaved"
+    );
+
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "all stale and granted requests should be removed"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 5);
 }
