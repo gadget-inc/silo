@@ -855,9 +855,7 @@ impl ConcurrencyManager {
                 let job_key = crate::keys::job_info_key(tenant, job_id_str);
                 let (l, lt) = match db.get(&job_key).await {
                     Ok(Some(bytes)) => match JobView::new(bytes) {
-                        Ok(view) => {
-                            Self::resolve_queue_capacity(db, tenant, queue, &view).await
-                        }
+                        Ok(view) => Self::resolve_queue_capacity(db, tenant, queue, &view).await,
                         Err(_) => (1, ConcurrencyLimitType::Fixed),
                     },
                     _ => (1, ConcurrencyLimitType::Fixed),
@@ -1031,7 +1029,9 @@ impl ConcurrencyManager {
         }
 
         // Skip the write if there's nothing to do
-        if granted_task_groups.is_empty() && stale_request_keys.is_empty() && corrupt_keys.is_empty()
+        if granted_task_groups.is_empty()
+            && stale_request_keys.is_empty()
+            && corrupt_keys.is_empty()
         {
             return Vec::new();
         }
@@ -1048,8 +1048,7 @@ impl ConcurrencyManager {
         {
             // Roll back all in-memory reservations
             for request_id in &granted_request_ids {
-                self.counts
-                    .release_reservation(tenant, queue, request_id);
+                self.counts.release_reservation(tenant, queue, request_id);
             }
             tracing::warn!(
                 error = %e,
@@ -1059,9 +1058,7 @@ impl ConcurrencyManager {
             return Vec::new();
         }
 
-        for (request_id, task_group) in
-            granted_request_ids.iter().zip(granted_task_groups.iter())
-        {
+        for (request_id, task_group) in granted_request_ids.iter().zip(granted_task_groups.iter()) {
             tracing::debug!(
                 queue = %queue,
                 request_id = %request_id,
@@ -1153,4 +1150,3 @@ fn append_request_edits<W: WriteBatcher>(
 
     Ok(())
 }
-
