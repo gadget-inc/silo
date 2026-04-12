@@ -749,9 +749,11 @@ impl ConcurrencyManager {
     /// Scans up to `count` pending requests and grants those for which capacity exists.
     /// Returns the task groups that received grants.
     ///
-    /// Optimized for throughput: scans candidates, batch-validates their status
-    /// concurrently, then reserves in-memory slots and writes all grants plus stale
-    /// deletions in a single durable batch.
+    /// Optimized for throughput: scans candidates in batches, batch-validates their
+    /// status concurrently, reserves in-memory slots, then writes all grants plus
+    /// stale deletions in a single durable batch. If stale/corrupt requests reduce
+    /// the yield, scanning continues until `count` valid grants are found or the
+    /// request queue is exhausted.
     pub(crate) async fn process_grants(
         &self,
         db: &Db,
@@ -772,9 +774,6 @@ impl ConcurrencyManager {
 
         let now_ms = crate::job_store_shard::now_epoch_ms();
 
-        // --- Phase 1: Scan and decode request candidates ---
-        // We scan more than `count` candidates to account for stale requests that
-        // will be filtered out during validation. This avoids needing to re-scan.
         // [SILO-GRANT-2] Pre: Scan for pending requests for this queue
         let start = concurrency_request_prefix(tenant, queue);
         let end_key = end_bound(&start);
@@ -800,236 +799,247 @@ impl ConcurrencyManager {
             task_group: String,
         }
 
-        let mut corrupt_keys: Vec<Vec<u8>> = Vec::new();
-        let mut scanned: Vec<ScannedRequest> = Vec::new();
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
+        let mut batch = WriteBatch::new();
+        let mut grants: Vec<(String, String)> = Vec::new();
+        let mut stale_and_corrupt_count: usize = 0;
+        let mut iter_exhausted = false;
+        let mut capacity_exhausted = false;
 
-        while scanned.len() < count as usize {
-            let kv = match iter.next().await {
-                Ok(Some(kv)) => kv,
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!(error = %e, "grant scanner: iteration error");
+        // Scan→validate→grant loop: keeps pulling from the iterator until we've
+        // granted `count` requests, or hit the end / capacity limit. Each iteration
+        // scans a batch of candidates, validates them concurrently, then reserves
+        // slots for valid ones. Stale/corrupt entries are cleaned up along the way.
+        while grants.len() < count as usize && !iter_exhausted && !capacity_exhausted {
+            let needed = count as usize - grants.len();
+
+            // --- Scan batch of candidates ---
+            let mut scanned: Vec<ScannedRequest> = Vec::new();
+            while scanned.len() < needed {
+                let kv = match iter.next().await {
+                    Ok(Some(kv)) => kv,
+                    Ok(None) => {
+                        iter_exhausted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "grant scanner: iteration error");
+                        iter_exhausted = true;
+                        break;
+                    }
+                };
+
+                let parsed_req = parse_concurrency_request_key(&kv.key);
+
+                let decoded = match decode_concurrency_action(kv.value.clone()) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        tracing::warn!(queue = %queue, "grant scanner: failed to decode request, deleting");
+                        batch.delete(&kv.key);
+                        stale_and_corrupt_count += 1;
+                        continue;
+                    }
+                };
+                let a = decoded.fb();
+                let Some(et) = a.variant_as_enqueue_task() else {
+                    tracing::warn!(queue = %queue, "grant scanner: unknown concurrency action variant, deleting");
+                    batch.delete(&kv.key);
+                    stale_and_corrupt_count += 1;
+                    continue;
+                };
+
+                let start_time_ms = et.start_time_ms();
+                let job_id_str = et.job_id().unwrap_or_default();
+
+                if start_time_ms > now_ms {
+                    iter_exhausted = true;
                     break;
                 }
-            };
 
-            let parsed_req = parse_concurrency_request_key(&kv.key);
-
-            // Decode request
-            let decoded = match decode_concurrency_action(kv.value.clone()) {
-                Ok(d) => d,
-                Err(_) => {
-                    tracing::warn!(queue = %queue, "grant scanner: failed to decode request, deleting");
-                    corrupt_keys.push(kv.key.to_vec());
+                let Some(parsed_req) = parsed_req else {
                     continue;
+                };
+                let request_id = parsed_req.request_id();
+
+                // Resolve max_concurrency from the first request whose job info is readable.
+                // Don't cache failures — a stale request's missing job shouldn't lock
+                // the limit to 1 for the rest of the scan.
+                if max_concurrency.is_none() {
+                    let job_key = crate::keys::job_info_key(tenant, job_id_str);
+                    match db.get(&job_key).await {
+                        Ok(Some(bytes)) => match JobView::new(bytes) {
+                            Ok(view) => {
+                                let (l, lt) =
+                                    Self::resolve_queue_capacity(db, tenant, queue, &view).await;
+                                self.cache_queue_limit(tenant, queue, l as u32, lt);
+                                max_concurrency = Some((l, lt));
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    job_id = %job_id_str,
+                                    queue = %queue,
+                                    "grant scanner: undecodable job info, will retry with next request"
+                                );
+                            }
+                        },
+                        Ok(None) => {
+                            tracing::debug!(
+                                job_id = %job_id_str,
+                                queue = %queue,
+                                "grant scanner: job info missing, will retry with next request"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                job_id = %job_id_str,
+                                queue = %queue,
+                                "grant scanner: failed to read job info, will retry with next request"
+                            );
+                        }
+                    };
                 }
-            };
-            let a = decoded.fb();
-            let Some(et) = a.variant_as_enqueue_task() else {
-                tracing::warn!(queue = %queue, "grant scanner: unknown concurrency action variant, deleting");
-                corrupt_keys.push(kv.key.to_vec());
-                continue;
-            };
 
-            let start_time_ms = et.start_time_ms();
-            let job_id_str = et.job_id().unwrap_or_default();
+                scanned.push(ScannedRequest {
+                    request_key: kv.key.to_vec(),
+                    request_id,
+                    job_id: job_id_str.to_string(),
+                    attempt_number: et.attempt_number(),
+                    relative_attempt_number: et.relative_attempt_number(),
+                    start_time_ms,
+                    priority: et.priority(),
+                    task_group: et.task_group().unwrap_or_default().to_string(),
+                });
+            }
 
-            // Check start_time (requests are ordered by time)
-            if start_time_ms > now_ms {
+            if scanned.is_empty() {
                 break;
             }
 
-            let Some(parsed_req) = parsed_req else {
-                continue;
-            };
-            let request_id = parsed_req.request_id();
+            // --- Batch validate status ---
+            let status_futures: Vec<_> = scanned
+                .iter()
+                .map(|c| {
+                    let key = job_status_key(tenant, &c.job_id);
+                    async move { db.get(&key).await }
+                })
+                .collect();
+            let status_results = futures::future::join_all(status_futures).await;
 
-            if max_concurrency.is_none() {
-                let job_key = crate::keys::job_info_key(tenant, job_id_str);
-                let (l, lt) = match db.get(&job_key).await {
-                    Ok(Some(bytes)) => match JobView::new(bytes) {
-                        Ok(view) => Self::resolve_queue_capacity(db, tenant, queue, &view).await,
+            let mut valid_requests: Vec<ScannedRequest> = Vec::new();
+            for (req, status_result) in scanned.into_iter().zip(status_results.into_iter()) {
+                let is_valid = match status_result {
+                    Ok(Some(status_raw)) => match decode_job_status_owned(&status_raw) {
+                        // [SILO-GRANT-5] Request records are only valid for the currently
+                        // scheduled attempt.
+                        Ok(status)
+                            if status.kind != JobStatusKind::Scheduled
+                                || status.current_attempt != Some(req.attempt_number) =>
+                        {
+                            // [SILO-GRANT-6] Drop stale request key without granting work.
+                            tracing::debug!(
+                                job_id = %req.job_id,
+                                queue = %queue,
+                                request_attempt = req.attempt_number,
+                                status_kind = ?status.kind,
+                                status_attempt = ?status.current_attempt,
+                                "grant scanner: skipping stale request for non-current attempt"
+                            );
+                            false
+                        }
+                        Ok(_) => true,
                         Err(_) => {
                             tracing::warn!(
-                                job_id = %job_id_str,
+                                job_id = %req.job_id,
                                 queue = %queue,
-                                "grant scanner: undecodable job info, falling back to limit=1"
+                                "grant scanner: dropping request with unreadable job status"
                             );
-                            (1, ConcurrencyLimitType::Fixed)
+                            false
                         }
                     },
                     Ok(None) => {
-                        tracing::warn!(
-                            job_id = %job_id_str,
+                        tracing::debug!(
+                            job_id = %req.job_id,
                             queue = %queue,
-                            "grant scanner: job info missing, falling back to limit=1"
+                            "grant scanner: dropping request for missing job status"
                         );
-                        (1, ConcurrencyLimitType::Fixed)
+                        false
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            job_id = %job_id_str,
+                            job_id = %req.job_id,
                             queue = %queue,
-                            "grant scanner: failed to read job info, falling back to limit=1"
+                            "grant scanner: failed to load job status; skipping request this pass"
                         );
-                        (1, ConcurrencyLimitType::Fixed)
+                        continue;
                     }
                 };
-                self.cache_queue_limit(tenant, queue, l as u32, lt);
-                max_concurrency = Some((l, lt));
-            }
 
-            scanned.push(ScannedRequest {
-                request_key: kv.key.to_vec(),
-                request_id,
-                job_id: job_id_str.to_string(),
-                attempt_number: et.attempt_number(),
-                relative_attempt_number: et.relative_attempt_number(),
-                start_time_ms,
-                priority: et.priority(),
-                task_group: et.task_group().unwrap_or_default().to_string(),
-            });
-        }
-
-        if scanned.is_empty() && corrupt_keys.is_empty() {
-            return Vec::new();
-        }
-
-        // --- Phase 2: Batch validate status for all scanned requests ---
-        // Issue all status reads concurrently, then partition into valid vs stale.
-        let status_futures: Vec<_> = scanned
-            .iter()
-            .map(|c| {
-                let key = job_status_key(tenant, &c.job_id);
-                async move { db.get(&key).await }
-            })
-            .collect();
-        let status_results = futures::future::join_all(status_futures).await;
-
-        let mut valid_requests: Vec<ScannedRequest> = Vec::new();
-        let mut stale_request_keys: Vec<Vec<u8>> = Vec::new();
-
-        for (req, status_result) in scanned.into_iter().zip(status_results.into_iter()) {
-            let is_valid = match status_result {
-                Ok(Some(status_raw)) => match decode_job_status_owned(&status_raw) {
-                    // [SILO-GRANT-5] Request records are only valid for the currently
-                    // scheduled attempt.
-                    Ok(status)
-                        if status.kind != JobStatusKind::Scheduled
-                            || status.current_attempt != Some(req.attempt_number) =>
-                    {
-                        // [SILO-GRANT-6] Drop stale request key without granting work.
-                        tracing::debug!(
-                            job_id = %req.job_id,
-                            queue = %queue,
-                            request_attempt = req.attempt_number,
-                            status_kind = ?status.kind,
-                            status_attempt = ?status.current_attempt,
-                            "grant scanner: skipping stale request for non-current attempt"
-                        );
-                        false
-                    }
-                    Ok(_) => true,
-                    Err(_) => {
-                        tracing::warn!(
-                            job_id = %req.job_id,
-                            queue = %queue,
-                            "grant scanner: dropping request with unreadable job status"
-                        );
-                        false
-                    }
-                },
-                Ok(None) => {
-                    tracing::debug!(
-                        job_id = %req.job_id,
-                        queue = %queue,
-                        "grant scanner: dropping request for missing job status"
-                    );
-                    false
+                if is_valid {
+                    valid_requests.push(req);
+                } else {
+                    batch.delete(&req.request_key);
+                    stale_and_corrupt_count += 1;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        job_id = %req.job_id,
-                        queue = %queue,
-                        "grant scanner: failed to load job status; skipping request this pass"
-                    );
-                    // Don't delete — may be valid, we just couldn't read it
-                    continue;
+            }
+
+            // --- Reserve in-memory slots and accumulate grant edits ---
+            let limit = max_concurrency.map(|(l, _)| l).unwrap_or(1);
+            for req in &valid_requests {
+                if grants.len() >= count as usize {
+                    break;
                 }
-            };
 
-            if is_valid {
-                valid_requests.push(req);
-            } else {
-                stale_request_keys.push(req.request_key);
-            }
-        }
-
-        // --- Phase 3: Reserve in-memory slots and build single WriteBatch ---
-        let limit = max_concurrency.map(|(l, _)| l).unwrap_or(1);
-        let mut batch = WriteBatch::new();
-        // Each grant: (request_id, task_group)
-        let mut grants: Vec<(String, String)> = Vec::new();
-
-        for req in &valid_requests {
-            if grants.len() >= count as usize {
-                break;
-            }
-
-            // [SILO-GRANT-1] Pre: Queue has capacity — try to atomically reserve a slot
-            if !self
-                .counts
-                .try_reserve_internal(tenant, queue, &req.request_id, limit, &req.job_id)
-            {
-                break;
-            }
-
-            // [SILO-GRANT-3] Create holder
-            let holder_val = encode_holder(&HolderRecord {
-                granted_at_ms: now_ms,
-            });
-            batch.put(
-                concurrency_holder_key(tenant, queue, &req.request_id),
-                &holder_val,
-            );
-
-            // [SILO-GRANT-4] Create RunAttempt task
-            let tval = encode_task(&Task::RunAttempt {
-                id: req.request_id.clone(),
-                tenant: tenant.to_string(),
-                job_id: req.job_id.clone(),
-                attempt_number: req.attempt_number,
-                relative_attempt_number: req.relative_attempt_number,
-                held_queues: vec![queue.to_string()],
-                task_group: req.task_group.clone(),
-            });
-            batch.put(
-                task_key(
-                    &req.task_group,
-                    req.start_time_ms,
-                    req.priority,
+                // [SILO-GRANT-1] Pre: Queue has capacity — try to atomically reserve a slot
+                if !self.counts.try_reserve_internal(
+                    tenant,
+                    queue,
+                    &req.request_id,
+                    limit,
                     &req.job_id,
-                    req.attempt_number,
-                ),
-                &tval,
-            );
-            batch.delete(&req.request_key);
+                ) {
+                    capacity_exhausted = true;
+                    break;
+                }
 
-            grants.push((req.request_id.clone(), req.task_group.clone()));
+                // [SILO-GRANT-3] Create holder
+                let holder_val = encode_holder(&HolderRecord {
+                    granted_at_ms: now_ms,
+                });
+                batch.put(
+                    concurrency_holder_key(tenant, queue, &req.request_id),
+                    &holder_val,
+                );
+
+                // [SILO-GRANT-4] Create RunAttempt task
+                let tval = encode_task(&Task::RunAttempt {
+                    id: req.request_id.clone(),
+                    tenant: tenant.to_string(),
+                    job_id: req.job_id.clone(),
+                    attempt_number: req.attempt_number,
+                    relative_attempt_number: req.relative_attempt_number,
+                    held_queues: vec![queue.to_string()],
+                    task_group: req.task_group.clone(),
+                });
+                batch.put(
+                    task_key(
+                        &req.task_group,
+                        req.start_time_ms,
+                        req.priority,
+                        &req.job_id,
+                        req.attempt_number,
+                    ),
+                    &tval,
+                );
+                batch.delete(&req.request_key);
+
+                grants.push((req.request_id.clone(), req.task_group.clone()));
+            }
         }
 
-        for key in &stale_request_keys {
-            batch.delete(key);
-        }
-        for key in &corrupt_keys {
-            batch.delete(key);
-        }
-
-        // Single combined counter decrement for all grants + stale deletions
-        let total_counter_decrement = grants.len() + stale_request_keys.len();
+        // Single combined counter decrement for all grants + stale/corrupt deletions
+        let total_counter_decrement = grants.len() + stale_and_corrupt_count;
         if total_counter_decrement > 0 {
             batch.merge(
                 concurrency_requester_counter_key(tenant, queue),
@@ -1037,11 +1047,11 @@ impl ConcurrencyManager {
             );
         }
 
-        if grants.is_empty() && stale_request_keys.is_empty() && corrupt_keys.is_empty() {
+        if grants.is_empty() && stale_and_corrupt_count == 0 {
             return Vec::new();
         }
 
-        // --- Phase 4: Single durable write ---
+        // --- Single durable write ---
         if let Err(e) = db
             .write_with_options(
                 batch,
