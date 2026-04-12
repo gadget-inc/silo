@@ -295,18 +295,34 @@ async fn bench_concurrency_reconcile_once(metadata: &GoldenShardMetadata) {
     println!();
 }
 
-async fn bench_process_grants_small(metadata: &GoldenShardMetadata) {
-    println!("--- process_grants (5 grants from fresh queue) ---");
-    let queue = "bench-grants-5";
-    let (_guard, shard) = setup_grant_bench("grants-small", metadata, queue, 5, 20).await;
+async fn bench_process_grants(
+    metadata: &GoldenShardMetadata,
+    label: &str,
+    grant_count: usize,
+    waiter_count: usize,
+) {
+    println!(
+        "--- process_grants ({} grants from fresh queue) ---",
+        grant_count
+    );
+    let queue = format!("bench-grants-{}", grant_count);
+    let clone_name = format!("grants-{}", label);
+    let (_guard, shard) =
+        setup_grant_bench(&clone_name, metadata, &queue, grant_count, waiter_count).await;
 
-    let r = bench_op("process_grants(5)", 0, 1, || {
+    let r = bench_op(&format!("process_grants({})", grant_count), 0, 1, || {
         let shard = Arc::clone(&shard);
+        let queue = queue.clone();
         async move {
             let granted = shard
-                .process_concurrency_grants(BENCH_DEEP_QUEUE_TENANT, queue, 5)
+                .process_concurrency_grants(BENCH_DEEP_QUEUE_TENANT, &queue, grant_count as u32)
                 .await;
-            assert_eq!(granted.len(), 5, "expected 5 grants");
+            assert_eq!(
+                granted.len(),
+                grant_count,
+                "expected {} grants",
+                grant_count
+            );
         }
     })
     .await;
@@ -401,48 +417,6 @@ async fn setup_grant_bench(
     }
 
     (_guard, shard)
-}
-
-async fn bench_process_grants_medium(metadata: &GoldenShardMetadata) {
-    println!("--- process_grants (50 grants from fresh queue) ---");
-    let queue = "bench-grants-50";
-    let (_guard, shard) = setup_grant_bench("grants-medium", metadata, queue, 50, 200).await;
-
-    let r = bench_op("process_grants(50)", 0, 1, || {
-        let shard = Arc::clone(&shard);
-        async move {
-            let granted = shard
-                .process_concurrency_grants(BENCH_DEEP_QUEUE_TENANT, queue, 50)
-                .await;
-            assert_eq!(granted.len(), 50, "expected 50 grants");
-        }
-    })
-    .await;
-    r.print();
-
-    shard.close().await.expect("close");
-    println!();
-}
-
-async fn bench_process_grants_large(metadata: &GoldenShardMetadata) {
-    println!("--- process_grants (500 grants from fresh queue) ---");
-    let queue = "bench-grants-500";
-    let (_guard, shard) = setup_grant_bench("grants-large", metadata, queue, 500, 1000).await;
-
-    let r = bench_op("process_grants(500)", 0, 1, || {
-        let shard = Arc::clone(&shard);
-        async move {
-            let granted = shard
-                .process_concurrency_grants(BENCH_DEEP_QUEUE_TENANT, queue, 500)
-                .await;
-            assert_eq!(granted.len(), 500, "expected 500 grants");
-        }
-    })
-    .await;
-    r.print();
-
-    shard.close().await.expect("close");
-    println!();
 }
 
 async fn bench_cancel_no_limit(metadata: &GoldenShardMetadata) {
@@ -702,9 +676,9 @@ async fn main() {
     bench_dequeue_no_limit(&metadata).await;
     bench_dequeue_heavy_concurrency(&metadata).await;
     bench_concurrency_reconcile_once(&metadata).await;
-    bench_process_grants_small(&metadata).await;
-    bench_process_grants_medium(&metadata).await;
-    bench_process_grants_large(&metadata).await;
+    bench_process_grants(&metadata, "small", 5, 20).await;
+    bench_process_grants(&metadata, "medium", 50, 200).await;
+    bench_process_grants(&metadata, "large", 500, 1000).await;
     bench_cancel_no_limit(&metadata).await;
     bench_cancel_with_concurrency(&metadata).await;
     bench_expedite_scheduled(&metadata).await;
