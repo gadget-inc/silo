@@ -752,7 +752,7 @@ impl ConcurrencyManager {
     /// Optimized for throughput: scans candidates, batch-validates their status
     /// concurrently, then reserves in-memory slots and writes all grants plus stale
     /// deletions in a single durable batch.
-    pub async fn process_grants(
+    pub(crate) async fn process_grants(
         &self,
         db: &Db,
         range: &ShardRange,
@@ -804,10 +804,9 @@ impl ConcurrencyManager {
         let mut scanned: Vec<ScannedRequest> = Vec::new();
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
 
-        // Scan up to 2x count to have enough candidates after filtering stale ones.
-        // On the common path (no stale requests), the extra scanning is bounded by
-        // the iterator returning None when requests are exhausted.
-        let scan_limit = (count as usize).saturating_mul(2).max(count as usize + 16);
+        // Scan up to 2x count to have enough candidates after filtering stale ones,
+        // capped to avoid issuing too many concurrent status reads in phase 2.
+        let scan_limit = (count as usize).saturating_mul(2).min(512);
 
         while scanned.len() < scan_limit {
             let kv = match iter.next().await {
@@ -850,15 +849,37 @@ impl ConcurrencyManager {
             };
             let request_id = parsed_req.request_id();
 
-            // Resolve max_concurrency once (cached per queue from first successful lookup)
             if max_concurrency.is_none() {
                 let job_key = crate::keys::job_info_key(tenant, job_id_str);
                 let (l, lt) = match db.get(&job_key).await {
                     Ok(Some(bytes)) => match JobView::new(bytes) {
                         Ok(view) => Self::resolve_queue_capacity(db, tenant, queue, &view).await,
-                        Err(_) => (1, ConcurrencyLimitType::Fixed),
+                        Err(_) => {
+                            tracing::warn!(
+                                job_id = %job_id_str,
+                                queue = %queue,
+                                "grant scanner: undecodable job info, falling back to limit=1"
+                            );
+                            (1, ConcurrencyLimitType::Fixed)
+                        }
                     },
-                    _ => (1, ConcurrencyLimitType::Fixed),
+                    Ok(None) => {
+                        tracing::warn!(
+                            job_id = %job_id_str,
+                            queue = %queue,
+                            "grant scanner: job info missing, falling back to limit=1"
+                        );
+                        (1, ConcurrencyLimitType::Fixed)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            job_id = %job_id_str,
+                            queue = %queue,
+                            "grant scanner: failed to read job info, falling back to limit=1"
+                        );
+                        (1, ConcurrencyLimitType::Fixed)
+                    }
                 };
                 self.cache_queue_limit(tenant, queue, l as u32, lt);
                 max_concurrency = Some((l, lt));
@@ -954,11 +975,11 @@ impl ConcurrencyManager {
         // --- Phase 3: Reserve in-memory slots and build single WriteBatch ---
         let limit = max_concurrency.map(|(l, _)| l).unwrap_or(1);
         let mut batch = WriteBatch::new();
-        let mut granted_task_groups: Vec<String> = Vec::new();
-        let mut granted_request_ids: Vec<String> = Vec::new();
+        // Each grant: (request_id, task_group)
+        let mut grants: Vec<(String, String)> = Vec::new();
 
         for req in &valid_requests {
-            if granted_task_groups.len() >= count as usize {
+            if grants.len() >= count as usize {
                 break;
             }
 
@@ -967,22 +988,20 @@ impl ConcurrencyManager {
                 .counts
                 .try_reserve_internal(tenant, queue, &req.request_id, limit, &req.job_id)
             {
-                // No capacity - stop granting
                 break;
             }
 
             // [SILO-GRANT-3] Create holder
-            let holder = HolderRecord {
+            let holder_val = encode_holder(&HolderRecord {
                 granted_at_ms: now_ms,
-            };
-            let holder_val = encode_holder(&holder);
+            });
             batch.put(
                 concurrency_holder_key(tenant, queue, &req.request_id),
                 &holder_val,
             );
 
             // [SILO-GRANT-4] Create RunAttempt task
-            let task = Task::RunAttempt {
+            let tval = encode_task(&Task::RunAttempt {
                 id: req.request_id.clone(),
                 tenant: tenant.to_string(),
                 job_id: req.job_id.clone(),
@@ -990,8 +1009,7 @@ impl ConcurrencyManager {
                 relative_attempt_number: req.relative_attempt_number,
                 held_queues: vec![queue.to_string()],
                 task_group: req.task_group.clone(),
-            };
-            let tval = encode_task(&task);
+            });
             batch.put(
                 task_key(
                     &req.task_group,
@@ -1004,35 +1022,26 @@ impl ConcurrencyManager {
             );
             batch.delete(&req.request_key);
 
-            // Decrement the per-queue requester counter (request converted to holder)
-            batch.merge(
-                concurrency_requester_counter_key(tenant, queue),
-                encode_counter(-1),
-            );
-
-            granted_request_ids.push(req.request_id.clone());
-            granted_task_groups.push(req.task_group.clone());
+            grants.push((req.request_id.clone(), req.task_group.clone()));
         }
 
-        // Add stale request deletions to the same batch
         for key in &stale_request_keys {
             batch.delete(key);
-            batch.merge(
-                concurrency_requester_counter_key(tenant, queue),
-                encode_counter(-1),
-            );
         }
-
-        // Add corrupt key deletions
         for key in &corrupt_keys {
             batch.delete(key);
         }
 
-        // Skip the write if there's nothing to do
-        if granted_task_groups.is_empty()
-            && stale_request_keys.is_empty()
-            && corrupt_keys.is_empty()
-        {
+        // Single combined counter decrement for all grants + stale deletions
+        let total_counter_decrement = grants.len() + stale_request_keys.len();
+        if total_counter_decrement > 0 {
+            batch.merge(
+                concurrency_requester_counter_key(tenant, queue),
+                encode_counter(-(total_counter_decrement as i64)),
+            );
+        }
+
+        if grants.is_empty() && stale_request_keys.is_empty() && corrupt_keys.is_empty() {
             return Vec::new();
         }
 
@@ -1046,19 +1055,18 @@ impl ConcurrencyManager {
             )
             .await
         {
-            // Roll back all in-memory reservations
-            for request_id in &granted_request_ids {
+            for (request_id, _) in &grants {
                 self.counts.release_reservation(tenant, queue, request_id);
             }
             tracing::warn!(
                 error = %e,
-                count = granted_request_ids.len(),
+                count = grants.len(),
                 "grant scanner: batch write failed, rolled back all reservations"
             );
             return Vec::new();
         }
 
-        for (request_id, task_group) in granted_request_ids.iter().zip(granted_task_groups.iter()) {
+        for (request_id, task_group) in &grants {
             tracing::debug!(
                 queue = %queue,
                 request_id = %request_id,
@@ -1067,7 +1075,7 @@ impl ConcurrencyManager {
             );
         }
 
-        granted_task_groups
+        grants.into_iter().map(|(_, tg)| tg).collect()
     }
 }
 
