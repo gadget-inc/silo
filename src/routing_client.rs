@@ -102,8 +102,9 @@ pub enum ErrorAction {
     /// Server returned FailedPrecondition — tenant not in shard range. Need full topology refresh.
     RefreshTopology,
     /// Server returned UNAVAILABLE — shard is temporarily unavailable (split in progress,
-    /// acquisition pending). Caller should retry with backoff.
-    RetryWithBackoff,
+    /// acquisition pending, or pod gone). Refresh topology to discover new pod addresses,
+    /// then retry with backoff.
+    RefreshTopologyWithBackoff,
     /// Not a routing error — don't retry.
     NotRoutingError,
 }
@@ -130,9 +131,10 @@ pub fn classify_error(status: &tonic::Status, shard_id: &str) -> ErrorAction {
             ErrorAction::RefreshTopology
         }
         tonic::Code::Unavailable => {
-            // Shard is temporarily unavailable: split in progress or acquisition pending.
-            // Retry with backoff — the shard will be ready soon.
-            ErrorAction::RetryWithBackoff
+            // Shard is temporarily unavailable: split in progress, acquisition pending,
+            // or pod completely gone. Refresh topology to discover new addresses, then
+            // retry with backoff.
+            ErrorAction::RefreshTopologyWithBackoff
         }
         _ => ErrorAction::NotRoutingError,
     }
@@ -333,10 +335,12 @@ impl RoutingClient {
                     None
                 }
             }
-            ErrorAction::RetryWithBackoff => {
-                // UNAVAILABLE — shard temporarily down (split/acquisition). Just signal
-                // the caller to retry with backoff; no topology change needed.
-                debug!("Shard temporarily unavailable, retrying with backoff");
+            ErrorAction::RefreshTopologyWithBackoff => {
+                // UNAVAILABLE — shard temporarily down (split/acquisition/pod gone).
+                // Refresh topology so we discover any new pod addresses, then signal
+                // the caller to retry with backoff.
+                info!("Shard unavailable, refreshing topology and retrying with backoff");
+                self.refresh_topology().await;
                 Some(true)
             }
             ErrorAction::NotRoutingError => None,

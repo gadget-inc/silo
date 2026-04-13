@@ -323,14 +323,14 @@ async fn classify_error_failed_precondition() {
     );
 }
 
-/// Test that classify_error returns RetryWithBackoff for UNAVAILABLE errors.
+/// Test that classify_error returns RefreshTopologyWithBackoff for UNAVAILABLE errors.
 #[silo::test(flavor = "multi_thread")]
 async fn classify_error_unavailable() {
     let status = tonic::Status::unavailable("shard temporarily unavailable");
     let action = silo::routing_client::classify_error(&status, "shard-456");
     assert!(
-        matches!(action, ErrorAction::RetryWithBackoff),
-        "expected RetryWithBackoff, got {:?}",
+        matches!(action, ErrorAction::RefreshTopologyWithBackoff),
+        "expected RefreshTopologyWithBackoff, got {:?}",
         action
     );
 }
