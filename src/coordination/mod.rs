@@ -404,6 +404,7 @@ impl CoordinatorBase {
 
     /// Create a coordinator base with pre-built shared state.
     /// Used by tests that need to share `shard_map` and `owned` Arcs with mock coordinators.
+    #[doc(hidden)]
     pub fn new_with_shared(
         node_id: impl Into<String>,
         grpc_addr: impl Into<String>,

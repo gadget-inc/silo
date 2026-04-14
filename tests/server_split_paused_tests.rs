@@ -609,13 +609,8 @@ async fn enqueue_fails_when_k8s_api_unreachable_during_split() {
     ));
 
     let coord = Arc::new(
-        K8sUnreachableCoordinator::new(
-            "test-node",
-            "http://localhost:7450",
-            2,
-            factory.clone(),
-        )
-        .await,
+        K8sUnreachableCoordinator::new("test-node", "http://localhost:7450", 2, factory.clone())
+            .await,
     );
 
     let shard_ids = coord.owned_shards().await;

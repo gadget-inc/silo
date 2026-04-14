@@ -117,6 +117,22 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+    // Re-hydrate the paused-shards cache from any persisted split records
+    // left behind by a previous incarnation. This ensures is_shard_paused
+    // correctly rejects traffic to shards that were mid-split before the
+    // process restarted. The split records themselves are NOT cleaned up —
+    // an operator must decide whether to abandon them (e.g. via siloctl or
+    // recover_stale_splits).
+    {
+        let splitter = silo::coordination::ShardSplitter::new(coordinator.clone());
+        splitter.rehydrate_paused_shards().await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to re-hydrate paused shards from split records: {}",
+                e
+            )
+        })?;
+    }
+
     // Start gRPC server and scheduled reaper together
     let addr: SocketAddr = cfg.server.grpc_addr.parse()?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

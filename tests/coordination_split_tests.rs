@@ -1362,6 +1362,280 @@ mod splitter_unit_tests {
         }
     }
 
+    /// Mock coordinator that accepts an external splits map, simulating
+    /// persistent split storage (ConfigMaps) that survives process restarts.
+    /// The CoordinatorBase is always fresh (empty paused_shards cache),
+    /// just like a real coordinator after restart.
+    struct MockSplitBackendWithSharedStorage {
+        base: CoordinatorBase,
+        splits: Arc<Mutex<HashMap<ShardId, SplitInProgress>>>,
+    }
+
+    impl MockSplitBackendWithSharedStorage {
+        fn new(
+            shard_map: Arc<Mutex<ShardMap>>,
+            owned: Arc<Mutex<HashSet<ShardId>>>,
+            factory: Arc<ShardFactory>,
+            splits: Arc<Mutex<HashMap<ShardId, SplitInProgress>>>,
+        ) -> Self {
+            let base = CoordinatorBase::new_with_shared(
+                "mock-node",
+                "http://mock:7450",
+                shard_map,
+                owned,
+                factory,
+            );
+            Self { base, splits }
+        }
+    }
+
+    #[async_trait]
+    impl Coordinator for MockSplitBackendWithSharedStorage {
+        fn base(&self) -> &CoordinatorBase {
+            &self.base
+        }
+
+        async fn shutdown(&self) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn wait_converged(&self, _timeout: Duration) -> bool {
+            true
+        }
+
+        async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
+            Ok(vec![])
+        }
+
+        async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
+            let shard_map = self.base.shard_map.lock().await.clone();
+            Ok(ShardOwnerMap {
+                shard_map,
+                shard_to_node: HashMap::new(),
+                shard_to_addr: HashMap::new(),
+            })
+        }
+
+        async fn update_shard_placement_ring(
+            &self,
+            _shard_id: &ShardId,
+            _ring: Option<&str>,
+        ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+            Ok((None, None))
+        }
+
+        async fn force_release_shard_lease(
+            &self,
+            _shard_id: &ShardId,
+        ) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+            Ok(vec![])
+        }
+    }
+
+    #[async_trait]
+    impl SplitStorageBackend for MockSplitBackendWithSharedStorage {
+        async fn load_split(
+            &self,
+            parent_shard_id: &ShardId,
+        ) -> Result<Option<SplitInProgress>, CoordinationError> {
+            Ok(self.splits.lock().await.get(parent_shard_id).cloned())
+        }
+
+        async fn store_split(&self, split: &SplitInProgress) -> Result<(), CoordinationError> {
+            self.splits
+                .lock()
+                .await
+                .insert(split.parent_shard_id, split.clone());
+            Ok(())
+        }
+
+        async fn delete_split(&self, parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+            self.splits.lock().await.remove(parent_shard_id);
+            Ok(())
+        }
+
+        async fn update_shard_map_for_split(
+            &self,
+            split: &SplitInProgress,
+        ) -> Result<(), CoordinationError> {
+            let mut shard_map = self.base.shard_map.lock().await;
+            shard_map.split_shard(
+                &split.parent_shard_id,
+                &split.split_point,
+                split.left_child_id,
+                split.right_child_id,
+            )?;
+            Ok(())
+        }
+
+        async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
+            Ok(self.splits.lock().await.values().cloned().collect())
+        }
+    }
+
+    /// After a process restart, the split ConfigMap still exists in storage
+    /// but the local paused_shards cache is empty. This means is_shard_paused
+    /// returns false, allowing traffic through to a shard that was mid-split.
+    #[tokio::test]
+    async fn test_restart_loses_paused_state_for_stuck_split() {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let factory = Arc::new(ShardFactory::new_noop());
+
+        // Shared split storage — survives "restarts" like a real ConfigMap would.
+        let splits: Arc<Mutex<HashMap<ShardId, SplitInProgress>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        owned.lock().await.insert(shard_id);
+
+        // --- First incarnation: request a split and advance to SplitPausing ---
+        let mock1 = Arc::new(MockSplitBackendWithSharedStorage::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory.clone(),
+            splits.clone(),
+        ));
+        let splitter1 = ShardSplitter::new(Arc::clone(&mock1) as Arc<dyn Coordinator>);
+
+        splitter1
+            .request_split(shard_id, "2".to_string())
+            .await
+            .unwrap();
+        splitter1.advance_split_phase(shard_id).await.unwrap();
+
+        // In production, execute_split_inner populates the paused cache when
+        // advancing to SplitPausing. advance_split_phase is a test helper that
+        // only updates the record, so we replicate what execute_split does.
+        mock1.base().mark_shard_paused(shard_id);
+
+        // Split is in SplitPausing — traffic should be paused.
+        let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
+        assert_eq!(status.phase, SplitPhase::SplitPausing);
+        assert!(
+            mock1.base().is_shard_paused(&shard_id),
+            "shard should be paused before restart"
+        );
+
+        // The split record exists in storage.
+        assert!(
+            splits.lock().await.contains_key(&shard_id),
+            "split ConfigMap should exist in storage"
+        );
+
+        // --- Simulate process restart: new coordinator, same storage ---
+        // The CoordinatorBase is fresh (empty paused_shards cache),
+        // but the split ConfigMap persists in the shared storage.
+        let mock2 = Arc::new(MockSplitBackendWithSharedStorage::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory.clone(),
+            splits.clone(),
+        ));
+        let splitter2 = ShardSplitter::new(Arc::clone(&mock2) as Arc<dyn Coordinator>);
+
+        // The split record still exists in storage.
+        let status = splitter2.get_split_status(shard_id).await.unwrap().unwrap();
+        assert_eq!(
+            status.phase,
+            SplitPhase::SplitPausing,
+            "split record should survive restart"
+        );
+        assert!(
+            splits.lock().await.contains_key(&shard_id),
+            "split ConfigMap should still exist after restart"
+        );
+
+        // Before re-hydration the local cache is empty.
+        assert!(
+            !mock2.base().is_shard_paused(&shard_id),
+            "paused_shards cache should be empty before re-hydration"
+        );
+
+        // Re-hydrate the cache from persisted split records.
+        splitter2.rehydrate_paused_shards().await.unwrap();
+
+        // The shard should now be paused again.
+        assert!(
+            mock2.base().is_shard_paused(&shard_id),
+            "shard should be paused after re-hydrating from stored split records"
+        );
+
+        // The split ConfigMap must still exist — rehydrate does not clean up.
+        // An operator should decide whether to abandon or retry the split
+        // (e.g. via siloctl or recover_stale_splits).
+        assert!(
+            splits.lock().await.contains_key(&shard_id),
+            "split ConfigMap should not be deleted by rehydrate_paused_shards"
+        );
+        let status = splitter2.get_split_status(shard_id).await.unwrap().unwrap();
+        assert_eq!(
+            status.phase,
+            SplitPhase::SplitPausing,
+            "split record should be untouched"
+        );
+    }
+
+    /// recover_stale_splits must clear the paused-shards cache entry after
+    /// deleting the split record. Without this, a shard stays permanently
+    /// paused with no way to unpause through normal operation.
+    #[tokio::test]
+    async fn test_recover_stale_splits_clears_paused_cache() {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let factory = Arc::new(ShardFactory::new_noop());
+        let splits: Arc<Mutex<HashMap<ShardId, SplitInProgress>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        owned.lock().await.insert(shard_id);
+
+        // Create a split and advance to SplitPausing.
+        let mock = Arc::new(MockSplitBackendWithSharedStorage::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory.clone(),
+            splits.clone(),
+        ));
+        let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
+
+        splitter
+            .request_split(shard_id, "2".to_string())
+            .await
+            .unwrap();
+        splitter.advance_split_phase(shard_id).await.unwrap();
+
+        // Simulate startup: re-hydrate populates the cache.
+        splitter.rehydrate_paused_shards().await.unwrap();
+        assert!(
+            mock.base().is_shard_paused(&shard_id),
+            "shard should be paused after rehydrate"
+        );
+
+        // Operator runs recover_stale_splits to abandon the stuck split.
+        splitter.recover_stale_splits().await.unwrap();
+
+        // The split record should be gone.
+        assert!(
+            splits.lock().await.is_empty(),
+            "split record should be deleted"
+        );
+
+        // The paused cache must also be cleared.
+        assert!(
+            !mock.base().is_shard_paused(&shard_id),
+            "shard must not be paused after recover_stale_splits"
+        );
+    }
+
     #[tokio::test]
     async fn test_request_split_validates_ownership() {
         let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
@@ -1874,5 +2148,4 @@ mod splitter_unit_tests {
             "shard should be usable after factory.close + factory.open"
         );
     }
-
 }
