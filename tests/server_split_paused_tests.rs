@@ -452,3 +452,243 @@ async fn requests_succeed_after_split_completes() {
     let result = svc.enqueue(req).await;
     assert!(result.is_ok(), "should succeed after split completes");
 }
+
+/// Mock coordinator that simulates a k8s API outage.
+///
+/// All backend/split-storage operations return errors. Crucially, it does NOT
+/// override `is_shard_paused`, so the default trait implementation is used —
+/// which reads from the local `CoordinatorBase` paused-shards cache.
+struct K8sUnreachableCoordinator {
+    base: CoordinatorBase,
+}
+
+impl K8sUnreachableCoordinator {
+    async fn new(
+        node_id: impl Into<String>,
+        grpc_addr: impl Into<String>,
+        num_shards: u32,
+        factory: Arc<ShardFactory>,
+    ) -> Self {
+        let shard_map = ShardMap::create_initial(num_shards).expect("create shard map");
+        let owned_shards: HashSet<ShardId> = shard_map.shard_ids().into_iter().collect();
+        let base = CoordinatorBase::new(node_id, grpc_addr, shard_map, factory, Vec::new());
+        *base.owned.lock().await = owned_shards;
+        Self { base }
+    }
+}
+
+#[tonic::async_trait]
+impl Coordinator for K8sUnreachableCoordinator {
+    fn base(&self) -> &CoordinatorBase {
+        &self.base
+    }
+
+    async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn wait_converged(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
+
+    async fn shutdown(&self) -> Result<(), CoordinationError> {
+        Ok(())
+    }
+
+    // NOTE: is_shard_paused is intentionally NOT overridden here.
+    // The default trait impl reads from base().paused_shards — this is
+    // exactly the code path we're testing.
+
+    async fn update_shard_placement_ring(
+        &self,
+        _shard_id: &ShardId,
+        _ring: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn force_release_shard_lease(
+        &self,
+        _shard_id: &ShardId,
+    ) -> Result<(), CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+}
+
+#[tonic::async_trait]
+impl SplitStorageBackend for K8sUnreachableCoordinator {
+    async fn load_split(
+        &self,
+        _parent_shard_id: &ShardId,
+    ) -> Result<Option<SplitInProgress>, CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn store_split(&self, _split: &SplitInProgress) -> Result<(), CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn delete_split(&self, _parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn update_shard_map_for_split(
+        &self,
+        _split: &SplitInProgress,
+    ) -> Result<(), CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+
+    async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
+        Err(CoordinationError::BackendError(
+            "k8s API unreachable".to_string(),
+        ))
+    }
+}
+
+/// Enqueue must fail with UNAVAILABLE when the k8s API is unreachable and
+/// the shard has a split in progress. The local paused-shards cache (not
+/// a live API call) must be the source of truth on the hot request path.
+///
+/// Also verifies that a non-paused shard on the same node still accepts
+/// enqueues — an API outage must not block all traffic.
+#[silo::test]
+async fn enqueue_fails_when_k8s_api_unreachable_during_split() {
+    let tmpdir = std::env::temp_dir().join(format!(
+        "silo-k8s-unreachable-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let factory = Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            wal: None,
+            apply_wal_on_close: true,
+            concurrency_reconcile_interval_ms: 5000,
+            slatedb: None,
+            memory_cache: None,
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    ));
+
+    let coord = Arc::new(
+        K8sUnreachableCoordinator::new(
+            "test-node",
+            "http://localhost:7450",
+            2,
+            factory.clone(),
+        )
+        .await,
+    );
+
+    let shard_ids = coord.owned_shards().await;
+    let paused_shard = shard_ids[0];
+    let healthy_shard = shard_ids[1];
+
+    // Open both shards in the factory
+    factory
+        .open(&paused_shard, &ShardRange::full())
+        .await
+        .expect("open paused shard");
+    factory
+        .open(&healthy_shard, &ShardRange::full())
+        .await
+        .expect("open healthy shard");
+
+    // Simulate: a split was in progress before the k8s API went down.
+    // The local cache was populated when the split entered a pausing phase.
+    coord.base.mark_shard_paused(paused_shard);
+
+    let cfg = silo::settings::AppConfig::load(None).expect("load config");
+    let svc = SiloService::new(factory, coord, cfg, None);
+
+    // Enqueue to the paused shard — must fail with UNAVAILABLE
+    let req = Request::new(EnqueueRequest {
+        shard: paused_shard.to_string(),
+        tenant: None,
+        id: "job-paused".to_string(),
+        priority: 0,
+        start_at_ms: 0,
+        retry_policy: None,
+        payload: Some(SerializedBytes {
+            encoding: Some(serialized_bytes::Encoding::Msgpack(msgpack_payload(
+                &serde_json::json!({"data": "test"}),
+            ))),
+        }),
+        limits: vec![],
+        metadata: HashMap::new(),
+        task_group: "default".to_string(),
+    });
+    let result = svc.enqueue(req).await;
+    assert!(result.is_err(), "enqueue must fail on paused shard");
+    let status = result.err().unwrap();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unavailable,
+        "should return UNAVAILABLE, not silently succeed"
+    );
+    assert!(
+        status.message().contains("split in progress"),
+        "error message should mention split"
+    );
+
+    // Enqueue to the healthy shard — must succeed
+    let req = Request::new(EnqueueRequest {
+        shard: healthy_shard.to_string(),
+        tenant: None,
+        id: "job-healthy".to_string(),
+        priority: 0,
+        start_at_ms: 0,
+        retry_policy: None,
+        payload: Some(SerializedBytes {
+            encoding: Some(serialized_bytes::Encoding::Msgpack(msgpack_payload(
+                &serde_json::json!({"data": "test"}),
+            ))),
+        }),
+        limits: vec![],
+        metadata: HashMap::new(),
+        task_group: "default".to_string(),
+    });
+    let result = svc.enqueue(req).await;
+    assert!(
+        result.is_ok(),
+        "enqueue to non-paused shard must succeed even when k8s API is unreachable"
+    );
+}

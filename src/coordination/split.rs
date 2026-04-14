@@ -455,6 +455,15 @@ impl ShardSplitter {
                     CoordinationError::NoSplitInProgress(parent_shard_id),
                 ))?;
 
+            // Ensure the local paused cache reflects the persisted split state.
+            // This handles resumption after restarts or brief interruptions where
+            // the cache may not yet reflect a traffic-pausing phase.
+            if split.phase.traffic_paused() {
+                self.coordinator
+                    .base()
+                    .mark_shard_paused(parent_shard_id);
+            }
+
             // Verify we own the shard (not needed for SplitComplete which is just cleanup)
             if split.phase != SplitPhase::SplitComplete
                 && !self.ctx.owns_shard(&parent_shard_id).await
@@ -472,6 +481,11 @@ impl ShardSplitter {
                         .store_split(&split)
                         .await
                         .map_err(SplitExecutionError::PreCommit)?;
+                    // Mark shard as paused in local cache so the hot request path
+                    // returns UNAVAILABLE without any k8s API calls.
+                    self.coordinator
+                        .base()
+                        .mark_shard_paused(parent_shard_id);
                     info!(
                         parent_shard_id = %parent_shard_id,
                         phase = %split.phase,
@@ -696,6 +710,9 @@ impl ShardSplitter {
                         .delete_split(&parent_shard_id)
                         .await
                         .map_err(SplitExecutionError::PostCommit)?;
+                    self.coordinator
+                        .base()
+                        .mark_shard_unpaused(parent_shard_id);
                     info!(
                         parent_shard_id = %parent_shard_id,
                         "split record cleaned up"
@@ -716,7 +733,11 @@ impl ShardSplitter {
             parent_shard_id = %parent_shard_id,
             "abandoning split, deleting split record to restore parent shard"
         );
-        self.coordinator.delete_split(parent_shard_id).await
+        self.coordinator.delete_split(parent_shard_id).await?;
+        self.coordinator
+            .base()
+            .mark_shard_unpaused(*parent_shard_id);
+        Ok(())
     }
 
     /// Recover the parent shard after a failed split left its database closed.

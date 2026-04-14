@@ -367,6 +367,11 @@ pub struct CoordinatorBase {
     /// Placement rings this node participates in.
     /// Empty means the node participates in the default ring only.
     pub placement_rings: Vec<String>,
+    /// Cache of shards that are currently paused for split operations.
+    /// Updated by the split execution code when phases change.
+    /// Read by `is_shard_paused` on the hot request path to avoid k8s API calls.
+    /// Uses std::sync::RwLock (not tokio) because the critical section is tiny.
+    paused_shards: Arc<std::sync::RwLock<HashSet<ShardId>>>,
 }
 
 impl CoordinatorBase {
@@ -393,6 +398,31 @@ impl CoordinatorBase {
             factory,
             startup_time_ms,
             placement_rings,
+            paused_shards: Arc::new(std::sync::RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Create a coordinator base with pre-built shared state.
+    /// Used by tests that need to share `shard_map` and `owned` Arcs with mock coordinators.
+    pub fn new_with_shared(
+        node_id: impl Into<String>,
+        grpc_addr: impl Into<String>,
+        shard_map: Arc<Mutex<ShardMap>>,
+        owned: Arc<Mutex<HashSet<ShardId>>>,
+        factory: Arc<ShardFactory>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Self {
+            node_id: node_id.into(),
+            grpc_addr: grpc_addr.into(),
+            shard_map,
+            owned,
+            shutdown_tx,
+            shutdown_rx,
+            factory,
+            startup_time_ms: None,
+            placement_rings: Vec::new(),
+            paused_shards: Arc::new(std::sync::RwLock::new(HashSet::new())),
         }
     }
 
@@ -409,6 +439,30 @@ impl CoordinatorBase {
     /// Get all shard IDs from the shard map.
     pub async fn shard_ids(&self) -> Vec<ShardId> {
         self.shard_map.lock().await.shard_ids()
+    }
+
+    /// Mark a shard as paused for split (traffic should be rejected with retryable errors).
+    pub fn mark_shard_paused(&self, shard_id: ShardId) {
+        self.paused_shards
+            .write()
+            .expect("paused_shards lock poisoned")
+            .insert(shard_id);
+    }
+
+    /// Mark a shard as no longer paused for split.
+    pub fn mark_shard_unpaused(&self, shard_id: ShardId) {
+        self.paused_shards
+            .write()
+            .expect("paused_shards lock poisoned")
+            .remove(&shard_id);
+    }
+
+    /// Check if a shard is paused for split (reads from local cache, no I/O).
+    pub fn is_shard_paused(&self, shard_id: &ShardId) -> bool {
+        self.paused_shards
+            .read()
+            .expect("paused_shards lock poisoned")
+            .contains(shard_id)
     }
 
     /// Get owned shards sorted (shared by both backends).
@@ -619,11 +673,11 @@ pub trait Coordinator: SplitStorageBackend + Send + Sync {
     ///
     /// Returns true if the shard has an in-progress split in a traffic-pausing phase.
     /// Callers should return retryable errors when this returns true.
+    ///
+    /// Reads from a local in-memory cache (no I/O). The cache is updated by the
+    /// split execution code when split phases change.
     async fn is_shard_paused(&self, shard_id: ShardId) -> bool {
-        match self.load_split(&shard_id).await {
-            Ok(Some(split)) => split.phase.traffic_paused(),
-            _ => false,
-        }
+        self.base().is_shard_paused(&shard_id)
     }
 
     /// Update a shard's placement ring.

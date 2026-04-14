@@ -1249,19 +1249,13 @@ mod splitter_unit_tests {
             owned: Arc<Mutex<HashSet<ShardId>>>,
             factory: Arc<ShardFactory>,
         ) -> Self {
-            // Create a CoordinatorBase with the provided Arcs
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let base = CoordinatorBase {
-                node_id: "mock-node".to_string(),
-                grpc_addr: "http://mock:7450".to_string(),
+            let base = CoordinatorBase::new_with_shared(
+                "mock-node",
+                "http://mock:7450",
                 shard_map,
                 owned,
-                shutdown_tx,
-                shutdown_rx,
                 factory,
-                startup_time_ms: None,
-                placement_rings: Vec::new(),
-            };
+            );
             Self {
                 base,
                 splits: Mutex::new(HashMap::new()),
@@ -1602,18 +1596,13 @@ mod splitter_unit_tests {
             owned: Arc<Mutex<HashSet<ShardId>>>,
             factory: Arc<ShardFactory>,
         ) -> Self {
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let base = CoordinatorBase {
-                node_id: "mock-node".to_string(),
-                grpc_addr: "http://mock:7450".to_string(),
+            let base = CoordinatorBase::new_with_shared(
+                "mock-node",
+                "http://mock:7450",
                 shard_map,
                 owned,
-                shutdown_tx,
-                shutdown_rx,
                 factory,
-                startup_time_ms: None,
-                placement_rings: Vec::new(),
-            };
+            );
             Self {
                 base,
                 splits: Mutex::new(HashMap::new()),
@@ -1885,4 +1874,5 @@ mod splitter_unit_tests {
             "shard should be usable after factory.close + factory.open"
         );
     }
+
 }
