@@ -20,7 +20,7 @@ jobs:
             runner: ubuntu-latest-l
             nix_system: x86_64-linux
           - platform: arm64
-            runner: ubuntu-latest-l-arm
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
             nix_system: aarch64-linux
     runs-on: ${{ matrix.runner }}
     permissions:
