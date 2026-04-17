@@ -455,16 +455,15 @@ pred hasLeaseHolder[s: Shard, t: Time] {
 
 /**
  * Check if a node can safely serve a shard.
- * 
- * A node can serve a shard only if:
- * - It holds the lease for the shard
- * - It has not flapped (lost connectivity)
- * - It is still a member (from etcd's perspective)
+ *
+ * A node can serve a shard whenever it holds the (permanent) lease. In
+ * particular, a node that is partitioned from the coordination layer (flapped)
+ * continues to serve traffic for shards it already owns — holding the lease is
+ * sufficient authority to serve. Lease *mutation* (acquire/release) still
+ * requires current membership; that is enforced at the step level.
  */
 pred canServe[n: Node, s: Shard, t: Time] {
     holdsLease[n, s, t]
-    isMember[n, t]
-    not hasFlapped[n, t]
 }
 
 /**
@@ -1589,14 +1588,20 @@ pred leaseAcquireStep[n: Node, s: Shard, t: Time, tnext: Time] {
     workerFrame[t, tnext]
 }
 
-/** Lease release with full frame conditions */
+/** Lease release with full frame conditions.
+ * [SILO-COORD-INV-4] A partitioned node cannot release its leases: mutation
+ * requires current membership. The node retains the lease through the partition
+ * and must re-establish membership before it can release (or an operator can
+ * force-release via forceReleaseLeaseStep). */
 pred leaseReleaseStep[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     holdsLease[n, s, t]
-    
+    isMember[n, t]
+    not hasFlapped[n, t]
+
     -- Postconditions
     not hasLeaseHolder[s, tnext]
-    
+
     -- Frame conditions
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
@@ -2046,13 +2051,21 @@ assert splitChildrenContiguous {
 }
 
 /**
- * [SILO-COORD-INV-4] Flapping node cannot safely serve any shard.
- * 
- * If a node has flapped (lost connectivity but thinks it owns shards),
- * it should NOT be able to serve requests - canServe should be false.
+ * [SILO-COORD-INV-4] A partitioned node keeps serving but cannot mutate leases.
+ *
+ * A node that is partitioned from the coordination layer (flapped) continues to
+ * serve requests for shards it already owns — its permanent lease persists and
+ * holding the lease is sufficient authority to serve. It *cannot* acquire or
+ * release shard leases while partitioned: lease mutations require current
+ * membership, so ownership changes must wait until the node re-establishes
+ * membership (or an operator force-releases from a live node).
  */
-assert flappedNodeCannotServe {
-    all n: Node, s: Shard, t: Time | hasFlapped[n, t] implies not canServe[n, s, t]
+assert flappedNodeCannotMutateLeases {
+    all n: Node, s: Shard, t: Time, tnext: Time |
+        hasFlapped[n, t] implies {
+            not leaseAcquireStep[n, s, t, tnext]
+            not leaseReleaseStep[n, s, t, tnext]
+        }
 }
 
 /**
@@ -2324,11 +2337,12 @@ pred exampleNodeFlapPermanentLease {
         -- At some point after setup, n1 owns and can serve
         some t: Time | holdsLease[n1, s, t] and canServe[n1, s, t]
 
-        -- Then n1 flaps but retains the lease
-        some tFlap: Time | hasFlapped[n1, tFlap] and holdsLease[n1, s, tFlap]
-
-        -- n1 cannot serve while flapped (despite holding lease)
-        all t: Time | hasFlapped[n1, t] implies not canServe[n1, s, t]
+        -- Then n1 flaps but retains the lease and keeps serving
+        some tFlap: Time | {
+            hasFlapped[n1, tFlap]
+            holdsLease[n1, s, tFlap]
+            canServe[n1, s, tFlap]
+        }
 
         -- After force-release, n2 acquires and can serve
         some tAcq: Time | holdsLease[n2, s, tAcq] and canServe[n2, s, tAcq]
@@ -2354,8 +2368,8 @@ pred exampleNodeRestart {
         -- n owns and can serve
         some t1: Time | holdsLease[n, s, t1] and canServe[n, s, t1]
 
-        -- n flaps but retains lease
-        some t2: Time | hasFlapped[n, t2] and holdsLease[n, s, t2] and not canServe[n, s, t2]
+        -- n flaps but retains lease and continues to serve during partition
+        some t2: Time | hasFlapped[n, t2] and holdsLease[n, s, t2] and canServe[n, s, t2]
 
         -- n recovers and rejoins, still holds lease, can serve again
         some t3: Time | {
@@ -2660,8 +2674,8 @@ check splitChildrenContiguous for 3 but
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     8 TenantOrder
 
--- Flapped node safety
-check flappedNodeCannotServe for 3 but 
+-- Flapped node cannot mutate leases (acquire or release)
+check flappedNodeCannotMutateLeases for 3 but
     2 Node, 2 Shard, 2 Addr, 3 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
     6 NodeMembership, 6 NodeFlapped, 6 ShardMapEntry, 6 ShardLease,
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
