@@ -7,7 +7,8 @@ use silo::settings::{
 };
 use silo::shard_range::{ShardMap, ShardRange};
 use silo::storage::resolve_object_store;
-use std::time::Duration;
+use slatedb_common::metrics::MetricValue;
+use std::time::{Duration, Instant};
 
 /// Create SlateDB settings with a fast flush interval for tests
 fn fast_flush_slatedb_settings() -> slatedb::config::Settings {
@@ -737,4 +738,106 @@ async fn factory_passes_slatedb_settings_to_shards() {
     shard.db().flush().await.expect("flush");
     let result = shard.db().get(b"key").await.expect("get");
     assert_eq!(result.unwrap().as_ref(), b"value");
+}
+
+/// Read a counter value from a SlateDB metrics snapshot.
+fn read_slatedb_counter(
+    recorder: &slatedb_common::metrics::DefaultMetricsRecorder,
+    name: &str,
+) -> u64 {
+    let snapshot = recorder.snapshot();
+    snapshot.by_name_and_labels(name, &[]).map_or(0, |m| {
+        if let MetricValue::Counter(v) = m.value {
+            v
+        } else {
+            0
+        }
+    })
+}
+
+/// Verify that steady-state writes at the configured flush_interval don't trigger
+/// SlateDB backpressure. Backpressure fires when unflushed bytes exceed
+/// max_unflushed_bytes (default 1GB), which happens when flushes lag writes.
+///
+/// Also checks that L0 SST flushes are occurring so that replay_after_wal_id
+/// advances — a prerequisite for WAL garbage collection to run.
+///
+/// SlateDB freezes the active memtable (triggering an L0 SST upload) after
+/// MAX_WAL_FLUSHES_BEFORE_L0_FLUSH (4096) WAL segments are flushed, or when the
+/// memtable reaches l0_sst_size_bytes. At 1ms flush_interval, 4096 WAL segments
+/// accumulate in ~4s, so running for 30s should produce several L0 flushes.
+#[silo::test]
+async fn steady_state_writes_dont_trigger_backpressure() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let wal_dir = tempfile::tempdir().unwrap();
+
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: data_dir.path().to_string_lossy().to_string(),
+        wal: Some(WalConfig {
+            backend: Backend::Fs,
+            path: wal_dir.path().to_string_lossy().to_string(),
+        }),
+        apply_wal_on_close: false,
+        slatedb: Some(slatedb::config::Settings {
+            flush_interval: Some(Duration::from_millis(1)),
+            ..Default::default()
+        }),
+        memory_cache: None,
+    };
+
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
+        .await
+        .expect("open shard");
+
+    let recorder = shard.slatedb_metrics_recorder().clone();
+
+    // Write 1KB entries continuously for 30 seconds. With await_durable=true (the
+    // default), each write waits for the WAL to flush. At 1ms flush_interval the
+    // WAL ID advances ~1000/s, crossing the 4096-WAL-segment L0-flush threshold
+    // roughly every 4s, so 30s should produce several L0 SST flushes.
+    let start = Instant::now();
+    let mut write_count = 0u64;
+    while start.elapsed() < Duration::from_secs(30) {
+        let key = format!("key-{write_count:010}");
+        let value = vec![42u8; 1024];
+        shard
+            .db()
+            .put(key.as_bytes(), &value)
+            .await
+            .expect("put failed");
+        write_count += 1;
+    }
+
+    let backpressure = read_slatedb_counter(&recorder, slatedb::db_stats::BACKPRESSURE_COUNT);
+    let flushes =
+        read_slatedb_counter(&recorder, slatedb::db_stats::IMMUTABLE_MEMTABLE_FLUSHES);
+    let wal_flushes = read_slatedb_counter(&recorder, slatedb::db_stats::WAL_BUFFER_FLUSHES);
+
+    eprintln!(
+        "writes={write_count} wal_flushes={wal_flushes} l0_flushes={flushes} backpressure={backpressure}"
+    );
+
+    assert_eq!(
+        backpressure, 0,
+        "writes triggered backpressure {backpressure} times after {write_count} writes — \
+         flush_interval is too slow to drain WAL at this write rate"
+    );
+
+    // WAL should be flushing regularly to make data durable.
+    assert!(
+        wal_flushes > 0,
+        "no WAL flushes observed after {write_count} writes — flush path is broken"
+    );
+
+    // At least one memtable → L0 SST flush must have occurred. Without this,
+    // replay_after_wal_id never advances and WAL GC cannot delete any WAL files,
+    // causing unbounded WAL disk growth.
+    assert!(
+        flushes >= 1,
+        "no L0 SST flushes in 30s after {write_count} writes ({wal_flushes} WAL flushes) — \
+         replay_after_wal_id is not advancing; WAL GC will accumulate unbounded WAL disk usage"
+    );
 }
