@@ -17,11 +17,13 @@
 //! leases and survive node crashes. This ensures the crashed node's WAL can be
 //! recovered when it restarts.
 //!
-//! [SILO-COORD-INV-4] A flapped node cannot safely serve any shard. Even though
-//! permanent leases persist through crashes, a node that has lost membership cannot
-//! serve requests: if it actually crashed, it is not running; if its membership
-//! keepalive expired while still alive, reconciliation detects the loss and the
-//! server cannot route to shards it no longer manages.
+//! [SILO-COORD-INV-4] A node partitioned from the coordination layer can continue
+//! to serve requests for shards that it owns. Its permanent shard leases persist
+//! through the partition, and holding the lease is sufficient authority to serve
+//! traffic. However, a partitioned node cannot acquire or release shard leases
+//! while partitioned: lease mutations require current cluster membership, so any
+//! ownership change has to wait until the node re-establishes membership (or until
+//! an operator force-releases the lease from a live node).
 //!
 //! [SILO-COORD-INV-6] Lease *acquisition* requires membership - only a current member
 //! can acquire a new shard lease. But existing leases persist through flaps.
