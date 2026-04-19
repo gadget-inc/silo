@@ -18,6 +18,7 @@ fn make_fs_factory(tmp: &tempfile::TempDir) -> Arc<ShardFactory> {
         concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
         memory_cache: None,
+        compaction: Default::default(),
     };
     Arc::new(ShardFactory::new(
         template,
@@ -46,6 +47,7 @@ fn make_fs_factory_with_wal(
         concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
         memory_cache: None,
+        compaction: Default::default(),
     };
     Arc::new(ShardFactory::new(
         template,
@@ -359,6 +361,7 @@ async fn open_invalid_template_no_placeholder() {
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -387,6 +390,7 @@ async fn open_invalid_template_bad_boundary() {
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         },
         MockGubernatorClient::new_arc(),
         None,

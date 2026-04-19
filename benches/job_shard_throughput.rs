@@ -18,6 +18,7 @@ async fn open_temp_shard(flush_interval_ms: u64) -> (tempfile::TempDir, Arc<JobS
             ..Default::default()
         }),
         memory_cache: None,
+        compaction: Default::default(),
     };
     let shard = JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
         .await

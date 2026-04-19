@@ -346,6 +346,7 @@ async fn open_shard_at_path(path: &str, flush_interval_ms: u64) -> Arc<JobStoreS
             ..Default::default()
         }),
         memory_cache: None,
+        compaction: Default::default(),
     };
     JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
         .await
@@ -612,6 +613,7 @@ pub async fn clone_golden_shard(
             concurrency_reconcile_interval: Duration::from_millis(
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
             ),
+            compaction: Default::default(),
         },
         ShardRange::full(),
     )

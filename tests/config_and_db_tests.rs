@@ -37,6 +37,7 @@ async fn open_fs_db_from_config() {
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         },
     };
 
@@ -83,6 +84,7 @@ async fn shard_with_local_wal_has_wal_close_config() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -116,6 +118,7 @@ async fn shard_without_local_wal_has_no_wal_close_config() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -147,6 +150,7 @@ async fn close_with_flush_wal_removes_local_wal_directory() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -195,6 +199,7 @@ async fn close_without_flush_wal_preserves_local_wal_directory() {
         apply_wal_on_close: false, // Disable apply on close
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -242,6 +247,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -275,6 +281,7 @@ async fn data_persists_after_close_with_flush_and_reopen() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -314,6 +321,7 @@ async fn factory_close_all_flushes_all_shards_wal() {
         concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -720,6 +728,7 @@ async fn factory_passes_slatedb_settings_to_shards() {
             ..Default::default()
         }),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();

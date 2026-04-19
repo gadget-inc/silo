@@ -202,6 +202,94 @@ pub struct DatabaseTemplate {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// Settings that control how / whether compaction runs for this silo
+    /// instance. Used by the compaction A/B test harness.
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+}
+
+/// Compaction-related tuning for a silo instance. All fields default to
+/// "compact as SlateDB does out of the box" — change these for the harness.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct CompactionConfig {
+    /// Disable the in-process SlateDB compactor for this silo instance.
+    /// When true, the opened SlateDB will NOT run compaction; an external
+    /// process (e.g. `silo-compactor`) is expected to compact the store.
+    ///
+    /// Implemented by forcing `compactor_options = None` on the merged
+    /// SlateDB settings before opening the database.
+    #[serde(default)]
+    pub disable: bool,
+    /// Compaction scheduler selection and tuning. Today the only variant
+    /// available in SlateDB is `size_tiered`; the enum is structured so future
+    /// schedulers (e.g. leveled) can be added without a config breaking change.
+    #[serde(default)]
+    pub scheduler: CompactionSchedulerConfig,
+    /// Optional SlateDB compaction filter to install.
+    #[serde(default)]
+    pub filter: CompactionFilterConfig,
+    /// When true, also emit slatedb compaction stats to structured logs on a
+    /// periodic interval. Prometheus metrics are unaffected.
+    #[serde(default)]
+    pub log_stats: bool,
+}
+
+/// Compaction scheduler configuration. Tagged enum — new variants can be
+/// added without breaking existing configs.
+///
+/// Example TOML:
+/// ```toml
+/// [database.compaction.scheduler]
+/// kind = "size_tiered"
+/// min_compaction_sources = 4
+/// max_compaction_sources = 8
+/// include_size_threshold = 4.0
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactionSchedulerConfig {
+    /// Size-tiered compaction (the only scheduler implemented in slatedb 0.12).
+    SizeTiered {
+        #[serde(default = "default_stcs_min_sources")]
+        min_compaction_sources: usize,
+        #[serde(default = "default_stcs_max_sources")]
+        max_compaction_sources: usize,
+        #[serde(default = "default_stcs_include_size_threshold")]
+        include_size_threshold: f32,
+    },
+}
+
+impl Default for CompactionSchedulerConfig {
+    fn default() -> Self {
+        Self::SizeTiered {
+            min_compaction_sources: default_stcs_min_sources(),
+            max_compaction_sources: default_stcs_max_sources(),
+            include_size_threshold: default_stcs_include_size_threshold(),
+        }
+    }
+}
+
+fn default_stcs_min_sources() -> usize {
+    4
+}
+fn default_stcs_max_sources() -> usize {
+    8
+}
+fn default_stcs_include_size_threshold() -> f32 {
+    4.0
+}
+
+/// Compaction filter selection for the A/B test harness.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactionFilterConfig {
+    /// No compaction filter installed (default).
+    #[default]
+    None,
+    /// Keep all entries but count what was seen and log a summary at the end
+    /// of each compaction job. Used to validate the filter plumbing without
+    /// changing compaction semantics.
+    NoopCounting,
 }
 
 /// Configuration for SlateDB's in-memory caches.
@@ -459,6 +547,9 @@ pub struct DatabaseConfig {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// Compaction-related settings — see [`CompactionConfig`].
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -575,6 +666,7 @@ impl AppConfig {
                 concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
                 slatedb: None,
                 memory_cache: None,
+                compaction: CompactionConfig::default(),
             },
         };
 

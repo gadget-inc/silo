@@ -76,6 +76,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -746,6 +747,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -934,6 +936,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -1062,6 +1065,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -1187,6 +1191,7 @@ async fn setup_test_server_production_path(
         concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
         memory_cache: None,
+        compaction: Default::default(),
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));

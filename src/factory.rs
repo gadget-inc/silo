@@ -95,6 +95,7 @@ impl ShardFactory {
                 concurrency_reconcile_interval_ms: 5000,
                 slatedb: None,
                 memory_cache: None,
+                compaction: Default::default(),
             },
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
@@ -196,6 +197,7 @@ impl ShardFactory {
                         concurrency_reconcile_interval: Duration::from_millis(
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
+                        compaction: template.compaction.clone(),
                     },
                     range.clone(),
                 )
@@ -249,7 +251,7 @@ impl ShardFactory {
     ///
     /// The returned `ResolvedStore.root_path` combined with `db_path` gives the
     /// full path where shard data is stored.
-    fn resolve_at_root(
+    pub fn resolve_at_root(
         backend: &crate::settings::Backend,
         template_path: &str,
         shard_name: &str,

@@ -124,3 +124,24 @@ processes:
         max_size_mb: 5
         max_age_days: 3
         max_backups: 1
+
+  # Standalone compactor for the compaction A/B test harness. Disabled by
+  # default — the usual silo-1/silo-2 nodes have their own in-process
+  # compactor. Enable this ONLY when running against a writer that has
+  # `[database.compaction] disable = true` in its config (e.g. the
+  # example_configs/compaction-harness-writer.toml setup). Start with:
+  #   process-compose start --service silo-compactor
+  silo-compactor:
+    disabled: true
+    command: |
+      cargo run --bin silo-compactor -- \
+        -c example_configs/compaction-harness-compactor.toml \
+        --shard ${SILO_COMPACTOR_SHARD:-UNSET} \
+        --mode loop
+    shutdown:
+      signal: 15
+      timeout_seconds: 10
+    availability:
+      restart: on_failure
+      backoff_seconds: 1
+    log_location: ./tmp/silo-compactor.log

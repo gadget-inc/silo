@@ -1,0 +1,55 @@
+# Standalone compactor config for the compaction A/B test harness.
+#
+# Pointed at the SAME database path as compaction-harness-writer.toml so
+# that this process compacts the writer's shard without the writer touching
+# compaction itself. Tune `[database.compaction.scheduler]` and
+# `[database.slatedb.compactor_options]` to A/B different compaction regimes.
+
+[server]
+# Unused — silo-compactor does not bind a gRPC port. Required by the schema.
+grpc_addr = "127.0.0.1:7461"
+dev_mode = true
+
+[coordination]
+backend = "none"
+initial_shard_count = 1
+
+[tenancy]
+enabled = false
+
+[webui]
+enabled = false
+
+[metrics]
+enabled = true
+addr = "127.0.0.1:9191"
+
+[database]
+backend = "fs"
+path = "./tmp/compaction-harness/%shard%"
+
+# `disable` is explicitly false: this process IS the compactor. (silo-compactor
+# forces this at runtime anyway, so setting it here is just documentation.)
+[database.compaction]
+disable = false
+
+# Install the noop counting filter on the compactor-side builder. On each
+# compaction job the filter logs a summary with entries_seen, value_entries,
+# tombstone_entries, merge_entries, bytes_seen.
+[database.compaction.filter]
+kind = "noop_counting"
+
+[database.compaction.scheduler]
+kind = "size_tiered"
+min_compaction_sources = 4
+max_compaction_sources = 8
+include_size_threshold = 4.0
+
+# Tune compactor throughput / SST size for the A/B experiment. Smaller
+# max_sst_size produces more PUT operations and exposes per-object overhead;
+# larger values produce fewer, larger objects.
+[database.slatedb.compactor_options]
+poll_interval = "2s"
+max_sst_size = 67108864          # 64 MiB  — a vs b knob
+max_concurrent_compactions = 2
+max_fetch_tasks = 4

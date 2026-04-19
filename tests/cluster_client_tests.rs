@@ -27,6 +27,7 @@ fn make_test_factory_with_shards(num_shards: u32) -> (Arc<ShardFactory>, ShardMa
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -785,6 +786,7 @@ fn make_test_app_config(tmp: &tempfile::TempDir) -> AppConfig {
             concurrency_reconcile_interval_ms: 5000,
             slatedb: None,
             memory_cache: None,
+        compaction: Default::default(),
         },
     }
 }

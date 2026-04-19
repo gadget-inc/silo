@@ -33,6 +33,7 @@ async fn create_multi_shard_factory(
         concurrency_reconcile_interval_ms: 5000,
         slatedb: None,
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();

@@ -325,6 +325,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             concurrency_reconcile_interval_ms: 5000,
             slatedb: Some(dst_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         },
     };
 

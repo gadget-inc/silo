@@ -66,6 +66,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -100,6 +101,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -150,6 +152,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -179,6 +182,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -221,6 +225,7 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -246,6 +251,7 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -288,6 +294,7 @@ async fn no_cleanup_when_already_complete() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -316,6 +323,7 @@ async fn no_cleanup_when_already_complete() {
             apply_wal_on_close: true,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
+        compaction: Default::default(),
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -357,6 +365,7 @@ async fn cleanup_cancelled_on_shard_close() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -417,6 +426,7 @@ async fn cleanup_progress_saved_on_cancellation() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     // Create shard with data
@@ -511,6 +521,7 @@ async fn cleanup_result_indicates_cancellation() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -577,6 +588,7 @@ async fn cleanup_handles_multiple_close_calls() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -619,6 +631,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     // Phase 1: Create shard, enqueue data, simulate split state
@@ -716,6 +729,7 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
         apply_wal_on_close: true,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
 
     // Phase 1: Start cleanup and interrupt it

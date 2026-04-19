@@ -3,6 +3,7 @@ pub mod cluster_client;
 pub mod cluster_query;
 pub mod codec;
 pub mod concurrency;
+pub mod compaction_filters;
 pub mod coordination;
 pub mod dst_events;
 pub mod factory;

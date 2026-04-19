@@ -50,6 +50,7 @@ async fn open_shard_with_gubernator()
         apply_wal_on_close: true,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         memory_cache: None,
+        compaction: Default::default(),
     };
     let shard = JobStoreShard::open(&cfg, gubernator.clone(), None, ShardRange::full())
         .await

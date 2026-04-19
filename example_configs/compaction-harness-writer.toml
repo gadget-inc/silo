@@ -1,0 +1,68 @@
+# Writer config for the compaction A/B test harness.
+#
+# This config runs a single-shard silo server whose in-process compactor is
+# disabled — all compaction is done by `silo-compactor` running in a separate
+# process against the SAME object store. That separation is what lets us
+# measure compaction work in isolation.
+
+[server]
+grpc_addr = "127.0.0.1:7460"
+dev_mode = true
+
+[coordination]
+backend = "none"
+initial_shard_count = 1
+
+[tenancy]
+# silo-bench writes tenant-prefixed keys (bench-0…bench-3), which requires
+# tenancy to be enabled on the server-side.
+enabled = true
+
+[webui]
+enabled = false
+
+[metrics]
+enabled = true
+addr = "127.0.0.1:9190"
+
+[database]
+backend = "fs"
+# Shared between writer and compactor processes.
+path = "./tmp/compaction-harness/%shard%"
+
+# Force memtables to flush to L0 SSTs quickly so the harness produces
+# compactable state from even a short bench run. Default is 64 MiB which
+# would require ~gigabytes of writes to exercise.
+[database.slatedb]
+l0_sst_size_bytes = 262144       # 256 KiB
+flush_interval = "100ms"
+
+[database.compaction]
+# THE KEY SETTING: disable the writer's in-process compactor so the external
+# silo-compactor binary is the only one doing compaction work.
+disable = true
+# Record noop-counting filter stats so we can confirm the filter plumbing fires.
+# NOTE: In slatedb 0.12 filters only run in the external compactor (not on
+# DbBuilder), so this setting on the writer is a no-op today but will be
+# applied when the compactor opens the same object store.
+[database.compaction.filter]
+kind = "noop_counting"
+
+[database.compaction.scheduler]
+kind = "size_tiered"
+min_compaction_sources = 4
+max_compaction_sources = 8
+include_size_threshold = 4.0
+
+# Aggressive GC so we observe compaction/GC interaction without waiting a day.
+[database.slatedb.garbage_collector_options.manifest_options]
+interval = "60s"
+min_age = "60s"
+
+[database.slatedb.garbage_collector_options.compacted_options]
+interval = "60s"
+min_age = "60s"
+
+[database.slatedb.garbage_collector_options.compactions_options]
+interval = "60s"
+min_age = "60s"

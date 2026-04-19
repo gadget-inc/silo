@@ -76,6 +76,9 @@ pub struct OpenShardOptions {
     pub metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     pub concurrency_reconcile_interval: Duration,
+    /// Compaction-related tuning (disable, scheduler, filter). Defaults to
+    /// "behave like slatedb defaults".
+    pub compaction: crate::settings::CompactionConfig,
 }
 
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
@@ -271,6 +274,7 @@ impl JobStoreShard {
                 concurrency_reconcile_interval: Duration::from_millis(
                     crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
                 ),
+                compaction: cfg.compaction.clone(),
             },
             range,
         )
@@ -307,6 +311,7 @@ impl JobStoreShard {
             rate_limiter,
             metrics,
             concurrency_reconcile_interval,
+            compaction,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -319,12 +324,23 @@ impl JobStoreShard {
             db_builder = db_builder.with_wal_object_store(wal);
         }
 
-        // Apply custom SlateDB settings if specified
+        // Apply custom SlateDB settings, then overlay our compaction config on top.
         // Note: The merge_operator field in settings is ignored because we already
-        // set it above via with_merge_operator() for counter support
-        if let Some(settings) = slatedb_settings {
-            db_builder = db_builder.with_settings(settings);
-        }
+        // set it above via with_merge_operator() for counter support.
+        //
+        // Compaction filter suppliers are NOT installed here — slatedb 0.12's
+        // DbBuilder does not expose `with_compaction_filter_supplier` (only
+        // AdminBuilder and CompactorBuilder do). The `silo-compactor` binary
+        // installs the configured filter on the CompactorBuilder it owns; the
+        // server-side Db simply honours `disable_compaction` + scheduler
+        // tuning applied below.
+        let mut effective_settings = slatedb_settings.unwrap_or_default();
+        crate::compaction_filters::apply_compaction_config(
+            &mut effective_settings,
+            &compaction,
+            &name,
+        );
+        db_builder = db_builder.with_settings(effective_settings);
 
         // Apply custom in-memory cache sizes if specified
         if let Some(cache_cfg) = memory_cache {
