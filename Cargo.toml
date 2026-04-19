@@ -14,6 +14,7 @@ version = "0.2.0"
 clap = { version = "4.3.14", features = ["derive", "env"] }
 futures = "0.3"
 slatedb = { version = "0.12.0", features = ["compaction_filters"] }
+ulid = "1"
 slatedb-common = "0.12.0"
 object_store = { version = "0.12", features = ["gcp"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

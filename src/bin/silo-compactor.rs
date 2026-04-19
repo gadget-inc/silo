@@ -253,12 +253,17 @@ async fn run_once_mode(
     match spec {
         None => info!("nothing to compact (no L0 SSTs or sorted runs)"),
         Some(spec) => {
-            admin
+            let submitted = admin
                 .submit_compaction(spec)
                 .await
                 .map_err(|e| anyhow::anyhow!("submit_compaction: {e}"))?;
-            info!("submitted full compaction; polling until sorted_run_count <= 1");
-            poll_until_compacted(admin, poll_interval, overall_timeout).await?;
+            let compaction_id = submitted.id();
+            info!(
+                %compaction_id,
+                "submitted full compaction; polling until this compaction completes"
+            );
+            poll_until_compaction_done(admin, compaction_id, poll_interval, overall_timeout)
+                .await?;
         }
     }
 
@@ -301,13 +306,23 @@ async fn build_full_compaction_spec(
     Ok(Some(CompactionSpec::new(sources, destination)))
 }
 
-async fn poll_until_compacted(
+/// Poll slatedb until the specific compaction we submitted is in a terminal
+/// state (Completed or Failed). We intentionally do NOT wait for the global
+/// manifest state (l0 == 0) because the writer is actively flushing new L0
+/// SSTs alongside us — waiting for l0 == 0 deadlocks in that workload.
+async fn poll_until_compaction_done(
     admin: &slatedb::admin::Admin,
+    compaction_id: ulid::Ulid,
     poll_interval: Duration,
     overall_timeout: Duration,
 ) -> anyhow::Result<()> {
+    use slatedb::compactor::CompactionStatus;
     let deadline = std::time::Instant::now() + overall_timeout;
     loop {
+        let record = admin
+            .read_compaction(compaction_id, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("read_compaction: {e}"))?;
         let state = admin
             .read_compactor_state_view()
             .await
@@ -315,17 +330,41 @@ async fn poll_until_compacted(
         let manifest = state.manifest();
         let sorted_run_count = manifest.compacted.len();
         let l0_count = manifest.l0.len();
-        info!(
-            sorted_runs = sorted_run_count,
-            l0 = l0_count,
-            "compaction progress"
-        );
-        if sorted_run_count <= 1 && l0_count == 0 {
-            return Ok(());
+
+        match record.as_ref().map(|c| c.status()) {
+            Some(CompactionStatus::Completed) => {
+                info!(
+                    %compaction_id,
+                    sorted_runs = sorted_run_count,
+                    l0 = l0_count,
+                    "submitted compaction completed"
+                );
+                return Ok(());
+            }
+            Some(CompactionStatus::Failed) => {
+                return Err(anyhow::anyhow!(
+                    "submitted compaction {compaction_id} failed"
+                ));
+            }
+            Some(status) => {
+                info!(
+                    %compaction_id,
+                    ?status,
+                    sorted_runs = sorted_run_count,
+                    l0 = l0_count,
+                    "compaction progress"
+                );
+            }
+            None => {
+                // The compaction record isn't yet visible in the latest
+                // compactions file; keep polling.
+                info!(%compaction_id, "compaction record not yet visible");
+            }
         }
+
         if std::time::Instant::now() >= deadline {
             return Err(anyhow::anyhow!(
-                "timed out waiting for compaction to drain (sorted_runs={sorted_run_count}, l0={l0_count})"
+                "timed out waiting for compaction {compaction_id} to complete"
             ));
         }
         tokio::time::sleep(poll_interval).await;
