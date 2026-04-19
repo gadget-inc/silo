@@ -341,6 +341,26 @@ function buildSummary(opts: {
     afterCompact.bytesCompactedTotal !== null
       ? afterCompact.bytesCompactedTotal - (before.bytesCompactedTotal ?? 0)
       : null;
+  // Each compactor iteration runs as its own process, so its
+  // `bytes_compacted_total` counter starts at 0. Sum them across iterations.
+  let compactorBytesSum = 0;
+  let compactorBytesAny = false;
+  let lastCompactionTs: number | null = null;
+  for (let i = 1; i <= opts.args.compactions; i += 1) {
+    const gauges = parseSlatedbGauges(
+      resolve(opts.runDir, `compactor-metrics-iter-${i}.txt`),
+    );
+    if (gauges.bytesCompactedTotal !== null) {
+      compactorBytesSum += gauges.bytesCompactedTotal;
+      compactorBytesAny = true;
+    }
+    // Only take the timestamp when it's actually populated — iterations that
+    // found nothing to compact leave the gauge at 0, which parses as the
+    // Unix epoch and misleads the summary.
+    if (gauges.lastCompactionTs !== null && gauges.lastCompactionTs > 0) {
+      lastCompactionTs = Math.max(lastCompactionTs ?? 0, gauges.lastCompactionTs);
+    }
+  }
   return {
     runId: opts.runId,
     shard: opts.shard,
@@ -359,6 +379,10 @@ function buildSummary(opts: {
       afterWrites,
       afterCompact,
       bytesCompactedDelta,
+    },
+    compactor: {
+      bytesCompactedTotal: compactorBytesAny ? compactorBytesSum : null,
+      lastCompactionTs,
     },
   };
 }
@@ -391,15 +415,13 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
     ["L0 SSTs after writes", String(summary.slatedb.afterWrites.l0SstCount ?? "n/a")],
     ["L0 SSTs after compact", String(summary.slatedb.afterCompact.l0SstCount ?? "n/a")],
     [
-      "Bytes compacted (delta)",
-      formatBytes(summary.slatedb.bytesCompactedDelta),
+      "Bytes compacted (sum)",
+      formatBytes(summary.compactor.bytesCompactedTotal),
     ],
     [
       "Last compaction ts",
-      summary.slatedb.afterCompact.lastCompactionTs !== null
-        ? new Date(
-            summary.slatedb.afterCompact.lastCompactionTs * 1000,
-          ).toISOString()
+      summary.compactor.lastCompactionTs !== null
+        ? new Date(summary.compactor.lastCompactionTs * 1000).toISOString()
         : "n/a",
     ],
     ["", ""],
@@ -531,9 +553,28 @@ async function main(): Promise<void> {
       );
       compactor.stdout!.pipe(compactorLog, { end: false });
       compactor.stderr!.pipe(compactorLog, { end: false });
+      // The compactor's /metrics endpoint is only alive while the process
+      // runs. Poll it throughout this iteration and keep the last successful
+      // response so we have something to snapshot even if the process exits
+      // between our polls.
+      const compactorRunning = { done: false };
+      const snapshotFile = resolve(runDir, `compactor-metrics-iter-${i}.txt`);
+      const poller = (async () => {
+        while (!compactorRunning.done) {
+          try {
+            const text = await fetchText(`${args.compactorMetrics}/metrics`);
+            writeFileSync(snapshotFile, text);
+          } catch {
+            /* server not up yet or already gone — keep trying */
+          }
+          await sleep(100);
+        }
+      })();
       const exitCode = await new Promise<number>((res) => {
         compactor.on("exit", (code) => res(code ?? -1));
       });
+      compactorRunning.done = true;
+      await poller;
       perIterRuns.push({ iteration: i, exitCode, startedAt });
       if (exitCode !== 0) {
         console.warn(`[harness]   iteration ${i} exited with code ${exitCode}`);
@@ -549,7 +590,8 @@ async function main(): Promise<void> {
 
     await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-writes.txt"));
     await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-compact.txt"));
-    await snapshotMetrics(args.compactorMetrics, resolve(runDir, "compactor-metrics-after.txt"));
+    // Compactor `/metrics` is only alive while a silo-compactor process is
+    // running; per-iteration files are captured above, no final snapshot.
 
     const summary = buildSummary({
       runId,

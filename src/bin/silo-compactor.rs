@@ -14,6 +14,7 @@
 //!     --shard 01HZ… --mode loop
 //! ```
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +23,14 @@ use clap::{Parser, ValueEnum};
 use slatedb::CompactorBuilder;
 use slatedb::admin::AdminBuilder;
 use slatedb::compactor::{CompactionSpec, SourceId};
+use slatedb_common::metrics::DefaultMetricsRecorder;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use silo::compaction_filters;
 use silo::factory::ShardFactory;
+use silo::metrics::{self, Metrics};
 use silo::settings::AppConfig;
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -77,6 +81,37 @@ async fn main() -> anyhow::Result<()> {
 
     silo::trace::init(cfg.logging.format)?;
 
+    // Initialize Prometheus metrics + serve on cfg.metrics.addr. This is the
+    // only side of the harness that sees the compactor-side slatedb stats
+    // (BYTES_COMPACTED, LAST_COMPACTION_TS_SEC, RUNNING_COMPACTIONS) — the
+    // writer's compactor is disabled, so its /metrics endpoint never emits
+    // those families.
+    let metrics_init: Option<Metrics> = if cfg.metrics.enabled {
+        match metrics::init() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                error!(error = %e, "failed to initialize metrics, continuing without");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (metrics_shutdown_tx, _) = broadcast::channel::<()>(1);
+    let metrics_server_handle = if let (true, Some(m)) = (cfg.metrics.enabled, metrics_init.clone())
+    {
+        let addr: SocketAddr = cfg.metrics.addr.parse()?;
+        let rx = metrics_shutdown_tx.subscribe();
+        info!(addr = %addr, "silo-compactor metrics server starting");
+        Some(tokio::spawn(async move {
+            if let Err(e) = metrics::run_metrics_server(addr, m, rx).await {
+                error!(error = %e, "metrics server error");
+            }
+        }))
+    } else {
+        None
+    };
+
     let template = &cfg.database;
     let (resolved, db_path) =
         ShardFactory::resolve_at_root(&template.backend, &template.path, &args.shard)
@@ -115,20 +150,44 @@ async fn main() -> anyhow::Result<()> {
     // Build the Compactor directly so we can configure options + merge
     // operator + filter supplier. Admin::run_compactor can't do all three at
     // once in slatedb 0.12 (it only passes the filter supplier through).
+    let slatedb_recorder = Arc::new(DefaultMetricsRecorder::new());
     let mut compactor_builder =
         CompactorBuilder::new(db_path.clone(), Arc::clone(&resolved.store))
             .with_options(compactor_options)
-            .with_merge_operator(silo::job_store_shard::counter_merge_operator());
+            .with_merge_operator(silo::job_store_shard::counter_merge_operator())
+            .with_metrics_recorder(slatedb_recorder.clone());
     if let Some(supplier) = supplier {
         compactor_builder = compactor_builder.with_compaction_filter_supplier(supplier);
     }
     let compactor = compactor_builder.build();
 
+    // Pump slatedb stats from the recorder into the Prometheus exporter on a
+    // 1s interval. Silo's Metrics::update_slatedb_stats handles the delta
+    // math for monotonic counters.
+    let slatedb_poll_handle = if let Some(m) = metrics_init.clone() {
+        let shard_label = args.shard.clone();
+        let recorder = slatedb_recorder.clone();
+        let mut rx = metrics_shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => break,
+                    _ = ticker.tick() => {
+                        m.update_slatedb_stats(&shard_label, &recorder);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Admin is only used for read_compactor_state_view + submit_compaction,
     // which do not depend on compactor options or merge operator.
     let admin = AdminBuilder::new(db_path.clone(), Arc::clone(&resolved.store)).build();
 
-    match args.mode {
+    let result = match args.mode {
         Mode::Loop => run_loop_mode(compactor).await,
         Mode::Once => {
             run_once_mode(
@@ -139,7 +198,22 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+    };
+
+    // One last stats pump so the final snapshot reflects the last compaction
+    // even if shutdown beats the 1s tick.
+    if let Some(m) = metrics_init.as_ref() {
+        m.update_slatedb_stats(&args.shard, &slatedb_recorder);
     }
+    let _ = metrics_shutdown_tx.send(());
+    if let Some(h) = slatedb_poll_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = metrics_server_handle {
+        let _ = h.await;
+    }
+
+    result
 }
 
 async fn run_loop_mode(compactor: slatedb::compactor::Compactor) -> anyhow::Result<()> {
