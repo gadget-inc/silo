@@ -53,3 +53,17 @@ poll_interval = "2s"
 max_sst_size = 67108864          # 64 MiB  — a vs b knob
 max_concurrent_compactions = 2
 max_fetch_tasks = 4
+
+# Harness-only section. Silo ignores unknown top-level tables; these keys are
+# read by scripts/compaction-harness.mts to control how often the harness
+# invokes `silo-compactor --mode once` alongside the writer. CLI flags on the
+# harness (--compactions / --compaction-interval-ms / --iterations) override
+# these defaults.
+[harness]
+# Total number of `silo-compactor --mode once` invocations the harness will
+# run against the writer during a single harness run.
+compactions = 3
+# Milliseconds to wait BEFORE each compactor invocation. The first sleep runs
+# after the bench starts, giving the writer time to accumulate some L0 SSTs
+# before the first compaction pass.
+compaction_interval_ms = 3000

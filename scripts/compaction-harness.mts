@@ -45,12 +45,46 @@ type Args = {
   durationSecs: number;
   enqueuers: number;
   workers: number;
+  compactions: number;
+  compactionIntervalMs: number;
   shard: string | null;
   dataRoot: string;
   writerGrpc: string;
   writerMetrics: string;
   compactorMetrics: string;
 };
+
+/** Read `compactions` + `compaction_interval_ms` from the compactor TOML's
+ * `[harness]` section. Returns nulls for keys not present. We parse with a
+ * tiny regex scanner rather than pulling in a TOML dep — the only keys we
+ * care about here are two integers. */
+function readHarnessDefaults(tomlPath: string): {
+  compactions: number | null;
+  compactionIntervalMs: number | null;
+} {
+  if (!existsSync(tomlPath)) return { compactions: null, compactionIntervalMs: null };
+  const txt = readFileSync(tomlPath, "utf8");
+  // Find the [harness] section body — everything between the `[harness]`
+  // header and the next TOML table header (or end of file). `\Z` is not a
+  // valid JS regex anchor; we use a lookahead for `\n[` or end of string.
+  const header = /^\[harness\][ \t]*\r?\n/m;
+  const headerMatch = header.exec(txt);
+  let body = "";
+  if (headerMatch) {
+    const start = headerMatch.index + headerMatch[0].length;
+    const rest = txt.slice(start);
+    const nextHeader = rest.match(/^\[/m);
+    body = nextHeader ? rest.slice(0, nextHeader.index!) : rest;
+  }
+  const pick = (key: string): number | null => {
+    const m = body.match(new RegExp(`^\\s*${key}\\s*=\\s*(\\d+)`, "m"));
+    return m ? Number(m[1]) : null;
+  };
+  return {
+    compactions: pick("compactions"),
+    compactionIntervalMs: pick("compaction_interval_ms"),
+  };
+}
 
 function parseArgs(argv: string[]): Args {
   const flag = (name: string, def?: string) => {
@@ -75,6 +109,17 @@ function parseArgs(argv: string[]): Args {
   );
   const enqueuers = Number(flag("enqueuers", "4"));
   const workers = Number(flag("workers", "8"));
+  // Harness settings: CLI > [harness] section in compactor TOML > built-in.
+  const harnessDefaults = readHarnessDefaults(resolve(root, compactorConfig));
+  const compactionsCli = flag("compactions") ?? flag("iterations");
+  const compactions = Number(
+    compactionsCli ?? harnessDefaults.compactions ?? "1",
+  );
+  const compactionIntervalMs = Number(
+    flag("compaction-interval-ms") ??
+      harnessDefaults.compactionIntervalMs ??
+      "2000",
+  );
   const shard = flag("shard") ?? null;
   const dataRoot = flag("data-root", resolve(root, "tmp/compaction-harness"))!;
   const writerGrpc = flag("writer-grpc", "http://127.0.0.1:7460")!;
@@ -86,6 +131,8 @@ function parseArgs(argv: string[]): Args {
     durationSecs,
     enqueuers,
     workers,
+    compactions,
+    compactionIntervalMs,
     shard,
     dataRoot,
     writerGrpc,
@@ -302,6 +349,8 @@ function buildSummary(opts: {
     durationSecs: opts.args.durationSecs,
     enqueuers: opts.args.enqueuers,
     workers: opts.args.workers,
+    compactions: opts.args.compactions,
+    compactionIntervalMs: opts.args.compactionIntervalMs,
     completedAt: new Date().toISOString(),
     bench,
     noopFilter: noop,
@@ -322,6 +371,10 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
     ["Compactor config", summary.compactorConfig],
     ["", ""],
     ["Bench duration", `${summary.durationSecs}s`],
+    [
+      "Compactor passes",
+      `${summary.compactions} x --mode once (interval ${summary.compactionIntervalMs}ms)`,
+    ],
     [
       "Bench enqueue",
       summary.bench.totalEnqueued !== null
@@ -421,7 +474,9 @@ async function main(): Promise<void> {
     // Pre-bench metrics snapshot.
     await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-before.txt"));
 
-    // Run the write burst.
+    // Launch silo-bench in the background so the compactor can run
+    // concurrently with the write workload. This mirrors the realistic case
+    // where compaction happens while writes are still arriving.
     console.log(
       `[harness] running silo-bench for ${args.durationSecs}s (enqueuers=${args.enqueuers} workers=${args.workers})...`,
     );
@@ -444,28 +499,55 @@ async function main(): Promise<void> {
     );
     bench.stdout!.pipe(benchLog);
     bench.stderr!.pipe(benchLog);
-    await new Promise<void>((res, rej) => {
-      bench.on("exit", (code) => (code === 0 ? res() : rej(new Error(`bench exited ${code}`))));
+    const benchDone = new Promise<number>((res) => {
+      bench.on("exit", (code) => res(code ?? -1));
     });
+
+    // Run silo-compactor --mode once, N times, with compactionIntervalMs
+    // sleep before each invocation. A single append-only log captures all
+    // iterations so `noop_counting compaction filter summary` lines across
+    // all passes can be grepped/summed.
+    console.log(
+      `[harness] will run silo-compactor --mode once x${args.compactions} ` +
+        `(interval ${args.compactionIntervalMs}ms) alongside bench`,
+    );
+    const compactorLog = createWriteStream(resolve(runDir, "compactor.log"));
+    const perIterRuns: Array<{ iteration: number; exitCode: number; startedAt: string }> = [];
+    for (let i = 1; i <= args.compactions; i += 1) {
+      await sleep(args.compactionIntervalMs);
+      // Snapshot before running this iteration so we can compute L0 delta
+      // per pass if needed.
+      await snapshotMetrics(
+        args.writerMetrics,
+        resolve(runDir, `writer-metrics-before-compact-${i}.txt`),
+      );
+      const startedAt = new Date().toISOString();
+      console.log(`[harness]   compactor iteration ${i}/${args.compactions}...`);
+      compactorLog.write(`\n===== iteration ${i}/${args.compactions} @ ${startedAt} =====\n`);
+      const compactor = spawn(
+        resolve(root, "target/debug/silo-compactor"),
+        ["-c", args.compactorConfig, "--shard", shard, "--mode", "once"],
+        { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      compactor.stdout!.pipe(compactorLog, { end: false });
+      compactor.stderr!.pipe(compactorLog, { end: false });
+      const exitCode = await new Promise<number>((res) => {
+        compactor.on("exit", (code) => res(code ?? -1));
+      });
+      perIterRuns.push({ iteration: i, exitCode, startedAt });
+      if (exitCode !== 0) {
+        console.warn(`[harness]   iteration ${i} exited with code ${exitCode}`);
+      }
+    }
+    compactorLog.end();
+
+    // Wait for the bench to finish if it hasn't already.
+    const benchExitCode = await benchDone;
+    if (benchExitCode !== 0) {
+      throw new Error(`bench exited ${benchExitCode}`);
+    }
 
     await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-writes.txt"));
-
-    // Run the standalone compactor once and wait for it to drain.
-    console.log("[harness] running silo-compactor --mode once...");
-    const compactorLog = createWriteStream(resolve(runDir, "compactor.log"));
-    const compactor = spawn(
-      resolve(root, "target/debug/silo-compactor"),
-      ["-c", args.compactorConfig, "--shard", shard, "--mode", "once"],
-      { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    compactor.stdout!.pipe(compactorLog);
-    compactor.stderr!.pipe(compactorLog);
-    await new Promise<void>((res, rej) => {
-      compactor.on("exit", (code) =>
-        code === 0 ? res() : rej(new Error(`compactor exited ${code}`)),
-      );
-    });
-
     await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-compact.txt"));
     await snapshotMetrics(args.compactorMetrics, resolve(runDir, "compactor-metrics-after.txt"));
 
