@@ -62,8 +62,8 @@ max_fetch_tasks = 4
 [harness]
 # Total number of `silo-compactor --mode once` invocations the harness will
 # run against the writer during a single harness run.
-compactions = 3
+compactions = 6
 # Milliseconds to wait BEFORE each compactor invocation. The first sleep runs
 # after the bench starts, giving the writer time to accumulate some L0 SSTs
 # before the first compaction pass.
-compaction_interval_ms = 3000
+compaction_interval_ms = 10000
