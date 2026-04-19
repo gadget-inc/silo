@@ -8,13 +8,16 @@
 //! each.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use object_store::path::Path;
 use slatedb::{CompactionFilterSupplier, config::CompactorOptions};
 
 use crate::settings::{
     CompactionConfig, CompactionFilterConfig, CompactionSchedulerConfig,
 };
 
+pub mod completed_jobs;
 pub mod noop_counting;
 
 /// Mutate `settings` in place to reflect the silo-level compaction config:
@@ -73,18 +76,42 @@ fn apply_scheduler_config(opts: &mut CompactorOptions, scheduler: &CompactionSch
     }
 }
 
-/// Build the optional compaction filter supplier from silo config. Returns
-/// `None` for [`CompactionFilterConfig::None`] (the default) so the DbBuilder
-/// is not touched.
-pub fn build_supplier(
+/// Object-store context needed by filter variants that read from the DB
+/// (e.g. [`CompactionFilterConfig::CompletedJobs`]).
+pub struct SupplierContext {
+    pub db_path: Path,
+    pub store: Arc<dyn object_store::ObjectStore>,
+}
+
+/// Build the optional compaction filter supplier from silo config.
+///
+/// `ctx` is required for variants that need to open a `DbReader` for point
+/// reads (currently `CompletedJobs`). Pass `None` when you know the config
+/// variant doesn't need it (tests, `None`/`NoopCounting`).
+pub async fn build_supplier(
     compaction: &CompactionConfig,
     shard_name: &str,
-) -> Option<Arc<dyn CompactionFilterSupplier>> {
-    match compaction.filter {
-        CompactionFilterConfig::None => None,
-        CompactionFilterConfig::NoopCounting => Some(Arc::new(
+    ctx: Option<SupplierContext>,
+) -> anyhow::Result<Option<Arc<dyn CompactionFilterSupplier>>> {
+    match &compaction.filter {
+        CompactionFilterConfig::None => Ok(None),
+        CompactionFilterConfig::NoopCounting => Ok(Some(Arc::new(
             noop_counting::NoopCountingSupplier::new(shard_name.to_string()),
-        )),
+        ))),
+        CompactionFilterConfig::CompletedJobs { retention_secs } => {
+            let ctx = ctx.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CompletedJobs filter requires a SupplierContext (db_path + object store)"
+                )
+            })?;
+            let retention = Duration::from_secs(*retention_secs);
+            Ok(Some(Arc::new(
+                completed_jobs::CompletedJobCompactionFilterSupplier::new(
+                    retention,
+                    Some((ctx.db_path, ctx.store)),
+                ),
+            )))
+        }
     }
 }
 
@@ -131,18 +158,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_supplier_none_by_default() {
+    #[tokio::test]
+    async fn build_supplier_none_by_default() {
         let cfg = CompactionConfig::default();
-        assert!(build_supplier(&cfg, "shard").is_none());
+        assert!(build_supplier(&cfg, "shard", None).await.unwrap().is_none());
     }
 
-    #[test]
-    fn build_supplier_noop_counting() {
+    #[tokio::test]
+    async fn build_supplier_noop_counting() {
         let cfg = CompactionConfig {
             filter: CompactionFilterConfig::NoopCounting,
             ..Default::default()
         };
-        assert!(build_supplier(&cfg, "shard").is_some());
+        assert!(build_supplier(&cfg, "shard", None)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn build_supplier_completed_jobs_requires_context() {
+        let cfg = CompactionConfig {
+            filter: CompactionFilterConfig::CompletedJobs {
+                retention_secs: 3600,
+            },
+            ..Default::default()
+        };
+        assert!(build_supplier(&cfg, "shard", None).await.is_err());
     }
 }

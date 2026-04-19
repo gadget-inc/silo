@@ -37,7 +37,8 @@ disable = false
 # compaction job the filter logs a summary with entries_seen, value_entries,
 # tombstone_entries, merge_entries, bytes_seen.
 [database.compaction.filter]
-kind = "noop_counting"
+kind = "completed_jobs"
+retention_secs = 15          # 7 days
 
 [database.compaction.scheduler]
 kind = "size_tiered"

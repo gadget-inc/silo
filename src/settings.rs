@@ -290,6 +290,20 @@ pub enum CompactionFilterConfig {
     /// of each compaction job. Used to validate the filter plumbing without
     /// changing compaction semantics.
     NoopCounting,
+    /// Delete completed (terminal) job data older than `retention_secs`.
+    /// Jobs in Succeeded, Failed, or Cancelled state whose status changed
+    /// more than `retention_secs` ago will have all associated keys removed
+    /// during compaction.
+    CompletedJobs {
+        /// Seconds to retain completed job data before purging. Defaults to
+        /// 7 days (604 800 seconds).
+        #[serde(default = "default_completed_jobs_retention_secs")]
+        retention_secs: u64,
+    },
+}
+
+fn default_completed_jobs_retention_secs() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 /// Configuration for SlateDB's in-memory caches.
