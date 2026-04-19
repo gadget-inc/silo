@@ -26,7 +26,14 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdirSync, writeFileSync, createWriteStream, readdirSync } from "node:fs";
+import {
+  mkdirSync,
+  writeFileSync,
+  createWriteStream,
+  readdirSync,
+  readFileSync,
+  existsSync,
+} from "node:fs";
 import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -161,6 +168,214 @@ async function snapshotMetrics(url: string, file: string): Promise<void> {
   }
 }
 
+type BenchTotals = {
+  totalEnqueued: number | null;
+  totalCompleted: number | null;
+  avgRate: number | null;
+  enqueueRate: number | null;
+};
+
+type NoopFilterStats = {
+  invocations: number;
+  entriesSeen: number;
+  valueEntries: number;
+  tombstoneEntries: number;
+  mergeEntries: number;
+  bytesSeen: number;
+};
+
+type SlatedbGauges = {
+  bytesCompactedTotal: number | null;
+  l0SstCount: number | null;
+  lastCompactionTs: number | null;
+  runningCompactions: number | null;
+};
+
+function parseBenchTotals(file: string): BenchTotals {
+  const defaults: BenchTotals = {
+    totalEnqueued: null,
+    totalCompleted: null,
+    avgRate: null,
+    enqueueRate: null,
+  };
+  if (!existsSync(file)) return defaults;
+  const txt = readFileSync(file, "utf8");
+  // Strip ANSI escapes so regexes line up.
+  const clean = txt.replace(/\u001b\[[0-9;]*m/g, "");
+  const num = (re: RegExp): number | null => {
+    const m = clean.match(re);
+    return m ? Number(m[1]) : null;
+  };
+  return {
+    totalEnqueued: num(/Total enqueued:\s*([\d.]+)/),
+    totalCompleted: num(/Total completed:\s*([\d.]+)/),
+    avgRate: num(/Average rate:\s*([\d.]+)\s*tasks\/sec/),
+    enqueueRate: num(/Average enqueue rate:\s*([\d.]+)\s*tasks\/sec/),
+  };
+}
+
+function parseNoopFilter(file: string): NoopFilterStats {
+  const out: NoopFilterStats = {
+    invocations: 0,
+    entriesSeen: 0,
+    valueEntries: 0,
+    tombstoneEntries: 0,
+    mergeEntries: 0,
+    bytesSeen: 0,
+  };
+  if (!existsSync(file)) return out;
+  const clean = readFileSync(file, "utf8").replace(/\u001b\[[0-9;]*m/g, "");
+  for (const line of clean.split("\n")) {
+    if (!line.includes("noop_counting compaction filter summary")) continue;
+    out.invocations += 1;
+    const pick = (key: string): number => {
+      const m = line.match(new RegExp(`${key}=([\\d]+)`));
+      return m ? Number(m[1]) : 0;
+    };
+    out.entriesSeen += pick("entries_seen");
+    out.valueEntries += pick("value_entries");
+    out.tombstoneEntries += pick("tombstone_entries");
+    out.mergeEntries += pick("merge_entries");
+    out.bytesSeen += pick("bytes_seen");
+  }
+  return out;
+}
+
+function parseSlatedbGauges(file: string): SlatedbGauges {
+  const out: SlatedbGauges = {
+    bytesCompactedTotal: null,
+    l0SstCount: null,
+    lastCompactionTs: null,
+    runningCompactions: null,
+  };
+  if (!existsSync(file)) return out;
+  const txt = readFileSync(file, "utf8");
+  // Prometheus exposition: <name>{labels} <value>. There can be multiple lines
+  // for the same metric across shards; for this 1-shard harness we just take
+  // the first numeric occurrence.
+  const pick = (metric: string): number | null => {
+    const re = new RegExp(`^${metric}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)`, "m");
+    const m = txt.match(re);
+    return m ? Number(m[1]) : null;
+  };
+  out.bytesCompactedTotal = pick("silo_slatedb_bytes_compacted_total");
+  out.l0SstCount = pick("silo_slatedb_l0_sst_count");
+  out.lastCompactionTs = pick("silo_slatedb_last_compaction_ts_seconds");
+  out.runningCompactions = pick("silo_slatedb_running_compactions");
+  return out;
+}
+
+function formatBytes(n: number | null): string {
+  if (n === null || Number.isNaN(n)) return "n/a";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+function buildSummary(opts: {
+  runId: string;
+  shard: string;
+  args: Args;
+  runDir: string;
+}) {
+  const bench = parseBenchTotals(resolve(opts.runDir, "bench.log"));
+  const noop = parseNoopFilter(resolve(opts.runDir, "compactor.log"));
+  const before = parseSlatedbGauges(
+    resolve(opts.runDir, "writer-metrics-before.txt"),
+  );
+  const afterWrites = parseSlatedbGauges(
+    resolve(opts.runDir, "writer-metrics-after-writes.txt"),
+  );
+  const afterCompact = parseSlatedbGauges(
+    resolve(opts.runDir, "writer-metrics-after-compact.txt"),
+  );
+  const bytesCompactedDelta =
+    afterCompact.bytesCompactedTotal !== null
+      ? afterCompact.bytesCompactedTotal - (before.bytesCompactedTotal ?? 0)
+      : null;
+  return {
+    runId: opts.runId,
+    shard: opts.shard,
+    writerConfig: opts.args.writerConfig,
+    compactorConfig: opts.args.compactorConfig,
+    durationSecs: opts.args.durationSecs,
+    enqueuers: opts.args.enqueuers,
+    workers: opts.args.workers,
+    completedAt: new Date().toISOString(),
+    bench,
+    noopFilter: noop,
+    slatedb: {
+      before,
+      afterWrites,
+      afterCompact,
+      bytesCompactedDelta,
+    },
+  };
+}
+
+function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string): void {
+  const rows: [string, string][] = [
+    ["Run ID", summary.runId],
+    ["Shard", summary.shard],
+    ["Writer config", summary.writerConfig],
+    ["Compactor config", summary.compactorConfig],
+    ["", ""],
+    ["Bench duration", `${summary.durationSecs}s`],
+    [
+      "Bench enqueue",
+      summary.bench.totalEnqueued !== null
+        ? `${summary.bench.totalEnqueued} tasks (${summary.bench.enqueueRate ?? "?"}/s)`
+        : "n/a",
+    ],
+    [
+      "Bench complete",
+      summary.bench.totalCompleted !== null
+        ? `${summary.bench.totalCompleted} tasks (${summary.bench.avgRate ?? "?"}/s)`
+        : "n/a",
+    ],
+    ["", ""],
+    ["L0 SSTs after writes", String(summary.slatedb.afterWrites.l0SstCount ?? "n/a")],
+    ["L0 SSTs after compact", String(summary.slatedb.afterCompact.l0SstCount ?? "n/a")],
+    [
+      "Bytes compacted (delta)",
+      formatBytes(summary.slatedb.bytesCompactedDelta),
+    ],
+    [
+      "Last compaction ts",
+      summary.slatedb.afterCompact.lastCompactionTs !== null
+        ? new Date(
+            summary.slatedb.afterCompact.lastCompactionTs * 1000,
+          ).toISOString()
+        : "n/a",
+    ],
+    ["", ""],
+    ["Filter invocations", String(summary.noopFilter.invocations)],
+    ["Filter entries seen", String(summary.noopFilter.entriesSeen)],
+    [
+      "  value / tombstone / merge",
+      `${summary.noopFilter.valueEntries} / ${summary.noopFilter.tombstoneEntries} / ${summary.noopFilter.mergeEntries}`,
+    ],
+    ["Filter bytes seen", formatBytes(summary.noopFilter.bytesSeen)],
+  ];
+  const w = Math.max(...rows.map(([k]) => k.length));
+  console.log("");
+  console.log("================ compaction harness summary ================");
+  for (const [k, v] of rows) {
+    if (!k && !v) {
+      console.log("");
+    } else {
+      console.log(`  ${k.padEnd(w)}  ${v}`);
+    }
+  }
+  console.log("============================================================");
+  console.log(`  artifacts: ${runDir}`);
+  console.log(
+    "  diff writer-metrics-after-compact.txt across two runs to A/B compaction configs",
+  );
+  console.log("");
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const runId = new Date().toISOString().replace(/[:.]/g, "-");
@@ -254,27 +469,14 @@ async function main(): Promise<void> {
     await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-compact.txt"));
     await snapshotMetrics(args.compactorMetrics, resolve(runDir, "compactor-metrics-after.txt"));
 
-    writeFileSync(
-      resolve(runDir, "summary.json"),
-      JSON.stringify(
-        {
-          runId,
-          shard,
-          writerConfig: args.writerConfig,
-          compactorConfig: args.compactorConfig,
-          durationSecs: args.durationSecs,
-          enqueuers: args.enqueuers,
-          workers: args.workers,
-          completedAt: new Date().toISOString(),
-        },
-        null,
-        2,
-      ),
-    );
-    console.log(`[harness] done. run artifacts at ${runDir}`);
-    console.log(
-      "[harness] key slatedb metrics to diff across runs: silo_slatedb_bytes_compacted_total, silo_slatedb_l0_sst_count, silo_slatedb_running_compactions",
-    );
+    const summary = buildSummary({
+      runId,
+      shard,
+      args,
+      runDir,
+    });
+    writeFileSync(resolve(runDir, "summary.json"), JSON.stringify(summary, null, 2));
+    printSummary(summary, runDir);
   } finally {
     writer.kill("SIGTERM");
     await new Promise<void>((res) => writer.on("exit", () => res()));
