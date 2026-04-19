@@ -168,8 +168,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     // Build the Compactor directly so we can configure options + merge
-    // operator + filter supplier. Admin::run_compactor can't do all three at
-    // once in slatedb 0.12 (it only passes the filter supplier through).
+    // operator + filter supplier + scheduler supplier.
     let slatedb_recorder = Arc::new(DefaultMetricsRecorder::new());
     let mut compactor_builder =
         CompactorBuilder::new(db_path.clone(), Arc::clone(&counting_store))
@@ -178,6 +177,11 @@ async fn main() -> anyhow::Result<()> {
             .with_metrics_recorder(slatedb_recorder.clone());
     if let Some(supplier) = supplier {
         compactor_builder = compactor_builder.with_compaction_filter_supplier(supplier);
+    }
+    if let Some(scheduler) =
+        compaction_filters::build_scheduler_supplier(&template.compaction)
+    {
+        compactor_builder = compactor_builder.with_scheduler_supplier(scheduler);
     }
     let compactor = compactor_builder.build();
 
@@ -228,6 +232,9 @@ async fn main() -> anyhow::Result<()> {
         m.update_slatedb_stats(&args.shard, &slatedb_recorder);
         m.update_object_store_counters(&args.shard, &object_store_counters);
     }
+    // Give the harness metrics poller (100ms interval) time to scrape the
+    // final stats before we tear down the HTTP server.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let _ = metrics_shutdown_tx.send(());
     if let Some(h) = slatedb_poll_handle {
         let _ = h.await;
@@ -313,7 +320,7 @@ async fn build_full_compaction_spec(
         .map_err(|e| anyhow::anyhow!("read_compactor_state_view: {e}"))?;
     let manifest = state.manifest();
     let l0_ids: Vec<ulid::Ulid> = manifest
-        .l0
+        .l0()
         .iter()
         .map(|sst| sst.sst.id.unwrap_compacted_id())
         .collect();
@@ -322,7 +329,7 @@ async fn build_full_compaction_spec(
         .map(|&id| SourceId::SstView(id))
         .chain(
             manifest
-                .compacted
+                .compacted()
                 .iter()
                 .map(|sr| SourceId::SortedRun(sr.id)),
         )
@@ -330,7 +337,7 @@ async fn build_full_compaction_spec(
     if sources.is_empty() {
         return Ok((None, l0_ids));
     }
-    let destination = manifest.compacted.iter().map(|sr| sr.id).min().unwrap_or(0);
+    let destination = manifest.compacted().iter().map(|sr| sr.id).min().unwrap_or(0);
     Ok((Some(CompactionSpec::new(sources, destination)), l0_ids))
 }
 
@@ -354,11 +361,11 @@ async fn poll_until_sources_consumed(
             .map_err(|e| anyhow::anyhow!("read_compactor_state_view: {e}"))?;
         let manifest = state.manifest();
         let current_l0_ids: HashSet<ulid::Ulid> = manifest
-            .l0
+            .l0()
             .iter()
             .map(|sst| sst.sst.id.unwrap_compacted_id())
             .collect();
-        let sorted_run_count = manifest.compacted.len();
+        let sorted_run_count = manifest.compacted().len();
         let remaining = submitted.intersection(&current_l0_ids).count();
 
         if remaining == 0 {

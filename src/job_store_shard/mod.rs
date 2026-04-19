@@ -577,7 +577,7 @@ impl JobStoreShard {
         let manifest = state.manifest();
 
         let l0_ssts: Vec<LsmSstInfo> = manifest
-            .l0
+            .l0()
             .iter()
             .map(|sst| LsmSstInfo {
                 id: format!("{:?}", sst.id),
@@ -586,7 +586,7 @@ impl JobStoreShard {
             .collect();
 
         let sorted_runs: Vec<LsmSortedRunInfo> = manifest
-            .compacted
+            .compacted()
             .iter()
             .map(|sr| LsmSortedRunInfo {
                 id: sr.id,

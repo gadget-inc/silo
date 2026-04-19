@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::path::Path;
+use slatedb::compactor::CompactionSchedulerSupplier;
 use slatedb::{CompactionFilterSupplier, config::CompactorOptions};
 
 use crate::settings::{
@@ -54,12 +55,6 @@ fn apply_scheduler_config(opts: &mut CompactorOptions, scheduler: &CompactionSch
             max_compaction_sources,
             include_size_threshold,
         } => {
-            // slatedb's SizeTieredCompactionScheduler reads these keys from
-            // `CompactorOptions.scheduler_options` — see the
-            // `From<&HashMap<String,String>> for SizeTieredCompactionSchedulerOptions`
-            // impl in slatedb/src/config.rs. Using the string map keeps us on
-            // the public extension point and leaves room for future schedulers
-            // without pulling a scheduler-specific type into this API.
             opts.scheduler_options.insert(
                 "min_compaction_sources".to_string(),
                 min_compaction_sources.to_string(),
@@ -73,6 +68,43 @@ fn apply_scheduler_config(opts: &mut CompactorOptions, scheduler: &CompactionSch
                 include_size_threshold.to_string(),
             );
         }
+        CompactionSchedulerConfig::Leveled {
+            level0_file_num_compaction_trigger,
+            max_bytes_for_level_base,
+            max_bytes_for_level_multiplier,
+            num_levels,
+        } => {
+            opts.scheduler_options.insert(
+                "level0_file_num_compaction_trigger".to_string(),
+                level0_file_num_compaction_trigger.to_string(),
+            );
+            opts.scheduler_options.insert(
+                "max_bytes_for_level_base".to_string(),
+                max_bytes_for_level_base.to_string(),
+            );
+            opts.scheduler_options.insert(
+                "max_bytes_for_level_multiplier".to_string(),
+                max_bytes_for_level_multiplier.to_string(),
+            );
+            opts.scheduler_options.insert(
+                "num_levels".to_string(),
+                num_levels.to_string(),
+            );
+        }
+    }
+}
+
+/// Build the optional scheduler supplier. Returns `Some` only for
+/// scheduler variants that need a custom supplier (currently `Leveled`).
+/// `SizeTiered` uses the default scheduler built into slatedb.
+pub fn build_scheduler_supplier(
+    compaction: &CompactionConfig,
+) -> Option<Arc<dyn CompactionSchedulerSupplier>> {
+    match &compaction.scheduler {
+        CompactionSchedulerConfig::SizeTiered { .. } => None,
+        CompactionSchedulerConfig::Leveled { .. } => Some(Arc::new(
+            slatedb::compactor::LeveledCompactionSchedulerSupplier::new(),
+        )),
     }
 }
 

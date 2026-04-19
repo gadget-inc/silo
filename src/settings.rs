@@ -248,7 +248,7 @@ pub struct CompactionConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompactionSchedulerConfig {
-    /// Size-tiered compaction (the only scheduler implemented in slatedb 0.12).
+    /// Size-tiered compaction.
     SizeTiered {
         #[serde(default = "default_stcs_min_sources")]
         min_compaction_sources: usize,
@@ -256,6 +256,19 @@ pub enum CompactionSchedulerConfig {
         max_compaction_sources: usize,
         #[serde(default = "default_stcs_include_size_threshold")]
         include_size_threshold: f32,
+    },
+    /// Leveled compaction — organizes data into levels with exponentially
+    /// increasing target sizes. Reduces read and space amplification
+    /// compared to size-tiered compaction.
+    Leveled {
+        #[serde(default = "default_leveled_l0_trigger")]
+        level0_file_num_compaction_trigger: usize,
+        #[serde(default = "default_leveled_max_bytes_base")]
+        max_bytes_for_level_base: u64,
+        #[serde(default = "default_leveled_multiplier")]
+        max_bytes_for_level_multiplier: f64,
+        #[serde(default = "default_leveled_num_levels")]
+        num_levels: usize,
     },
 }
 
@@ -277,6 +290,18 @@ fn default_stcs_max_sources() -> usize {
 }
 fn default_stcs_include_size_threshold() -> f32 {
     4.0
+}
+fn default_leveled_l0_trigger() -> usize {
+    4
+}
+fn default_leveled_max_bytes_base() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_leveled_multiplier() -> f64 {
+    10.0
+}
+fn default_leveled_num_levels() -> usize {
+    7
 }
 
 /// Compaction filter selection for the A/B test harness.

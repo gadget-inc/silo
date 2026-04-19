@@ -1,0 +1,48 @@
+# Standalone compactor config — SIZE-TIERED scheduler.
+# Same as compaction-harness-compactor.toml but with size_tiered scheduler
+# for A/B comparison against leveled compaction.
+
+[server]
+grpc_addr = "127.0.0.1:7461"
+dev_mode = true
+
+[coordination]
+backend = "none"
+initial_shard_count = 1
+
+[tenancy]
+enabled = false
+
+[webui]
+enabled = false
+
+[metrics]
+enabled = true
+addr = "127.0.0.1:9191"
+
+[database]
+backend = "fs"
+path = "./tmp/compaction-harness/%shard%"
+
+[database.compaction]
+disable = false
+
+[database.compaction.filter]
+kind = "completed_jobs"
+retention_secs = 15
+
+[database.compaction.scheduler]
+kind = "size_tiered"
+min_compaction_sources = 4
+max_compaction_sources = 8
+include_size_threshold = 4.0
+
+[database.slatedb.compactor_options]
+poll_interval = "2s"
+max_sst_size = 67108864          # 64 MiB
+max_concurrent_compactions = 2
+max_fetch_tasks = 4
+
+[harness]
+compactions = 25
+compaction_interval_ms = 10000

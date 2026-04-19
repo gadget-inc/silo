@@ -41,10 +41,11 @@ kind = "completed_jobs"
 retention_secs = 15          # 7 days
 
 [database.compaction.scheduler]
-kind = "size_tiered"
-min_compaction_sources = 4
-max_compaction_sources = 8
-include_size_threshold = 4.0
+kind = "leveled"
+level0_file_num_compaction_trigger = 4
+max_bytes_for_level_base = 268435456   # 256 MiB
+max_bytes_for_level_multiplier = 10.0
+num_levels = 7
 
 # Tune compactor throughput / SST size for the A/B experiment. Smaller
 # max_sst_size produces more PUT operations and exposes per-object overhead;
@@ -63,7 +64,7 @@ max_fetch_tasks = 4
 [harness]
 # Total number of `silo-compactor --mode once` invocations the harness will
 # run against the writer during a single harness run.
-compactions = 6
+compactions = 25
 # Milliseconds to wait BEFORE each compactor invocation. The first sleep runs
 # after the bench starts, giving the writer time to accumulate some L0 SSTs
 # before the first compaction pass.

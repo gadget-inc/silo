@@ -399,12 +399,12 @@ impl JobStoreShard {
         // the lowest sorted run, which allows tombstones to be dropped.
         let manifest = state.manifest();
         let sources: Vec<SourceId> = manifest
-            .l0
+            .l0()
             .iter()
             .map(|sst| SourceId::SstView(sst.sst.id.unwrap_compacted_id()))
             .chain(
                 manifest
-                    .compacted
+                    .compacted()
                     .iter()
                     .map(|sr| SourceId::SortedRun(sr.id)),
             )
@@ -415,7 +415,7 @@ impl JobStoreShard {
             return Ok(());
         }
 
-        let destination = manifest.compacted.iter().map(|sr| sr.id).min().unwrap_or(0);
+        let destination = manifest.compacted().iter().map(|sr| sr.id).min().unwrap_or(0);
         let spec = CompactionSpec::new(sources, destination);
 
         admin

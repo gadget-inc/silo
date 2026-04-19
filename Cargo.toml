@@ -13,9 +13,9 @@ version = "0.2.0"
 [dependencies]
 clap = { version = "4.3.14", features = ["derive", "env"] }
 futures = "0.3"
-slatedb = { version = "0.12.0", features = ["compaction_filters"] }
+slatedb = { git = "https://github.com/kirinrastogi/slatedb.git", branch = "kirin/levelled_compaction", features = ["compaction_filters"] }
 ulid = "1"
-slatedb-common = "0.12.0"
+slatedb-common = { git = "https://github.com/kirinrastogi/slatedb.git", branch = "kirin/levelled_compaction" }
 object_store = { version = "0.12", features = ["gcp"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
