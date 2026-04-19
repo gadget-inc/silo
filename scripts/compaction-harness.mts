@@ -238,6 +238,79 @@ type SlatedbGauges = {
   runningCompactions: number | null;
 };
 
+type ObjectStoreOps = {
+  put: number;
+  put_multipart: number;
+  get: number;
+  delete: number;
+  list: number;
+  list_with_delimiter: number;
+  copy: number;
+  copy_if_not_exists: number;
+  bytes: number;
+};
+
+const ZERO_OBJECT_STORE_OPS: ObjectStoreOps = {
+  put: 0,
+  put_multipart: 0,
+  get: 0,
+  delete: 0,
+  list: 0,
+  list_with_delimiter: 0,
+  copy: 0,
+  copy_if_not_exists: 0,
+  bytes: 0,
+};
+
+function addObjectStoreOps(a: ObjectStoreOps, b: ObjectStoreOps): ObjectStoreOps {
+  return {
+    put: a.put + b.put,
+    put_multipart: a.put_multipart + b.put_multipart,
+    get: a.get + b.get,
+    delete: a.delete + b.delete,
+    list: a.list + b.list,
+    list_with_delimiter: a.list_with_delimiter + b.list_with_delimiter,
+    copy: a.copy + b.copy,
+    copy_if_not_exists: a.copy_if_not_exists + b.copy_if_not_exists,
+    bytes: a.bytes + b.bytes,
+  };
+}
+
+function totalOps(o: ObjectStoreOps): number {
+  return (
+    o.put +
+    o.put_multipart +
+    o.get +
+    o.delete +
+    o.list +
+    o.list_with_delimiter +
+    o.copy +
+    o.copy_if_not_exists
+  );
+}
+
+function parseObjectStoreOps(file: string): ObjectStoreOps {
+  const out: ObjectStoreOps = { ...ZERO_OBJECT_STORE_OPS };
+  if (!existsSync(file)) return out;
+  const txt = readFileSync(file, "utf8");
+  const opRe =
+    /^silo_object_store_ops_total\{[^}]*op="([a-z_]+)"[^}]*\}\s+([\d.eE+-]+)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = opRe.exec(txt)) !== null) {
+    const op = m[1];
+    const val = Number(m[2]);
+    if (op in out) {
+      // @ts-expect-error — indexed access guarded by `in` check above.
+      out[op] = (out[op] ?? 0) + val;
+    }
+  }
+  const bytesM = txt.match(
+    /^silo_object_store_bytes_total(?:\{[^}]*\})?\s+([\d.eE+-]+)/m,
+  );
+  if (bytesM) out.bytes = Number(bytesM[1]);
+  return out;
+}
+
 function parseBenchTotals(file: string): BenchTotals {
   const defaults: BenchTotals = {
     totalEnqueued: null,
@@ -346,10 +419,14 @@ function buildSummary(opts: {
   let compactorBytesSum = 0;
   let compactorBytesAny = false;
   let lastCompactionTs: number | null = null;
+  let objectStoreTotals: ObjectStoreOps = { ...ZERO_OBJECT_STORE_OPS };
+  const objectStorePerIter: Array<{ iteration: number; ops: ObjectStoreOps }> = [];
   for (let i = 1; i <= opts.args.compactions; i += 1) {
-    const gauges = parseSlatedbGauges(
-      resolve(opts.runDir, `compactor-metrics-iter-${i}.txt`),
+    const snapshotFile = resolve(
+      opts.runDir,
+      `compactor-metrics-iter-${i}.txt`,
     );
+    const gauges = parseSlatedbGauges(snapshotFile);
     if (gauges.bytesCompactedTotal !== null) {
       compactorBytesSum += gauges.bytesCompactedTotal;
       compactorBytesAny = true;
@@ -360,6 +437,9 @@ function buildSummary(opts: {
     if (gauges.lastCompactionTs !== null && gauges.lastCompactionTs > 0) {
       lastCompactionTs = Math.max(lastCompactionTs ?? 0, gauges.lastCompactionTs);
     }
+    const ops = parseObjectStoreOps(snapshotFile);
+    objectStorePerIter.push({ iteration: i, ops });
+    objectStoreTotals = addObjectStoreOps(objectStoreTotals, ops);
   }
   return {
     runId: opts.runId,
@@ -383,6 +463,11 @@ function buildSummary(opts: {
     compactor: {
       bytesCompactedTotal: compactorBytesAny ? compactorBytesSum : null,
       lastCompactionTs,
+    },
+    objectStore: {
+      perIteration: objectStorePerIter,
+      totals: objectStoreTotals,
+      totalOps: totalOps(objectStoreTotals),
     },
   };
 }
@@ -432,6 +517,26 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
       `${summary.noopFilter.valueEntries} / ${summary.noopFilter.tombstoneEntries} / ${summary.noopFilter.mergeEntries}`,
     ],
     ["Filter bytes seen", formatBytes(summary.noopFilter.bytesSeen)],
+    ["", ""],
+    [
+      "Object-store API calls",
+      `${summary.objectStore.totalOps} total across ${summary.compactions} compaction passes`,
+    ],
+    ["  put", String(summary.objectStore.totals.put)],
+    ["  put_multipart", String(summary.objectStore.totals.put_multipart)],
+    ["  get (incl. head)", String(summary.objectStore.totals.get)],
+    ["  delete", String(summary.objectStore.totals.delete)],
+    ["  list", String(summary.objectStore.totals.list)],
+    [
+      "  list_with_delimiter",
+      String(summary.objectStore.totals.list_with_delimiter),
+    ],
+    ["  copy", String(summary.objectStore.totals.copy)],
+    [
+      "  copy_if_not_exists",
+      String(summary.objectStore.totals.copy_if_not_exists),
+    ],
+    ["Object-store put bytes", formatBytes(summary.objectStore.totals.bytes)],
   ];
   const w = Math.max(...rows.map(([k]) => k.length));
   console.log("");

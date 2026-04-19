@@ -31,6 +31,7 @@ use tracing::{error, info, warn};
 use silo::compaction_filters;
 use silo::factory::ShardFactory;
 use silo::metrics::{self, Metrics};
+use silo::object_store_counters::{CountingObjectStore, ObjectStoreCounters};
 use silo::settings::AppConfig;
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -117,6 +118,16 @@ async fn main() -> anyhow::Result<()> {
         ShardFactory::resolve_at_root(&template.backend, &template.path, &args.shard)
             .map_err(|e| anyhow::anyhow!("resolve object store: {e}"))?;
 
+    // Wrap the resolved store with a CountingObjectStore so every call the
+    // compactor makes (put/get/list/delete/copy) is attributable to this
+    // run. The wrapped store is handed to BOTH CompactorBuilder and
+    // AdminBuilder so submit_compaction / read_compactor_state_view are
+    // counted too — those are part of the cost of running a compaction pass.
+    let object_store_counters = ObjectStoreCounters::new();
+    let counting_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(
+        CountingObjectStore::new(Arc::clone(&resolved.store), object_store_counters.clone()),
+    );
+
     info!(
         shard = %args.shard,
         db_path = %db_path,
@@ -152,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
     // once in slatedb 0.12 (it only passes the filter supplier through).
     let slatedb_recorder = Arc::new(DefaultMetricsRecorder::new());
     let mut compactor_builder =
-        CompactorBuilder::new(db_path.clone(), Arc::clone(&resolved.store))
+        CompactorBuilder::new(db_path.clone(), Arc::clone(&counting_store))
             .with_options(compactor_options)
             .with_merge_operator(silo::job_store_shard::counter_merge_operator())
             .with_metrics_recorder(slatedb_recorder.clone());
@@ -167,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
     let slatedb_poll_handle = if let Some(m) = metrics_init.clone() {
         let shard_label = args.shard.clone();
         let recorder = slatedb_recorder.clone();
+        let os_counters = object_store_counters.clone();
         let mut rx = metrics_shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -175,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
                     _ = rx.recv() => break,
                     _ = ticker.tick() => {
                         m.update_slatedb_stats(&shard_label, &recorder);
+                        m.update_object_store_counters(&shard_label, &os_counters);
                     }
                 }
             }
@@ -185,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Admin is only used for read_compactor_state_view + submit_compaction,
     // which do not depend on compactor options or merge operator.
-    let admin = AdminBuilder::new(db_path.clone(), Arc::clone(&resolved.store)).build();
+    let admin = AdminBuilder::new(db_path.clone(), Arc::clone(&counting_store)).build();
 
     let result = match args.mode {
         Mode::Loop => run_loop_mode(compactor).await,
@@ -204,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
     // even if shutdown beats the 1s tick.
     if let Some(m) = metrics_init.as_ref() {
         m.update_slatedb_stats(&args.shard, &slatedb_recorder);
+        m.update_object_store_counters(&args.shard, &object_store_counters);
     }
     let _ = metrics_shutdown_tx.send(());
     if let Some(h) = slatedb_poll_handle {

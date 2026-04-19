@@ -121,6 +121,15 @@ pub struct Metrics {
     slatedb_l0_sst_count: GaugeVec,
     slatedb_total_mem_size_bytes: GaugeVec,
 
+    // Object-store request accounting (set by the compaction test harness
+    // via CountingObjectStore, but the metric family is defined here so
+    // both silo and silo-compactor export it uniformly).
+    object_store_ops: CounterVec,
+    object_store_bytes: CounterVec,
+    // Remembers the last-observed counter values so we can emit deltas
+    // against the monotonic Prometheus counters without double-counting.
+    object_store_prev_values: Arc<Mutex<HashMap<String, u64>>>,
+
     // SlateDB cache counters (per-shard, monotonically increasing)
     slatedb_cache_data_block_hit: CounterVec,
     slatedb_cache_data_block_miss: CounterVec,
@@ -307,6 +316,47 @@ impl Metrics {
     /// Call this periodically (e.g., every second) to sync SlateDB's internal
     /// statistics to Prometheus metrics. Counter-type stats are tracked via deltas
     /// since Prometheus counters only support `inc_by()`, not `set()`.
+    /// Pump the raw atomic counters held by a [`crate::object_store_counters::ObjectStoreCounters`]
+    /// into the Prometheus CounterVec families. Counter values are monotonic
+    /// at the source, so we compute deltas against the last snapshot to avoid
+    /// double-counting on each scrape interval.
+    pub fn update_object_store_counters(
+        &self,
+        shard: &str,
+        counters: &crate::object_store_counters::ObjectStoreCounters,
+    ) {
+        let snap = counters.snapshot();
+        let ops: &[(&str, u64)] = &[
+            ("put", snap.put_opts),
+            ("put_multipart", snap.put_multipart),
+            ("get", snap.get_opts),
+            ("delete", snap.delete),
+            ("list", snap.list),
+            ("list_with_delimiter", snap.list_with_delimiter),
+            ("copy", snap.copy),
+            ("copy_if_not_exists", snap.copy_if_not_exists),
+        ];
+        let mut prev = self.object_store_prev_values.lock().unwrap();
+        for (op, value) in ops {
+            let key = format!("ops:{shard}:{op}");
+            let last = prev.get(&key).copied().unwrap_or(0);
+            if *value > last {
+                self.object_store_ops
+                    .with_label_values(&[shard, op])
+                    .inc_by((*value - last) as f64);
+            }
+            prev.insert(key, *value);
+        }
+        let bytes_key = format!("bytes:{shard}");
+        let last_bytes = prev.get(&bytes_key).copied().unwrap_or(0);
+        if snap.put_bytes > last_bytes {
+            self.object_store_bytes
+                .with_label_values(&[shard])
+                .inc_by((snap.put_bytes - last_bytes) as f64);
+        }
+        prev.insert(bytes_key, snap.put_bytes);
+    }
+
     pub fn update_slatedb_stats(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
         // Counter-type stats: monotonically increasing in SlateDB
         // REQUEST_COUNT uses an "op" label to distinguish get/scan/flush
@@ -925,6 +975,27 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let object_store_ops = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_object_store_ops_total",
+                "Total object-store API calls made through CountingObjectStore, labeled by op",
+            ),
+            &["shard", "op"],
+        )?,
+    );
+    let object_store_bytes = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_object_store_bytes_total",
+                "Total bytes sent via object-store put operations through CountingObjectStore",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // SlateDB cache counters
     let slatedb_cache_data_block_hit = register(
         &registry,
@@ -1040,6 +1111,9 @@ pub fn init() -> anyhow::Result<Metrics> {
         slatedb_cache_filter_hit,
         slatedb_cache_filter_miss,
         slatedb_prev_values: Arc::new(Mutex::new(HashMap::new())),
+        object_store_ops,
+        object_store_bytes,
+        object_store_prev_values: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 

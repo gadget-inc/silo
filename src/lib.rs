@@ -5,6 +5,7 @@ pub mod codec;
 pub mod concurrency;
 pub mod compaction_filters;
 pub mod coordination;
+pub mod object_store_counters;
 pub mod dst_events;
 pub mod factory;
 pub mod gubernator;
