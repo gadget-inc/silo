@@ -236,6 +236,7 @@ type SlatedbGauges = {
   l0SstCount: number | null;
   lastCompactionTs: number | null;
   runningCompactions: number | null;
+  totalMemBytes: number | null;
 };
 
 type ObjectStoreOps = {
@@ -367,6 +368,7 @@ function parseSlatedbGauges(file: string): SlatedbGauges {
     l0SstCount: null,
     lastCompactionTs: null,
     runningCompactions: null,
+    totalMemBytes: null,
   };
   if (!existsSync(file)) return out;
   const txt = readFileSync(file, "utf8");
@@ -382,6 +384,7 @@ function parseSlatedbGauges(file: string): SlatedbGauges {
   out.l0SstCount = pick("silo_slatedb_l0_sst_count");
   out.lastCompactionTs = pick("silo_slatedb_last_compaction_ts_seconds");
   out.runningCompactions = pick("silo_slatedb_running_compactions");
+  out.totalMemBytes = pick("silo_slatedb_total_mem_size_bytes");
   return out;
 }
 
@@ -421,6 +424,7 @@ function buildSummary(opts: {
   let lastCompactionTs: number | null = null;
   let objectStoreTotals: ObjectStoreOps = { ...ZERO_OBJECT_STORE_OPS };
   const objectStorePerIter: Array<{ iteration: number; ops: ObjectStoreOps }> = [];
+  let peakMemBytes: number | null = null;
   for (let i = 1; i <= opts.args.compactions; i += 1) {
     const snapshotFile = resolve(
       opts.runDir,
@@ -440,6 +444,9 @@ function buildSummary(opts: {
     const ops = parseObjectStoreOps(snapshotFile);
     objectStorePerIter.push({ iteration: i, ops });
     objectStoreTotals = addObjectStoreOps(objectStoreTotals, ops);
+    if (gauges.totalMemBytes !== null) {
+      peakMemBytes = Math.max(peakMemBytes ?? 0, gauges.totalMemBytes);
+    }
   }
   return {
     runId: opts.runId,
@@ -463,6 +470,7 @@ function buildSummary(opts: {
     compactor: {
       bytesCompactedTotal: compactorBytesAny ? compactorBytesSum : null,
       lastCompactionTs,
+      peakMemBytes,
     },
     objectStore: {
       perIteration: objectStorePerIter,
@@ -508,6 +516,10 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
       summary.compactor.lastCompactionTs !== null
         ? new Date(summary.compactor.lastCompactionTs * 1000).toISOString()
         : "n/a",
+    ],
+    [
+      "Compactor peak total mem",
+      formatBytes(summary.compactor.peakMemBytes),
     ],
     ["", ""],
     ["Filter invocations", String(summary.noopFilter.invocations)],
