@@ -147,6 +147,8 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
             dropped_idx_metadata: 0,
             dropped_attempt: 0,
             dropped_job_cancelled: 0,
+            decision_drops: 0,
+            decision_tombstones: 0,
             tenant_status_drops: HashMap::new(),
         }))
     }
@@ -169,6 +171,11 @@ pub struct CompletedJobCompactionFilter {
     dropped_idx_metadata: u64,
     dropped_attempt: u64,
     dropped_job_cancelled: u64,
+    // Drop vs Tombstone counts — every entry in a compaction job gets the
+    // same decision (determined by is_dest_last_run), but tracking both
+    // makes it visible in the logs which path was taken.
+    decision_drops: u64,
+    decision_tombstones: u64,
 
     // (tenant, status_kind) → count for counter decrements.
     tenant_status_drops: HashMap<(String, String), u64>,
@@ -185,11 +192,14 @@ impl CompletedJobCompactionFilter {
     }
 
     /// Returns [`Drop`] when the destination is the oldest sorted run (no
-    /// resurrection risk), [`Modify(Tombstone)`] otherwise.
-    fn drop_decision(&self) -> CompactionFilterDecision {
+    /// resurrection risk), [`Modify(Tombstone)`] otherwise. Tracks the
+    /// count of each decision for diagnostics.
+    fn drop_decision(&mut self) -> CompactionFilterDecision {
         if self.is_dest_last_run {
+            self.decision_drops += 1;
             CompactionFilterDecision::Drop
         } else {
+            self.decision_tombstones += 1;
             CompactionFilterDecision::Modify(ValueDeletable::Tombstone)
         }
     }
@@ -332,6 +342,8 @@ impl CompactionFilter for CompletedJobCompactionFilter {
                 idx_metadata = self.dropped_idx_metadata,
                 attempt = self.dropped_attempt,
                 job_cancelled = self.dropped_job_cancelled,
+                drops = self.decision_drops,
+                tombstones = self.decision_tombstones,
                 is_dest_last_run = self.is_dest_last_run,
                 cutoff_ms = self.cutoff_ms,
                 "completed_jobs compaction filter: dropped rows"
@@ -346,6 +358,8 @@ impl CompactionFilter for CompletedJobCompactionFilter {
         let Some(db) = &self.db_writer else {
             warn!(
                 jobs_dropped,
+                drops = self.decision_drops,
+                tombstones = self.decision_tombstones,
                 "completed_jobs compaction filter: counter decrements skipped (no Db writer)"
             );
             return Ok(());
@@ -408,6 +422,8 @@ mod tests {
             dropped_idx_metadata: 0,
             dropped_attempt: 0,
             dropped_job_cancelled: 0,
+            decision_drops: 0,
+            decision_tombstones: 0,
             tenant_status_drops: HashMap::new(),
         }
     }
@@ -416,17 +432,21 @@ mod tests {
 
     #[tokio::test]
     async fn drop_decision_uses_drop_when_last_run() {
-        let filter = make_filter(0, true);
+        let mut filter = make_filter(0, true);
         assert_eq!(filter.drop_decision(), CompactionFilterDecision::Drop);
+        assert_eq!(filter.decision_drops, 1);
+        assert_eq!(filter.decision_tombstones, 0);
     }
 
     #[tokio::test]
     async fn drop_decision_uses_tombstone_when_not_last_run() {
-        let filter = make_filter(0, false);
+        let mut filter = make_filter(0, false);
         assert_eq!(
             filter.drop_decision(),
             CompactionFilterDecision::Modify(ValueDeletable::Tombstone)
         );
+        assert_eq!(filter.decision_drops, 0);
+        assert_eq!(filter.decision_tombstones, 1);
     }
 
     // ── JOB_STATUS tests ──

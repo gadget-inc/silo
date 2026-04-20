@@ -38,7 +38,7 @@ disable = false
 # tombstone_entries, merge_entries, bytes_seen.
 [database.compaction.filter]
 kind = "completed_jobs"
-retention_secs = 15          # 7 days
+retention_secs = 180         # 3 minutes
 
 [database.compaction.scheduler]
 kind = "leveled"
@@ -64,7 +64,7 @@ max_fetch_tasks = 4
 [harness]
 # Total number of `silo-compactor --mode once` invocations the harness will
 # run against the writer during a single harness run.
-compactions = 25
+compactions = 80
 # Milliseconds to wait BEFORE each compactor invocation. The first sleep runs
 # after the bench starts, giving the writer time to accumulate some L0 SSTs
 # before the first compaction pass.

@@ -29,7 +29,7 @@ disable = false
 
 [database.compaction.filter]
 kind = "completed_jobs"
-retention_secs = 15
+retention_secs = 180         # 3 minutes
 
 [database.compaction.scheduler]
 kind = "size_tiered"
@@ -44,5 +44,5 @@ max_concurrent_compactions = 2
 max_fetch_tasks = 4
 
 [harness]
-compactions = 25
+compactions = 80
 compaction_interval_ms = 10000
