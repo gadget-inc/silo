@@ -198,8 +198,7 @@ impl EtcdCoordinator {
             // after reclaim so parent shards are open in the factory; the clone
             // path in `execute_split` expects to close an open parent.
             {
-                let splitter =
-                    ShardSplitter::new(Arc::new(me_bg.clone()) as Arc<dyn Coordinator>);
+                let splitter = ShardSplitter::new(Arc::new(me_bg.clone()) as Arc<dyn Coordinator>);
                 if let Err(e) = splitter
                     .resume_in_progress_splits(|| me_bg.get_shard_owner_map())
                     .await

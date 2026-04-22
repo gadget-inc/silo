@@ -235,12 +235,7 @@ async fn clone_closed_shard_creates_copies() {
         .await
         .expect("prepare split checkpoint");
     factory
-        .clone_closed_shard(
-            &parent_id,
-            &left_child_id,
-            &right_child_id,
-            &checkpoint_id,
-        )
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id, &checkpoint_id)
         .await
         .expect("clone closed shard");
 
@@ -324,12 +319,7 @@ async fn clone_closed_shard_with_split_wal() {
         .await
         .expect("prepare split checkpoint");
     factory
-        .clone_closed_shard(
-            &parent_id,
-            &left_child_id,
-            &right_child_id,
-            &checkpoint_id,
-        )
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id, &checkpoint_id)
         .await
         .expect("clone closed shard with WAL");
 
@@ -403,24 +393,14 @@ async fn clone_closed_shard_is_idempotent_with_same_checkpoint() {
 
     // First clone — writes child manifests bound to this checkpoint.
     factory
-        .clone_closed_shard(
-            &parent_id,
-            &left_child_id,
-            &right_child_id,
-            &checkpoint_id,
-        )
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id, &checkpoint_id)
         .await
         .expect("first clone");
 
     // Second clone — must succeed because slatedb validates the existing
     // manifest matches and returns as-is.
     factory
-        .clone_closed_shard(
-            &parent_id,
-            &left_child_id,
-            &right_child_id,
-            &checkpoint_id,
-        )
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id, &checkpoint_id)
         .await
         .expect("idempotent re-clone");
 

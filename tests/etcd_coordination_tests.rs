@@ -1949,7 +1949,10 @@ async fn etcd_crash_recovery_cloning_phase_resumes_split() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(completed, "resumed split should complete and clear its record");
+    assert!(
+        completed,
+        "resumed split should complete and clear its record"
+    );
 
     let shard_map = c2.get_shard_map().await.unwrap();
     assert_eq!(shard_map.len(), 2, "split should have created two children");
