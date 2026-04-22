@@ -36,10 +36,13 @@
         };
       };
 
-      # Toxiproxy proxy definitions for dev (silo servers behind proxy ports)
+      # Toxiproxy proxy definitions for dev (silo servers behind proxy ports).
+      # The etcd proxy lets tests simulate a slow/unreachable coordination
+      # layer without stopping the etcd process outright.
       toxiproxyConfig = pkgs.writeText "toxiproxy-config.json" (builtins.toJSON [
         { name = "silo-1"; listen = "127.0.0.1:17450"; upstream = "127.0.0.1:7450"; enabled = true; }
         { name = "silo-2"; listen = "127.0.0.1:17451"; upstream = "127.0.0.1:7451"; enabled = true; }
+        { name = "etcd";   listen = "127.0.0.1:12379"; upstream = "127.0.0.1:2379"; enabled = true; }
       ]);
 
       # Script to run development services via process-compose
