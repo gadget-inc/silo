@@ -3536,9 +3536,10 @@ async fn k8s_split_in_multi_node_cluster() {
     h2.abort();
 }
 
-/// Test crash recovery during early phase abandons the split.
+/// Test that a split crashed in an early phase (SplitPausing) is auto-resumed
+/// to completion after restart.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
-async fn k8s_crash_recovery_early_phase_abandons_split() {
+async fn k8s_crash_recovery_early_phase_resumes_split() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
     let num_shards: u32 = 1;
@@ -3559,10 +3560,9 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
     let shard_id = owned[0];
 
     // Create splitter and request split, advance to SplitPausing (early phase)
-
     let splitter1 = ShardSplitter::new(c1.clone());
 
-    let _split = splitter1
+    let split = splitter1
         .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split");
@@ -3576,7 +3576,9 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
     h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Start new coordinator
+    // Start new coordinator. The coordination loop runs
+    // resume_in_progress_splits after reclaim, so the paused split should
+    // drive itself through SplitCloning to SplitComplete automatically.
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -3594,32 +3596,189 @@ async fn k8s_crash_recovery_early_phase_abandons_split() {
 
     assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
-    // Create splitter for c2
-
     let splitter2 = ShardSplitter::new(c2.clone());
 
-    // Early phase crash should abandon the split
-    splitter2
-        .recover_stale_splits()
-        .await
-        .expect("recover_stale_splits");
+    // Wait for the background resume to drive the split to completion.
+    let completed = wait_until(Duration::from_secs(15), || async {
+        splitter2
+            .get_split_status(shard_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    })
+    .await;
+    assert!(completed, "resumed split should clear its split record");
 
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get status");
-    assert!(
-        status.is_none(),
-        "early phase split should be abandoned after crash"
-    );
-
-    // Shard map should still have original shard
+    // Shard map should reflect the completed split.
     let shard_map = c2.get_shard_map().await.unwrap();
-    assert_eq!(shard_map.len(), 1);
-    assert!(shard_map.get_shard(&shard_id).is_some());
+    assert_eq!(shard_map.len(), 2, "split should have created two children");
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+    assert!(
+        shard_map.get_shard(&shard_id).is_none(),
+        "parent should be removed from shard map after split"
+    );
 
     c2.shutdown().await.unwrap();
     h2.abort();
+}
+
+/// Test that a split crashed in SplitCloning before the shard-map commit is
+/// auto-resumed to completion after restart.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_crash_recovery_cloning_phase_resumes_split() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "crash-cloning-1",
+        "http://127.0.0.1:7450",
+        num_shards
+    );
+    let c1: Arc<dyn Coordinator> = Arc::new(c1);
+
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+
+    let shard_id = c1.owned_shards().await[0];
+
+    let splitter1 = ShardSplitter::new(c1.clone());
+
+    let split = splitter1
+        .request_split(shard_id, "8000000000000000".to_string())
+        .await
+        .expect("request_split");
+    // Advance through SplitPausing into SplitCloning without executing the
+    // clone itself, so the persisted record looks like a mid-clone crash
+    // with no partial child data on disk yet.
+    splitter1.advance_split_phase(shard_id).await.unwrap();
+    splitter1.advance_split_phase(shard_id).await.unwrap();
+    let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
+    assert_eq!(status.phase, SplitPhase::SplitCloning);
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (c2, h2) = K8sCoordinator::start(
+        make_coordinator_config(
+            &namespace,
+            &prefix,
+            "crash-cloning-1",
+            "http://127.0.0.1:7450",
+            num_shards,
+            30,
+        ),
+        make_test_factory("crash-cloning-1-restart"),
+    )
+    .await
+    .expect("restart coordinator");
+    let c2: Arc<dyn Coordinator> = Arc::new(c2);
+
+    assert!(c2.wait_converged(Duration::from_secs(30)).await);
+
+    let splitter2 = ShardSplitter::new(c2.clone());
+
+    let completed = wait_until(Duration::from_secs(20), || async {
+        splitter2
+            .get_split_status(shard_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    })
+    .await;
+    assert!(
+        completed,
+        "split stuck in SplitCloning should resume and complete"
+    );
+
+    let shard_map = c2.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+
+    // And a fresh split on one of the children should now succeed (not fail
+    // with FailedPrecondition / SplitAlreadyInProgress).
+    let followup = splitter2
+        .request_split(split.left_child_id, "4000000000000000".to_string())
+        .await;
+    assert!(
+        followup.is_ok(),
+        "follow-up split on child should succeed, got {:?}",
+        followup
+    );
+
+    c2.shutdown().await.unwrap();
+    h2.abort();
+}
+
+/// Test that resume skips splits initiated by a different node. The surviving
+/// peer must not drive a split whose initiator's parent shard may hold
+/// unflushed WAL data.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_resume_skips_splits_from_other_initiators() {
+    use silo::shard_range::SplitInProgress;
+
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let num_shards: u32 = 1;
+
+    let (c1, h1) = start_coordinator!(
+        &namespace,
+        &prefix,
+        "resume-peer-1",
+        "http://127.0.0.1:7450",
+        num_shards
+    );
+    let c1: Arc<dyn Coordinator> = Arc::new(c1);
+
+    assert!(c1.wait_converged(Duration::from_secs(30)).await);
+
+    let shard_id = c1.owned_shards().await[0];
+
+    // Manually write a split record for a *different* initiator. This
+    // simulates a peer's in-flight split that this node must not touch.
+    let foreign_split = SplitInProgress {
+        parent_shard_id: shard_id,
+        split_point: "8000000000000000".to_string(),
+        left_child_id: ShardId::new(),
+        right_child_id: ShardId::new(),
+        phase: SplitPhase::SplitCloning,
+        requested_at_ms: 0,
+        initiator_node_id: "some-other-node".to_string(),
+        checkpoint_id: None,
+    };
+    c1.store_split(&foreign_split)
+        .await
+        .expect("store foreign split");
+
+    // Running resume on c1 must not disturb the foreign record.
+    let splitter = ShardSplitter::new(c1.clone());
+    splitter
+        .resume_in_progress_splits(|| c1.get_shard_owner_map())
+        .await
+        .expect("resume should not error");
+
+    let still_there = c1
+        .load_split(&shard_id)
+        .await
+        .expect("load")
+        .expect("foreign split should still be present");
+    assert_eq!(still_there.initiator_node_id, "some-other-node");
+    assert_eq!(still_there.phase, SplitPhase::SplitCloning);
+
+    let shard_map = c1.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 1, "shard map must be untouched");
+
+    // Cleanup: remove the foreign split so we don't leak the ConfigMap.
+    c1.delete_split(&shard_id).await.ok();
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
 }
 
 /// Test that nodes acquire child shards via ConfigMap watch after a split.

@@ -13,7 +13,8 @@ use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use crate::coordination::{
     CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardGuardContext,
-    ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend, get_hostname, keys,
+    ShardGuardState, ShardOwnerMap, ShardPhase, ShardSplitter, SplitStorageBackend, get_hostname,
+    keys,
 };
 
 /// etcd-based coordinator for distributed shard ownership.
@@ -191,6 +192,20 @@ impl EtcdCoordinator {
             // guards in Held state so reconciliation can manage them normally.
             if let Err(e) = me_bg.reclaim_and_open_shards().await {
                 warn!(node_id = %nid, error = %e, "failed to reclaim shards from previous run");
+            }
+
+            // Drive any splits initiated by this node to completion. Must run
+            // after reclaim so parent shards are open in the factory; the clone
+            // path in `execute_split` expects to close an open parent.
+            {
+                let splitter =
+                    ShardSplitter::new(Arc::new(me_bg.clone()) as Arc<dyn Coordinator>);
+                if let Err(e) = splitter
+                    .resume_in_progress_splits(|| me_bg.get_shard_owner_map())
+                    .await
+                {
+                    warn!(node_id = %nid, error = %e, "failed to resume in-progress splits");
+                }
             }
 
             // Initial reconcile

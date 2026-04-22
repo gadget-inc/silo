@@ -1036,7 +1036,7 @@ async fn execute_split_abandons_on_clone_failure() {
 
 /// Test crash recovery during early phase (split should be abandoned)
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_recovery_early_phase_abandons_split() {
+async fn crash_recovery_early_phase_resumes_split() {
     let _guard = acquire_test_mutex();
 
     let prefix = unique_prefix();
@@ -1063,10 +1063,9 @@ async fn crash_recovery_early_phase_abandons_split() {
     let shard_id = shards[0];
 
     // Create splitter, request split and advance to SplitPausing (early phase)
-
     let splitter1 = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let _split = splitter1
+    let split = splitter1
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
@@ -1080,7 +1079,9 @@ async fn crash_recovery_early_phase_abandons_split() {
     let _ = h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Start new coordinator
+    // Start new coordinator. Its coordination loop runs
+    // resume_in_progress_splits after reclaim, so the paused split should
+    // drive itself to SplitComplete automatically.
     let (c2, h2) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
@@ -1096,42 +1097,43 @@ async fn crash_recovery_early_phase_abandons_split() {
 
     assert!(c2.wait_converged(Duration::from_secs(10)).await);
 
-    // Create splitter for c2
-
     let splitter2 = ShardSplitter::new(Arc::new(c2.clone()));
 
-    // Early phase crash should abandon the split
-    // The coordinator should detect the stale split and clean it up
-    splitter2
-        .recover_stale_splits()
-        .await
-        .expect("recover stale splits");
+    // Poll for background resume completion.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut completed = false;
+    while std::time::Instant::now() < deadline {
+        if splitter2
+            .get_split_status(shard_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(completed, "resumed split should clear its record");
 
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get status");
-    assert!(
-        status.is_none(),
-        "early phase split should be abandoned after crash"
-    );
-
-    // Shard map should still have original shard
     let shard_map = c2.get_shard_map().await.expect("get shard map");
-    assert_eq!(shard_map.len(), 1);
-    assert!(shard_map.get_shard(&shard_id).is_some());
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+    assert!(
+        shard_map.get_shard(&shard_id).is_none(),
+        "parent should have been removed"
+    );
 
     c2.shutdown().await.unwrap();
     let _ = h2.abort();
 }
 
-/// Test crash recovery during cloning phase (split should be abandoned)
-///
-/// With the simplified split model, ALL incomplete splits are abandoned on crash.
-/// The shard map update is the commit point - if children don't exist in the
-/// shard map, the split never completed and is safely abandoned.
+/// Test that a split crashed in SplitCloning (before shard-map commit) is
+/// auto-resumed to completion on restart.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_recovery_cloning_phase_abandons_split() {
+async fn crash_recovery_cloning_phase_resumes_split() {
     let _guard = acquire_test_mutex();
 
     let prefix = unique_prefix();
@@ -1157,28 +1159,25 @@ async fn crash_recovery_cloning_phase_abandons_split() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create splitter, request split and advance to cloning phase
-
     let splitter1 = ShardSplitter::new(Arc::new(c1.clone()));
 
-    let _split = splitter1
+    let split = splitter1
         .request_split(shard_id, "m".to_string())
         .await
         .expect("request split");
 
-    // Advance to SplitCloning phase
+    // Advance to SplitCloning phase without actually cloning, then crash.
     splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitPausing
     splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitCloning
 
     let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
     assert_eq!(status.phase, SplitPhase::SplitCloning);
 
-    // Simulate crash
     c1.shutdown().await.unwrap();
     let _ = h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Start new coordinator
+    // Start new coordinator - should auto-resume the split.
     let (c2, h2) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
@@ -1194,29 +1193,42 @@ async fn crash_recovery_cloning_phase_abandons_split() {
 
     assert!(c2.wait_converged(Duration::from_secs(10)).await);
 
-    // Create splitter for c2
-
     let splitter2 = ShardSplitter::new(Arc::new(c2.clone()));
 
-    // Recover stale splits - should abandon the incomplete split
-    splitter2
-        .recover_stale_splits()
-        .await
-        .expect("recover stale splits");
-
-    // Split should be abandoned (deleted)
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get status");
-    assert!(status.is_none(), "incomplete split should be abandoned");
-
-    // Shard map should still have original shard (split was not committed)
-    let shard_map = c2.get_shard_map().await.expect("get shard map");
-    assert_eq!(shard_map.len(), 1, "shard map should have original shard");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut completed = false;
+    while std::time::Instant::now() < deadline {
+        if splitter2
+            .get_split_status(shard_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(
-        shard_map.get_shard(&shard_id).is_some(),
-        "original shard should still exist"
+        completed,
+        "stuck SplitCloning split should resume and complete"
+    );
+
+    let shard_map = c2.get_shard_map().await.expect("get shard map");
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+
+    // Re-issuing a split on one of the children should succeed — the prior
+    // stuck split no longer blocks further operations on the parent.
+    let followup = splitter2
+        .request_split(split.left_child_id, "b".to_string())
+        .await;
+    assert!(
+        followup.is_ok(),
+        "follow-up split on child should succeed, got {:?}",
+        followup
     );
 
     c2.shutdown().await.unwrap();

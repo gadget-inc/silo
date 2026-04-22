@@ -20,8 +20,8 @@ use crate::coordination::k8s_backend::{
 };
 use crate::coordination::{
     CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo,
-    ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend,
-    compute_desired_shards_for_node, get_hostname, keys,
+    ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, ShardSplitter,
+    SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
@@ -588,6 +588,19 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         // guards in Held state so reconciliation can manage them normally.
         if let Err(e) = self.reclaim_and_open_shards().await {
             warn!(node_id = %self.base.node_id, error = %e, "failed to reclaim shards from previous run");
+        }
+
+        // Drive any splits initiated by this node to completion. Must run
+        // after reclaim so parent shards are open in the factory; the clone
+        // path in `execute_split` expects to close an open parent.
+        {
+            let splitter = ShardSplitter::new(Arc::new(self.clone()) as Arc<dyn Coordinator>);
+            if let Err(e) = splitter
+                .resume_in_progress_splits(|| self.get_shard_owner_map())
+                .await
+            {
+                warn!(node_id = %self.base.node_id, error = %e, "failed to resume in-progress splits");
+            }
         }
 
         // Do initial reconciliation immediately

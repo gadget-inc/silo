@@ -229,9 +229,18 @@ async fn clone_closed_shard_creates_copies() {
     // Close parent (clone_closed_shard expects it to be closed)
     parent.close().await.expect("close parent");
 
-    // Clone the shard to both children
+    // Prepare the split checkpoint on the parent, then clone both children.
+    let checkpoint_id = factory
+        .prepare_split_checkpoint(&parent_id)
+        .await
+        .expect("prepare split checkpoint");
     factory
-        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .clone_closed_shard(
+            &parent_id,
+            &left_child_id,
+            &right_child_id,
+            &checkpoint_id,
+        )
         .await
         .expect("clone closed shard");
 
@@ -309,9 +318,18 @@ async fn clone_closed_shard_with_split_wal() {
     // Close parent (clone_closed_shard expects it to be closed)
     parent.close().await.expect("close parent");
 
-    // Clone the shard — this should succeed even with split WAL
+    // Prepare checkpoint then clone — should succeed even with split WAL.
+    let checkpoint_id = factory
+        .prepare_split_checkpoint(&parent_id)
+        .await
+        .expect("prepare split checkpoint");
     factory
-        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .clone_closed_shard(
+            &parent_id,
+            &left_child_id,
+            &right_child_id,
+            &checkpoint_id,
+        )
         .await
         .expect("clone closed shard with WAL");
 
@@ -344,6 +362,75 @@ async fn clone_closed_shard_with_split_wal() {
         right_counters.total_jobs, 1,
         "right child should have the parent's job"
     );
+}
+
+/// Resume-safety: calling `clone_closed_shard` a second time with the same
+/// checkpoint UUID must succeed (slatedb's create_clone is idempotent when
+/// the existing child manifest references the same parent checkpoint). This
+/// is the property the split resumer relies on.
+#[silo::test]
+async fn clone_closed_shard_is_idempotent_with_same_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory(&tmp);
+    let parent_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("idempotent-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    parent.close().await.expect("close parent");
+
+    let checkpoint_id = factory
+        .prepare_split_checkpoint(&parent_id)
+        .await
+        .expect("prepare checkpoint");
+
+    // First clone — writes child manifests bound to this checkpoint.
+    factory
+        .clone_closed_shard(
+            &parent_id,
+            &left_child_id,
+            &right_child_id,
+            &checkpoint_id,
+        )
+        .await
+        .expect("first clone");
+
+    // Second clone — must succeed because slatedb validates the existing
+    // manifest matches and returns as-is.
+    factory
+        .clone_closed_shard(
+            &parent_id,
+            &left_child_id,
+            &right_child_id,
+            &checkpoint_id,
+        )
+        .await
+        .expect("idempotent re-clone");
+
+    // The children should still be readable and contain the parent's data.
+    let left = factory
+        .open(&left_child_id, &ShardRange::full())
+        .await
+        .expect("open left");
+    let counters = left.get_counters().await.expect("counters");
+    assert_eq!(counters.total_jobs, 1);
 }
 
 // --- template path validation tests ---

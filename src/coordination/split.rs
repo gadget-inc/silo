@@ -528,13 +528,53 @@ impl ShardSplitter {
                         "closed parent shard before cloning"
                     );
 
-                    // Clone the closed parent's database for both children. This reopens
-                    // just the raw SlateDB database, creates a checkpoint, clones to both
-                    // children, then closes the raw database.
+                    // Determine the slatedb checkpoint to clone from. On first
+                    // entry, create a fresh checkpoint and persist the UUID in
+                    // the split record *before* cloning starts, so a crash
+                    // mid-clone lets the resumer pass the same UUID back and
+                    // rely on slatedb's idempotent `create_clone`. On resume,
+                    // a previously persisted UUID is reused as-is.
+                    let checkpoint_id = match split.checkpoint_id.clone() {
+                        Some(id) => {
+                            info!(
+                                parent_shard_id = %parent_shard_id,
+                                checkpoint_id = %id,
+                                "reusing persisted split checkpoint"
+                            );
+                            id
+                        }
+                        None => {
+                            let id = self
+                                .ctx
+                                .factory
+                                .prepare_split_checkpoint(&parent_shard_id)
+                                .await
+                                .map_err(|e| {
+                                    SplitExecutionError::PreCommitParentClosed(
+                                        CoordinationError::BackendError(format!(
+                                            "failed to prepare split checkpoint: {}",
+                                            e
+                                        )),
+                                    )
+                                })?;
+                            split.checkpoint_id = Some(id.clone());
+                            self.coordinator
+                                .store_split(&split)
+                                .await
+                                .map_err(SplitExecutionError::PreCommitParentClosed)?;
+                            id
+                        }
+                    };
+
+                    // Clone both children from the persisted checkpoint. Idempotent
+                    // on crash recovery: slatedb's create_clone validates any
+                    // existing child manifest against this same checkpoint UUID
+                    // and continues initialization from whatever state is on disk.
                     info!(
                         parent_shard_id = %parent_shard_id,
                         left_child = %split.left_child_id,
                         right_child = %split.right_child_id,
+                        checkpoint_id = %checkpoint_id,
                         "cloning database for split"
                     );
 
@@ -544,6 +584,7 @@ impl ShardSplitter {
                             &parent_shard_id,
                             &split.left_child_id,
                             &split.right_child_id,
+                            &checkpoint_id,
                         )
                         .await
                         .map_err(|e| {
@@ -813,6 +854,64 @@ impl ShardSplitter {
                     parent_shard_id = %split.parent_shard_id,
                     phase = %split.phase,
                     "re-hydrated paused state from persisted split record"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Drive any in-progress splits initiated by this node to completion.
+    ///
+    /// Called once at startup, after the coordinator has reclaimed leases and
+    /// opened the parent shards owned by this node. For each split record
+    /// whose `initiator_node_id` is this node and whose phase is non-terminal,
+    /// this method re-enters `execute_split` so the split advances to
+    /// `SplitComplete` (or fails and is abandoned by the normal error path).
+    ///
+    /// Resume of `SplitCloning` is idempotent because the slatedb checkpoint
+    /// UUID is persisted in the split record before cloning begins: the
+    /// resumer passes the same UUID back to `clone_closed_shard`, and
+    /// slatedb's `create_clone` validates and continues from whatever partial
+    /// child manifest exists on disk.
+    ///
+    /// Splits initiated by other nodes are skipped; only the initiator can
+    /// safely drive the clone forward (its parent shard may still hold
+    /// unflushed WAL data).
+    pub async fn resume_in_progress_splits<F, Fut>(
+        &self,
+        get_shard_owner_map: F,
+    ) -> Result<(), CoordinationError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<ShardOwnerMap, CoordinationError>>,
+    {
+        let splits = self.coordinator.list_all_splits().await?;
+
+        for split in splits {
+            if split.initiator_node_id != self.ctx.node_id {
+                continue;
+            }
+            if split.phase == SplitPhase::SplitComplete {
+                // Terminal record, leave for recover_stale_splits / cleanup.
+                continue;
+            }
+
+            info!(
+                parent_shard_id = %split.parent_shard_id,
+                phase = %split.phase,
+                checkpoint_id = ?split.checkpoint_id,
+                "resuming in-progress split"
+            );
+
+            if let Err(e) = self
+                .execute_split(split.parent_shard_id, &get_shard_owner_map)
+                .await
+            {
+                warn!(
+                    parent_shard_id = %split.parent_shard_id,
+                    error = %e,
+                    "resumed split did not complete"
                 );
             }
         }

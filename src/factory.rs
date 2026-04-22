@@ -532,45 +532,27 @@ impl ShardFactory {
         }
     }
 
-    /// Clone a closed shard's database to create child shards for splitting.
+    /// Create a persistent slatedb checkpoint on the parent's closed database
+    /// that the subsequent `clone_closed_shard` call will clone from.
     ///
-    /// This is used during shard splits after the parent shard has been fully closed.
-    /// It opens a raw SlateDB database at the parent's path (without WAL, broker, or
-    /// any silo-level processing), creates a single checkpoint, clones to both children,
-    /// then closes the raw database.
+    /// Factored out from cloning so the split coordinator can persist the
+    /// checkpoint UUID in the split record before the clone starts. On crash
+    /// recovery the resumer passes the persisted UUID back to
+    /// `clone_closed_shard`, letting slatedb's idempotent `create_clone`
+    /// reuse any partially written child manifest.
     ///
-    /// By operating on a fully closed parent, we guarantee that no in-flight writes
-    /// can land after the checkpoint, ensuring children get a consistent snapshot.
-    pub async fn clone_closed_shard(
+    /// The parent shard must be fully closed (no open JobStoreShard instance);
+    /// this opens a raw SlateDB at its path, flushes, checkpoints, and closes.
+    /// Returns the checkpoint UUID as a string for serialization.
+    pub async fn prepare_split_checkpoint(
         &self,
         parent_id: &ShardId,
-        left_child_id: &ShardId,
-        right_child_id: &ShardId,
-    ) -> Result<(), ShardFactoryError> {
+    ) -> Result<String, ShardFactoryError> {
         let parent_name = parent_id.to_string();
-        let left_child_name = left_child_id.to_string();
-        let right_child_name = right_child_id.to_string();
 
-        // Resolve paths relative to storage root
         let (parent_resolved, parent_db_path) =
             Self::resolve_at_root(&self.template.backend, &self.template.path, &parent_name)?;
-        let (_, left_child_db_path) = Self::resolve_at_root(
-            &self.template.backend,
-            &self.template.path,
-            &left_child_name,
-        )?;
-        let (_, right_child_db_path) = Self::resolve_at_root(
-            &self.template.backend,
-            &self.template.path,
-            &right_child_name,
-        )?;
-
-        // Resolve separate WAL object stores if configured. Each shard (parent and
-        // children) gets its own WAL store so that the clone's wal_object_store_uri
-        // is correctly recorded in the manifest.
         let parent_wal_store = self.resolve_wal_store(&parent_name)?;
-        let left_child_wal_store = self.resolve_wal_store(&left_child_name)?;
-        let right_child_wal_store = self.resolve_wal_store(&right_child_name)?;
 
         // Open a raw SlateDB database at the parent's path. We need the WAL store
         // configured so slatedb can validate the wal_object_store_uri in the manifest.
@@ -583,7 +565,10 @@ impl ShardFactory {
             parent_db_builder = parent_db_builder.with_wal_object_store(Arc::clone(wal));
         }
         let db = parent_db_builder.build().await.map_err(|e| {
-            ShardFactoryError::CloneError(format!("failed to reopen parent DB for cloning: {}", e))
+            ShardFactoryError::CloneError(format!(
+                "failed to reopen parent DB for checkpoint: {}",
+                e
+            ))
         })?;
 
         // Flush to ensure all data is in object storage before checkpointing
@@ -609,9 +594,8 @@ impl ShardFactory {
             ShardFactoryError::CloneError(format!("failed to delete clone sentinel: {}", e))
         })?;
 
-        // Create a single checkpoint shared by both children. Use no lifetime so
-        // the checkpoint persists until the children have fully compacted away their
-        // dependency on the parent's SSTs.
+        // Create a checkpoint with no lifetime — it persists until the children
+        // have fully compacted away their dependency on the parent's SSTs.
         // CheckpointScope::All calls flush_wals() + flush_memtables() internally,
         // which flushes the sentinel to L0 and advances replay_after_wal_id past
         // all WAL SSTs. This ensures clones don't inherit a WAL gap.
@@ -626,13 +610,72 @@ impl ShardFactory {
                 ShardFactoryError::CloneError(format!("failed to create checkpoint: {}", e))
             })?;
 
+        db.close().await.map_err(|e| {
+            ShardFactoryError::CloneError(format!(
+                "failed to close raw parent DB after checkpoint: {}",
+                e
+            ))
+        })?;
+
         tracing::info!(
             parent_shard_id = %parent_id,
-            left_child_id = %left_child_id,
-            right_child_id = %right_child_id,
-            checkpoint_id = ?checkpoint.id,
-            "created checkpoint for shard cloning (from closed parent)"
+            checkpoint_id = %checkpoint.id,
+            "created slatedb checkpoint on parent for split"
         );
+
+        Ok(checkpoint.id.to_string())
+    }
+
+    /// Clone a closed shard's database into two children using an existing
+    /// slatedb checkpoint on the parent.
+    ///
+    /// The checkpoint must already exist on the parent (created by
+    /// `prepare_split_checkpoint`). This call reads the parent manifest
+    /// directly from object storage via the slatedb admin API — the parent
+    /// shard must not be open as a `JobStoreShard`, but no open raw DB handle
+    /// is required either.
+    ///
+    /// Idempotent on crash recovery: if a child path already has a partial
+    /// clone manifest from a prior interrupted clone, slatedb's `create_clone`
+    /// validates that it references the same `checkpoint_id` and continues
+    /// initialization from whatever state is on disk.
+    pub async fn clone_closed_shard(
+        &self,
+        parent_id: &ShardId,
+        left_child_id: &ShardId,
+        right_child_id: &ShardId,
+        checkpoint_id: &str,
+    ) -> Result<(), ShardFactoryError> {
+        let parent_name = parent_id.to_string();
+        let left_child_name = left_child_id.to_string();
+        let right_child_name = right_child_id.to_string();
+
+        let checkpoint_uuid = uuid::Uuid::parse_str(checkpoint_id).map_err(|e| {
+            ShardFactoryError::CloneError(format!(
+                "invalid checkpoint UUID {:?}: {}",
+                checkpoint_id, e
+            ))
+        })?;
+
+        // Resolve paths relative to storage root
+        let (parent_resolved, parent_db_path) =
+            Self::resolve_at_root(&self.template.backend, &self.template.path, &parent_name)?;
+        let (_, left_child_db_path) = Self::resolve_at_root(
+            &self.template.backend,
+            &self.template.path,
+            &left_child_name,
+        )?;
+        let (_, right_child_db_path) = Self::resolve_at_root(
+            &self.template.backend,
+            &self.template.path,
+            &right_child_name,
+        )?;
+
+        // Resolve separate WAL object stores if configured. Each child gets
+        // its own WAL store so that the clone's wal_object_store_uri is
+        // correctly recorded in the manifest.
+        let left_child_wal_store = self.resolve_wal_store(&left_child_name)?;
+        let right_child_wal_store = self.resolve_wal_store(&right_child_name)?;
 
         // Clone for left child
         let mut left_admin_builder = slatedb::admin::Admin::builder(
@@ -645,7 +688,7 @@ impl ShardFactory {
         let left_admin = left_admin_builder.build();
 
         left_admin
-            .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
+            .create_clone(parent_db_path.as_str(), Some(checkpoint_uuid))
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(
@@ -665,7 +708,7 @@ impl ShardFactory {
         let right_admin = right_admin_builder.build();
 
         right_admin
-            .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
+            .create_clone(parent_db_path.as_str(), Some(checkpoint_uuid))
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(
@@ -674,14 +717,6 @@ impl ShardFactory {
                 ))
             })?;
 
-        // Close the raw database
-        db.close().await.map_err(|e| {
-            ShardFactoryError::CloneError(format!(
-                "failed to close raw parent DB after cloning: {}",
-                e
-            ))
-        })?;
-
         tracing::info!(
             parent_shard_id = %parent_id,
             left_child_id = %left_child_id,
@@ -689,6 +724,7 @@ impl ShardFactory {
             parent_db_path = %parent_db_path,
             left_child_db_path = %left_child_db_path,
             right_child_db_path = %right_child_db_path,
+            checkpoint_id = %checkpoint_id,
             "cloned closed shard database to both children"
         );
 

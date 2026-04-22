@@ -337,6 +337,13 @@ pub struct SplitInProgress {
     pub requested_at_ms: i64,
     /// Node ID that initiated the split (for crash recovery)
     pub initiator_node_id: String,
+    /// slatedb checkpoint UUID (string form) created on the parent shard during
+    /// `SplitCloning`. Persisted so that on crash recovery we re-use the same
+    /// checkpoint and let slatedb's idempotent `create_clone` resume from
+    /// whatever partial child manifest exists on disk. `None` until the
+    /// checkpoint is created (i.e. before the first SplitCloning iteration).
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
 }
 
 impl SplitInProgress {
@@ -353,6 +360,7 @@ impl SplitInProgress {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
             initiator_node_id,
+            checkpoint_id: None,
         }
     }
 
