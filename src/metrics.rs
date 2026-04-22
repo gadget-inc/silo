@@ -138,6 +138,24 @@ pub struct Metrics {
     slatedb_cache_filter_hit: CounterVec,
     slatedb_cache_filter_miss: CounterVec,
 
+    // New compactor manifest gauges (kirin/new_compaction_metrics)
+    slatedb_sorted_run_count: GaugeVec,
+    slatedb_total_sr_size_bytes: GaugeVec,
+    slatedb_avg_sst_size_bytes: GaugeVec,
+    slatedb_output_tombstone_ratio: GaugeVec,
+
+    // New compactor scheduler counters
+    slatedb_compactions_proposed: CounterVec,      // labels: shard, source_type
+    slatedb_backpressure_rejections: CounterVec,   // labels: shard
+    slatedb_conflict_rejections: CounterVec,       // labels: shard
+    slatedb_dest_last_run_compactions: CounterVec, // labels: shard
+
+    // New compactor per-job counters
+    slatedb_entries_written: CounterVec, // labels: shard, value_type
+
+    // New compaction filter counters
+    slatedb_filter_decisions: CounterVec, // labels: shard, decision, is_last_run
+
     /// Tracks previous SlateDB counter values per (stat_name, shard) for delta computation.
     /// SlateDB exposes counters as absolute values via `stat.get()`, but Prometheus counters
     /// only support `inc_by(delta)`, so we compute deltas between polls.
@@ -411,6 +429,19 @@ impl Metrics {
                 slatedb::compactor::stats::BYTES_COMPACTED,
                 &self.slatedb_bytes_compacted,
             ),
+            // New compactor scheduler counters (no slatedb-side labels)
+            (
+                slatedb::compactor::stats::BACKPRESSURE_REJECTIONS_TOTAL,
+                &self.slatedb_backpressure_rejections,
+            ),
+            (
+                slatedb::compactor::stats::CONFLICT_REJECTIONS_TOTAL,
+                &self.slatedb_conflict_rejections,
+            ),
+            (
+                slatedb::compactor::stats::DEST_LAST_RUN_COMPACTIONS_TOTAL,
+                &self.slatedb_dest_last_run_compactions,
+            ),
         ];
 
         // Labeled cache counters (ACCESS_COUNT with entry_kind + result labels)
@@ -465,6 +496,23 @@ impl Metrics {
             (
                 slatedb::db_stats::TOTAL_MEM_SIZE_BYTES,
                 &self.slatedb_total_mem_size_bytes,
+            ),
+            // New compactor manifest gauges
+            (
+                slatedb::compactor::stats::SORTED_RUN_COUNT,
+                &self.slatedb_sorted_run_count,
+            ),
+            (
+                slatedb::compactor::stats::TOTAL_SR_SIZE_BYTES,
+                &self.slatedb_total_sr_size_bytes,
+            ),
+            (
+                slatedb::compactor::stats::AVG_SST_SIZE_BYTES,
+                &self.slatedb_avg_sst_size_bytes,
+            ),
+            (
+                slatedb::compactor::stats::OUTPUT_TOMBSTONE_RATIO,
+                &self.slatedb_output_tombstone_ratio,
             ),
         ];
 
@@ -530,6 +578,105 @@ impl Metrics {
                     MetricValue::Histogram { .. } => continue,
                 };
                 gauge.with_label_values(&[shard]).set(value);
+            }
+        }
+
+        // Labeled counters with multiple Prometheus label dimensions.
+        // Each entry: (slatedb stat name, slatedb label filter, prometheus CounterVec, prometheus label values).
+        struct LabeledEntry<'a> {
+            stat: &'a str,
+            slatedb_labels: &'a [(&'a str, &'a str)],
+            counter: &'a CounterVec,
+            prom_labels: &'a [&'a str],
+        }
+        let l0 = "l0";
+        let sr = "sr";
+        let put = "put";
+        let tombstone = "tombstone";
+        let merge = "merge";
+        let kept = "kept";
+        let dropped = "dropped";
+        let true_s = "true";
+        let false_s = "false";
+        let labeled_entries: &[LabeledEntry<'_>] = &[
+            LabeledEntry {
+                stat: slatedb::compactor::stats::COMPACTIONS_PROPOSED_TOTAL,
+                slatedb_labels: &[("source_type", "l0")],
+                counter: &self.slatedb_compactions_proposed,
+                prom_labels: &[shard, l0],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::COMPACTIONS_PROPOSED_TOTAL,
+                slatedb_labels: &[("source_type", "sr")],
+                counter: &self.slatedb_compactions_proposed,
+                prom_labels: &[shard, sr],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::ENTRIES_WRITTEN_TOTAL,
+                slatedb_labels: &[("value_type", "put")],
+                counter: &self.slatedb_entries_written,
+                prom_labels: &[shard, put],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::ENTRIES_WRITTEN_TOTAL,
+                slatedb_labels: &[("value_type", "tombstone")],
+                counter: &self.slatedb_entries_written,
+                prom_labels: &[shard, tombstone],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::ENTRIES_WRITTEN_TOTAL,
+                slatedb_labels: &[("value_type", "merge")],
+                counter: &self.slatedb_entries_written,
+                prom_labels: &[shard, merge],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::FILTER_DECISIONS_TOTAL,
+                slatedb_labels: &[("decision", "kept"), ("is_last_run", "true")],
+                counter: &self.slatedb_filter_decisions,
+                prom_labels: &[shard, kept, true_s],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::FILTER_DECISIONS_TOTAL,
+                slatedb_labels: &[("decision", "dropped"), ("is_last_run", "true")],
+                counter: &self.slatedb_filter_decisions,
+                prom_labels: &[shard, dropped, true_s],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::FILTER_DECISIONS_TOTAL,
+                slatedb_labels: &[("decision", "kept"), ("is_last_run", "false")],
+                counter: &self.slatedb_filter_decisions,
+                prom_labels: &[shard, kept, false_s],
+            },
+            LabeledEntry {
+                stat: slatedb::compactor::stats::FILTER_DECISIONS_TOTAL,
+                slatedb_labels: &[("decision", "dropped"), ("is_last_run", "false")],
+                counter: &self.slatedb_filter_decisions,
+                prom_labels: &[shard, dropped, false_s],
+            },
+        ];
+        {
+            let mut prev_values = self.slatedb_prev_values.lock().expect("lock poisoned");
+            for entry in labeled_entries {
+                if let Some(metric) = snapshot.by_name_and_labels(entry.stat, entry.slatedb_labels) {
+                    let current = match &metric.value {
+                        MetricValue::Counter(v) => *v as f64,
+                        MetricValue::Gauge(v) => *v as f64,
+                        MetricValue::UpDownCounter(v) => *v as f64,
+                        MetricValue::Histogram { .. } => continue,
+                    };
+                    let label_suffix = entry
+                        .slatedb_labels
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let key = (format!("{}/{}", entry.stat, label_suffix), shard.to_string());
+                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                    if current > prev {
+                        entry.counter.with_label_values(entry.prom_labels).inc_by(current - prev);
+                    }
+                    prev_values.insert(key, current);
+                }
             }
         }
     }
@@ -1063,6 +1210,111 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    // New compactor manifest gauges
+    let slatedb_sorted_run_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new("silo_slatedb_sorted_run_count", "Number of sorted runs in SlateDB"),
+            &["shard"],
+        )?,
+    );
+    let slatedb_total_sr_size_bytes = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_total_sr_size_bytes",
+                "Total bytes across all sorted runs in SlateDB",
+            ),
+            &["shard"],
+        )?,
+    );
+    let slatedb_avg_sst_size_bytes = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_avg_sst_size_bytes",
+                "Average SST size in bytes across all sorted runs",
+            ),
+            &["shard"],
+        )?,
+    );
+    let slatedb_output_tombstone_ratio = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_output_tombstone_ratio",
+                "Permille (0-1000) of tombstones in the most recent compaction output",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    // New compactor scheduler counters
+    let slatedb_compactions_proposed = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_compactions_proposed_total",
+                "Total compactions proposed by the scheduler, by source type",
+            ),
+            &["shard", "source_type"],
+        )?,
+    );
+    let slatedb_backpressure_rejections = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_backpressure_rejections_total",
+                "Compactions rejected due to backpressure (downstream queue full)",
+            ),
+            &["shard"],
+        )?,
+    );
+    let slatedb_conflict_rejections = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_conflict_rejections_total",
+                "Compactions rejected due to conflict with an in-flight compaction",
+            ),
+            &["shard"],
+        )?,
+    );
+    let slatedb_dest_last_run_compactions = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_dest_last_run_compactions_total",
+                "Compactions whose destination is the last (deepest) sorted run",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    // New compactor per-job counters
+    let slatedb_entries_written = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_entries_written_total",
+                "Entries written during compaction, by value type",
+            ),
+            &["shard", "value_type"],
+        )?,
+    );
+
+    // New compaction filter counters
+    let slatedb_filter_decisions = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_filter_decisions_total",
+                "Compaction filter keep/drop decisions, by decision and whether this was the last run",
+            ),
+            &["shard", "decision", "is_last_run"],
+        )?,
+    );
+
     Ok(Metrics {
         registry: Arc::new(registry),
         jobs_enqueued,
@@ -1110,6 +1362,16 @@ pub fn init() -> anyhow::Result<Metrics> {
         slatedb_cache_index_miss,
         slatedb_cache_filter_hit,
         slatedb_cache_filter_miss,
+        slatedb_sorted_run_count,
+        slatedb_total_sr_size_bytes,
+        slatedb_avg_sst_size_bytes,
+        slatedb_output_tombstone_ratio,
+        slatedb_compactions_proposed,
+        slatedb_backpressure_rejections,
+        slatedb_conflict_rejections,
+        slatedb_dest_last_run_compactions,
+        slatedb_entries_written,
+        slatedb_filter_decisions,
         slatedb_prev_values: Arc::new(Mutex::new(HashMap::new())),
         object_store_ops,
         object_store_bytes,

@@ -6,8 +6,13 @@
  *   1. A single-shard `silo` server with its in-process compactor DISABLED
  *      (see example_configs/compaction-harness-writer.toml).
  *   2. `silo-bench` to push write traffic at that server.
- *   3. A separate `silo-compactor` process that compacts the same object
- *      store the writer is writing to.
+ *   3. A separate `silo-compactor --mode loop` process that compacts the
+ *      same object store the writer is writing to, running continuously
+ *      for the duration of the bench.
+ *
+ * The compactor's Prometheus metrics are polled periodically (default every
+ * 5 s) and saved as timestamped snapshots. The final snapshot provides
+ * cumulative counters; the full time series is included in summary.json.
  *
  * Results (logs, Prometheus snapshots, filter summaries) are collected into
  * `tmp/compaction-runs/<run-id>/` so two runs with different compactor
@@ -16,7 +21,8 @@
  * Usage:
  *   node scripts/compaction-harness.mts --writer-config <path> \
  *                                       --compactor-config <path> \
- *                                       [--writes 10000] \
+ *                                       [--duration-secs 20] \
+ *                                       [--metrics-interval-ms 5000] \
  *                                       [--shard <uuid>]
  *
  * The shard UUID is auto-discovered from the writer's /shards endpoint if
@@ -45,8 +51,7 @@ type Args = {
   durationSecs: number;
   enqueuers: number;
   workers: number;
-  compactions: number;
-  compactionIntervalMs: number;
+  metricsIntervalMs: number;
   shard: string | null;
   dataRoot: string;
   writerGrpc: string;
@@ -54,19 +59,17 @@ type Args = {
   compactorMetrics: string;
 };
 
-/** Read `compactions` + `compaction_interval_ms` from the compactor TOML's
- * `[harness]` section. Returns nulls for keys not present. We parse with a
- * tiny regex scanner rather than pulling in a TOML dep — the only keys we
- * care about here are two integers. */
+/** Read `metrics_interval_ms` from the compactor TOML's `[harness]` section.
+ * Returns null for keys not present. We parse with a tiny regex scanner
+ * rather than pulling in a TOML dep — the only key we care about here is
+ * one integer. */
 function readHarnessDefaults(tomlPath: string): {
-  compactions: number | null;
-  compactionIntervalMs: number | null;
+  metricsIntervalMs: number | null;
 } {
-  if (!existsSync(tomlPath)) return { compactions: null, compactionIntervalMs: null };
+  if (!existsSync(tomlPath)) return { metricsIntervalMs: null };
   const txt = readFileSync(tomlPath, "utf8");
   // Find the [harness] section body — everything between the `[harness]`
-  // header and the next TOML table header (or end of file). `\Z` is not a
-  // valid JS regex anchor; we use a lookahead for `\n[` or end of string.
+  // header and the next TOML table header (or end of file).
   const header = /^\[harness\][ \t]*\r?\n/m;
   const headerMatch = header.exec(txt);
   let body = "";
@@ -81,8 +84,7 @@ function readHarnessDefaults(tomlPath: string): {
     return m ? Number(m[1]) : null;
   };
   return {
-    compactions: pick("compactions"),
-    compactionIntervalMs: pick("compaction_interval_ms"),
+    metricsIntervalMs: pick("metrics_interval_ms"),
   };
 }
 
@@ -111,14 +113,10 @@ function parseArgs(argv: string[]): Args {
   const workers = Number(flag("workers", "8"));
   // Harness settings: CLI > [harness] section in compactor TOML > built-in.
   const harnessDefaults = readHarnessDefaults(resolve(root, compactorConfig));
-  const compactionsCli = flag("compactions") ?? flag("iterations");
-  const compactions = Number(
-    compactionsCli ?? harnessDefaults.compactions ?? "1",
-  );
-  const compactionIntervalMs = Number(
-    flag("compaction-interval-ms") ??
-      harnessDefaults.compactionIntervalMs ??
-      "2000",
+  const metricsIntervalMs = Number(
+    flag("metrics-interval-ms") ??
+      harnessDefaults.metricsIntervalMs ??
+      "5000",
   );
   const shard = flag("shard") ?? null;
   const dataRoot = flag("data-root", resolve(root, "tmp/compaction-harness"))!;
@@ -131,8 +129,7 @@ function parseArgs(argv: string[]): Args {
     durationSecs,
     enqueuers,
     workers,
-    compactions,
-    compactionIntervalMs,
+    metricsIntervalMs,
     shard,
     dataRoot,
     writerGrpc,
@@ -263,20 +260,6 @@ const ZERO_OBJECT_STORE_OPS: ObjectStoreOps = {
   bytes: 0,
 };
 
-function addObjectStoreOps(a: ObjectStoreOps, b: ObjectStoreOps): ObjectStoreOps {
-  return {
-    put: a.put + b.put,
-    put_multipart: a.put_multipart + b.put_multipart,
-    get: a.get + b.get,
-    delete: a.delete + b.delete,
-    list: a.list + b.list,
-    list_with_delimiter: a.list_with_delimiter + b.list_with_delimiter,
-    copy: a.copy + b.copy,
-    copy_if_not_exists: a.copy_if_not_exists + b.copy_if_not_exists,
-    bytes: a.bytes + b.bytes,
-  };
-}
-
 function totalOps(o: ObjectStoreOps): number {
   return (
     o.put +
@@ -362,6 +345,101 @@ function parseNoopFilter(file: string): NoopFilterStats {
   return out;
 }
 
+type CompactorNewMetrics = {
+  // manifest gauges (last observed value)
+  sortedRunCount: number | null;
+  totalSrSizeBytes: number | null;
+  avgSstSizeBytes: number | null;
+  outputTombstoneRatio: number | null;
+  // scheduler counters (cumulative)
+  compactionsProposedL0: number | null;
+  compactionsProposedSr: number | null;
+  backpressureRejections: number | null;
+  conflictRejections: number | null;
+  destLastRunCompactions: number | null;
+  // per-job counters
+  entriesWrittenPuts: number | null;
+  entriesWrittenTombstones: number | null;
+  entriesWrittenMerges: number | null;
+  // filter decisions
+  filterKeptLastRun: number | null;
+  filterDroppedLastRun: number | null;
+  filterKeptNonLastRun: number | null;
+  filterDroppedNonLastRun: number | null;
+};
+
+const ZERO_COMPACTOR_METRICS: CompactorNewMetrics = {
+  sortedRunCount: null,
+  totalSrSizeBytes: null,
+  avgSstSizeBytes: null,
+  outputTombstoneRatio: null,
+  compactionsProposedL0: null,
+  compactionsProposedSr: null,
+  backpressureRejections: null,
+  conflictRejections: null,
+  destLastRunCompactions: null,
+  entriesWrittenPuts: null,
+  entriesWrittenTombstones: null,
+  entriesWrittenMerges: null,
+  filterKeptLastRun: null,
+  filterDroppedLastRun: null,
+  filterKeptNonLastRun: null,
+  filterDroppedNonLastRun: null,
+};
+
+function pickMetric(txt: string, name: string, extraLabels?: string): number | null {
+  // Match: name{...shard="..."[,...extraLabel="value"...]} <number>
+  // or name{shard="..."} <number> when no extra labels.
+  // We use a flexible regex that picks the first matching line.
+  const escaped = name.replace(/\./g, "\\.");
+  const pattern = extraLabels
+    ? new RegExp(`^${escaped}\\{[^}]*${extraLabels}[^}]*\\}\\s+([\\d.eE+-]+)`, "m")
+    : new RegExp(`^${escaped}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)`, "m");
+  const m = txt.match(pattern);
+  return m ? Number(m[1]) : null;
+}
+
+function sumMetric(txt: string, name: string, extraLabels?: string): number | null {
+  // Sum all series matching the name (and optional extra label substring).
+  const escaped = name.replace(/\./g, "\\.");
+  const pattern = extraLabels
+    ? new RegExp(`^${escaped}\\{[^}]*${extraLabels}[^}]*\\}\\s+([\\d.eE+-]+)`, "gm")
+    : new RegExp(`^${escaped}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)`, "gm");
+  let sum = 0;
+  let any = false;
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(txt)) !== null) {
+    sum += Number(m[1]);
+    any = true;
+  }
+  return any ? sum : null;
+}
+
+function parseCompactorNewMetrics(file: string): CompactorNewMetrics {
+  if (!existsSync(file)) return { ...ZERO_COMPACTOR_METRICS };
+  const txt = readFileSync(file, "utf8");
+  const p = (name: string, extra?: string) => pickMetric(txt, name, extra);
+  const s = (name: string, extra?: string) => sumMetric(txt, name, extra);
+  return {
+    sortedRunCount: p("silo_slatedb_sorted_run_count"),
+    totalSrSizeBytes: p("silo_slatedb_total_sr_size_bytes"),
+    avgSstSizeBytes: p("silo_slatedb_avg_sst_size_bytes"),
+    outputTombstoneRatio: p("silo_slatedb_output_tombstone_ratio"),
+    compactionsProposedL0: s(`silo_slatedb_compactions_proposed_total`, `source_type="l0"`),
+    compactionsProposedSr: s(`silo_slatedb_compactions_proposed_total`, `source_type="sr"`),
+    backpressureRejections: s("silo_slatedb_backpressure_rejections_total"),
+    conflictRejections: s("silo_slatedb_conflict_rejections_total"),
+    destLastRunCompactions: s("silo_slatedb_dest_last_run_compactions_total"),
+    entriesWrittenPuts: s(`silo_slatedb_entries_written_total`, `value_type="put"`),
+    entriesWrittenTombstones: s(`silo_slatedb_entries_written_total`, `value_type="tombstone"`),
+    entriesWrittenMerges: s(`silo_slatedb_entries_written_total`, `value_type="merge"`),
+    filterKeptLastRun: s(`silo_slatedb_filter_decisions_total`, `decision="kept",is_last_run="true"`),
+    filterDroppedLastRun: s(`silo_slatedb_filter_decisions_total`, `decision="dropped",is_last_run="true"`),
+    filterKeptNonLastRun: s(`silo_slatedb_filter_decisions_total`, `decision="kept",is_last_run="false"`),
+    filterDroppedNonLastRun: s(`silo_slatedb_filter_decisions_total`, `decision="dropped",is_last_run="false"`),
+  };
+}
+
 function parseSlatedbGauges(file: string): SlatedbGauges {
   const out: SlatedbGauges = {
     bytesCompactedTotal: null,
@@ -396,11 +474,14 @@ function formatBytes(n: number | null): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
 
+type MetricsSnapshot = { index: number; timestampMs: number; file: string };
+
 function buildSummary(opts: {
   runId: string;
   shard: string;
   args: Args;
   runDir: string;
+  metricsSnapshots: MetricsSnapshot[];
 }) {
   const bench = parseBenchTotals(resolve(opts.runDir, "bench.log"));
   const noop = parseNoopFilter(resolve(opts.runDir, "compactor.log"));
@@ -417,37 +498,33 @@ function buildSummary(opts: {
     afterCompact.bytesCompactedTotal !== null
       ? afterCompact.bytesCompactedTotal - (before.bytesCompactedTotal ?? 0)
       : null;
-  // Each compactor iteration runs as its own process, so its
-  // `bytes_compacted_total` counter starts at 0. Sum them across iterations.
-  let compactorBytesSum = 0;
-  let compactorBytesAny = false;
-  let lastCompactionTs: number | null = null;
-  let objectStoreTotals: ObjectStoreOps = { ...ZERO_OBJECT_STORE_OPS };
-  const objectStorePerIter: Array<{ iteration: number; ops: ObjectStoreOps }> = [];
-  let peakMemBytes: number | null = null;
-  for (let i = 1; i <= opts.args.compactions; i += 1) {
-    const snapshotFile = resolve(
-      opts.runDir,
-      `compactor-metrics-iter-${i}.txt`,
-    );
-    const gauges = parseSlatedbGauges(snapshotFile);
-    if (gauges.bytesCompactedTotal !== null) {
-      compactorBytesSum += gauges.bytesCompactedTotal;
-      compactorBytesAny = true;
-    }
-    // Only take the timestamp when it's actually populated — iterations that
-    // found nothing to compact leave the gauge at 0, which parses as the
-    // Unix epoch and misleads the summary.
-    if (gauges.lastCompactionTs !== null && gauges.lastCompactionTs > 0) {
-      lastCompactionTs = Math.max(lastCompactionTs ?? 0, gauges.lastCompactionTs);
-    }
-    const ops = parseObjectStoreOps(snapshotFile);
-    objectStorePerIter.push({ iteration: i, ops });
-    objectStoreTotals = addObjectStoreOps(objectStoreTotals, ops);
-    if (gauges.totalMemBytes !== null) {
-      peakMemBytes = Math.max(peakMemBytes ?? 0, gauges.totalMemBytes);
-    }
-  }
+
+  // With a single long-lived compactor process, the final metrics snapshot
+  // has the cumulative counters directly — no cross-iteration summation.
+  const finalSnapshot = opts.metricsSnapshots.length > 0
+    ? opts.metricsSnapshots[opts.metricsSnapshots.length - 1]
+    : null;
+  const finalFile = finalSnapshot?.file ?? "";
+  const finalGauges = parseSlatedbGauges(finalFile);
+  const finalObjectStore = parseObjectStoreOps(finalFile);
+  const finalCompactorMetrics = parseCompactorNewMetrics(finalFile);
+
+  // Build per-snapshot time series for the JSON artifact. Each entry records
+  // the timestamp and gauge/counter values at that point so downstream tools
+  // can plot metrics over time.
+  const timeSeries = opts.metricsSnapshots.map((snap) => {
+    const gauges = parseSlatedbGauges(snap.file);
+    const ops = parseObjectStoreOps(snap.file);
+    const cm = parseCompactorNewMetrics(snap.file);
+    return {
+      index: snap.index,
+      timestampMs: snap.timestampMs,
+      slatedbGauges: gauges,
+      objectStoreOps: ops,
+      compactorMetrics: cm,
+    };
+  });
+
   return {
     runId: opts.runId,
     shard: opts.shard,
@@ -456,8 +533,8 @@ function buildSummary(opts: {
     durationSecs: opts.args.durationSecs,
     enqueuers: opts.args.enqueuers,
     workers: opts.args.workers,
-    compactions: opts.args.compactions,
-    compactionIntervalMs: opts.args.compactionIntervalMs,
+    metricsIntervalMs: opts.args.metricsIntervalMs,
+    metricsSnapshots: opts.metricsSnapshots.length,
     completedAt: new Date().toISOString(),
     bench,
     noopFilter: noop,
@@ -468,15 +545,18 @@ function buildSummary(opts: {
       bytesCompactedDelta,
     },
     compactor: {
-      bytesCompactedTotal: compactorBytesAny ? compactorBytesSum : null,
-      lastCompactionTs,
-      peakMemBytes,
+      bytesCompactedTotal: finalGauges.bytesCompactedTotal,
+      lastCompactionTs:
+        finalGauges.lastCompactionTs !== null && finalGauges.lastCompactionTs > 0
+          ? finalGauges.lastCompactionTs
+          : null,
     },
+    compactorMetrics: finalCompactorMetrics,
     objectStore: {
-      perIteration: objectStorePerIter,
-      totals: objectStoreTotals,
-      totalOps: totalOps(objectStoreTotals),
+      totals: finalObjectStore,
+      totalOps: totalOps(finalObjectStore),
     },
+    timeSeries,
   };
 }
 
@@ -489,8 +569,8 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
     ["", ""],
     ["Bench duration", `${summary.durationSecs}s`],
     [
-      "Compactor passes",
-      `${summary.compactions} x --mode once (interval ${summary.compactionIntervalMs}ms)`,
+      "Compactor mode",
+      `--mode loop (metrics every ${summary.metricsIntervalMs}ms, ${summary.metricsSnapshots} snapshots)`,
     ],
     [
       "Bench enqueue",
@@ -508,7 +588,7 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
     ["L0 SSTs after writes", String(summary.slatedb.afterWrites.l0SstCount ?? "n/a")],
     ["L0 SSTs after compact", String(summary.slatedb.afterCompact.l0SstCount ?? "n/a")],
     [
-      "Bytes compacted (sum)",
+      "Bytes compacted (total)",
       formatBytes(summary.compactor.bytesCompactedTotal),
     ],
     [
@@ -516,10 +596,6 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
       summary.compactor.lastCompactionTs !== null
         ? new Date(summary.compactor.lastCompactionTs * 1000).toISOString()
         : "n/a",
-    ],
-    [
-      "Compactor peak total mem",
-      formatBytes(summary.compactor.peakMemBytes),
     ],
     ["", ""],
     ["Filter invocations", String(summary.noopFilter.invocations)],
@@ -532,7 +608,7 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
     ["", ""],
     [
       "Object-store API calls",
-      `${summary.objectStore.totalOps} total across ${summary.compactions} compaction passes`,
+      `${summary.objectStore.totalOps} total`,
     ],
     ["  put", String(summary.objectStore.totals.put)],
     ["  put_multipart", String(summary.objectStore.totals.put_multipart)],
@@ -549,6 +625,26 @@ function printSummary(summary: ReturnType<typeof buildSummary>, runDir: string):
       String(summary.objectStore.totals.copy_if_not_exists),
     ],
     ["Object-store put bytes", formatBytes(summary.objectStore.totals.bytes)],
+    ["", ""],
+    ["── Compactor scheduler ──", ""],
+    ["Sorted run count (final)", String(summary.compactorMetrics.sortedRunCount ?? "n/a")],
+    ["Total SR size (final)", formatBytes(summary.compactorMetrics.totalSrSizeBytes)],
+    ["Avg SST size (final)", formatBytes(summary.compactorMetrics.avgSstSizeBytes)],
+    ["Compactions proposed L0", String(summary.compactorMetrics.compactionsProposedL0 ?? "n/a")],
+    ["Compactions proposed SR", String(summary.compactorMetrics.compactionsProposedSr ?? "n/a")],
+    ["Backpressure rejections", String(summary.compactorMetrics.backpressureRejections ?? "n/a")],
+    ["Conflict rejections", String(summary.compactorMetrics.conflictRejections ?? "n/a")],
+    ["Dest=last-run compactions", String(summary.compactorMetrics.destLastRunCompactions ?? "n/a")],
+    ["── Entries written ──", ""],
+    ["  puts", String(summary.compactorMetrics.entriesWrittenPuts ?? "n/a")],
+    ["  tombstones", String(summary.compactorMetrics.entriesWrittenTombstones ?? "n/a")],
+    ["  merges", String(summary.compactorMetrics.entriesWrittenMerges ?? "n/a")],
+    ["Output tombstone ratio", String(summary.compactorMetrics.outputTombstoneRatio ?? "n/a")],
+    ["── Filter decisions ──", ""],
+    ["  kept (last run)", String(summary.compactorMetrics.filterKeptLastRun ?? "n/a")],
+    ["  dropped (last run)", String(summary.compactorMetrics.filterDroppedLastRun ?? "n/a")],
+    ["  kept (non-last run)", String(summary.compactorMetrics.filterKeptNonLastRun ?? "n/a")],
+    ["  dropped (non-last run)", String(summary.compactorMetrics.filterDroppedNonLastRun ?? "n/a")],
   ];
   const w = Math.max(...rows.map(([k]) => k.length));
   console.log("");
@@ -642,82 +738,92 @@ async function main(): Promise<void> {
       bench.on("exit", (code) => res(code ?? -1));
     });
 
-    // Run silo-compactor --mode once, N times, with compactionIntervalMs
-    // sleep before each invocation. A single append-only log captures all
-    // iterations so `noop_counting compaction filter summary` lines across
-    // all passes can be grepped/summed.
+    // Start silo-compactor in loop mode alongside the bench. The compactor
+    // runs continuously until we SIGTERM it after the bench finishes, which
+    // mirrors production where compaction runs alongside live writes.
     console.log(
-      `[harness] will run silo-compactor --mode once x${args.compactions} ` +
-        `(interval ${args.compactionIntervalMs}ms) alongside bench`,
+      `[harness] starting silo-compactor --mode loop (metrics every ${args.metricsIntervalMs}ms)`,
     );
     const compactorLog = createWriteStream(resolve(runDir, "compactor.log"));
-    const perIterRuns: Array<{ iteration: number; exitCode: number; startedAt: string }> = [];
-    for (let i = 1; i <= args.compactions; i += 1) {
-      await sleep(args.compactionIntervalMs);
-      // Snapshot before running this iteration so we can compute L0 delta
-      // per pass if needed.
-      await snapshotMetrics(
-        args.writerMetrics,
-        resolve(runDir, `writer-metrics-before-compact-${i}.txt`),
-      );
-      const startedAt = new Date().toISOString();
-      console.log(`[harness]   compactor iteration ${i}/${args.compactions}...`);
-      compactorLog.write(`\n===== iteration ${i}/${args.compactions} @ ${startedAt} =====\n`);
-      const compactor = spawn(
-        resolve(root, "target/debug/silo-compactor"),
-        ["-c", args.compactorConfig, "--shard", shard, "--mode", "once"],
-        { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
-      );
-      compactor.stdout!.pipe(compactorLog, { end: false });
-      compactor.stderr!.pipe(compactorLog, { end: false });
-      // The compactor's /metrics endpoint is only alive while the process
-      // runs. Poll it throughout this iteration and keep the last successful
-      // response so we have something to snapshot even if the process exits
-      // between our polls.
-      const compactorRunning = { done: false };
-      const snapshotFile = resolve(runDir, `compactor-metrics-iter-${i}.txt`);
-      const poller = (async () => {
-        while (!compactorRunning.done) {
-          try {
-            const text = await fetchText(`${args.compactorMetrics}/metrics`);
-            writeFileSync(snapshotFile, text);
-          } catch {
-            /* server not up yet or already gone — keep trying */
-          }
-          await sleep(100);
+    const compactor = spawn(
+      resolve(root, "target/debug/silo-compactor"),
+      ["-c", args.compactorConfig, "--shard", shard, "--mode", "loop"],
+      { cwd: root, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    compactor.stdout!.pipe(compactorLog, { end: false });
+    compactor.stderr!.pipe(compactorLog, { end: false });
+    const compactorDone = new Promise<number>((res) => {
+      compactor.on("exit", (code) => res(code ?? -1));
+    });
+
+    // Periodically snapshot the compactor's /metrics endpoint. Each snapshot
+    // is saved with a monotonic index so we can reconstruct a time series.
+    const metricsSnapshots: Array<{ index: number; timestampMs: number; file: string }> = [];
+    const compactorRunning = { done: false };
+    let snapshotIndex = 0;
+    const metricsPoller = (async () => {
+      // Give the compactor a moment to start its metrics server.
+      await sleep(500);
+      while (!compactorRunning.done) {
+        snapshotIndex += 1;
+        const file = resolve(runDir, `compactor-metrics-${String(snapshotIndex).padStart(4, "0")}.txt`);
+        try {
+          const text = await fetchText(`${args.compactorMetrics}/metrics`);
+          writeFileSync(file, text);
+          metricsSnapshots.push({ index: snapshotIndex, timestampMs: Date.now(), file });
+        } catch {
+          /* compactor metrics server not up yet — keep trying */
         }
-      })();
-      const exitCode = await new Promise<number>((res) => {
-        compactor.on("exit", (code) => res(code ?? -1));
-      });
+        await sleep(args.metricsIntervalMs);
+      }
+    })();
+
+    // Helper to stop the compactor and its metrics poller cleanly.
+    const stopCompactor = async () => {
+      // Take a final compactor metrics snapshot before shutting it down.
+      snapshotIndex += 1;
+      const finalFile = resolve(runDir, `compactor-metrics-${String(snapshotIndex).padStart(4, "0")}.txt`);
+      try {
+        const text = await fetchText(`${args.compactorMetrics}/metrics`);
+        writeFileSync(finalFile, text);
+        metricsSnapshots.push({ index: snapshotIndex, timestampMs: Date.now(), file: finalFile });
+      } catch {
+        console.warn("[harness] final compactor metrics snapshot failed");
+      }
+      compactor.kill("SIGTERM");
+      const exitCode = await compactorDone;
       compactorRunning.done = true;
-      await poller;
-      perIterRuns.push({ iteration: i, exitCode, startedAt });
-      if (exitCode !== 0) {
-        console.warn(`[harness]   iteration ${i} exited with code ${exitCode}`);
+      await metricsPoller;
+      compactorLog.end();
+      console.log(`[harness] compactor exited code=${exitCode}`);
+    };
+
+    try {
+      // Wait for the bench to finish.
+      const benchExitCode = await benchDone;
+      if (benchExitCode !== 0) {
+        throw new Error(`bench exited ${benchExitCode}`);
+      }
+
+      await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-writes.txt"));
+      await stopCompactor();
+      await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-compact.txt"));
+
+      const summary = buildSummary({
+        runId,
+        shard,
+        args,
+        runDir,
+        metricsSnapshots,
+      });
+      writeFileSync(resolve(runDir, "summary.json"), JSON.stringify(summary, null, 2));
+      printSummary(summary, runDir);
+    } finally {
+      // Ensure the compactor is stopped even if the bench fails.
+      if (!compactorRunning.done) {
+        await stopCompactor();
       }
     }
-    compactorLog.end();
-
-    // Wait for the bench to finish if it hasn't already.
-    const benchExitCode = await benchDone;
-    if (benchExitCode !== 0) {
-      throw new Error(`bench exited ${benchExitCode}`);
-    }
-
-    await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-writes.txt"));
-    await snapshotMetrics(args.writerMetrics, resolve(runDir, "writer-metrics-after-compact.txt"));
-    // Compactor `/metrics` is only alive while a silo-compactor process is
-    // running; per-iteration files are captured above, no final snapshot.
-
-    const summary = buildSummary({
-      runId,
-      shard,
-      args,
-      runDir,
-    });
-    writeFileSync(resolve(runDir, "summary.json"), JSON.stringify(summary, null, 2));
-    printSummary(summary, runDir);
   } finally {
     writer.kill("SIGTERM");
     await new Promise<void>((res) => writer.on("exit", () => res()));
