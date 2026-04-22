@@ -94,17 +94,19 @@ fn apply_scheduler_config(opts: &mut CompactorOptions, scheduler: &CompactionSch
     }
 }
 
-/// Build the optional scheduler supplier. Returns `Some` only for
-/// scheduler variants that need a custom supplier (currently `Leveled`).
-/// `SizeTiered` uses the default scheduler built into slatedb.
+/// Build the optional scheduler supplier. Returns `None` for `SizeTiered`,
+/// which uses slatedb's built-in default scheduler.
+///
+/// `Leveled` panics — leveled compaction was removed from slatedb main.
+/// Configs that set `kind = "leveled"` will fail at runtime.
 pub fn build_scheduler_supplier(
     compaction: &CompactionConfig,
 ) -> Option<Arc<dyn CompactionSchedulerSupplier>> {
     match &compaction.scheduler {
         CompactionSchedulerConfig::SizeTiered { .. } => None,
-        CompactionSchedulerConfig::Leveled { .. } => Some(Arc::new(
-            slatedb::compactor::LeveledCompactionSchedulerSupplier::new(),
-        )),
+        CompactionSchedulerConfig::Leveled { .. } => {
+            panic!("leveled compaction was removed from slatedb; use size_tiered instead")
+        }
     }
 }
 
