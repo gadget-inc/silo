@@ -3011,12 +3011,13 @@ async fn k8s_is_shard_paused_returns_correct_values() {
     handle.abort();
 }
 
-/// Test that split state persists across coordinator restart.
+/// Test that a split record persisted to k8s by one coordinator is picked up
+/// and resumed to completion by a replacement coordinator on restart.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
-async fn k8s_split_state_persists_across_restart() {
+async fn k8s_split_state_persists_and_resumes_across_restart() {
     let prefix = unique_prefix();
     let namespace = get_namespace();
-    let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
+    let num_shards: u32 = 1;
 
     // Start first coordinator
     let (c1, h1) = start_coordinator!(
@@ -3026,14 +3027,13 @@ async fn k8s_split_state_persists_across_restart() {
         "http://127.0.0.1:7450",
         num_shards
     );
+    let c1_concrete = c1.clone();
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
     assert!(c1.wait_converged(Duration::from_secs(30)).await);
 
     let owned = c1.owned_shards().await;
     let shard_id = owned[0];
-
-    // Create splitter and request a split
 
     let splitter1 = ShardSplitter::new(c1.clone());
 
@@ -3042,14 +3042,15 @@ async fn k8s_split_state_persists_across_restart() {
         .await
         .expect("request_split should succeed");
 
-    // Shutdown the coordinator
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard leases
+    // in k8s, so the replacement coordinator can reclaim them.
+    c1_concrete.crash().await;
     h1.abort();
-
-    // Wait for K8s resources to be cleaned up before restarting
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Start new coordinator with same prefix (simulates restart)
+    // Start new coordinator with same node_id + storage. Its coord loop runs
+    // resume_in_progress_splits after reclaim, so the split should drive
+    // itself to completion automatically.
     let (c2, h2) = K8sCoordinator::start(
         make_coordinator_config(
             &namespace,
@@ -3059,7 +3060,7 @@ async fn k8s_split_state_persists_across_restart() {
             num_shards,
             30,
         ),
-        make_test_factory("persist-test-1-restart"),
+        make_test_factory("persist-test-1"),
     )
     .await
     .expect("restart coordinator");
@@ -3067,25 +3068,24 @@ async fn k8s_split_state_persists_across_restart() {
 
     assert!(c2.wait_converged(Duration::from_secs(30)).await);
 
-    // Create splitter for c2 and verify the split state persisted
-
     let splitter2 = ShardSplitter::new(c2.clone());
 
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get_split_status should succeed");
-    assert!(
-        status.is_some(),
-        "split status should persist after restart"
-    );
-    let status = status.unwrap();
-    assert_eq!(status.parent_shard_id, shard_id);
-    assert_eq!(status.split_point, "8000000000000000");
-    assert_eq!(status.left_child_id, split.left_child_id);
-    assert_eq!(status.right_child_id, split.right_child_id);
+    let completed = wait_until(Duration::from_secs(20), || async {
+        splitter2
+            .get_split_status(shard_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    })
+    .await;
+    assert!(completed, "auto-resume should complete the persisted split");
 
-    // Cleanup
+    let shard_map = c2.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+
     c2.shutdown().await.unwrap();
     h2.abort();
 }
