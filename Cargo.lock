@@ -5357,7 +5357,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.12.0"
-source = "git+https://github.com/kirinrastogi/slatedb.git?branch=kirin%2Fnew_compaction_metrics#3d8596580c85e93add3881ce6055229e2901af8a"
+source = "git+https://github.com/kirinrastogi/slatedb.git?branch=kirin%2Fleveled_compaction_with_metrics#1e72d4f75072934863b5981ec8f7950838b326e4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5404,7 +5404,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.12.0"
-source = "git+https://github.com/kirinrastogi/slatedb.git?branch=kirin%2Fnew_compaction_metrics#3d8596580c85e93add3881ce6055229e2901af8a"
+source = "git+https://github.com/kirinrastogi/slatedb.git?branch=kirin%2Fleveled_compaction_with_metrics#1e72d4f75072934863b5981ec8f7950838b326e4"
 dependencies = [
  "chrono",
  "log",
@@ -5415,7 +5415,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.12.0"
-source = "git+https://github.com/kirinrastogi/slatedb.git?branch=kirin%2Fnew_compaction_metrics#3d8596580c85e93add3881ce6055229e2901af8a"
+source = "git+https://github.com/kirinrastogi/slatedb.git?branch=kirin%2Fleveled_compaction_with_metrics#1e72d4f75072934863b5981ec8f7950838b326e4"
 dependencies = [
  "async-trait",
  "bytes",

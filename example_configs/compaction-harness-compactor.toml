@@ -38,7 +38,7 @@ disable = false
 # tombstone_entries, merge_entries, bytes_seen.
 [database.compaction.filter]
 kind = "completed_jobs"
-retention_secs = 180         # 3 minutes
+retention_secs = 420         # 7 minutes
 
 [database.compaction.scheduler]
 kind = "leveled"
