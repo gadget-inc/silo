@@ -6,7 +6,10 @@ use silo_compactor::coordinator::Coordinator;
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(name = "silo-compactor", about = "Standalone slatedb compactor for silo shards")]
+#[command(
+    name = "silo-compactor",
+    about = "Standalone slatedb compactor for silo shards"
+)]
 struct Args {
     #[arg(short = 'c', long, env = "SILO_COMPACTOR_CONFIG")]
     config: PathBuf,

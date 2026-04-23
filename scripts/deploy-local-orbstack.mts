@@ -62,12 +62,16 @@ await nixBuildAndLoad("silo-docker-dev");
 console.log("\nBuilding silo-autoscaler image inside OrbStack (aarch64-linux)...");
 await nixBuildAndLoad("silo-autoscaler-docker");
 
+console.log("\nBuilding silo-compactor image inside OrbStack (aarch64-linux)...");
+await nixBuildAndLoad("silo-compactor-docker");
+
 console.log("\nApplying Kubernetes manifests to OrbStack...");
 run("kubectl", ["--context", "orbstack", "apply", "-f", "deploy/local-test"]);
 
-console.log("\nRestarting StatefulSet and autoscaler...");
+console.log("\nRestarting StatefulSet, autoscaler, and compactor...");
 run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "statefulset/silo"]);
 run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "deployment/silo-autoscaler"]);
+run("kubectl", ["--context", "orbstack", "-n", "silo-test", "rollout", "restart", "deployment/silo-compactor"]);
 
 console.log("\nDone. Pods:");
 run("kubectl", ["--context", "orbstack", "-n", "silo-test", "get", "pods"]);

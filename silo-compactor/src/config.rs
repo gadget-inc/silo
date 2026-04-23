@@ -56,9 +56,15 @@ pub struct CoordinatorConfig {
     pub pod_label_selector: String,
     #[serde(default = "default_max_shards_per_pod")]
     pub max_shards_per_pod: usize,
-    #[serde(default = "default_rebalance_interval", deserialize_with = "duration_serde::deserialize")]
+    #[serde(
+        default = "default_rebalance_interval",
+        deserialize_with = "duration_serde::deserialize"
+    )]
     pub rebalance_interval: Duration,
-    #[serde(default = "default_worker_backoff", deserialize_with = "duration_serde::deserialize")]
+    #[serde(
+        default = "default_worker_backoff",
+        deserialize_with = "duration_serde::deserialize"
+    )]
     pub worker_restart_backoff: Duration,
 }
 

@@ -1,0 +1,36 @@
+# silo-compactor config for the local OrbStack test cluster.
+# Discovers sibling pods via the k8s API (label selector), reads silo's shard
+# map from the ConfigMap silo writes (silo-local-test-shard-map), and runs
+# slatedb's standalone compactor for each assigned shard. Reads/writes the
+# same hostPath volume that silo's StatefulSet uses for shared data.
+#
+# POD_NAME and POD_NAMESPACE are injected via the Downward API in
+# compactor-deployment.yaml. The actual ConfigMap applied to the cluster is
+# inlined in compactor-deployment.yaml (this file is the reference copy).
+
+[storage]
+backend = "fs"
+path = "/data/shared/%shard%"
+
+[shard_discovery]
+backend = "k8s_configmap"
+cluster_prefix = "silo-local-test"
+k8s_namespace = "${POD_NAMESPACE}"
+
+[coordinator]
+mode = "k8s_deployment"
+self_pod_name = "${POD_NAME}"
+namespace = "${POD_NAMESPACE}"
+pod_label_selector = "app=silo-compactor"
+max_shards_per_pod = 6
+rebalance_interval = "10s"
+worker_restart_backoff = "2s"
+
+[logging]
+format = "json"
+
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 67108864
+max_concurrent_compactions = 2
+max_fetch_tasks = 4
