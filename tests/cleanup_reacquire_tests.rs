@@ -109,8 +109,23 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
         // Trigger the background cleanup (this is what coordination backends call)
         shard.maybe_spawn_background_cleanup(range.clone());
 
-        // Wait for background cleanup to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Poll until cleanup reaches its terminal state, rather than sleeping
+        // for a fixed amount of time — under CI load the transition through
+        // CleanupPending → CleanupRunning → CleanupDone → CompactionDone can
+        // take several seconds and a tight sleep flakes.
+        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = shard.get_cleanup_status().await.expect("get status");
+            if status == SplitCleanupStatus::CompactionDone {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "cleanup did not reach CompactionDone within 30s; last status: {:?}",
+                status,
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
         shard.db().flush().await.unwrap();
 
         // Verify cleanup completed - only in-range tenants should remain
@@ -188,8 +203,23 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
         // Trigger background cleanup
         shard.maybe_spawn_background_cleanup(range.clone());
 
-        // Wait for cleanup
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Poll until cleanup reaches its terminal state, rather than sleeping
+        // for a fixed amount of time — under CI load the transition through
+        // CleanupRunning → CleanupDone → CompactionDone can take several
+        // seconds and a tight sleep flakes.
+        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = shard.get_cleanup_status().await.expect("get status");
+            if status == SplitCleanupStatus::CompactionDone {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "cleanup did not reach CompactionDone within 30s; last status: {:?}",
+                status,
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
         shard.db().flush().await.unwrap();
 
         // Verify cleanup completed
