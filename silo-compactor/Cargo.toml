@@ -1,0 +1,40 @@
+[package]
+name = "silo-compactor"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone slatedb compactor process for Silo shards"
+
+[[bin]]
+name = "silo-compactor"
+path = "src/main.rs"
+
+[dependencies]
+slatedb = "0.12.0"
+slatedb-common = "0.12.0"
+object_store = { version = "0.12", features = ["gcp"] }
+
+kube = { version = "0.98", features = ["runtime", "client"] }
+k8s-openapi = { version = "0.24", features = ["v1_31"] }
+etcd-client = { version = "0.13", default-features = false, features = ["tls"] }
+
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+url = "2"
+uuid = { version = "1.9", features = ["v4", "serde"] }
+humantime = "2"
+hostname = "0.4"
+
+clap = { version = "4.3", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1.0"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

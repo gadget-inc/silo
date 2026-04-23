@@ -101,5 +101,22 @@
         ];
       };
     };
+
+    packages.silo-compactor-docker = pkgs.dockerTools.buildLayeredImage {
+      name = "silo-compactor";
+      tag = "latest";
+
+      contents = [
+        self'.packages.silo-compactor
+        pkgs.cacert
+      ];
+
+      config = {
+        Entrypoint = [ "${self'.packages.silo-compactor}/bin/silo-compactor" ];
+        Env = [
+          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        ];
+      };
+    };
   };
 }

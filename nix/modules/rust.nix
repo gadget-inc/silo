@@ -83,11 +83,25 @@
         cargoArtifacts = cargoArtifactsAutoscaler;
         doCheck = false;
       });
+
+      # Standalone slatedb compactor binary
+      compactorArgs = {
+        inherit src;
+        strictDeps = true;
+        nativeBuildInputs = [ pkgs.protobuf pkgs.flatbuffers ];
+        cargoExtraArgs = "--package silo-compactor";
+      };
+      cargoArtifactsCompactor = craneLib.buildDepsOnly compactorArgs;
+      silo-compactor = craneLib.buildPackage (compactorArgs // {
+        cargoArtifacts = cargoArtifactsCompactor;
+        doCheck = false;
+      });
     in
     {
       packages.default = silo;
       packages.silo = silo;
       packages.silo-debug = silo-debug;
       packages.silo-autoscaler = silo-autoscaler;
+      packages.silo-compactor = silo-compactor;
     };
 }

@@ -5471,6 +5471,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-compactor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "etcd-client",
+ "futures",
+ "hostname",
+ "humantime",
+ "k8s-openapi",
+ "kube",
+ "object_store",
+ "serde",
+ "serde_json",
+ "slatedb",
+ "slatedb-common",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "silo-macros"
 version = "0.1.0"
 dependencies = [
