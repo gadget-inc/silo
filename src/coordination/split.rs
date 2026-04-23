@@ -919,15 +919,26 @@ impl ShardSplitter {
         Ok(())
     }
 
-    /// Recover from stale split operations after a node restart.
+    /// Operator escape hatch: abandon every in-progress split this node
+    /// initiated, regardless of phase.
     ///
-    /// [SILO-COORD-INV-11] All incomplete splits are abandoned on crash.
-    /// The shard map update is the commit point - if children don't exist in the
-    /// shard map, the split never completed and is safe to abandon. Orphaned
-    /// clone databases may exist but don't affect correctness.
+    /// The default crash-recovery path is `resume_in_progress_splits`
+    /// (auto-resume): the persisted split record is picked up on restart and
+    /// driven forward through the normal phase machine. This method is the
+    /// opposite — intended only for use when auto-resume keeps failing (e.g.,
+    /// persistent object-store errors during clone) and an operator wants to
+    /// give up on a stuck split.
     ///
-    /// This preserves the parent shard when a crash occurs before the commit point,
-    /// ensuring no data is lost during failed splits.
+    /// For pre-commit phases (SplitRequested/SplitPausing/SplitCloning) it
+    /// deletes the ConfigMap/KV record and clears the paused flag; the parent
+    /// shard remains in the shard map. For post-commit SplitComplete it
+    /// simply deletes the residual record.
+    ///
+    /// Note: this does NOT reclaim orphaned clone databases written to object
+    /// storage during an interrupted SplitCloning, nor does it delete the
+    /// slatedb checkpoint pinned on the parent's manifest.
+    ///
+    /// Not currently wired to a siloctl command; call sites are tests only.
     pub async fn recover_stale_splits(&self) -> Result<(), CoordinationError> {
         let splits = self.coordinator.list_all_splits().await?;
 

@@ -1505,24 +1505,15 @@ pred nodeFlapStep[n: Node, t: Time, tnext: Time] {
     -- Permanent leases: all leases are preserved through flap
     leaseFrame[t, tnext]
 
-    -- All incomplete splits are abandoned when the node crashes.
-    -- The shard map update is the commit point - if children don't exist in the shard map,
-    -- the split never completed and is safe to abandon. Orphaned clone databases may exist
-    -- but don't affect correctness.
-    all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and
-                    splitPhaseAt[s, t] in (SplitRequested + SplitPausing + SplitCloning)) implies
-        not splitInProgressFor[s, tnext]
-
-    -- SplitComplete phase splits are also cleaned up (just the record deletion)
-    all s: Shard | (holdsLease[n, s, t] and splitInProgressFor[s, t] and
-                    splitPhaseAt[s, t] = SplitComplete) implies
-        not splitInProgressFor[s, tnext]
-
-    -- Splits not involving shards held by n are unchanged
-    all s: Shard | not holdsLease[n, s, t] implies {
-        splitInProgressFor[s, tnext] iff splitInProgressFor[s, t]
-        splitInProgressFor[s, t] implies splitPhaseAt[s, tnext] = splitPhaseAt[s, t]
-    }
+    -- [SILO-COORD-INV-16] Split records are preserved through flap.
+    -- Crashing mid-split must NOT abandon the record: the backing ConfigMap (k8s)
+    -- or KV entry (etcd) persists, and a replacement coordinator with the same
+    -- node identity picks it up on restart and drives the split forward through
+    -- the normal splitCloneDbStep / splitUpdateMapStep / splitCleanupStep
+    -- transitions (auto-resume). Abandon on crash would have lost the
+    -- persisted slatedb checkpoint UUID, leaving partial child manifests
+    -- that slatedb's idempotent create_clone could not validate on retry.
+    splitFrame[t, tnext]
 
     -- Frame conditions for other nodes
     membershipFrameExcept[n, t, tnext]
@@ -1828,63 +1819,19 @@ pred splitAbandonStep[n: Node, s: Shard, t: Time, tnext: Time] {
 }
 
 /**
- * NOTE: Split resume is no longer needed with the simplified split model.
- * All incomplete splits are abandoned on crash. The shard map update is
- * the commit point - if children don't exist in the shard map, the split
- * never completed and is safe to abandon.
+ * Split resume after crash: modeled implicitly.
  *
- * This predicate is kept as a placeholder but is never used.
- */
-pred splitResumeStep_UNUSED[n: Node, s: Shard, t: Time, tnext: Time] {
-    -- This predicate is unused - all incomplete splits are abandoned
-    -- Keeping this as documentation of the old behavior
-    
-    -- Preconditions (would have been)
-    splitInProgressFor[s, t]
-    splitPhaseAt[s, t] = SplitComplete  -- Only SplitComplete can exist after crash
-    
-    some orig: splitFor[s, t] | {
-        let leftChild = orig.split_leftChild,
-            rightChild = orig.split_rightChild | {
-            
-            -- Children exist (map was updated before crash)
-            shardExists[leftChild, t]
-            shardExists[rightChild, t]
-            
-            -- New node holds leases on children (it took over)
-            holdsLease[n, leftChild, t]
-            holdsLease[n, rightChild, t]
-            
-            -- Parent no longer exists (was removed in UpdateMap)
-            not shardExists[s, t]
-            
-            -- Postconditions: Complete the split
-            splitInProgressFor[s, tnext]
-            splitPhaseAt[s, tnext] = SplitComplete
-            some next: splitFor[s, tnext] | {
-                next.split_point = orig.split_point
-                next.split_leftChild = leftChild
-                next.split_rightChild = rightChild
-            }
-        }
-    }
-    
-    -- Frame conditions
-    membershipFrame[t, tnext]
-    shardMapFrame[t, tnext]
-    leaseFrame[t, tnext]
-    splitFrameExcept[s, t, tnext]
-    workerFrame[t, tnext]
-}
-
-/**
- * A new node restarts a split from scratch.
- * 
- * When a node crashes before splitUpdateMap, the split is abandoned.
- * A new node that acquires the lease on the parent can start a new split.
- * This is just splitRequestStep with different preconditions - the parent
- * shard is already set up, we're just restarting the process.
- * (No separate transition needed - splitRequestStep covers this case)
+ * After nodeFlapStep preserves the split record (see INV-16), a replacement
+ * coordinator with the same node identity reacquires membership via
+ * nodeRecoverStep + nodeJoinStep. The shard lease is permanent, so
+ * holdsLease[n, s, t] still holds. The existing split transitions
+ * (splitCloneDbStep, splitUpdateMapStep, splitCleanupStep) then fire as
+ * normal — their preconditions only check lease ownership + phase, not
+ * whether this is a "fresh" execution. Idempotency across the crash is
+ * ensured by the persisted checkpoint_id on SplitInProgress: the
+ * re-entered splitCloneDbStep reuses the same slatedb checkpoint UUID,
+ * and slatedb's create_clone validates any partial child manifest
+ * against it rather than rejecting the retry.
  */
 
 /** Cleanup start with full frame conditions */
@@ -2169,20 +2116,28 @@ assert memberAndFlappedMutuallyExclusive {
 }
 
 /**
- * [SILO-COORD-INV-11] Early split crash preserves parent shard.
- * 
- * If a split crashes during an early phase (before UpdateMap), the parent
- * shard must remain available. This ensures no data is lost.
+ * [SILO-COORD-INV-11] Pre-commit split termination preserves data.
+ *
+ * If a split is in a pre-commit phase at t1 and is no longer "in progress"
+ * at some later t2, the split terminated in exactly one of two ways:
+ *   (a) it was abandoned (by splitAbandonStep, e.g. clone failure, operator),
+ *       in which case the parent shard must still exist and be unchanged, or
+ *   (b) it was resumed to completion (via splitUpdateMapStep + splitCleanupStep
+ *       firing after a crash, the auto-resume path), in which case the parent
+ *       has been replaced by its two children in the shard map.
+ *
+ * Either way no data is lost: reads and writes route to the parent in case
+ * (a) and to the children in case (b).
  */
-assert earlySplitCrashPreservesParent {
+assert earlySplitCrashPreservesDataPath {
     all s: Shard, t1, t2: Time |
-        -- If split was in early phase at t1
-        (splitInProgressFor[s, t1] and 
+        (splitInProgressFor[s, t1] and
          splitPhaseAt[s, t1] in (SplitRequested + SplitPausing + SplitCloning) and
-         -- And split is no longer in progress at t2 (abandoned)
          lt[t1, t2] and not splitInProgressFor[s, t2]) implies
-        -- Then parent shard still exists
-        shardExists[s, t2]
+        (shardExists[s, t2]   -- (a) abandoned: parent preserved
+         or (some sp: splitFor[s, t1] |  -- (b) resumed to completion: children exist
+             shardExists[sp.split_leftChild, t2] and
+             shardExists[sp.split_rightChild, t2]))
 }
 
 /**
@@ -2203,10 +2158,12 @@ assert splitChildrenPersist {
 
 /**
  * [SILO-COORD-INV-13] Committed splits preserve their state.
- * 
+ *
  * If a split reaches SplitComplete phase (committed), the split state
- * can be cleaned up but not regressed. Before SplitComplete, any crash
- * abandons the split. This ensures the shard map is the source of truth.
+ * can be cleaned up but not regressed. Pre-commit splits may either be
+ * abandoned (via splitAbandonStep) or resumed to completion after a crash;
+ * the commit point is the shard map update in splitUpdateMapStep, after
+ * which the phase cannot move backwards.
  */
 assert committedSplitStatePreserved {
     all s: Shard, t1, t2: Time |
@@ -2215,6 +2172,28 @@ assert committedSplitStatePreserved {
          lt[t1, t2] and splitInProgressFor[s, t2]) implies
         -- Then phase remains Complete (not regressed, just waiting for cleanup)
         splitPhaseAt[s, t2] = SplitComplete
+}
+
+/**
+ * [SILO-COORD-INV-16] Split records persist through node flap.
+ *
+ * A nodeFlapStep must not delete any in-progress split records. The
+ * backing ConfigMap (k8s) or KV entry (etcd) is what auto-resume relies
+ * on when a replacement coordinator comes up with the same node identity;
+ * losing the record on crash would strand the persisted slatedb
+ * checkpoint UUID and make the resume's idempotent clone impossible.
+ *
+ * Formally: if a split is in progress at t1, and nodeFlapStep takes us
+ * to t2 = next[t1], the same split is still in progress at t2 with the
+ * same phase.
+ */
+assert splitRecordPersistsThroughFlap {
+    all s: Shard, n: Node, t1, t2: Time |
+        (splitInProgressFor[s, t1] and
+         next[t1] = t2 and
+         nodeFlapStep[n, t1, t2]) implies
+        (splitInProgressFor[s, t2] and
+         splitPhaseAt[s, t2] = splitPhaseAt[s, t1])
 }
 
 /**
@@ -2478,16 +2457,18 @@ pred exampleWorkerDuringSplit {
  */
 
 /**
- * Example: Crash during split before UpdateMap (early phase).
+ * Example: Crash during pre-commit split, operator force-release + abandon.
+ *
+ * This is the escape-hatch path: auto-resume has been giving up (e.g., cloud
+ * storage flakiness), so an operator force-releases n1's lease and a peer
+ * takes over to abandon the stuck split.
  *
  * Scenario:
  * - n1 starts a split (reaches SplitPausing or SplitCloning phase)
- * - n1 crashes (flaps) - lease preserved, split abandoned
+ * - n1 crashes (flaps) - lease + split record both preserved (INV-16)
  * - Operator force-releases n1's shard lease
- * - n2 acquires lease on parent shard
- *
- * Key property: The parent shard remains available after the crash,
- * and the system can proceed without the partial split.
+ * - n2 acquires lease on parent shard and explicitly abandons the split
+ * - Parent shard remains available and usable
  */
 pred exampleCrashDuringEarlySplit {
     some n1, n2: Node, parent: Shard | {
@@ -2500,18 +2481,68 @@ pred exampleCrashDuringEarlySplit {
             splitPhaseAt[parent, tSplit] in (SplitPausing + SplitCloning)
         }
 
-        -- n1 crashes (lease preserved)
-        some tFlap: Time | hasFlapped[n1, tFlap] and holdsLease[n1, parent, tFlap]
+        -- n1 crashes: lease and split record both preserved
+        some tFlap: Time | {
+            hasFlapped[n1, tFlap]
+            holdsLease[n1, parent, tFlap]
+            splitInProgressFor[parent, tFlap]
+        }
 
-        -- After crash, split is abandoned (no longer in progress)
+        -- After force-release + operator abandon, split is gone
         some tAfter: Time | {
             not splitInProgressFor[parent, tAfter]
-            -- Parent shard still exists and is usable
             shardExists[parent, tAfter]
         }
 
-        -- After force-release, n2 takes over the parent shard
+        -- n2 ends up holding the parent shard
         some tTakeover: Time | holdsLease[n2, parent, tTakeover]
+    }
+}
+
+/**
+ * Example: Crash during pre-commit split, auto-resume drives to completion.
+ *
+ * This is the common/expected path added by the resume-on-restart feature:
+ * the crashed pod's replacement picks up the persisted split record and
+ * drives it forward. No operator action is needed.
+ *
+ * Scenario:
+ * - n1 starts a split (reaches SplitCloning phase)
+ * - n1 crashes (flaps) - lease + split record both preserved (INV-16)
+ * - n1 recovers and rejoins with the same identity
+ * - Auto-resume: splitCloneDbStep + splitUpdateMapStep + splitCleanupStep
+ *   fire normally, driving the split to SplitComplete and then cleaning
+ *   up the record
+ * - Parent is removed from the shard map, children take its place
+ */
+pred exampleCrashDuringSplitAutoResumes {
+    some n1: Node, parent: Shard | {
+        -- n1 starts split and reaches SplitCloning
+        some tCloning: Time | {
+            holdsLease[n1, parent, tCloning]
+            splitInProgressFor[parent, tCloning]
+            splitPhaseAt[parent, tCloning] = SplitCloning
+        }
+
+        -- n1 crashes: split record preserved
+        some tFlap: Time | {
+            hasFlapped[n1, tFlap]
+            splitInProgressFor[parent, tFlap]
+        }
+
+        -- n1 recovers and rejoins
+        some tRejoin: Time | isMember[n1, tRejoin] and not hasFlapped[n1, tRejoin]
+
+        -- Auto-resume completes: split record cleaned up, children in shard map
+        some tDone: Time | {
+            not splitInProgressFor[parent, tDone]
+            not shardExists[parent, tDone]
+            some sp: SplitInProgress | {
+                sp.split_parent = parent
+                shardExists[sp.split_leftChild, tDone]
+                shardExists[sp.split_rightChild, tDone]
+            }
+        }
     }
 }
 
@@ -2629,12 +2660,20 @@ run exampleWorkerDuringSplit for 3 but
 
 -- NOTE: Cleanup examples removed (see comment in pred section above)
 
--- Crash during early split phase (split abandoned, parent available)
-run exampleCrashDuringEarlySplit for 4 but 
-    exactly 2 Node, exactly 3 Shard, exactly 2 Addr, 
+-- Crash during pre-commit split, operator force-releases + abandons (escape hatch)
+run exampleCrashDuringEarlySplit for 4 but
+    exactly 2 Node, exactly 3 Shard, exactly 2 Addr,
     exactly 4 TenantId, exactly 10 Time, exactly 1 SplitPoint, exactly 0 Worker,
-    10 NodeMembership, 10 NodeFlapped, 20 ShardMapEntry, 10 ShardLease, 
+    10 NodeMembership, 10 NodeFlapped, 20 ShardMapEntry, 10 ShardLease,
     10 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
+    10 TenantOrder
+
+-- Crash during pre-commit split, auto-resume drives it to completion (primary path)
+run exampleCrashDuringSplitAutoResumes for 4 but
+    exactly 1 Node, exactly 3 Shard, exactly 1 Addr,
+    exactly 4 TenantId, exactly 12 Time, exactly 1 SplitPoint, exactly 0 Worker,
+    12 NodeMembership, 12 NodeFlapped, 20 ShardMapEntry, 12 ShardLease,
+    12 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     10 TenantOrder
 
 -- Crash after split commit (children persist)
@@ -2737,8 +2776,15 @@ check memberAndFlappedMutuallyExclusive for 3 but
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     6 TenantOrder
 
--- Early split crash preserves parent shard
-check earlySplitCrashPreservesParent for 3 but 
+-- Early split crash: parent preserved (abandon) OR resumed to completion (children exist)
+check earlySplitCrashPreservesDataPath for 3 but
+    2 Node, 3 Shard, 2 Addr, 4 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
+    6 NodeMembership, 6 NodeFlapped, 12 ShardMapEntry, 6 ShardLease,
+    6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
+    8 TenantOrder
+
+-- Split records persist through node flap (resume requires the record)
+check splitRecordPersistsThroughFlap for 3 but
     2 Node, 3 Shard, 2 Addr, 4 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
     6 NodeMembership, 6 NodeFlapped, 12 ShardMapEntry, 6 ShardLease,
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
