@@ -14,6 +14,12 @@ pub fn compute_assignment(
     mut shards: Vec<ShardId>,
     max_shards: usize,
 ) -> Vec<ShardId> {
+    let total_pods = pods.len();
+    let n = shards.len();
+    if n == 0 || total_pods == 0 {
+        return Vec::new();
+    }
+
     pods.sort();
     pods.dedup();
     shards.sort_by_key(|s| s.0);
@@ -22,12 +28,6 @@ pub fn compute_assignment(
     let Some(my_idx) = pods.iter().position(|n| n == self_name) else {
         return Vec::new();
     };
-
-    let total_pods = pods.len();
-    let n = shards.len();
-    if n == 0 || total_pods == 0 {
-        return Vec::new();
-    }
 
     let start = (my_idx * n) / total_pods;
     let end = ((my_idx + 1) * n) / total_pods;
