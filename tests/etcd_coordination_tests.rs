@@ -33,6 +33,13 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
     let counter = PREFIX_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let tmpdir =
         std::env::temp_dir().join(format!("silo-etcd-test-{}-{}-{}", node_id, nanos, counter));
+    make_test_factory_at(&tmpdir)
+}
+
+/// Create a factory rooted at an explicit directory. Use this when two
+/// coordinators in the same test must share storage (e.g. restart/resume
+/// tests), matching production where pods share the same object store.
+fn make_test_factory_at(tmpdir: &std::path::Path) -> Arc<ShardFactory> {
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
             // Use Fs backend for split tests because SlateDB cloning requires a real object store
@@ -1381,19 +1388,36 @@ async fn etcd_is_shard_paused_returns_correct_values() {
     handle.abort();
 }
 
-/// Test that split state persists across coordinator restart.
+/// Test that a split record placed in etcd by one coordinator is picked up by
+/// a replacement coordinator on restart. With auto-resume in the coordination
+/// loop, the split is driven to completion rather than left as a stuck record.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
-async fn etcd_split_state_persists_across_restart() {
+async fn etcd_split_state_persists_and_resumes_across_restart() {
     let prefix = unique_prefix();
-    let num_shards: u32 = 1; // Use 1 shard so it covers the entire keyspace
+    let num_shards: u32 = 1;
 
-    // Start first coordinator
-    let (c1, h1) = start_etcd_coordinator!(
+    // Shared storage directory so the replacement coordinator sees the same
+    // parent SlateDB data (mirrors production where pods share object store).
+    let shared_dir = std::env::temp_dir().join(format!(
+        "silo-etcd-resume-{}-{}",
+        unique_prefix(),
+        PREFIX_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+
+    let endpoints = get_etcd_endpoints();
+    let (c1, h1) = EtcdCoordinator::start(
+        &endpoints,
         &prefix,
         "persist-test-1",
         "http://127.0.0.1:7450",
-        num_shards
-    );
+        num_shards,
+        10,
+        make_test_factory_at(&shared_dir),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator 1");
+    let c1_concrete = c1.clone();
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
     assert!(c1.wait_converged(Duration::from_secs(15)).await);
@@ -1401,23 +1425,19 @@ async fn etcd_split_state_persists_across_restart() {
     let owned = c1.owned_shards().await;
     let shard_id = owned[0];
 
-    // Create splitter and request a split
     let splitter1 = ShardSplitter::new(c1.clone());
-
     let split = splitter1
         .request_split(shard_id, "8000000000000000".to_string())
         .await
         .expect("request_split should succeed");
 
-    // Shutdown the coordinator
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard owner
+    // keys in etcd, so the replacement coordinator can reclaim them.
+    c1_concrete.crash().await;
     h1.abort();
-
-    // Small delay
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Start new coordinator with same prefix (simulates restart)
-    let endpoints = get_etcd_endpoints();
+    // Restart with the same storage — auto-resume should drive it to completion.
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
         &prefix,
@@ -1425,7 +1445,7 @@ async fn etcd_split_state_persists_across_restart() {
         "http://127.0.0.1:7450",
         num_shards,
         10,
-        make_test_factory("persist-test-1-restart"),
+        make_test_factory_at(&shared_dir),
         Vec::new(),
     )
     .await
@@ -1434,24 +1454,30 @@ async fn etcd_split_state_persists_across_restart() {
 
     assert!(c2.wait_converged(Duration::from_secs(15)).await);
 
-    // Create splitter for c2 and verify the split state persisted
     let splitter2 = ShardSplitter::new(c2.clone());
 
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get_split_status should succeed");
-    assert!(
-        status.is_some(),
-        "split status should persist after restart"
-    );
-    let status = status.unwrap();
-    assert_eq!(status.parent_shard_id, shard_id);
-    assert_eq!(status.split_point, "8000000000000000");
-    assert_eq!(status.left_child_id, split.left_child_id);
-    assert_eq!(status.right_child_id, split.right_child_id);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut completed = false;
+    while Instant::now() < deadline {
+        if splitter2
+            .get_split_status(shard_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(completed, "auto-resume should complete the persisted split");
 
-    // Cleanup
+    let shard_map = c2.get_shard_map().await.unwrap();
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
+
     c2.shutdown().await.unwrap();
     h2.abort();
 }
@@ -1876,13 +1902,27 @@ async fn etcd_crash_recovery_cloning_phase_resumes_split() {
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
 
-    // Start first coordinator
-    let (c1, h1) = start_etcd_coordinator!(
+    // Shared storage so the replacement coordinator sees the same parent data.
+    let shared_dir = std::env::temp_dir().join(format!(
+        "silo-etcd-resume-{}-{}",
+        unique_prefix(),
+        PREFIX_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+
+    let endpoints = get_etcd_endpoints();
+    let (c1, h1) = EtcdCoordinator::start(
+        &endpoints,
         &prefix,
         "crash-cloning-1",
         "http://127.0.0.1:7450",
-        num_shards
-    );
+        num_shards,
+        10,
+        make_test_factory_at(&shared_dir),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator 1");
+    let c1_concrete = c1.clone();
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
     assert!(c1.wait_converged(Duration::from_secs(15)).await);
@@ -1905,15 +1945,15 @@ async fn etcd_crash_recovery_cloning_phase_resumes_split() {
     let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
     assert_eq!(status.phase, SplitPhase::SplitCloning);
 
-    // Simulate crash
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard owner
+    // keys in etcd, so the replacement coordinator can reclaim them.
+    c1_concrete.crash().await;
     h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Start new coordinator. Its coordination loop runs
-    // resume_in_progress_splits after reclaim, so the stuck split should
-    // drive itself to SplitComplete automatically.
-    let endpoints = get_etcd_endpoints();
+    // Start new coordinator with the same storage directory. Its coordination
+    // loop runs resume_in_progress_splits after reclaim, so the stuck split
+    // should drive itself to SplitComplete automatically.
     let (c2, h2) = EtcdCoordinator::start(
         &endpoints,
         &prefix,
@@ -1921,7 +1961,7 @@ async fn etcd_crash_recovery_cloning_phase_resumes_split() {
         "http://127.0.0.1:7450",
         num_shards,
         10,
-        make_test_factory("crash-cloning-1-restart"),
+        make_test_factory_at(&shared_dir),
         Vec::new(),
     )
     .await

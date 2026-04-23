@@ -320,15 +320,17 @@ async fn is_shard_paused_returns_correct_values() {
 }
 
 /// Test that split state is persisted across coordinator restarts
+/// Test that a persisted split record is picked up by a replacement
+/// coordinator on restart. With auto-resume in the coord loop, the split is
+/// driven to completion rather than left untouched.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
-async fn split_state_persists_across_restart() {
+async fn split_state_persists_and_resumes_across_restart() {
     let _guard = acquire_test_mutex();
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
     let cfg = silo::settings::AppConfig::load(None).expect("load default config");
 
-    // Start first coordinator and request a split
     let (c1, h1) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
@@ -347,8 +349,6 @@ async fn split_state_persists_across_restart() {
     let shards = c1.owned_shards().await;
     let shard_id = shards[0];
 
-    // Create splitter and request split
-
     let splitter1 = ShardSplitter::new(Arc::new(c1.clone()));
 
     let split = splitter1
@@ -356,17 +356,13 @@ async fn split_state_persists_across_restart() {
         .await
         .expect("request split");
 
-    let left_child_id = split.left_child_id;
-    let right_child_id = split.right_child_id;
-
-    // Shutdown first coordinator
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard owner
+    // keys in etcd, so the replacement coordinator can reclaim them.
+    c1.crash().await;
     let _ = h1.abort();
-
-    // Give etcd time to process the shutdown
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Start a new coordinator
+    // Start a new coordinator with the same node_id + storage.
     let (c2, h2) = EtcdCoordinator::start(
         &cfg.coordination.etcd_endpoints,
         &prefix,
@@ -374,7 +370,7 @@ async fn split_state_persists_across_restart() {
         "http://127.0.0.1:7450",
         num_shards,
         10,
-        make_test_factory(&prefix, "n1-restart"),
+        make_test_factory(&prefix, "n1"),
         Vec::new(),
     )
     .await
@@ -382,20 +378,30 @@ async fn split_state_persists_across_restart() {
 
     assert!(c2.wait_converged(Duration::from_secs(10)).await);
 
-    // Create splitter for c2 and check split status
-
     let splitter2 = ShardSplitter::new(Arc::new(c2.clone()));
 
-    // Split state should still be there
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get split status");
-    assert!(status.is_some());
-    let status = status.unwrap();
-    assert_eq!(status.parent_shard_id, shard_id);
-    assert_eq!(status.left_child_id, left_child_id);
-    assert_eq!(status.right_child_id, right_child_id);
+    // Poll for the background resume to drive the split to completion.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut completed = false;
+    while std::time::Instant::now() < deadline {
+        if splitter2
+            .get_split_status(shard_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(completed, "auto-resume should complete the persisted split");
+
+    let shard_map = c2.get_shard_map().await.expect("get shard map");
+    assert_eq!(shard_map.len(), 2);
+    assert!(shard_map.get_shard(&split.left_child_id).is_some());
+    assert!(shard_map.get_shard(&split.right_child_id).is_some());
 
     c2.shutdown().await.unwrap();
     let _ = h2.abort();
@@ -1074,8 +1080,9 @@ async fn crash_recovery_early_phase_resumes_split() {
         .await
         .expect("advance to pausing");
 
-    // Simulate crash by shutting down abruptly
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard owner
+    // keys in etcd, so the replacement coordinator can reclaim them.
+    c1.crash().await;
     let _ = h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1089,7 +1096,7 @@ async fn crash_recovery_early_phase_resumes_split() {
         "http://127.0.0.1:7450",
         num_shards,
         10,
-        make_test_factory(&prefix, "n1-restart"),
+        make_test_factory(&prefix, "n1"),
         Vec::new(),
     )
     .await
@@ -1173,7 +1180,9 @@ async fn crash_recovery_cloning_phase_resumes_split() {
     let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
     assert_eq!(status.phase, SplitPhase::SplitCloning);
 
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard owner
+    // keys in etcd, so the replacement coordinator can reclaim them.
+    c1.crash().await;
     let _ = h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1185,7 +1194,7 @@ async fn crash_recovery_cloning_phase_resumes_split() {
         "http://127.0.0.1:7450",
         num_shards,
         10,
-        make_test_factory(&prefix, "n1-restart"),
+        make_test_factory(&prefix, "n1"),
         Vec::new(),
     )
     .await

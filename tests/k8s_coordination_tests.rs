@@ -3552,6 +3552,7 @@ async fn k8s_crash_recovery_early_phase_resumes_split() {
         "http://127.0.0.1:7450",
         num_shards
     );
+    let c1_concrete = c1.clone();
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
     assert!(c1.wait_converged(Duration::from_secs(30)).await);
@@ -3571,8 +3572,9 @@ async fn k8s_crash_recovery_early_phase_resumes_split() {
         .await
         .expect("advance to pausing");
 
-    // Simulate crash
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard leases
+    // in k8s, so the replacement coordinator can reclaim them.
+    c1_concrete.crash().await;
     h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -3588,7 +3590,7 @@ async fn k8s_crash_recovery_early_phase_resumes_split() {
             num_shards,
             30,
         ),
-        make_test_factory("crash-early-1-restart"),
+        make_test_factory("crash-early-1"),
     )
     .await
     .expect("restart coordinator");
@@ -3639,6 +3641,7 @@ async fn k8s_crash_recovery_cloning_phase_resumes_split() {
         "http://127.0.0.1:7450",
         num_shards
     );
+    let c1_concrete = c1.clone();
     let c1: Arc<dyn Coordinator> = Arc::new(c1);
 
     assert!(c1.wait_converged(Duration::from_secs(30)).await);
@@ -3659,7 +3662,9 @@ async fn k8s_crash_recovery_cloning_phase_resumes_split() {
     let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
     assert_eq!(status.phase, SplitPhase::SplitCloning);
 
-    c1.shutdown().await.unwrap();
+    // Simulate a crash: stop background tasks without releasing shard leases
+    // in k8s, so the replacement coordinator can reclaim them.
+    c1_concrete.crash().await;
     h1.abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -3672,7 +3677,7 @@ async fn k8s_crash_recovery_cloning_phase_resumes_split() {
             num_shards,
             30,
         ),
-        make_test_factory("crash-cloning-1-restart"),
+        make_test_factory("crash-cloning-1"),
     )
     .await
     .expect("restart coordinator");
@@ -4008,99 +4013,6 @@ async fn k8s_child_shards_usable_after_split() {
 
     coord.shutdown().await.unwrap();
     handle.abort();
-}
-
-/// Test crash recovery during cloning phase abandons the split.
-///
-/// With the simplified split model, ALL incomplete splits are abandoned on crash.
-/// The shard map update is the commit point - if children don't exist in the
-/// shard map, the split never completed and is safely abandoned.
-#[silo::test(flavor = "multi_thread", worker_threads = 2)]
-async fn k8s_crash_recovery_cloning_phase_abandons_split() {
-    let prefix = unique_prefix();
-    let namespace = get_namespace();
-    let num_shards: u32 = 1;
-
-    // Start first coordinator
-    let (c1, h1) = start_coordinator!(
-        &namespace,
-        &prefix,
-        "crash-cloning-1",
-        "http://127.0.0.1:7450",
-        num_shards
-    );
-    let c1: Arc<dyn Coordinator> = Arc::new(c1);
-
-    assert!(c1.wait_converged(Duration::from_secs(30)).await);
-
-    let owned = c1.owned_shards().await;
-    let shard_id = owned[0];
-
-    // Create splitter and request split, advance to SplitCloning phase
-
-    let splitter1 = ShardSplitter::new(c1.clone());
-
-    let _split = splitter1
-        .request_split(shard_id, "8000000000000000".to_string())
-        .await
-        .expect("request_split");
-
-    splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitPausing
-    splitter1.advance_split_phase(shard_id).await.unwrap(); // -> SplitCloning
-
-    let status = splitter1.get_split_status(shard_id).await.unwrap().unwrap();
-    assert_eq!(status.phase, SplitPhase::SplitCloning);
-
-    // Simulate crash
-    c1.shutdown().await.unwrap();
-    h1.abort();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Start new coordinator
-    let (c2, h2) = K8sCoordinator::start(
-        make_coordinator_config(
-            &namespace,
-            &prefix,
-            "crash-cloning-1",
-            "http://127.0.0.1:7450",
-            num_shards,
-            30,
-        ),
-        make_test_factory("crash-cloning-1-restart"),
-    )
-    .await
-    .expect("restart coordinator");
-    let c2: Arc<dyn Coordinator> = Arc::new(c2);
-
-    assert!(c2.wait_converged(Duration::from_secs(30)).await);
-
-    // Create splitter for c2
-
-    let splitter2 = ShardSplitter::new(c2.clone());
-
-    // Recover stale splits - should abandon the incomplete split
-    splitter2
-        .recover_stale_splits()
-        .await
-        .expect("recover stale splits");
-
-    // Split should be abandoned (deleted)
-    let status = splitter2
-        .get_split_status(shard_id)
-        .await
-        .expect("get status");
-    assert!(status.is_none(), "incomplete split should be abandoned");
-
-    // Shard map should still have original shard (split was not committed)
-    let shard_map = c2.get_shard_map().await.unwrap();
-    assert_eq!(shard_map.len(), 1, "shard map should have original shard");
-    assert!(
-        shard_map.get_shard(&shard_id).is_some(),
-        "original shard should still exist"
-    );
-
-    c2.shutdown().await.unwrap();
-    h2.abort();
 }
 
 /// Helper to create K8sCoordinatorConfig with placement rings

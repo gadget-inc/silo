@@ -381,6 +381,32 @@ impl EtcdCoordinator {
         }
     }
 
+    /// Simulate a crash: stop all guards immediately WITHOUT releasing shard
+    /// owner keys or membership lease. Used by tests to exercise the
+    /// reclaim/resume path, which relies on owner keys still being present in
+    /// etcd after a replacement coordinator comes up.
+    pub async fn crash(&self) {
+        // Jump each guard straight to ShutDown, bypassing ShuttingDown which
+        // would call release_ownership and delete the owner key.
+        let guards = self.shard_guards.lock().await;
+        for (sid, guard) in guards.iter() {
+            let mut st = guard.ctx.state.lock().await;
+            st.phase = ShardPhase::ShutDown;
+            debug!(shard_id = %sid, "crash: guard set to ShutDown");
+        }
+        drop(guards);
+
+        // Clear in-memory owned set so any future work on this handle is a no-op.
+        let mut owned = self.base.owned.lock().await;
+        owned.clear();
+        drop(owned);
+
+        // Signal shutdown to stop the coordination loop + watchers. Membership
+        // lease is deliberately NOT revoked; on real crashes it would expire
+        // via TTL instead.
+        self.base.signal_shutdown();
+    }
+
     /// Reclaim shards from a previous run and open them before normal reconciliation.
     ///
     /// This is called once at startup to recover shards this node still owns
@@ -1096,7 +1122,13 @@ impl EtcdShardGuard {
         loop {
             if self.ctx.is_shutdown() {
                 let mut st = self.ctx.state.lock().await;
-                st.phase = ShardPhase::ShuttingDown;
+                // Preserve ShutDown: `crash()` uses it to stop the guard
+                // without running the ShuttingDown release-ownership path,
+                // which would delete the owner key and make reclaim on
+                // restart impossible.
+                if st.phase != ShardPhase::ShutDown {
+                    st.phase = ShardPhase::ShuttingDown;
+                }
             }
 
             {
