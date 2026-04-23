@@ -732,6 +732,40 @@ flush_interval = "1ms"
 }
 
 #[silo::test]
+fn parse_toml_slatedb_compactor_enabled_via_nested_scheduler_options() {
+    // Regression: the common "only override scheduler_options" shape must still
+    // enable the compactor and fill in the rest of CompactorOptions from defaults.
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+
+[database.slatedb.compactor_options.scheduler_options]
+min_compaction_sources = "2"
+max_compaction_sources = "16"
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    let slatedb_settings = cfg.database.slatedb.expect("slatedb settings present");
+    let compactor = slatedb_settings
+        .compactor_options
+        .expect("compactor_options should be Some when [compactor_options.*] is present");
+    assert_eq!(
+        compactor.scheduler_options.get("min_compaction_sources"),
+        Some(&"2".to_string())
+    );
+    assert_eq!(
+        compactor.scheduler_options.get("max_compaction_sources"),
+        Some(&"16".to_string())
+    );
+    let defaults = slatedb::config::CompactorOptions::default();
+    assert_eq!(compactor.poll_interval, defaults.poll_interval);
+    assert_eq!(
+        compactor.max_concurrent_compactions,
+        defaults.max_concurrent_compactions
+    );
+}
+
+#[silo::test]
 fn parse_toml_slatedb_compactor_enabled_when_section_present() {
     // When the user explicitly provides [compactor_options], the compactor is enabled and
     // partial overrides merge onto CompactorOptions::default().
