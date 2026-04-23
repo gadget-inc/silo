@@ -1,0 +1,30 @@
+# Local dev silo-compactor config (process-compose).
+# Reads silo's shard map from the same etcd instance silo-1/silo-2 use,
+# then compacts data at the same fs path silo-1/silo-2 write to.
+# NOTE: relative paths resolve from process-compose's CWD (the repo root).
+
+[storage]
+backend = "fs"
+path = "./tmp/silo-data/%shard%"
+
+[shard_discovery]
+backend = "etcd"
+cluster_prefix = "silo-dev"
+# Routes through toxiproxy (port 12379 → 2379) so dev fault injection works.
+etcd_endpoints = ["http://127.0.0.1:12379"]
+
+[coordinator]
+mode = "single"
+self_pod_name = "compactor-local"
+max_shards_per_pod = 12
+rebalance_interval = "10s"
+worker_restart_backoff = "5s"
+
+[logging]
+format = "text"
+
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 67108864
+max_concurrent_compactions = 2
+max_fetch_tasks = 4

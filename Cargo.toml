@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "silo-macros", "silo-autoscaler"]
+members = [".", "silo-macros", "silo-autoscaler", "silo-compactor"]
 
 [package]
 authors = ["Harry Brundage <harry@gadget.dev>"]

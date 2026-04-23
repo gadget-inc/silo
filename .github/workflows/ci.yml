@@ -276,8 +276,12 @@ jobs:
         run: cargo build
       - name: Run background processes
         shell: bash
+        # Start only the processes the TS tests need. silo-compactor is not
+        # exercised by these tests and its first cargo run (even after a
+        # workspace pre-build) recompiles its dep tree under watchexec, which
+        # starves silo-1/silo-2 of CPU long enough to fail topology refresh.
         run: |
-          process-compose up --tui=false &
+          process-compose up --tui=false etcd gubernator toxiproxy silo-1 silo-2 &
           sleep 5
       - name: Build typescript package
         shell: bash
@@ -328,6 +332,11 @@ jobs:
           nix build .#packages.${{ matrix.nix_system }}.silo-autoscaler-docker -L
           docker load < result
 
+      - name: Build silo-compactor Docker image with Nix
+        run: |
+          nix build .#packages.${{ matrix.nix_system }}.silo-compactor-docker -L
+          docker load < result
+
       - name: Push to Cachix
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         env:
@@ -373,6 +382,18 @@ jobs:
           image_tag="${registry}/silo-autoscaler:sha-${sha}-${{ matrix.platform }}"
 
           docker tag silo-autoscaler:latest "${image_tag}"
+          docker push "${image_tag}"
+
+          echo "✅ Pushed: ${image_tag}"
+
+      - name: Tag and push silo-compactor image
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          registry="us-central1-docker.pkg.dev/gadget-core-production/core-production"
+          image_tag="${registry}/silo-compactor:sha-${sha}-${{ matrix.platform }}"
+
+          docker tag silo-compactor:latest "${image_tag}"
           docker push "${image_tag}"
 
           echo "✅ Pushed: ${image_tag}"
@@ -431,9 +452,23 @@ jobs:
 
           docker manifest push "${registry}/silo-autoscaler:latest"
 
+          docker manifest create "${registry}/silo-compactor:sha-${sha}" \
+              "${registry}/silo-compactor:sha-${sha}-amd64" \
+              "${registry}/silo-compactor:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-compactor:sha-${sha}"
+
+          docker manifest create "${registry}/silo-compactor:latest" \
+              "${registry}/silo-compactor:sha-${sha}-amd64" \
+              "${registry}/silo-compactor:sha-${sha}-arm64"
+
+          docker manifest push "${registry}/silo-compactor:latest"
+
           echo ""
           echo "✅ Successfully pushed multi-architecture Docker images:"
           echo "   - ${registry}/silo:sha-${sha}"
           echo "   - ${registry}/silo:latest"
           echo "   - ${registry}/silo-autoscaler:sha-${sha}"
           echo "   - ${registry}/silo-autoscaler:latest"
+          echo "   - ${registry}/silo-compactor:sha-${sha}"
+          echo "   - ${registry}/silo-compactor:latest"

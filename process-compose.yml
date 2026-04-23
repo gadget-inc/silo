@@ -124,3 +124,35 @@ processes:
         max_size_mb: 5
         max_age_days: 3
         max_backups: 1
+
+  # Silo standalone compactor - watchexec restarts cargo run on source changes.
+  # Depends on silo-1 because silo bootstraps the shard map in etcd; the
+  # compactor reads it from there.
+  silo-compactor:
+    command: |
+      watchexec \
+        --restart \
+        --stop-signal SIGTERM \
+        --stop-timeout 5 \
+        --watch silo-compactor/src \
+        --watch silo-compactor/Cargo.toml \
+        --ignore target \
+        --ignore tmp \
+        --ignore '*.lock' \
+        -- cargo run --package silo-compactor -- -c example_configs/compactor-dev.toml
+    depends_on:
+      etcd:
+        condition: process_healthy
+      silo-1:
+        condition: process_started
+    shutdown:
+      timeout_seconds: 5
+    availability:
+      restart: always
+      backoff_seconds: 2
+    log_location: ./tmp/silo-compactor.log
+    log_configuration:
+      rotation:
+        max_size_mb: 5
+        max_age_days: 3
+        max_backups: 1

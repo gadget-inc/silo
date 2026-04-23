@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: silo-compactor-config
+  namespace: silo-test
+data:
+  config.toml: |
+    [storage]
+    backend = "fs"
+    path = "/data/shared/%shard%"
+
+    [shard_discovery]
+    backend = "k8s_configmap"
+    cluster_prefix = "silo-local-test"
+    k8s_namespace = "${POD_NAMESPACE}"
+
+    [coordinator]
+    mode = "k8s_deployment"
+    self_pod_name = "${POD_NAME}"
+    namespace = "${POD_NAMESPACE}"
+    pod_label_selector = "app=silo-compactor"
+    max_shards_per_pod = 6
+    rebalance_interval = "10s"
+    worker_restart_backoff = "2s"
+
+    [logging]
+    format = "json"
+
+    [compactor_options]
+    poll_interval = "5s"
+    max_sst_size = 67108864
+    max_concurrent_compactions = 2
+    max_fetch_tasks = 4
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: silo-compactor
+  namespace: silo-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: silo-compactor
+  namespace: silo-test
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: silo-compactor
+  namespace: silo-test
+subjects:
+  - kind: ServiceAccount
+    name: silo-compactor
+    namespace: silo-test
+roleRef:
+  kind: Role
+  name: silo-compactor
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: silo-compactor
+  namespace: silo-test
+  labels:
+    app: silo-compactor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: silo-compactor
+  template:
+    metadata:
+      labels:
+        app: silo-compactor
+    spec:
+      serviceAccountName: silo-compactor
+      containers:
+        - name: compactor
+          image: silo-compactor:latest
+          imagePullPolicy: Never
+          command: ["silo-compactor"]
+          args: ["-c", "/etc/silo-compactor/config.toml"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUST_LOG
+              value: "info,silo_compactor=debug"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/silo-compactor
+              readOnly: true
+            - name: shared-data
+              mountPath: /data/shared
+      volumes:
+        - name: config
+          configMap:
+            name: silo-compactor-config
+        - name: shared-data
+          hostPath:
+            path: /tmp/silo-test-shared
+            type: DirectoryOrCreate
