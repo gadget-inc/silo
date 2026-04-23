@@ -273,7 +273,10 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build silo server
         shell: bash
-        run: cargo build
+        # --workspace so silo-compactor is pre-built; otherwise process-compose
+        # triggers its first cargo build while tests are already running and
+        # starves silo-1/silo-2 of CPU, causing topology refresh to time out.
+        run: cargo build --workspace
       - name: Run background processes
         shell: bash
         run: |
