@@ -273,14 +273,15 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build silo server
         shell: bash
-        # --workspace so silo-compactor is pre-built; otherwise process-compose
-        # triggers its first cargo build while tests are already running and
-        # starves silo-1/silo-2 of CPU, causing topology refresh to time out.
-        run: cargo build --workspace
+        run: cargo build
       - name: Run background processes
         shell: bash
+        # Start only the processes the TS tests need. silo-compactor is not
+        # exercised by these tests and its first cargo run (even after a
+        # workspace pre-build) recompiles its dep tree under watchexec, which
+        # starves silo-1/silo-2 of CPU long enough to fail topology refresh.
         run: |
-          process-compose up --tui=false &
+          process-compose up --tui=false etcd gubernator toxiproxy silo-1 silo-2 &
           sleep 5
       - name: Build typescript package
         shell: bash
