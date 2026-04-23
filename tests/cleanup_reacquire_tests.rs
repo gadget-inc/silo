@@ -655,8 +655,23 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         // This is what the coordination backend would call after factory.open()
         shard.maybe_spawn_background_cleanup(range.clone());
 
-        // Wait for background cleanup to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Poll until cleanup reaches its terminal state, rather than sleeping
+        // for a fixed amount of time — under CI load the transition through
+        // CleanupPending → CleanupRunning → CleanupDone → CompactionDone can
+        // take several seconds and a tight sleep flakes.
+        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = shard.get_cleanup_status().await.expect("get status");
+            if status == SplitCleanupStatus::CompactionDone {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "cleanup did not reach CompactionDone within 30s; last status: {:?}",
+                status,
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
         shard.db().flush().await.unwrap();
 
         // Verify cleanup happened

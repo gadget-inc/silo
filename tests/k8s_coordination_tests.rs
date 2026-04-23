@@ -457,11 +457,11 @@ async fn k8s_removing_node_rebalances() {
     // and convergence may require multiple reconciliation cycles to acquire all
     // released shards (especially with 64 shards under K8s API load).
     assert!(
-        c1.wait_converged(Duration::from_secs(30)).await,
+        c1.wait_converged(Duration::from_secs(35)).await,
         "c1 should reconverge after node removal"
     );
     assert!(
-        c2.wait_converged(Duration::from_secs(30)).await,
+        c2.wait_converged(Duration::from_secs(35)).await,
         "c2 should reconverge after node removal"
     );
 
