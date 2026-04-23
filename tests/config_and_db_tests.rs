@@ -546,6 +546,10 @@ scan_interval = "3600s"
     );
     assert_eq!(slatedb_settings.l0_sst_size_bytes, 33554432);
     assert_eq!(slatedb_settings.l0_max_ssts, 4);
+    assert!(
+        slatedb_settings.compactor_options.is_some(),
+        "[compactor_options] in TOML should enable the embedded compactor"
+    );
 }
 
 #[silo::test]
@@ -700,6 +704,55 @@ cache_puts = true
         slatedb_settings.object_store_cache_options.part_size_bytes,
         defaults.object_store_cache_options.part_size_bytes,
         "part_size_bytes should use default"
+    );
+
+    // Silo default: embedded compactor is off unless the user explicitly configures it.
+    assert!(
+        slatedb_settings.compactor_options.is_none(),
+        "compactor_options should default to None when user omits [compactor_options]"
+    );
+}
+
+#[silo::test]
+fn parse_toml_slatedb_compactor_disabled_when_omitted() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+
+[database.slatedb]
+flush_interval = "1ms"
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    let slatedb_settings = cfg.database.slatedb.expect("slatedb settings present");
+    assert!(
+        slatedb_settings.compactor_options.is_none(),
+        "omitting [compactor_options] must disable the embedded compactor"
+    );
+}
+
+#[silo::test]
+fn parse_toml_slatedb_compactor_enabled_when_section_present() {
+    // When the user explicitly provides [compactor_options], the compactor is enabled and
+    // partial overrides merge onto CompactorOptions::default().
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+
+[database.slatedb.compactor_options]
+poll_interval = "7s"
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    let slatedb_settings = cfg.database.slatedb.expect("slatedb settings present");
+    let compactor = slatedb_settings
+        .compactor_options
+        .expect("compactor_options should be Some when [compactor_options] is present");
+    assert_eq!(compactor.poll_interval, std::time::Duration::from_secs(7));
+    let defaults = slatedb::config::CompactorOptions::default();
+    assert_eq!(
+        compactor.max_concurrent_compactions, defaults.max_concurrent_compactions,
+        "unspecified compactor fields should use CompactorOptions defaults"
     );
 }
 

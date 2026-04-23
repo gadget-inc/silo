@@ -8,6 +8,14 @@ use std::time::Duration;
 /// values with defaults. This is necessary because slatedb's Settings struct
 /// doesn't use #[serde(default)] on its fields, so serde requires all non-Option
 /// fields to be present when any field is specified.
+///
+/// Silo's default diverges from slatedb's in one place: the embedded compactor
+/// is off unless the user explicitly configures it. If the user's TOML has no
+/// `compactor_options` key, we strip it from the default base so the merged
+/// result has `compactor_options: None` → no in-process compactor. If the user
+/// does provide `compactor_options`, we seed the base with
+/// `Some(CompactorOptions::default())` so their partial overrides merge onto a
+/// complete set of fields (CompactorOptions lacks per-field serde defaults).
 fn deserialize_slatedb_settings<'de, D>(
     deserializer: D,
 ) -> Result<Option<slatedb::config::Settings>, D::Error>
@@ -20,8 +28,16 @@ where
     match user_config {
         None => Ok(None),
         Some(user_table) => {
-            // Serialize defaults to TOML
-            let defaults = slatedb::config::Settings::default();
+            // Silo default: embedded compactor off unless the user asks for it.
+            let user_has_compactor_options = user_table.contains_key("compactor_options");
+            let defaults = slatedb::config::Settings {
+                compactor_options: if user_has_compactor_options {
+                    Some(slatedb::config::CompactorOptions::default())
+                } else {
+                    None
+                },
+                ..slatedb::config::Settings::default()
+            };
             let default_str = toml::to_string(&defaults).map_err(serde::de::Error::custom)?;
             let mut merged: toml::Table =
                 toml::from_str(&default_str).map_err(serde::de::Error::custom)?;
