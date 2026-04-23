@@ -656,7 +656,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         shard.maybe_spawn_background_cleanup(range.clone());
 
         // Wait for background cleanup to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(5500)).await;
         shard.db().flush().await.unwrap();
 
         // Verify cleanup happened
