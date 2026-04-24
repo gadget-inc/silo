@@ -21,10 +21,10 @@ use silo::keys::{
 use silo_compactor::compaction_filter::CompletedJobCompactionFilterSupplier;
 use slatedb::admin::AdminBuilder;
 use slatedb::compactor::{CompactionSpec, SourceId};
+use slatedb::config::{CompactorOptions, FlushOptions, FlushType};
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::path::Path;
-use slatedb::config::{CompactorOptions, FlushOptions, FlushType};
 use slatedb::{CompactorBuilder, Db, DbReaderBuilder};
 use ulid::Ulid;
 
@@ -158,7 +158,14 @@ async fn drops_old_completed_jobs_on_compaction() {
             .unwrap();
 
         // Expired terminal jobs — the filter should drop every row.
-        write_job_family(&db, "tenant-a", "job-old-ok", JobStatusKind::Succeeded, old_ms).await;
+        write_job_family(
+            &db,
+            "tenant-a",
+            "job-old-ok",
+            JobStatusKind::Succeeded,
+            old_ms,
+        )
+        .await;
         write_job_family(
             &db,
             "tenant-a",
@@ -293,10 +300,16 @@ async fn drops_old_completed_jobs_on_compaction() {
             missing.len(),
             5,
             "expired {tenant}/{job_id} should be fully dropped; still present: {:?}",
-            (["JOB_STATUS", "JOB_INFO", "IDX_METADATA", "ATTEMPT", "JOB_CANCELLED"])
-                .iter()
-                .filter(|k| !missing.contains(k))
-                .collect::<Vec<_>>(),
+            ([
+                "JOB_STATUS",
+                "JOB_INFO",
+                "IDX_METADATA",
+                "ATTEMPT",
+                "JOB_CANCELLED"
+            ])
+            .iter()
+            .filter(|k| !missing.contains(k))
+            .collect::<Vec<_>>(),
         );
     }
 
@@ -357,11 +370,7 @@ async fn drops_old_completed_jobs_on_compaction() {
 /// Submit a compaction spec and poll the manifest until every source listed
 /// in the spec has been consumed (L0 SSTs removed from `l0`, sorted runs
 /// removed from `compacted`).
-async fn submit_and_wait(
-    admin: &slatedb::admin::Admin,
-    spec: CompactionSpec,
-    timeout: Duration,
-) {
+async fn submit_and_wait(admin: &slatedb::admin::Admin, spec: CompactionSpec, timeout: Duration) {
     let expected_l0: Vec<Ulid> = spec
         .sources()
         .iter()
@@ -390,8 +399,7 @@ async fn submit_and_wait(
             .iter()
             .map(|s| s.sst.id.unwrap_compacted_id())
             .collect();
-        let current_srs: HashSet<u32> =
-            state.manifest().compacted.iter().map(|sr| sr.id).collect();
+        let current_srs: HashSet<u32> = state.manifest().compacted.iter().map(|sr| sr.id).collect();
         let l0_done = expected_l0.iter().all(|id| !current_l0.contains(id));
         let srs_done = expected_srs.iter().all(|id| !current_srs.contains(id));
         if l0_done && srs_done {
