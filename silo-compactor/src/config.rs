@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 
+use crate::compaction_filter::DEFAULT_RETENTION_SECS;
 use crate::storage::Backend;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -16,6 +17,27 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     #[serde(default, deserialize_with = "deserialize_compactor_options")]
     pub compactor_options: Option<slatedb::config::CompactorOptions>,
+    #[serde(default)]
+    pub compaction_filter: CompactionFilterConfig,
+}
+
+/// Compaction filter selection. Defaults to [`CompactionFilterConfig::None`]
+/// so existing deployments keep current behavior after the upgrade.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactionFilterConfig {
+    #[default]
+    None,
+    /// Delete terminal (Succeeded/Failed/Cancelled) job data older than
+    /// `retention_secs`. Defaults to 7 days.
+    CompletedJobs {
+        #[serde(default = "default_completed_jobs_retention_secs")]
+        retention_secs: u64,
+    },
+}
+
+fn default_completed_jobs_retention_secs() -> u64 {
+    DEFAULT_RETENTION_SECS
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -262,6 +284,54 @@ mod tests {
         assert_eq!(cfg.coordinator.rebalance_interval, Duration::from_secs(30));
         assert_eq!(cfg.coordinator.mode, CoordinatorMode::K8sDeployment);
         assert!(cfg.compactor_options.is_none());
+        assert_eq!(cfg.compaction_filter, CompactionFilterConfig::None);
+    }
+
+    #[test]
+    fn parses_completed_jobs_filter_with_retention() {
+        let toml_str = r#"
+            [storage]
+            backend = "memory"
+            path = "memory://x/%shard%"
+
+            [shard_discovery]
+            backend = "etcd"
+            cluster_prefix = "silo-dev"
+
+            [compaction_filter]
+            kind = "completed_jobs"
+            retention_secs = 900
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            cfg.compaction_filter,
+            CompactionFilterConfig::CompletedJobs {
+                retention_secs: 900
+            }
+        );
+    }
+
+    #[test]
+    fn completed_jobs_filter_defaults_to_seven_days() {
+        let toml_str = r#"
+            [storage]
+            backend = "memory"
+            path = "memory://x/%shard%"
+
+            [shard_discovery]
+            backend = "etcd"
+            cluster_prefix = "silo-dev"
+
+            [compaction_filter]
+            kind = "completed_jobs"
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            cfg.compaction_filter,
+            CompactionFilterConfig::CompletedJobs {
+                retention_secs: DEFAULT_RETENTION_SECS,
+            }
+        );
     }
 
     #[test]
