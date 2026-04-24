@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::assignment::compute_assignment;
-use crate::config::{AppConfig, CoordinatorMode, ShardDiscoveryBackend};
+use crate::config::{AppConfig, CompactionFilterConfig, CoordinatorMode, ShardDiscoveryBackend};
 use crate::error::CompactorError;
 use crate::pod_discovery::{K8sPodDiscovery, PodDiscovery, StaticPodDiscovery};
 use crate::shard_loader::ShardMapLoader;
@@ -21,6 +21,7 @@ pub struct Coordinator {
     backend: Backend,
     path_template: Arc<String>,
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
+    filter_config: Arc<CompactionFilterConfig>,
     discovery: Arc<dyn PodDiscovery>,
     shard_loader: Arc<dyn ShardMapLoader>,
     placement_ring: Option<String>,
@@ -41,6 +42,7 @@ impl Coordinator {
         let backend = cfg.storage.backend.clone();
         let path_template = Arc::new(cfg.storage.path.clone());
         let compactor_options = Arc::new(cfg.compactor_options.clone());
+        let filter_config = Arc::new(cfg.compaction_filter.clone());
 
         let needs_kube = matches!(cfg.coordinator.mode, CoordinatorMode::K8sDeployment)
             || matches!(
@@ -114,6 +116,7 @@ impl Coordinator {
             backend,
             path_template,
             compactor_options,
+            filter_config,
             discovery,
             shard_loader,
             placement_ring: cfg.shard_discovery.placement_ring,
@@ -187,6 +190,7 @@ impl Coordinator {
                 self.backend.clone(),
                 Arc::clone(&self.path_template),
                 Arc::clone(&self.compactor_options),
+                Arc::clone(&self.filter_config),
                 self.worker_backoff,
             );
             self.workers.insert(*shard, handle);
