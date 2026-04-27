@@ -36,7 +36,6 @@ use silo::keys::{
     idx_status_time_all_prefix, parse_attempt_key, parse_job_cancelled_key, parse_job_info_key,
     parse_job_status_key, parse_metadata_index_key, parse_status_time_index_key, prefix,
 };
-use slatedb::config::ScanOptions;
 use slatedb::{
     CompactionFilter, CompactionFilterDecision, CompactionFilterError, CompactionFilterSupplier,
     CompactionJobContext, DbReader, DbReaderBuilder, RowEntry, ValueDeletable,
@@ -102,9 +101,6 @@ impl ExpiredSet {
 /// Returns `Ok(Some(set))` on a clean drain, `Ok(None)` when the cap was
 /// exceeded mid-scan (caller falls back to per-row point reads), or `Err`
 /// when the underlying scan errored.
-///
-/// Reads with `cache_blocks: false` so a one-shot pre-scan doesn't pollute
-/// the compactor's block cache.
 async fn build_expired_set(
     reader: &DbReader,
     cutoff_ms: i64,
@@ -113,13 +109,7 @@ async fn build_expired_set(
     if max_entries == 0 {
         return Ok(None);
     }
-    let opts = ScanOptions {
-        cache_blocks: false,
-        ..ScanOptions::default()
-    };
-    let mut iter = reader
-        .scan_prefix_with_options(idx_status_time_all_prefix(), &opts)
-        .await?;
+    let mut iter = reader.scan_prefix(idx_status_time_all_prefix()).await?;
     let mut set = ExpiredSet::new();
     while let Some(kv) = iter.next().await? {
         let Some(parsed) = parse_status_time_index_key(&kv.key) else {
