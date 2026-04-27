@@ -14,18 +14,21 @@
 //! counter keys from conflict detection, since these global shard-level keys would otherwise
 //! cause excessive transaction conflicts under concurrent load.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
 use slatedb::{MergeOperator, MergeOperatorError};
 
+use crate::codec::decode_job_status_owned;
 use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     concurrency_requester_counter_key, concurrency_requester_counter_tenant_prefix, end_bound,
-    parse_concurrency_requester_counter_key, shard_completed_jobs_counter_key,
-    shard_total_jobs_counter_key,
+    parse_concurrency_requester_counter_key, parse_job_info_key, parse_job_status_key, prefix,
+    shard_completed_jobs_counter_key, shard_total_jobs_counter_key, tenant_status_counter_key,
 };
+use crate::shard_range::ShardRange;
 
 /// Shard job counters returned by get_counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -323,4 +326,209 @@ impl JobStoreShard {
         }
         Ok(results)
     }
+
+    /// Re-derive shard-level and per-tenant counter truth by scanning the
+    /// `JOB_INFO` and `JOB_STATUS` source-of-truth keys, then write a single
+    /// signed merge operand per counter to correct any drift.
+    ///
+    /// Drift is expected because the standalone `silo-compactor` drops terminal
+    /// job rows during compaction without a writable `Db` handle and therefore
+    /// cannot decrement counters at drop time. This method is the sole owner of
+    /// counter truth in steady state.
+    ///
+    /// The pass is best-effort: if any individual counter fails to scan or
+    /// merge, a `warn!` is logged for that counter and the rest of the pass
+    /// continues. Concurrent writes during the scan can leave the corrected
+    /// value slightly off; the next pass corrects that drift.
+    pub async fn reconcile_counters(
+        &self,
+        range: &ShardRange,
+    ) -> ReconcileSummary {
+        let mut summary = ReconcileSummary::default();
+
+        match self.reconcile_shard_counters(range).await {
+            Ok((scanned, corrected)) => {
+                summary.scanned_jobs = scanned;
+                summary.corrected += corrected;
+            }
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    shard = %self.name,
+                    error = %e,
+                    "counter reconcile failed (shard counters); shard counters will remain stale until next pass"
+                );
+            }
+        }
+
+        match self.reconcile_tenant_status_counters(range).await {
+            Ok(corrected) => summary.corrected += corrected,
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    shard = %self.name,
+                    error = %e,
+                    "counter reconcile failed (tenant status counters); per-tenant counters will remain stale until next pass"
+                );
+            }
+        }
+
+        summary
+    }
+
+    /// Reconcile the two shard-level counters (`total_jobs`, `completed_jobs`).
+    /// Returns `(jobs_scanned, counters_corrected)`.
+    async fn reconcile_shard_counters(
+        &self,
+        range: &ShardRange,
+    ) -> Result<(u64, u64), JobStoreShardError> {
+        // Truth scan: count JOB_INFO rows for total_jobs.
+        let mut total_jobs_truth: i64 = 0;
+        let info_prefix = vec![prefix::JOB_INFO];
+        let info_end = end_bound(&info_prefix);
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(info_prefix..info_end, &crate::scan_options())
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            if let Some(parsed) = parse_job_info_key(&kv.key)
+                && range.contains_tenant(&parsed.tenant)
+            {
+                total_jobs_truth += 1;
+            }
+        }
+
+        // Truth scan: count terminal JOB_STATUS rows for completed_jobs.
+        let mut completed_jobs_truth: i64 = 0;
+        let mut scanned: u64 = 0;
+        let status_prefix = vec![prefix::JOB_STATUS];
+        let status_end = end_bound(&status_prefix);
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(status_prefix..status_end, &crate::scan_options())
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            let Some(parsed) = parse_job_status_key(&kv.key) else {
+                continue;
+            };
+            if !range.contains_tenant(&parsed.tenant) {
+                continue;
+            }
+            scanned += 1;
+            match decode_job_status_owned(&kv.value) {
+                Ok(status) if status.is_terminal() => completed_jobs_truth += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        shard = %self.name,
+                        tenant = %parsed.tenant,
+                        job_id = %parsed.job_id,
+                        error = %e,
+                        "counter reconcile: failed to decode job status, skipping row"
+                    );
+                }
+            }
+        }
+
+        let mut corrected: u64 = 0;
+        corrected += self
+            .apply_counter_correction(shard_total_jobs_counter_key(), total_jobs_truth)
+            .await?;
+        corrected += self
+            .apply_counter_correction(shard_completed_jobs_counter_key(), completed_jobs_truth)
+            .await?;
+
+        Ok((scanned, corrected))
+    }
+
+    /// Reconcile per-tenant per-status counters by re-scanning JOB_STATUS and
+    /// computing truth, then driving any stale stored counters to that truth.
+    /// Returns the number of counters that received a non-zero correction.
+    async fn reconcile_tenant_status_counters(
+        &self,
+        range: &ShardRange,
+    ) -> Result<u64, JobStoreShardError> {
+        // Build truth from JOB_STATUS scan.
+        let mut truth: HashMap<(String, String), i64> = HashMap::new();
+        let status_prefix = vec![prefix::JOB_STATUS];
+        let status_end = end_bound(&status_prefix);
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(status_prefix..status_end, &crate::scan_options())
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            let Some(parsed) = parse_job_status_key(&kv.key) else {
+                continue;
+            };
+            if !range.contains_tenant(&parsed.tenant) {
+                continue;
+            }
+            let Ok(status) = decode_job_status_owned(&kv.value) else {
+                continue;
+            };
+            *truth
+                .entry((parsed.tenant, status.kind.as_str().to_owned()))
+                .or_insert(0) += 1;
+        }
+
+        // Collect existing stored counters in this shard's range so we can
+        // explicitly drive zombies (counter > 0 but no matching JOB_STATUS) to
+        // zero. Reuses `scan_tenant_status_counters` which already filters by
+        // shard range, but only returns count > 0 rows — that's exactly the
+        // set we might need to zero out.
+        let existing = self.scan_tenant_status_counters(None).await?;
+
+        let mut corrected: u64 = 0;
+        let mut truth_remaining = truth;
+
+        for (tenant, kind, _current) in existing {
+            let want = truth_remaining
+                .remove(&(tenant.clone(), kind.clone()))
+                .unwrap_or(0);
+            let key = tenant_status_counter_key(&tenant, &kind);
+            corrected += self.apply_counter_correction(key, want).await?;
+        }
+
+        // Anything remaining in truth_remaining has no existing stored counter
+        // (or the existing stored counter was already <= 0 and was filtered
+        // out by scan_tenant_status_counters). Issue a fresh delta from 0.
+        for ((tenant, kind), want) in truth_remaining {
+            if want != 0 {
+                let key = tenant_status_counter_key(&tenant, &kind);
+                corrected += self.apply_counter_correction(key, want).await?;
+            }
+        }
+
+        Ok(corrected)
+    }
+
+    /// Read `key`, compute `delta = truth - current`, and merge the delta if
+    /// non-zero. Returns 1 if a merge was issued, 0 otherwise.
+    async fn apply_counter_correction(
+        &self,
+        key: Vec<u8>,
+        truth: i64,
+    ) -> Result<u64, JobStoreShardError> {
+        let current = match self.db.get(&key).await? {
+            Some(b) => decode_counter(&b),
+            None => 0,
+        };
+        let delta = truth.saturating_sub(current);
+        if delta == 0 {
+            return Ok(0);
+        }
+        self.db.merge(&key, &encode_counter(delta)).await?;
+        Ok(1)
+    }
+}
+
+/// Result of a single `reconcile_counters` pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileSummary {
+    /// Number of `JOB_STATUS` rows scanned.
+    pub scanned_jobs: u64,
+    /// Number of counters that received a non-zero correction merge.
+    pub corrected: u64,
+    /// Number of sub-tasks that failed (each has been logged at warn).
+    pub failed: u64,
 }
