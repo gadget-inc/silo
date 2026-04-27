@@ -18,11 +18,11 @@
 //! | 0x07   | ATTEMPT          | Point-read JOB_STATUS via DbReader   |
 //! | 0x0A   | JOB_CANCELLED    | Point-read JOB_STATUS via DbReader   |
 //!
-//! In the standalone `silo-compactor` process we do not have a writable `Db`
-//! handle, so counter decrements are tracked but emitted only via the warn
-//! log on `on_compaction_end`. The live silo server owns the counters; those
-//! will drift slightly and are expected to be reconciled by silo's own
-//! cleanup paths.
+//! Job counters (per-tenant `tenant_status_counter`, shard
+//! `total_jobs`/`completed_jobs`) are NOT touched by this filter. They will
+//! drift relative to the keys this filter drops; reconciliation is
+//! delegated to a separate background task that scans the live counters
+//! against the live JOB_STATUS rows.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use silo::codec::decode_job_status_owned;
 use silo::job_store_shard::counter_merge_operator;
 use silo::keys::{
     idx_status_time_all_prefix, parse_attempt_key, parse_job_cancelled_key, parse_job_info_key,
-    parse_job_status_key, parse_metadata_index_key, parse_status_time_index_key, prefix,
+    parse_metadata_index_key, parse_status_time_index_key, prefix,
 };
 use slatedb::{
     CompactionFilter, CompactionFilterDecision, CompactionFilterError, CompactionFilterSupplier,
@@ -273,7 +273,6 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
             dropped_idx_metadata: 0,
             dropped_attempt: 0,
             dropped_job_cancelled: 0,
-            tenant_status_drops: HashMap::new(),
         }))
     }
 }
@@ -301,9 +300,6 @@ pub struct CompletedJobCompactionFilter {
     dropped_idx_metadata: u64,
     dropped_attempt: u64,
     dropped_job_cancelled: u64,
-
-    // (tenant, status_kind) → count for counter decrements.
-    tenant_status_drops: HashMap<(String, String), u64>,
 }
 
 impl CompletedJobCompactionFilter {
@@ -400,12 +396,6 @@ impl CompactionFilter for CompletedJobCompactionFilter {
                 };
 
                 if status.is_terminal() && status.changed_at_ms < self.cutoff_ms {
-                    if let Some(parsed) = parse_job_status_key(&entry.key) {
-                        *self
-                            .tenant_status_drops
-                            .entry((parsed.tenant, status.kind.as_str().to_owned()))
-                            .or_insert(0) += 1;
-                    }
                     self.dropped_status += 1;
                     return Ok(self.drop_decision());
                 }
@@ -476,23 +466,6 @@ impl CompactionFilter for CompletedJobCompactionFilter {
             );
         }
 
-        // In the standalone compactor we have no writable Db handle, so
-        // counter decrements are only tracked for diagnostics and emitted
-        // here. The live silo writer reconciles counters elsewhere.
-        if self.dropped_status > 0 {
-            let tenants: Vec<_> = self
-                .tenant_status_drops
-                .iter()
-                .map(|((tenant, status), count)| format!("{tenant}/{status}={count}"))
-                .collect();
-            warn!(
-                jobs_dropped = self.dropped_status,
-                tenant_status = ?tenants,
-                "completed_jobs compaction filter: counter decrements skipped \
-                 (standalone compactor has no Db writer)"
-            );
-        }
-
         Ok(())
     }
 }
@@ -541,7 +514,6 @@ mod tests {
             dropped_idx_metadata: 0,
             dropped_attempt: 0,
             dropped_job_cancelled: 0,
-            tenant_status_drops: HashMap::new(),
         }
     }
 
@@ -645,24 +617,6 @@ mod tests {
         let entry = row(job_info_key("tenant-1", "job-1"), Bytes::from_static(b"x"));
         let decision = filter.filter(&entry).await.unwrap();
         assert_eq!(decision, CompactionFilterDecision::Keep);
-    }
-
-    #[tokio::test]
-    async fn tracks_tenant_status_drops() {
-        let cutoff = now_epoch_ms() - 1_000;
-        let mut filter = make_filter(cutoff, true);
-        let row_a = status_row(JobStatusKind::Succeeded, cutoff - 10);
-        let _ = filter.filter(&row_a).await.unwrap();
-        let row_b = status_row(JobStatusKind::Failed, cutoff - 5);
-        let _ = filter.filter(&row_b).await.unwrap();
-        let succ = filter
-            .tenant_status_drops
-            .get(&("tenant-1".to_string(), "Succeeded".to_string()));
-        let fail = filter
-            .tenant_status_drops
-            .get(&("tenant-1".to_string(), "Failed".to_string()));
-        assert_eq!(succ.copied(), Some(1));
-        assert_eq!(fail.copied(), Some(1));
     }
 
     #[tokio::test]
