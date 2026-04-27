@@ -24,18 +24,19 @@
 //! will drift slightly and are expected to be reconciled by silo's own
 //! cleanup paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use object_store::path::Path;
 use silo::codec::decode_job_status_owned;
 use silo::job_store_shard::counter_merge_operator;
 use silo::keys::{
-    parse_attempt_key, parse_job_cancelled_key, parse_job_info_key, parse_job_status_key,
-    parse_metadata_index_key, parse_status_time_index_key, prefix,
+    idx_status_time_all_prefix, parse_attempt_key, parse_job_cancelled_key, parse_job_info_key,
+    parse_job_status_key, parse_metadata_index_key, parse_status_time_index_key, prefix,
 };
+use slatedb::config::ScanOptions;
 use slatedb::{
     CompactionFilter, CompactionFilterDecision, CompactionFilterError, CompactionFilterSupplier,
     CompactionJobContext, DbReader, DbReaderBuilder, RowEntry, ValueDeletable,
@@ -48,21 +49,120 @@ const TERMINAL_STATUSES: &[&str] = &["Succeeded", "Failed", "Cancelled"];
 /// Default retention window for completed jobs: 7 days.
 pub const DEFAULT_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Default upper bound on the pre-scanned `ExpiredSet`. If the IDX_STATUS_TIME
+/// pass would exceed this, the supplier falls back to per-row point reads
+/// rather than holding an arbitrarily large set in memory.
+pub const DEFAULT_EXPIRED_SET_MAX_ENTRIES: usize = 250_000;
+
+// ---------------------------------------------------------------------------
+// ExpiredSet
+// ---------------------------------------------------------------------------
+
+/// Cache of `(tenant, job_id)` pairs that the filter knows to be terminal +
+/// older than `cutoff_ms`. Built once per compaction job by scanning
+/// IDX_STATUS_TIME via a `DbReader`, then consulted by `is_job_expired`
+/// instead of issuing one point-read per row.
+///
+/// Stored as a per-tenant map so that `contains(&str, &str)` doesn't have to
+/// allocate a tuple key on every lookup — the `HashMap::get` accepts `&str`
+/// directly via `Borrow<str>` on `String`.
+struct ExpiredSet {
+    by_tenant: HashMap<String, HashSet<String>>,
+    total: usize,
+}
+
+impl ExpiredSet {
+    fn new() -> Self {
+        Self {
+            by_tenant: HashMap::new(),
+            total: 0,
+        }
+    }
+
+    fn contains(&self, tenant: &str, job_id: &str) -> bool {
+        self.by_tenant
+            .get(tenant)
+            .is_some_and(|jobs| jobs.contains(job_id))
+    }
+
+    fn insert(&mut self, tenant: String, job_id: String) {
+        if self.by_tenant.entry(tenant).or_default().insert(job_id) {
+            self.total += 1;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+}
+
+/// Scan IDX_STATUS_TIME via `reader` and collect every (tenant, job_id) pair
+/// whose key parses to a TERMINAL status with `changed_at_ms < cutoff_ms`.
+///
+/// Returns `Ok(Some(set))` on a clean drain, `Ok(None)` when the cap was
+/// exceeded mid-scan (caller falls back to per-row point reads), or `Err`
+/// when the underlying scan errored.
+///
+/// Reads with `cache_blocks: false` so a one-shot pre-scan doesn't pollute
+/// the compactor's block cache.
+async fn build_expired_set(
+    reader: &DbReader,
+    cutoff_ms: i64,
+    max_entries: usize,
+) -> Result<Option<ExpiredSet>, slatedb::Error> {
+    if max_entries == 0 {
+        return Ok(None);
+    }
+    let opts = ScanOptions {
+        cache_blocks: false,
+        ..ScanOptions::default()
+    };
+    let mut iter = reader
+        .scan_prefix_with_options(idx_status_time_all_prefix(), &opts)
+        .await?;
+    let mut set = ExpiredSet::new();
+    while let Some(kv) = iter.next().await? {
+        let Some(parsed) = parse_status_time_index_key(&kv.key) else {
+            continue;
+        };
+        if !TERMINAL_STATUSES.contains(&parsed.status.as_str()) {
+            continue;
+        }
+        if parsed.changed_at_ms() >= cutoff_ms {
+            continue;
+        }
+        set.insert(parsed.tenant, parsed.job_id);
+        if set.len() > max_entries {
+            return Ok(None);
+        }
+    }
+    Ok(Some(set))
+}
+
 // ---------------------------------------------------------------------------
 // Supplier
 // ---------------------------------------------------------------------------
 
 /// Creates a fresh [`CompletedJobCompactionFilter`] for each compaction job.
 ///
-/// The supplier lazily opens a [`DbReader`] per compaction job for point-
-/// reading JOB_STATUS rows. The reader is NOT kept alive across jobs — this
-/// avoids a long-lived manifest poller / checkpoint that can interfere with
-/// the compactor's state management.
+/// The supplier lazily opens a [`DbReader`] per compaction job and uses it
+/// to pre-scan the IDX_STATUS_TIME index into an [`ExpiredSet`]. Per-row
+/// `is_job_expired` decisions are then served from the set instead of
+/// issuing one point-read per row. The reader is NOT kept alive across
+/// jobs — this avoids a long-lived manifest poller / checkpoint that can
+/// interfere with the compactor's state management.
+///
+/// If the pre-scan fails (reader couldn't open, scan errored, or
+/// `expired_set_max_entries` was exceeded) the filter falls back to
+/// per-row point reads via the same `DbReader`.
 pub struct CompletedJobCompactionFilterSupplier {
     retention: Duration,
     /// Object-store context for lazily opening a `DbReader` per compaction
     /// job. `None` disables point reads (unit tests only).
     reader_ctx: Option<ReaderContext>,
+    /// Soft cap on the pre-scanned [`ExpiredSet`]. `0` disables the
+    /// pre-scan entirely (every `is_job_expired` becomes a point read).
+    expired_set_max_entries: usize,
 }
 
 /// Everything needed to open a short-lived [`DbReader`].
@@ -80,7 +180,15 @@ impl CompletedJobCompactionFilterSupplier {
         Self {
             retention,
             reader_ctx: Some(ReaderContext { db_path, store }),
+            expired_set_max_entries: DEFAULT_EXPIRED_SET_MAX_ENTRIES,
         }
+    }
+
+    /// Override the per-filter pre-scan cap. `0` disables the pre-scan and
+    /// forces every `is_job_expired` to issue a point read.
+    pub fn with_max_expired_entries(mut self, cap: usize) -> Self {
+        self.expired_set_max_entries = cap;
+        self
     }
 
     #[cfg(test)]
@@ -88,6 +196,7 @@ impl CompletedJobCompactionFilterSupplier {
         Self {
             retention,
             reader_ctx: None,
+            expired_set_max_entries: DEFAULT_EXPIRED_SET_MAX_ENTRIES,
         }
     }
 }
@@ -111,10 +220,7 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
                 .build()
                 .await
             {
-                Ok(r) => {
-                    info!("completed_jobs filter: opened DbReader for point reads");
-                    Some(Arc::new(r))
-                }
+                Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
                     warn!(
                         error = %e,
@@ -128,9 +234,48 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
             None
         };
 
+        // Pre-scan IDX_STATUS_TIME into an ExpiredSet. When this succeeds the
+        // filter serves `is_job_expired` from memory; otherwise it falls back
+        // to per-row point reads via the same DbReader.
+        let expired = match reader.as_ref() {
+            Some(r) => {
+                let started = Instant::now();
+                match build_expired_set(r, cutoff_ms, self.expired_set_max_entries).await {
+                    Ok(Some(set)) => {
+                        info!(
+                            entries = set.len(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            cap = self.expired_set_max_entries,
+                            "completed_jobs filter: pre-scan ready"
+                        );
+                        Some(Arc::new(set))
+                    }
+                    Ok(None) => {
+                        warn!(
+                            cap = self.expired_set_max_entries,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "completed_jobs filter: pre-scan exceeded cap or disabled, \
+                             falling back to per-row point reads"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "completed_jobs filter: pre-scan failed, falling back to \
+                             per-row point reads"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         Ok(Box::new(CompletedJobCompactionFilter {
             cutoff_ms,
             reader,
+            expired,
             is_dest_last_run: context.is_dest_last_run,
             dropped_job_info: 0,
             dropped_status: 0,
@@ -149,7 +294,14 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
 
 pub struct CompletedJobCompactionFilter {
     cutoff_ms: i64,
+    /// DbReader used by `is_job_expired` only when `expired` is `None` (the
+    /// pre-scan failed or was disabled). Otherwise membership is served
+    /// entirely from the pre-built [`ExpiredSet`].
     reader: Option<Arc<DbReader>>,
+    /// Pre-scanned set of `(tenant, job_id)` that the filter knows to be
+    /// terminal + expired. Built once at filter creation. `None` means the
+    /// filter must fall back to per-row point reads.
+    expired: Option<Arc<ExpiredSet>>,
     is_dest_last_run: bool,
 
     // Per-prefix drop counts (diagnostics).
@@ -184,9 +336,20 @@ impl CompletedJobCompactionFilter {
         }
     }
 
-    /// Point-read the job's `JOB_STATUS` from the live DB and check whether
-    /// it is terminal and older than the retention cutoff.
+    /// Decide whether `(tenant, job_id)` is terminal and older than the
+    /// retention cutoff.
+    ///
+    /// Fast path: consult the pre-scanned [`ExpiredSet`] when present. The
+    /// set is built from IDX_STATUS_TIME, which silo maintains as a
+    /// single-entry-per-job index — a pair only appears in the set if the
+    /// live status row says terminal+old, so no point read is needed.
+    ///
+    /// Fallback: when the pre-scan was skipped (cap exceeded, scan failed,
+    /// or no reader), point-read the job's `JOB_STATUS` and decode.
     async fn is_job_expired(&self, tenant: &str, job_id: &str) -> bool {
+        if let Some(set) = &self.expired {
+            return set.contains(tenant, job_id);
+        }
         let Some(reader) = &self.reader else {
             return false;
         };
@@ -380,6 +543,7 @@ mod tests {
         CompletedJobCompactionFilter {
             cutoff_ms,
             reader: None,
+            expired: None,
             is_dest_last_run,
             dropped_job_info: 0,
             dropped_status: 0,
@@ -522,5 +686,131 @@ mod tests {
         };
         let filter = sup.create_compaction_filter(&ctx).await.unwrap();
         drop(filter);
+    }
+
+    // ── ExpiredSet tests (no DB needed) ──
+
+    #[test]
+    fn expired_set_lookup_by_str_does_not_allocate() {
+        let mut set = ExpiredSet::new();
+        set.insert("tenant-a".into(), "job-1".into());
+        set.insert("tenant-a".into(), "job-2".into());
+        set.insert("tenant-b".into(), "job-3".into());
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("tenant-a", "job-1"));
+        assert!(set.contains("tenant-a", "job-2"));
+        assert!(set.contains("tenant-b", "job-3"));
+        assert!(!set.contains("tenant-a", "job-3"));
+        assert!(!set.contains("tenant-c", "job-1"));
+    }
+
+    #[test]
+    fn expired_set_dedupes_inserts() {
+        let mut set = ExpiredSet::new();
+        set.insert("t".into(), "j".into());
+        set.insert("t".into(), "j".into());
+        assert_eq!(set.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn is_job_expired_uses_set_when_present() {
+        // No reader, but a populated set: filter must answer purely from the
+        // set with no point-read attempt.
+        let mut set = ExpiredSet::new();
+        set.insert("tenant-a".into(), "expired-job".into());
+        let mut filter = make_filter(now_epoch_ms() - 1_000, true);
+        filter.expired = Some(Arc::new(set));
+        assert!(filter.is_job_expired("tenant-a", "expired-job").await);
+        assert!(!filter.is_job_expired("tenant-a", "other-job").await);
+        assert!(!filter.is_job_expired("tenant-b", "expired-job").await);
+    }
+
+    // ── build_expired_set against a real in-memory slatedb ──
+
+    use slatedb::Db;
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
+
+    /// Open an in-memory slatedb, write a batch of IDX_STATUS_TIME rows
+    /// matching the given (tenant, status, ts, job_id) tuples, close it,
+    /// then return a freshly-opened `DbReader` over the same store.
+    async fn seed_idx_status_time(rows: &[(&str, &str, i64, &str)]) -> Arc<DbReader> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = slatedb::object_store::path::Path::from("/db");
+        {
+            let db = Db::builder(path.clone(), Arc::clone(&store))
+                .build()
+                .await
+                .unwrap();
+            for (tenant, status, ts, job_id) in rows {
+                let key = idx_status_time_key(tenant, status, *ts, job_id);
+                db.put(&key, []).await.unwrap();
+            }
+            db.flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+            db.close().await.unwrap();
+        }
+        Arc::new(DbReaderBuilder::new(path, store).build().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn build_expired_set_picks_only_terminal_and_old() {
+        let cutoff = 1_000_000_000;
+        let reader = seed_idx_status_time(&[
+            ("tenant-a", "Succeeded", cutoff - 1, "job-old-ok"),
+            ("tenant-a", "Failed", cutoff - 100, "job-old-fail"),
+            ("tenant-b", "Cancelled", cutoff - 50, "job-old-cancel"),
+            ("tenant-a", "Succeeded", cutoff + 1, "job-recent-ok"),
+            ("tenant-a", "Running", cutoff - 999_999, "job-old-run"),
+            ("tenant-a", "Scheduled", cutoff - 999_999, "job-old-sched"),
+        ])
+        .await;
+        let set = build_expired_set(&reader, cutoff, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("tenant-a", "job-old-ok"));
+        assert!(set.contains("tenant-a", "job-old-fail"));
+        assert!(set.contains("tenant-b", "job-old-cancel"));
+        assert!(!set.contains("tenant-a", "job-recent-ok"));
+        assert!(!set.contains("tenant-a", "job-old-run"));
+        assert!(!set.contains("tenant-a", "job-old-sched"));
+    }
+
+    #[tokio::test]
+    async fn build_expired_set_returns_none_when_cap_exceeded() {
+        let cutoff = 1_000_000_000;
+        let reader = seed_idx_status_time(&[
+            ("tenant-a", "Succeeded", cutoff - 1, "j1"),
+            ("tenant-a", "Succeeded", cutoff - 2, "j2"),
+            ("tenant-a", "Succeeded", cutoff - 3, "j3"),
+        ])
+        .await;
+        // Cap of 2 with three terminal+old rows → returns None.
+        let result = build_expired_set(&reader, cutoff, 2).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_expired_set_returns_none_when_max_entries_zero() {
+        // cap = 0 short-circuits without scanning at all.
+        let reader = seed_idx_status_time(&[("t", "Succeeded", 0, "j")]).await;
+        let result = build_expired_set(&reader, i64::MAX, 0).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_expired_set_handles_empty_index() {
+        let reader = seed_idx_status_time(&[]).await;
+        let set = build_expired_set(&reader, i64::MAX, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.len(), 0);
+        assert!(!set.contains("anything", "anywhere"));
     }
 }

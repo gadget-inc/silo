@@ -125,15 +125,23 @@ async fn run_once(
     if let Some(opts) = compactor_options {
         builder = builder.with_options(opts);
     }
-    if let CompactionFilterConfig::CompletedJobs { retention_secs } = filter_config {
-        let supplier = CompletedJobCompactionFilterSupplier::new(
+    if let CompactionFilterConfig::CompletedJobs {
+        retention_secs,
+        expired_set_max_entries,
+    } = filter_config
+    {
+        let mut supplier = CompletedJobCompactionFilterSupplier::new(
             Duration::from_secs(*retention_secs),
             object_store::path::Path::from(canonical_path.as_str()),
             Arc::clone(&store),
         );
+        if let Some(cap) = expired_set_max_entries {
+            supplier = supplier.with_max_expired_entries(*cap);
+        }
         info!(
             shard = %shard_id,
             retention_secs = *retention_secs,
+            expired_set_max_entries = ?expired_set_max_entries,
             "enabling completed_jobs compaction filter",
         );
         builder = builder.with_compaction_filter_supplier(Arc::new(supplier));
