@@ -33,6 +33,13 @@ pub enum CompactionFilterConfig {
     CompletedJobs {
         #[serde(default = "default_completed_jobs_retention_secs")]
         retention_secs: u64,
+        /// Soft cap on the in-memory `(tenant, job_id)` set built by
+        /// pre-scanning IDX_STATUS_TIME. When unset, falls back to
+        /// `compaction_filter::DEFAULT_EXPIRED_SET_MAX_ENTRIES`. Set to
+        /// `0` to disable the pre-scan and use per-row point reads
+        /// exclusively.
+        #[serde(default)]
+        expired_set_max_entries: Option<usize>,
     },
 }
 
@@ -306,7 +313,8 @@ mod tests {
         assert_eq!(
             cfg.compaction_filter,
             CompactionFilterConfig::CompletedJobs {
-                retention_secs: 900
+                retention_secs: 900,
+                expired_set_max_entries: None,
             }
         );
     }
@@ -330,6 +338,33 @@ mod tests {
             cfg.compaction_filter,
             CompactionFilterConfig::CompletedJobs {
                 retention_secs: DEFAULT_RETENTION_SECS,
+                expired_set_max_entries: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_completed_jobs_filter_with_expired_set_cap() {
+        let toml_str = r#"
+            [storage]
+            backend = "memory"
+            path = "memory://x/%shard%"
+
+            [shard_discovery]
+            backend = "etcd"
+            cluster_prefix = "silo-dev"
+
+            [compaction_filter]
+            kind = "completed_jobs"
+            retention_secs = 900
+            expired_set_max_entries = 500_000
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            cfg.compaction_filter,
+            CompactionFilterConfig::CompletedJobs {
+                retention_secs: 900,
+                expired_set_max_entries: Some(500_000),
             }
         );
     }
