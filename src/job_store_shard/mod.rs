@@ -17,7 +17,8 @@ mod scan;
 pub use cleanup::{CleanupProgress, CleanupResult};
 
 pub use counters::{
-    ReconcileSummary, ShardCounters, TenantStatusCounterScanRange, counter_merge_operator,
+    JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
+    counter_merge_operator,
 };
 pub use expedite::JobNotExpediteableError;
 pub use import::JobNotReimportableError;
@@ -551,9 +552,8 @@ impl JobStoreShard {
         // no operational SLA, so there's no reason to tune it per-shard or
         // per-deployment. Plumbing a knob here would force every test/bench
         // that constructs OpenShardOptions/DatabaseTemplate to set a value.
-        let reconcile_interval = Duration::from_millis(
-            crate::settings::DEFAULT_COUNTER_RECONCILE_INTERVAL_MS.max(1),
-        );
+        let reconcile_interval =
+            Duration::from_millis(crate::settings::DEFAULT_COUNTER_RECONCILE_INTERVAL_MS.max(1));
 
         tokio::spawn(async move {
             // Deterministic jitter based on shard name so we don't stampede
