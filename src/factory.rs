@@ -47,11 +47,11 @@ impl ShardEntry {
 /// and shards can be opened/closed dynamically as ownership changes.
 /// Per-shard OnceCell ensures that concurrent opens for the same shard
 /// are serialized while opens for different shards proceed in parallel.
-/// Default timeout for shard close operations (30 seconds).
+/// Default timeout for shard close operations (5 minutes).
 /// SlateDB's internal retrying_object_store retries indefinitely on transient errors,
 /// so we need a timeout to prevent close from hanging forever if the object store is
 /// unreachable or the filesystem is read-only.
-const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub struct ShardFactory {
     instances: DashMap<ShardId, Arc<ShardEntry>>,
