@@ -16,7 +16,10 @@ mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
 
-pub use counters::{ShardCounters, TenantStatusCounterScanRange, counter_merge_operator};
+pub use counters::{
+    JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
+    counter_merge_operator,
+};
 pub use expedite::JobNotExpediteableError;
 pub use import::JobNotReimportableError;
 pub use lease_task::JobNotLeaseableError;
@@ -390,7 +393,13 @@ impl JobStoreShard {
 
         // Periodically reconcile pending concurrency requests to self-heal from
         // missed in-memory notifications or transient scanner failures.
-        shard.spawn_concurrency_reconcile_task(range);
+        shard.spawn_concurrency_reconcile_task(range.clone());
+
+        // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth.
+        // Required because the standalone compactor drops terminal job rows
+        // without a writable Db handle and therefore cannot decrement counters
+        // at drop time.
+        shard.spawn_counter_reconcile_task(range);
 
         // Set the shard creation timestamp if this is the first time opening
         shard.set_created_at_ms_if_unset().await?;
@@ -518,6 +527,91 @@ impl JobStoreShard {
                         tracing::debug!(
                             shard = %shard_name,
                             "stopping periodic concurrency reconciliation (shard closing)"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Spawn a background task that periodically calls `reconcile_counters`.
+    ///
+    /// Unlike the concurrency reconciler (small scan, fast cadence), this task
+    /// scans all `JOB_INFO` + `JOB_STATUS` rows in the shard and so runs at
+    /// hourly cadence by default. To avoid all shards spiking object-store
+    /// reads at the same wall-clock minute on process boot, we sleep a
+    /// shard-deterministic jitter `[0, interval)` before the first tick. The
+    /// jitter is derived from the shard name's hash so that deterministic
+    /// simulation tests remain reproducible.
+    fn spawn_counter_reconcile_task(self: &Arc<Self>, range: ShardRange) {
+        let shard = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        let shard_name = self.name.clone();
+        // Hardcoded: this counter is eventually-consistent observability with
+        // no operational SLA, so there's no reason to tune it per-shard or
+        // per-deployment. Plumbing a knob here would force every test/bench
+        // that constructs OpenShardOptions/DatabaseTemplate to set a value.
+        let reconcile_interval = Duration::from_millis(
+            crate::settings::DEFAULT_COUNTER_RECONCILE_INTERVAL_MS.max(1),
+        );
+
+        tokio::spawn(async move {
+            // Deterministic jitter based on shard name so we don't stampede
+            // object storage when many shards open simultaneously.
+            let interval_ms = reconcile_interval.as_millis() as u64;
+            let jitter_ms = if interval_ms > 0 {
+                let mut h: u64 = 1469598103934665603;
+                for b in shard_name.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(1099511628211);
+                }
+                h % interval_ms
+            } else {
+                0
+            };
+
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(Duration::from_millis(jitter_ms)) => {}
+                _ = cancellation.cancelled() => {
+                    tracing::debug!(
+                        shard = %shard_name,
+                        "stopping periodic counter reconciliation before first tick (shard closing)"
+                    );
+                    return;
+                }
+            }
+
+            let mut interval = tokio::time::interval(reconcile_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = interval.tick() => {
+                        let summary = shard.reconcile_counters(&range).await;
+                        if summary.failed > 0 {
+                            tracing::warn!(
+                                shard = %shard_name,
+                                scanned_jobs = summary.scanned_jobs,
+                                corrected = summary.corrected,
+                                failed = summary.failed,
+                                "counter reconcile pass had failures; counters may remain stale until next pass"
+                            );
+                        } else {
+                            tracing::debug!(
+                                shard = %shard_name,
+                                scanned_jobs = summary.scanned_jobs,
+                                corrected = summary.corrected,
+                                "counter reconcile pass complete"
+                            );
+                        }
+                    }
+                    _ = cancellation.cancelled() => {
+                        tracing::debug!(
+                            shard = %shard_name,
+                            "stopping periodic counter reconciliation (shard closing)"
                         );
                         break;
                     }
