@@ -17,7 +17,8 @@ mod scan;
 pub use cleanup::{CleanupProgress, CleanupResult};
 
 pub use counters::{
-    ReconcileSummary, ShardCounters, TenantStatusCounterScanRange, counter_merge_operator,
+    JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
+    counter_merge_operator,
 };
 pub use expedite::JobNotExpediteableError;
 pub use import::JobNotReimportableError;

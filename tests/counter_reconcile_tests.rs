@@ -184,6 +184,63 @@ async fn reconcile_corrects_tenant_status_counter_drift() {
 }
 
 #[silo::test]
+async fn scan_job_status_truth_reflects_jobs() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    enqueue_one(&shard, "-", "open-a").await;
+    enqueue_one(&shard, "-", "open-b").await;
+    enqueue_one(&shard, "-", "to-succeed").await;
+    dequeue_and_succeed(&shard).await;
+
+    let truth = shard
+        .scan_job_status_truth(&ShardRange::full())
+        .await
+        .expect("scan_job_status_truth");
+
+    assert_eq!(truth.scanned_jobs, 3, "all 3 JOB_STATUS rows scanned");
+    assert_eq!(truth.completed_jobs, 1, "exactly one terminal");
+    let succeeded = truth
+        .per_tenant_status
+        .get(&("-".to_string(), "Succeeded".to_string()))
+        .copied();
+    assert_eq!(succeeded, Some(1));
+    let scheduled = truth
+        .per_tenant_status
+        .get(&("-".to_string(), "Scheduled".to_string()))
+        .copied();
+    assert_eq!(scheduled, Some(2), "two jobs still scheduled");
+}
+
+#[silo::test]
+async fn scan_job_status_truth_filters_by_range() {
+    // Open a shard whose range covers everything *except* tenant "out".
+    let inside_range = ShardRange::full();
+    let (_tmp, shard) = open_temp_shard().await;
+
+    // Both inside-range and out-of-range tenants get jobs. Then we call
+    // scan_job_status_truth twice — once with the full range, once with an
+    // explicitly empty range — and assert the empty range produces no rows.
+    enqueue_one(&shard, "tenant-x", "a").await;
+    enqueue_one(&shard, "tenant-y", "b").await;
+
+    let full = shard
+        .scan_job_status_truth(&inside_range)
+        .await
+        .expect("scan with full range");
+    assert_eq!(full.scanned_jobs, 2);
+
+    // Empty range — start == end so contains_tenant returns false.
+    let empty = ShardRange::new("zzzzz".to_string(), "zzzzz".to_string());
+    let none = shard
+        .scan_job_status_truth(&empty)
+        .await
+        .expect("scan with empty range");
+    assert_eq!(none.scanned_jobs, 0, "no rows in an empty range");
+    assert_eq!(none.completed_jobs, 0);
+    assert!(none.per_tenant_status.is_empty());
+}
+
+#[silo::test]
 async fn reconcile_summary_reports_scanned_jobs() {
     let (_tmp, shard) = open_temp_shard().await;
 
