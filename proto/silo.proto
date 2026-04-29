@@ -455,6 +455,20 @@ message CpuProfileResponse {
   uint64 samples = 3;           // Number of samples collected.
 }
 
+// Request to capture a heap profile from this node.
+// The profiler is activated for the requested duration, then a jemalloc heap
+// dump of currently-live sampled allocations is returned.
+message HeapProfileRequest {
+  uint32 duration_seconds = 1;  // How long to profile before dumping (1-300 seconds). Default 30.
+}
+
+// Heap profile data in jemalloc/jeprof format.
+// Analyze with `jeprof <path-to-silo-binary> <profile-file>`.
+message HeapProfileResponse {
+  bytes profile_data = 1;       // jemalloc heap profile bytes.
+  uint32 duration_seconds = 2;  // Actual duration profiled.
+}
+
 // Request to initiate a shard split operation.
 message RequestSplitRequest {
   string shard_id = 1;     // Shard ID (UUID) of the shard to split.
@@ -685,6 +699,11 @@ service Silo {
   // Returns pprof protobuf data that can be analyzed with pprof or go tool pprof.
   // The profile captures CPU usage for the specified duration.
   rpc CpuProfile(CpuProfileRequest) returns (CpuProfileResponse);
+
+  // Capture a jemalloc heap profile from this node.
+  // The profiler is activated for the specified duration and then dumps
+  // currently-live sampled allocations in jeprof-compatible format.
+  rpc HeapProfile(HeapProfileRequest) returns (HeapProfileResponse);
   
   // Request a shard split operation.
   // Initiates splitting a shard into two child shards at the specified split point.

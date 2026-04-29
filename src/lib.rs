@@ -7,6 +7,7 @@ pub mod coordination;
 pub mod dst_events;
 pub mod factory;
 pub mod gubernator;
+pub mod heap_profile;
 pub mod job;
 pub mod job_attempt;
 pub mod job_store_shard;
@@ -41,6 +42,39 @@ pub mod pb {
 }
 pub mod server;
 pub mod siloctl;
+
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(unix)]
+union MallocConfPtr {
+    as_u8: &'static u8,
+    as_c_char: &'static std::ffi::c_char,
+}
+
+// Enable jemalloc heap profiling support in-process without requiring MALLOC_CONF
+// to be injected externally at startup.
+#[cfg(unix)]
+#[used]
+#[unsafe(no_mangle)]
+pub static malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
+    MallocConfPtr {
+        as_u8: &b"prof:true,prof_active:false,lg_prof_sample:19\0"[0],
+    }
+    .as_c_char
+});
+
+#[cfg(unix)]
+#[used]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static rjem_malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
+    MallocConfPtr {
+        as_u8: &b"prof:true,prof_active:false,lg_prof_sample:19\0"[0],
+    }
+    .as_c_char
+});
 
 /// Default scan options for all silo scans.
 ///

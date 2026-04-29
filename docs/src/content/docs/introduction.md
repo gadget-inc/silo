@@ -22,7 +22,7 @@ Silo sits in between. It has the simplicity and speed of a traditional job queue
 - **Concurrency limits**: built-in concurrency and rate limiting with high cardinality keys and dynamic floating limits.
 - **Job lifecycle management**: retries with exponential backoff, future scheduling, expediting, cancellation, restart, and deletion.
 - **Job results**: workers can return results that are stored and retrievable by the enqueuing process.
-- **Observability**: Prometheus metrics, OpenTelemetry tracing, structured logging, and on-demand CPU profiling.
+- **Observability**: Prometheus metrics, OpenTelemetry tracing, structured logging, and on-demand CPU and heap profiling.
 - **SQL queries**: inspect jobs with SQL via the built-in query engine.
 - **Web UI**: operator-facing dashboard for cluster health, queue inspection, and debugging.
 

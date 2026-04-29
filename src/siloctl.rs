@@ -12,8 +12,8 @@ use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, CompactShardRequest, ConfigureShardRequest, CpuProfileRequest,
     DeleteJobRequest, ExpediteJobRequest, ForceReleaseShardRequest, GetClusterInfoRequest,
-    GetJobRequest, GetJobResultRequest, GetSplitStatusRequest, QueryRequest, RequestSplitRequest,
-    RestartJobRequest,
+    GetJobRequest, GetJobResultRequest, GetSplitStatusRequest, HeapProfileRequest, QueryRequest,
+    RequestSplitRequest, RestartJobRequest,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -723,6 +723,78 @@ pub async fn profile<W: Write>(
             .unwrap_or(output_file.clone());
         writeln!(out, "  pprof -http=:8080 {}", display_path)?;
         writeln!(out, "  go tool pprof -http=:8080 {}", display_path)?;
+    }
+
+    Ok(())
+}
+
+/// Capture a heap profile from the connected Silo node
+pub async fn heap_profile<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    duration: u32,
+    output_path: Option<String>,
+) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address, opts.auth_token.as_deref()).await?;
+
+    if !opts.json {
+        writeln!(
+            out,
+            "Starting heap profile for {} seconds...",
+            duration
+        )?;
+        out.flush()?;
+    }
+
+    let response = client
+        .heap_profile(HeapProfileRequest {
+            duration_seconds: duration,
+        })
+        .await?
+        .into_inner();
+
+    let output_file = output_path.unwrap_or_else(|| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("heap-profile-{}.heap", timestamp)
+    });
+
+    let output_file = if output_file.ends_with(".heap") {
+        output_file
+    } else {
+        format!("{}.heap", output_file)
+    };
+
+    std::fs::write(&output_file, &response.profile_data)?;
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "status": "completed",
+            "output_file": output_file,
+            "duration_seconds": response.duration_seconds,
+            "profile_bytes": response.profile_data.len(),
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out)?;
+        writeln!(out, "Heap profile saved to: {}", output_file)?;
+        writeln!(
+            out,
+            "Duration: {}s, Size: {} bytes",
+            response.duration_seconds,
+            response.profile_data.len()
+        )?;
+        writeln!(out)?;
+        writeln!(out, "Analyze with:")?;
+
+        let display_path = Path::new(&output_file)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(output_file.clone());
+        writeln!(out, "  jeprof --text /path/to/silo {}", display_path)?;
+        writeln!(out, "  jeprof --svg /path/to/silo {} > heap.svg", display_path)?;
     }
 
     Ok(())

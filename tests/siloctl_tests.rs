@@ -15,7 +15,7 @@ use silo::pb::*;
 use silo::settings::AppConfig;
 use silo::siloctl::{self, BytesOutputFormat, GlobalOptions};
 
-// Global mutex to serialize profile tests - only one CPU profiler can run at a time system-wide
+// Global mutex to serialize profiler tests - both profilers use process-global state.
 static PROFILE_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 fn opts_for_addr(addr: &std::net::SocketAddr) -> GlobalOptions {
@@ -840,6 +840,48 @@ async fn siloctl_profile_json_output() -> anyhow::Result<()> {
             parsed.get("profile_bytes").is_some(),
             "JSON should have profile_bytes"
         );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_heap_profile() -> anyhow::Result<()> {
+    let _profile_lock = PROFILE_TEST_MUTEX.lock().unwrap();
+
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(60000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let opts = opts_for_addr(&addr);
+        let mut output = Vec::new();
+
+        let tmp_dir = tempfile::tempdir()?;
+        let output_path = tmp_dir.path().join("test-heap-profile.heap");
+
+        siloctl::heap_profile(
+            &opts,
+            &mut output,
+            1,
+            Some(output_path.to_string_lossy().to_string()),
+        )
+        .await?;
+
+        let stdout = String::from_utf8(output)?;
+        assert!(
+            stdout.contains("Heap profile saved to:"),
+            "should confirm save: {}",
+            stdout
+        );
+        assert!(output_path.exists(), "heap profile file should exist");
+
+        let metadata = std::fs::metadata(&output_path)?;
+        assert!(metadata.len() > 0, "heap profile should not be empty");
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())
