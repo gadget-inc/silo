@@ -88,8 +88,8 @@
         <div class="p-4">
             <div class="flex flex-wrap gap-2 justify-center py-4">
                 {% for shard in shards %}
-                <a href="/shard?id={{ shard.name }}" class="w-16 h-16 {% if shard.split_phase.is_some() %}bg-amber-900/30 border-amber-700{% else if shard.cleanup_status.is_some() %}bg-blue-900/30 border-blue-700{% else %}bg-emerald-900/30 border-emerald-700{% endif %} border flex flex-col items-center justify-center text-xs hover:opacity-80">
-                    <span class="{% if shard.split_phase.is_some() %}text-amber-400{% else if shard.cleanup_status.is_some() %}text-blue-400{% else %}text-emerald-400{% endif %} font-bold w-full truncate text-center">{{ shard.name }}</span>
+                <a href="/shard?id={{ shard.name }}" class="w-16 h-16 {% if shard.is_unavailable %}bg-red-900/30 border-red-700{% else if shard.split_phase.is_some() %}bg-amber-900/30 border-amber-700{% else if shard.cleanup_status.is_some() %}bg-blue-900/30 border-blue-700{% else %}bg-emerald-900/30 border-emerald-700{% endif %} border flex flex-col items-center justify-center text-xs hover:opacity-80">
+                    <span class="{% if shard.is_unavailable %}text-red-400{% else if shard.split_phase.is_some() %}text-amber-400{% else if shard.cleanup_status.is_some() %}text-blue-400{% else %}text-emerald-400{% endif %} font-bold w-full truncate text-center">{{ shard.name }}</span>
                     <span class="text-zinc-500">{{ shard.job_count }} jobs</span>
                 </a>
                 {% endfor %}
@@ -139,7 +139,9 @@
                             </td>
                             <td class="px-3 py-2 text-sm text-zinc-300 whitespace-nowrap">{{ shard.job_count }}</td>
                             <td class="px-3 py-2 text-sm whitespace-nowrap">
-                                {% if let Some(phase) = shard.split_phase %}
+                                {% if shard.is_unavailable %}
+                                <span class="px-2 py-0.5 text-xs font-medium border bg-amber-900/40 border-amber-700 text-amber-300">Active (Unavailable)</span>
+                                {% else if let Some(phase) = shard.split_phase %}
                                 <span class="px-2 py-0.5 text-xs font-medium border bg-amber-900/50 border-amber-600 text-amber-300">Splitting: {{ phase }}</span>
                                 {% else if let Some(cleanup) = shard.cleanup_status %}
                                 <span class="px-2 py-0.5 text-xs font-medium border bg-blue-900/50 border-blue-700 text-blue-400">{{ cleanup }}</span>

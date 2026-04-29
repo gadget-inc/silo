@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use datafusion::arrow::array::Array;
+use futures::future::join_all;
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -23,6 +24,7 @@ use crate::cluster_client::ClusterClient;
 use crate::cluster_query::ClusterQueryEngine;
 use crate::coordination::{Coordinator, SplitCleanupStatus};
 use crate::factory::ShardFactory;
+use crate::pb::{SerializedBytes, serialized_bytes};
 use crate::settings::AppConfig;
 
 #[derive(Clone)]
@@ -95,6 +97,8 @@ pub struct ShardRow {
     pub name: String,
     pub owner: String,
     pub job_count: usize,
+    /// Shard exists in the owner map but did not report node info
+    pub is_unavailable: bool,
     /// If this shard has a split in progress, the current phase
     pub split_phase: Option<String>,
     /// Cleanup status if not CompactionDone
@@ -151,6 +155,7 @@ struct QueuesTemplate {
     nav_active: &'static str,
     tenancy_enabled: bool,
     queues: Vec<QueueRow>,
+    unavailable_shards: Vec<String>,
     error: Option<String>,
 }
 
@@ -299,6 +304,7 @@ struct TenantsTemplate {
     page: usize,
     per_page: usize,
     total_pages: usize,
+    unavailable_shards: Vec<String>,
     error: Option<String>,
 }
 
@@ -481,6 +487,115 @@ struct TenantStatusCounts {
     scheduled: usize,
     running: usize,
     terminal: usize,
+}
+
+struct PartialShardQueryRows<T> {
+    rows: Vec<T>,
+    unavailable_shards: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct QueueCountQueryRow {
+    queue_name: Option<String>,
+    entry_type: Option<String>,
+    cnt: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct TenantCountQueryRow {
+    tenant: Option<String>,
+    status_kind: Option<String>,
+    cnt: Option<i64>,
+}
+
+fn decode_query_row<T: serde::de::DeserializeOwned>(row: &SerializedBytes) -> Result<T, String> {
+    let Some(serialized_bytes::Encoding::Msgpack(data)) = &row.encoding else {
+        return Err("unsupported row encoding".to_string());
+    };
+
+    rmp_serde::from_slice(data).map_err(|e| format!("failed to decode query row: {}", e))
+}
+
+async fn query_shards_partial<T>(state: &AppState, sql: &str) -> PartialShardQueryRows<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let owner_map = match state.cluster_client.get_shard_owner_map().await {
+        Ok(owner_map) => Some(owner_map),
+        Err(e) => {
+            warn!(error = %e, "failed to get shard owner map for partial query");
+            None
+        }
+    };
+
+    let mut shard_ids = owner_map
+        .as_ref()
+        .map(|owner_map| owner_map.shard_ids())
+        .unwrap_or_else(|| {
+            state
+                .factory
+                .instances()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        });
+
+    shard_ids.sort();
+
+    let local_node_id = state.coordinator.node_id().to_string();
+    let query_futures = shard_ids.into_iter().map(|shard_id| {
+        let owner_map = owner_map.clone();
+        let local_node_id = local_node_id.clone();
+        async move {
+            let shard_is_locally_unavailable = owner_map
+                .as_ref()
+                .and_then(|owner_map| owner_map.shard_to_node.get(&shard_id))
+                .map(|owner| owner == &local_node_id)
+                .unwrap_or(false)
+                && state.factory.get(&shard_id).is_none();
+
+            if shard_is_locally_unavailable {
+                return (shard_id, None, Some("local shard is not open".to_string()));
+            }
+
+            match state.cluster_client.query_shard(&shard_id, sql).await {
+                Ok(result) => (shard_id, Some(result), None),
+                Err(e) => (shard_id, None, Some(e.to_string())),
+            }
+        }
+    });
+
+    let mut rows = Vec::new();
+    let mut unavailable_shards = Vec::new();
+    let mut errors = Vec::new();
+
+    for (shard_id, result, query_error) in join_all(query_futures).await {
+        match result {
+            Some(result) => {
+                for row in result.rows {
+                    match decode_query_row::<T>(&row) {
+                        Ok(decoded) => rows.push(decoded),
+                        Err(e) => errors.push(format!("{}: {}", shard_id, e)),
+                    }
+                }
+            }
+            None => {
+                unavailable_shards.push(shard_id.to_string());
+                if let Some(error) = query_error {
+                    warn!(shard_id = %shard_id, error = %error, "skipping unavailable shard in web UI");
+                }
+            }
+        }
+    }
+
+    unavailable_shards.sort();
+
+    PartialShardQueryRows {
+        rows,
+        unavailable_shards,
+        errors,
+    }
 }
 
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -803,55 +918,23 @@ async fn cancel_job_handler(
 async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Key: queue_name -> (holders, waiters)
     let mut all_queues: HashMap<String, (usize, usize)> = HashMap::new();
-    let mut error: Option<String> = None;
-
-    // Use cluster query engine for proper aggregation across all shards
     let sql = "SELECT queue_name, entry_type, COUNT(*) as cnt FROM queues GROUP BY queue_name, entry_type";
+    let partial_rows = query_shards_partial::<QueueCountQueryRow>(&state, sql).await;
 
-    match state.query_engine.sql(sql).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                for batch in batches {
-                    let name_col = batch.column_by_name("queue_name").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let type_col = batch.column_by_name("entry_type").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let cnt_col = batch.column_by_name("cnt").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                    });
+    for row in partial_rows.rows {
+        let Some(queue_name) = row.queue_name else {
+            continue;
+        };
+        if queue_name.is_empty() {
+            continue;
+        }
 
-                    if let (Some(names), Some(types), Some(counts)) = (name_col, type_col, cnt_col)
-                    {
-                        for i in 0..batch.num_rows() {
-                            let queue_name = names.value(i).to_string();
-                            let entry_type = types.value(i);
-                            let count = counts.value(i) as usize;
-
-                            if !queue_name.is_empty() {
-                                let entry = all_queues.entry(queue_name).or_insert((0, 0));
-                                match entry_type {
-                                    "holder" => entry.0 += count,
-                                    "requester" => entry.1 += count,
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to collect query results");
-                error = Some(format!("Query execution error: {}", e));
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "failed to query queues from cluster");
-            error = Some(format!("Query error: {}", e));
+        let count = row.cnt.unwrap_or(0).max(0) as usize;
+        let entry = all_queues.entry(queue_name).or_insert((0, 0));
+        match row.entry_type.as_deref() {
+            Some("holder") => entry.0 += count,
+            Some("requester") => entry.1 += count,
+            _ => {}
         }
     }
 
@@ -867,10 +950,17 @@ async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
     queues.sort_by(|a, b| b.holders.cmp(&a.holders));
 
+    let error = if partial_rows.errors.is_empty() {
+        None
+    } else {
+        Some(partial_rows.errors.join("\n"))
+    };
+
     let template = QueuesTemplate {
         nav_active: "queues",
         tenancy_enabled: state.config.tenancy.enabled,
         queues,
+        unavailable_shards: partial_rows.unavailable_shards,
         error,
     };
 
@@ -1057,62 +1147,28 @@ async fn tenants_handler(
 
     let mut status_by_tenant: HashMap<String, TenantStatusCounts> = HashMap::new();
     let mut errors: Vec<String> = Vec::new();
-
     let jobs_sql = "SELECT tenant, status_kind, cnt FROM tenant_counts";
-    match state.query_engine.sql(jobs_sql).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                for batch in batches {
-                    let tenant_col = batch.column_by_name("tenant").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let status_col = batch.column_by_name("status_kind").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    });
-                    let count_col = batch.column_by_name("cnt").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                    });
+    let partial_rows = query_shards_partial::<TenantCountQueryRow>(&state, jobs_sql).await;
 
-                    if let (Some(tenants), Some(statuses), Some(counts)) =
-                        (tenant_col, status_col, count_col)
-                    {
-                        for i in 0..batch.num_rows() {
-                            if tenants.is_null(i) {
-                                continue;
-                            }
-                            let tenant = tenants.value(i).to_string();
-                            let status = if statuses.is_null(i) {
-                                ""
-                            } else {
-                                statuses.value(i)
-                            };
-                            let count = counts.value(i).max(0) as usize;
+    for row in partial_rows.rows {
+        let Some(tenant) = row.tenant else {
+            continue;
+        };
 
-                            let entry = status_by_tenant.entry(tenant).or_default();
-                            entry.total += count;
-                            match status {
-                                "Scheduled" | "Waiting" => entry.scheduled += count,
-                                "Running" => entry.running += count,
-                                "Succeeded" | "Failed" | "Cancelled" => entry.terminal += count,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to collect tenant status query results");
-                errors.push(format!("Jobs aggregation failed: {}", e));
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "failed to query tenant status aggregates");
-            errors.push(format!("Jobs query failed: {}", e));
+        let status = row.status_kind.unwrap_or_default();
+        let count = row.cnt.unwrap_or(0).max(0) as usize;
+
+        let entry = status_by_tenant.entry(tenant).or_default();
+        entry.total += count;
+        match status.as_str() {
+            "Scheduled" | "Waiting" => entry.scheduled += count,
+            "Running" => entry.running += count,
+            "Succeeded" | "Failed" | "Cancelled" => entry.terminal += count,
+            _ => {}
         }
     }
+
+    errors.extend(partial_rows.errors);
 
     let mut tenant_names = std::collections::BTreeSet::new();
     for tenant in status_by_tenant.keys() {
@@ -1172,6 +1228,7 @@ async fn tenants_handler(
         page,
         per_page,
         total_pages,
+        unavailable_shards: partial_rows.unavailable_shards,
         error,
     };
 
@@ -1482,6 +1539,8 @@ async fn render_cluster_page(state: &AppState) -> Html<String> {
             "local".to_string()
         };
 
+        let is_unavailable = shard_info.is_none();
+
         // Check if this shard has a split in progress
         let split_phase = active_split_map
             .get(&shard_id.to_string())
@@ -1511,6 +1570,7 @@ async fn render_cluster_page(state: &AppState) -> Html<String> {
             name: shard_id.to_string(),
             owner,
             job_count,
+            is_unavailable,
             split_phase,
             cleanup_status,
             parent_shard_id,
