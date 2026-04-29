@@ -880,8 +880,13 @@ async fn siloctl_heap_profile() -> anyhow::Result<()> {
         );
         assert!(output_path.exists(), "heap profile file should exist");
 
-        let metadata = std::fs::metadata(&output_path)?;
-        assert!(metadata.len() > 0, "heap profile should not be empty");
+        let profile_bytes = std::fs::read(&output_path)?;
+        assert!(!profile_bytes.is_empty(), "heap profile should not be empty");
+        assert!(
+            profile_bytes.starts_with(b"heap_v2/"),
+            "heap profile should start with jeprof header, got {:?}",
+            &profile_bytes[..profile_bytes.len().min(16)]
+        );
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())

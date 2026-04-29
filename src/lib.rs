@@ -53,25 +53,19 @@ union MallocConfPtr {
     as_c_char: &'static std::ffi::c_char,
 }
 
-// Enable jemalloc heap profiling support in-process without requiring MALLOC_CONF
-// to be injected externally at startup.
 #[cfg(unix)]
-#[used]
-#[unsafe(no_mangle)]
-pub static malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
-    MallocConfPtr {
-        as_u8: &b"prof:true,prof_active:false,lg_prof_sample:19\0"[0],
-    }
-    .as_c_char
-});
+const MALLOC_CONF_STR: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
+// This build keeps jemalloc's default `_rjem_` prefixing. If we switch to
+// `unprefixed_malloc_on_supported_platforms` later, this export should change
+// to the unprefixed `malloc_conf` symbol in the same patch.
 #[cfg(unix)]
 #[used]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static rjem_malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
     MallocConfPtr {
-        as_u8: &b"prof:true,prof_active:false,lg_prof_sample:19\0"[0],
+        as_u8: &MALLOC_CONF_STR[0],
     }
     .as_c_char
 });

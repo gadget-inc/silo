@@ -1,5 +1,7 @@
 use std::ffi::{CString, c_char};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::Mutex;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -51,6 +53,35 @@ pub fn set_profiling_active(_active: bool) -> anyhow::Result<()> {
     anyhow::bail!("heap profiling is only supported on unix targets")
 }
 
+pub struct ProfilingActivationGuard {
+    deactivate_on_drop: bool,
+}
+
+impl ProfilingActivationGuard {
+    pub fn activate_if_needed() -> anyhow::Result<Self> {
+        let was_active = profiling_active()?;
+        if !was_active {
+            set_profiling_active(true)?;
+        }
+
+        Ok(Self {
+            deactivate_on_drop: !was_active,
+        })
+    }
+
+    pub fn activated_profiling(&self) -> bool {
+        self.deactivate_on_drop
+    }
+}
+
+impl Drop for ProfilingActivationGuard {
+    fn drop(&mut self) {
+        if self.deactivate_on_drop {
+            let _ = set_profiling_active(false);
+        }
+    }
+}
+
 #[cfg(unix)]
 pub fn dump_profile(path: &Path) -> anyhow::Result<()> {
     let mut path_bytes = CString::new(path.as_os_str().as_bytes())
@@ -68,4 +99,29 @@ pub fn dump_profile(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 pub fn dump_profile(_path: &Path) -> anyhow::Result<()> {
     anyhow::bail!("heap profiling is only supported on unix targets")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    static HEAP_PROFILE_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn profiling_guard_deactivates_on_drop() -> anyhow::Result<()> {
+        let _lock = HEAP_PROFILE_TEST_MUTEX.lock().unwrap();
+
+        if !profiling_enabled()? {
+            anyhow::bail!("heap profiling is not enabled in the allocator")
+        }
+
+        set_profiling_active(false)?;
+        {
+            let guard = ProfilingActivationGuard::activate_if_needed()?;
+            assert!(guard.activated_profiling());
+            assert!(profiling_active()?);
+        }
+        assert!(!profiling_active()?);
+        Ok(())
+    }
 }

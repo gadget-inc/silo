@@ -32,7 +32,7 @@ use crate::pb::*;
 use crate::settings::AppConfig;
 use crate::task::DEFAULT_LEASE_MS;
 
-static HEAP_PROFILE_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+static PROFILE_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Convert a job::JobStatusKind to a proto JobStatus enum value
@@ -1662,6 +1662,7 @@ impl Silo for SiloService {
         &self,
         req: Request<CpuProfileRequest>,
     ) -> Result<Response<CpuProfileResponse>, Status> {
+        let _profile_lock = PROFILE_MUTEX.lock().await;
         let r = req.into_inner();
 
         // Validate and clamp duration (1-300 seconds, default 30)
@@ -1731,6 +1732,7 @@ impl Silo for SiloService {
         &self,
         req: Request<HeapProfileRequest>,
     ) -> Result<Response<HeapProfileResponse>, Status> {
+        let _profile_lock = PROFILE_MUTEX.lock().await;
         let r = req.into_inner();
 
         let duration = if r.duration_seconds == 0 {
@@ -1738,8 +1740,6 @@ impl Silo for SiloService {
         } else {
             r.duration_seconds.clamp(1, 300)
         };
-
-        let _profile_lock = HEAP_PROFILE_MUTEX.lock().await;
 
         if !crate::heap_profile::profiling_enabled()
             .map_err(|e| Status::internal(format!("failed to inspect heap profiler: {e}")))?
@@ -1749,15 +1749,14 @@ impl Silo for SiloService {
             ));
         }
 
-        let was_active = crate::heap_profile::profiling_active()
-            .map_err(|e| Status::internal(format!("failed to inspect heap profiler: {e}")))?;
+        let activation_guard = crate::heap_profile::ProfilingActivationGuard::activate_if_needed()
+            .map_err(|e| Status::internal(format!("failed to activate heap profiler: {e}")))?;
 
-        if !was_active {
-            crate::heap_profile::set_profiling_active(true)
-                .map_err(|e| Status::internal(format!("failed to activate heap profiler: {e}")))?;
-        }
-
-        tracing::info!(duration_seconds = duration, "starting heap profile");
+        tracing::warn!(
+            duration_seconds = duration,
+            activated_profiling = activation_guard.activated_profiling(),
+            "starting heap profile; dump may contain sampled live payload bytes"
+        );
 
         tokio::time::sleep(std::time::Duration::from_secs(duration as u64)).await;
 
@@ -1771,12 +1770,6 @@ impl Silo for SiloService {
             std::fs::read(&dump_path)
                 .map_err(|e| Status::internal(format!("failed to read heap profile: {e}")))
         })();
-
-        if !was_active {
-            crate::heap_profile::set_profiling_active(false).map_err(|e| {
-                Status::internal(format!("failed to deactivate heap profiler: {e}"))
-            })?;
-        }
 
         let profile_data = profile_data?;
 

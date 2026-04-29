@@ -95,7 +95,7 @@ enum Command {
     },
     /// Capture a jemalloc heap profile from a Silo node
     HeapProfile {
-        /// Duration in seconds to keep heap profiling active before dumping (1-300)
+        /// Seconds to wait before dumping the current live heap profile (1-300)
         #[arg(long, short = 'd', default_value = "30")]
         duration: u32,
         /// Output file path (default: heap-profile-{timestamp}.heap)

@@ -459,7 +459,7 @@ message CpuProfileResponse {
 // The profiler is activated for the requested duration, then a jemalloc heap
 // dump of currently-live sampled allocations is returned.
 message HeapProfileRequest {
-  uint32 duration_seconds = 1;  // How long to profile before dumping (1-300 seconds). Default 30.
+  uint32 duration_seconds = 1;  // How long to wait before dumping the current live heap profile (1-300 seconds). Default 30.
 }
 
 // Heap profile data in jemalloc/jeprof format.

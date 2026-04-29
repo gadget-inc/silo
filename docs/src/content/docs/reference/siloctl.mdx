@@ -411,7 +411,7 @@ siloctl heap-profile [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-d`, `--duration <SECONDS>` | How long to keep heap profiling active before dumping (1-300, default: 30) |
+| `-d`, `--duration <SECONDS>` | How long to wait before dumping the current live heap profile (1-300, default: 30) |
 | `-o`, `--output <FILE>` | Output file path (default: `heap-profile-{timestamp}.heap`) |
 
 **Example:**
@@ -447,7 +447,7 @@ siloctl --json heap-profile --duration 10
 ```
 
 <Aside type="note">
-Heap profiles require the `silo` binary used to produce the dump when analyzing with `jeprof`. On macOS, only Rust allocations that go through the process allocator are guaranteed to appear in the dump.
+Heap profiles require the exact `silo` binary used to produce the dump when analyzing with `jeprof`; in production, match by image SHA. The duration delays the dump and increases sample density, but the dump still reflects all sampled live allocations at capture time. For a quick snapshot, use `--duration 1`; for leak investigation, leave profiling active longer. On macOS, only allocations that go through the process allocator are guaranteed to appear in the dump.
 </Aside>
 
 ---
