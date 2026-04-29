@@ -401,6 +401,57 @@ Profiling uses sampling and has low overhead (~1-2%). The default 100Hz frequenc
 
 ---
 
+### heap-profile
+
+Capture a jemalloc heap profile from the connected Silo node. This activates heap profiling for the requested duration, then dumps currently-live sampled allocations in `jeprof` format.
+
+```bash
+siloctl heap-profile [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-d`, `--duration <SECONDS>` | How long to wait before dumping the current live heap profile (1-300, default: 30) |
+| `-o`, `--output <FILE>` | Output file path (default: `heap-profile-{timestamp}.heap`) |
+
+**Example:**
+
+```bash
+siloctl -a http://silo-node:7450 heap-profile --duration 30
+```
+
+```
+Starting heap profile for 30 seconds...
+
+Heap profile saved to: heap-profile-1706123456.heap
+Duration: 30s, Size: 18342 bytes
+
+Analyze with:
+  jeprof --text /path/to/silo heap-profile-1706123456.heap
+  jeprof --svg /path/to/silo heap-profile-1706123456.heap > heap.svg
+```
+
+**JSON output:**
+
+```bash
+siloctl --json heap-profile --duration 10
+```
+
+```json
+{
+  "status": "completed",
+  "output_file": "heap-profile-1706123456.heap",
+  "duration_seconds": 10,
+  "profile_bytes": 18342
+}
+```
+
+<Aside type="note">
+Heap profiles require the exact `silo` binary used to produce the dump when analyzing with `jeprof`; in production, match by image SHA. The duration delays the dump and increases sample density, but the dump still reflects all sampled live allocations at capture time. For a quick snapshot, use `--duration 1`; for leak investigation, leave profiling active longer. On macOS, only allocations that go through the process allocator are guaranteed to appear in the dump.
+</Aside>
+
+---
+
 ### validate-config
 
 Validate a Silo configuration file without starting the server. This is useful for checking configuration syntax and semantics before deployment.

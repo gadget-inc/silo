@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use rand::seq::SliceRandom;
@@ -30,6 +31,9 @@ use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
 use crate::task::DEFAULT_LEASE_MS;
+
+static PROFILE_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Convert a job::JobStatusKind to a proto JobStatus enum value
 fn job_status_kind_to_proto(kind: JobStatusKind) -> JobStatus {
@@ -1658,6 +1662,7 @@ impl Silo for SiloService {
         &self,
         req: Request<CpuProfileRequest>,
     ) -> Result<Response<CpuProfileResponse>, Status> {
+        let _profile_lock = PROFILE_MUTEX.lock().await;
         let r = req.into_inner();
 
         // Validate and clamp duration (1-300 seconds, default 30)
@@ -1720,6 +1725,63 @@ impl Silo for SiloService {
             profile_data,
             duration_seconds: duration,
             samples,
+        }))
+    }
+
+    async fn heap_profile(
+        &self,
+        req: Request<HeapProfileRequest>,
+    ) -> Result<Response<HeapProfileResponse>, Status> {
+        let _profile_lock = PROFILE_MUTEX.lock().await;
+        let r = req.into_inner();
+
+        let duration = if r.duration_seconds == 0 {
+            30
+        } else {
+            r.duration_seconds.clamp(1, 300)
+        };
+
+        if !crate::heap_profile::profiling_enabled()
+            .map_err(|e| Status::internal(format!("failed to inspect heap profiler: {e}")))?
+        {
+            return Err(Status::failed_precondition(
+                "heap profiling is not enabled in the allocator",
+            ));
+        }
+
+        let activation_guard = crate::heap_profile::ProfilingActivationGuard::activate_if_needed()
+            .map_err(|e| Status::internal(format!("failed to activate heap profiler: {e}")))?;
+
+        tracing::warn!(
+            duration_seconds = duration,
+            activated_profiling = activation_guard.activated_profiling(),
+            "starting heap profile; dump may contain sampled live payload bytes"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(duration as u64)).await;
+
+        let tmp_dir = tempfile::tempdir()
+            .map_err(|e| Status::internal(format!("failed to create tempdir: {e}")))?;
+        let dump_path = tmp_dir.path().join("silo.heap");
+
+        let profile_data = (|| -> Result<Vec<u8>, Status> {
+            crate::heap_profile::dump_profile(&dump_path)
+                .map_err(|e| Status::internal(format!("failed to dump heap profile: {e}")))?;
+            std::fs::read(&dump_path)
+                .map_err(|e| Status::internal(format!("failed to read heap profile: {e}")))
+        })();
+
+        let profile_data = profile_data?;
+
+        tracing::info!(
+            duration_seconds = duration,
+            profile_bytes = profile_data.len(),
+            "heap profile completed"
+        );
+
+        Ok(Response::new(HeapProfileResponse {
+            profile_data,
+            duration_seconds: duration,
         }))
     }
 

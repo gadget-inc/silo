@@ -7,6 +7,7 @@ pub mod coordination;
 pub mod dst_events;
 pub mod factory;
 pub mod gubernator;
+pub mod heap_profile;
 pub mod job;
 pub mod job_attempt;
 pub mod job_store_shard;
@@ -41,6 +42,33 @@ pub mod pb {
 }
 pub mod server;
 pub mod siloctl;
+
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(unix)]
+union MallocConfPtr {
+    as_u8: &'static u8,
+    as_c_char: &'static std::ffi::c_char,
+}
+
+#[cfg(unix)]
+const MALLOC_CONF_STR: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
+
+// This build keeps jemalloc's default `_rjem_` prefixing. If we switch to
+// `unprefixed_malloc_on_supported_platforms` later, this export should change
+// to the unprefixed `malloc_conf` symbol in the same patch.
+#[cfg(unix)]
+#[used]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static rjem_malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
+    MallocConfPtr {
+        as_u8: &MALLOC_CONF_STR[0],
+    }
+    .as_c_char
+});
 
 /// Default scan options for all silo scans.
 ///

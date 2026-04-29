@@ -93,6 +93,15 @@ enum Command {
         #[arg(long, short = 'o')]
         output: Option<String>,
     },
+    /// Capture a jemalloc heap profile from a Silo node
+    HeapProfile {
+        /// Seconds to wait before dumping the current live heap profile (1-300)
+        #[arg(long, short = 'd', default_value = "30")]
+        duration: u32,
+        /// Output file path (default: heap-profile-{timestamp}.heap)
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+    },
     /// Validate a config file and exit
     ValidateConfig {
         /// Path to the TOML config file to validate
@@ -303,6 +312,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             frequency,
             output,
         } => siloctl::profile(&opts, &mut stdout, *duration, *frequency, output.clone()).await,
+        Command::HeapProfile { duration, output } => {
+            siloctl::heap_profile(&opts, &mut stdout, *duration, output.clone()).await
+        }
         Command::ValidateConfig { config } => {
             siloctl::validate_config(&opts, &mut stdout, config).await
         }

@@ -323,3 +323,42 @@ siloctl profile --output after-change.pb.gz
 # Compare using pprof's diff mode
 pprof -http=:8080 -diff_base=baseline.pb.gz after-change.pb.gz
 ```
+
+## Heap Profiling
+
+Silo also supports on-demand heap profiling using jemalloc's built-in sampling profiler. A heap profile activates jemalloc profiling for a short window, then dumps the currently-live sampled allocations in `jeprof` format.
+
+### Capturing a Heap Profile
+
+Use `siloctl` to capture a heap profile from a running node:
+
+```bash
+siloctl -a http://silo-node:7450 heap-profile --duration 30
+```
+
+Options:
+- `--duration`, `-d`: How long to wait before dumping the current live heap profile (1-300, default 30)
+- `--output`, `-o`: Output file path (default: `heap-profile-{timestamp}.heap`)
+
+### Analyzing Heap Profiles
+
+Heap profiles are saved in jemalloc's `jeprof` format. Analysis requires the exact `silo` binary that produced the dump:
+
+```bash
+# Text summary
+jeprof --text /path/to/silo heap-profile-1706123456.heap
+
+# SVG graph
+jeprof --svg /path/to/silo heap-profile-1706123456.heap > heap.svg
+```
+
+To compare two dumps, use `jeprof --base=<baseline.heap> /path/to/silo <after.heap>`.
+
+### Production Considerations
+
+- Heap profiling is sampling-based rather than a full heap walk, which keeps overhead manageable.
+- The default runtime configuration enables profiling support but keeps sampling inactive until a profile is requested.
+- Profiles show sampled live allocations at dump time; the duration delays the dump and increases sample density during that window, but it does not restrict the dump to allocations created during the wait.
+- For a quick current snapshot, use `--duration 1`. For leak investigation or growth analysis, leave profiling active for several minutes before dumping.
+- Analysts need the exact matching binary for symbolization; in production, match it by image SHA rather than by version tag alone.
+- On macOS, the dump only covers allocations that flow through the process allocator; external system allocations may not appear.

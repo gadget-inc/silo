@@ -167,6 +167,13 @@ impl Silo for CountingClusterInfoService {
         Self::unimplemented("cpu_profile")
     }
 
+    async fn heap_profile(
+        &self,
+        _request: Request<HeapProfileRequest>,
+    ) -> Result<Response<HeapProfileResponse>, Status> {
+        Self::unimplemented("heap_profile")
+    }
+
     async fn request_split(
         &self,
         _request: Request<RequestSplitRequest>,

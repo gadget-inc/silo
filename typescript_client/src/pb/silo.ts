@@ -1238,6 +1238,35 @@ export interface CpuProfileResponse {
     samples: bigint; // Number of samples collected.
 }
 /**
+ * Request to capture a heap profile from this node.
+ * The profiler is activated for the requested duration, then a jemalloc heap
+ * dump of currently-live sampled allocations is returned.
+ *
+ * @generated from protobuf message silo.v1.HeapProfileRequest
+ */
+export interface HeapProfileRequest {
+    /**
+     * @generated from protobuf field: uint32 duration_seconds = 1
+     */
+    durationSeconds: number; // How long to wait before dumping the current live heap profile (1-300 seconds). Default 30.
+}
+/**
+ * Heap profile data in jemalloc/jeprof format.
+ * Analyze with `jeprof <path-to-silo-binary> <profile-file>`.
+ *
+ * @generated from protobuf message silo.v1.HeapProfileResponse
+ */
+export interface HeapProfileResponse {
+    /**
+     * @generated from protobuf field: bytes profile_data = 1
+     */
+    profileData: Uint8Array; // jemalloc heap profile bytes.
+    /**
+     * @generated from protobuf field: uint32 duration_seconds = 2
+     */
+    durationSeconds: number; // Actual duration profiled.
+}
+/**
  * Request to initiate a shard split operation.
  *
  * @generated from protobuf message silo.v1.RequestSplitRequest
@@ -5476,6 +5505,108 @@ class CpuProfileResponse$Type extends MessageType<CpuProfileResponse> {
  */
 export const CpuProfileResponse = new CpuProfileResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class HeapProfileRequest$Type extends MessageType<HeapProfileRequest> {
+    constructor() {
+        super("silo.v1.HeapProfileRequest", [
+            { no: 1, name: "duration_seconds", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<HeapProfileRequest>): HeapProfileRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.durationSeconds = 0;
+        if (value !== undefined)
+            reflectionMergePartial<HeapProfileRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: HeapProfileRequest): HeapProfileRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint32 duration_seconds */ 1:
+                    message.durationSeconds = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: HeapProfileRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint32 duration_seconds = 1; */
+        if (message.durationSeconds !== 0)
+            writer.tag(1, WireType.Varint).uint32(message.durationSeconds);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.HeapProfileRequest
+ */
+export const HeapProfileRequest = new HeapProfileRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class HeapProfileResponse$Type extends MessageType<HeapProfileResponse> {
+    constructor() {
+        super("silo.v1.HeapProfileResponse", [
+            { no: 1, name: "profile_data", kind: "scalar", T: 12 /*ScalarType.BYTES*/ },
+            { no: 2, name: "duration_seconds", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<HeapProfileResponse>): HeapProfileResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.profileData = new Uint8Array(0);
+        message.durationSeconds = 0;
+        if (value !== undefined)
+            reflectionMergePartial<HeapProfileResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: HeapProfileResponse): HeapProfileResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* bytes profile_data */ 1:
+                    message.profileData = reader.bytes();
+                    break;
+                case /* uint32 duration_seconds */ 2:
+                    message.durationSeconds = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: HeapProfileResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* bytes profile_data = 1; */
+        if (message.profileData.length)
+            writer.tag(1, WireType.LengthDelimited).bytes(message.profileData);
+        /* uint32 duration_seconds = 2; */
+        if (message.durationSeconds !== 0)
+            writer.tag(2, WireType.Varint).uint32(message.durationSeconds);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.HeapProfileResponse
+ */
+export const HeapProfileResponse = new HeapProfileResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class RequestSplitRequest$Type extends MessageType<RequestSplitRequest> {
     constructor() {
         super("silo.v1.RequestSplitRequest", [
@@ -6833,6 +6964,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "Query", options: {}, I: QueryRequest, O: QueryResponse },
     { name: "QueryArrow", serverStreaming: true, options: {}, I: QueryArrowRequest, O: ArrowIpcMessage },
     { name: "CpuProfile", options: {}, I: CpuProfileRequest, O: CpuProfileResponse },
+    { name: "HeapProfile", options: {}, I: HeapProfileRequest, O: HeapProfileResponse },
     { name: "RequestSplit", options: {}, I: RequestSplitRequest, O: RequestSplitResponse },
     { name: "GetSplitStatus", options: {}, I: GetSplitStatusRequest, O: GetSplitStatusResponse },
     { name: "ConfigureShard", options: {}, I: ConfigureShardRequest, O: ConfigureShardResponse },
