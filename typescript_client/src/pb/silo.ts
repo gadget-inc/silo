@@ -1248,7 +1248,7 @@ export interface HeapProfileRequest {
     /**
      * @generated from protobuf field: uint32 duration_seconds = 1
      */
-    durationSeconds: number; // How long to profile before dumping (1-300 seconds). Default 30.
+    durationSeconds: number; // How long to wait before dumping the current live heap profile (1-300 seconds). Default 30.
 }
 /**
  * Heap profile data in jemalloc/jeprof format.

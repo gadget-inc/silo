@@ -61,6 +61,11 @@
     {
       devShells.default = pkgs.mkShell {
         name = "silo-shell";
+        # Disable fortify hardening so jemalloc's configure script can build
+        # its strerror_r feature test. Nix's default _FORTIFY_SOURCE=2 + cargo's
+        # debug -O0 + jemalloc's -Werror combine into a hard error in glibc's
+        # features.h ("_FORTIFY_SOURCE requires compiling with optimization").
+        hardeningDisable = [ "fortify" ];
         packages = [
           rustToolchain
         ] ++ (with pkgs; [

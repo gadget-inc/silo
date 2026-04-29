@@ -738,11 +738,7 @@ pub async fn heap_profile<W: Write>(
     let mut client = connect(&opts.address, opts.auth_token.as_deref()).await?;
 
     if !opts.json {
-        writeln!(
-            out,
-            "Starting heap profile for {} seconds...",
-            duration
-        )?;
+        writeln!(out, "Starting heap profile for {} seconds...", duration)?;
         out.flush()?;
     }
 
@@ -794,7 +790,11 @@ pub async fn heap_profile<W: Write>(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(output_file.clone());
         writeln!(out, "  jeprof --text /path/to/silo {}", display_path)?;
-        writeln!(out, "  jeprof --svg /path/to/silo {} > heap.svg", display_path)?;
+        writeln!(
+            out,
+            "  jeprof --svg /path/to/silo {} > heap.svg",
+            display_path
+        )?;
     }
 
     Ok(())
