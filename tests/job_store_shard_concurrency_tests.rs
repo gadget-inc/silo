@@ -1834,3 +1834,104 @@ async fn grant_scanner_interleaved_stale_and_valid_requests() {
     );
     assert_eq!(count_concurrency_holders(shard.db()).await, 5);
 }
+
+/// Regression test for the unbounded `join_all` fan-out in `process_grants`
+/// that drove production OOMs (heap profile showed ~5.5 GB pinned in
+/// `CachedObjectStore::read_part` from concurrent slatedb reads).
+///
+/// Exercises the bounded `buffered(STATUS_LOOKUP_CONCURRENCY)` path with a
+/// pending backlog larger than the in-flight cap (currently 64). Verifies
+/// correctness — order-preserving validation must still pair each result
+/// with the right request — across more than one buffered batch.
+#[silo::test]
+async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
+    // Sized to be a multiple of STATUS_LOOKUP_CONCURRENCY (64) plus extras
+    // so we cross at least two buffered windows. Kept modest to keep the
+    // test fast while still beating the in-flight cap meaningfully.
+    const N: usize = 200;
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "backlog-q";
+    let tenant = "backlog-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: N as u32,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Fill all N concurrency slots with holders.
+    for i in 0..N {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("holder-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    let mut holder_tasks = Vec::with_capacity(N);
+    while holder_tasks.len() < N {
+        let tasks = shard.dequeue("w", "tg", N).await.unwrap().tasks;
+        assert!(!tasks.is_empty(), "dequeue should return holders");
+        for t in tasks {
+            holder_tasks.push(t.attempt().task_id().to_string());
+        }
+    }
+
+    // Enqueue N more — capacity is full, so each becomes a request record.
+    for i in 0..N {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("waiter-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(count_concurrency_requests(shard.db()).await, N);
+
+    // Release all holders to free capacity for the waiters.
+    for task_id in &holder_tasks {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .unwrap();
+    }
+
+    // One process_grants call should drain all N waiters. Internally this
+    // runs the buffered status-lookup pipeline across multiple batches of
+    // up to STATUS_LOOKUP_CONCURRENCY (64) in-flight db.gets.
+    let granted = shard
+        .process_concurrency_grants(tenant, queue, N as u32)
+        .await;
+    assert_eq!(
+        granted.len(),
+        N,
+        "all {} valid waiters should be granted via the bounded buffered pipeline",
+        N
+    );
+
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "all request records should be consumed"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, N);
+}

@@ -40,6 +40,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures::StreamExt;
+
 use slatedb::config::WriteOptions;
 use slatedb::{Db, DbIterator, WriteBatch};
 
@@ -83,6 +85,13 @@ impl From<crate::codec::CodecError> for ConcurrencyError {
         ConcurrencyError::Encoding(e.to_string())
     }
 }
+
+/// Max in-flight `db.get(job_status_key)` lookups during a single
+/// `process_grants` pass. Caps slatedb-side block-fetch fan-out so the
+/// scanner can't pin unbounded `Bytes` while validating a large pending
+/// backlog. Mirrors the `CONCURRENCY = 64` pattern used in
+/// `job_store_shard::get_jobs_status_batch` for the same reason.
+const STATUS_LOOKUP_CONCURRENCY: usize = 64;
 
 /// Result of attempting to enqueue a job with concurrency limits
 #[derive(Debug)]
@@ -917,14 +926,25 @@ impl ConcurrencyManager {
             }
 
             // --- Batch validate status ---
-            let status_futures: Vec<_> = scanned
+            // Use `buffered` (order-preserving) rather than `join_all` so that
+            // we cap in-flight slatedb reads at STATUS_LOOKUP_CONCURRENCY. Each
+            // db.get() can fan out to many SST block fetches; with thousands of
+            // pending requests, an unbounded join_all pinned multi-GB of Bytes.
+            // `buffered` (not `buffer_unordered`) keeps results in scanned-order
+            // for the zip below. Keys are materialized owned to avoid borrowing
+            // `scanned` across await points (needed for HRTB on the async closure).
+            let status_keys: Vec<_> = scanned
                 .iter()
-                .map(|c| {
-                    let key = job_status_key(tenant, &c.job_id);
-                    async move { db.get(&key).await }
-                })
+                .map(|c| job_status_key(tenant, &c.job_id))
                 .collect();
-            let status_results = futures::future::join_all(status_futures).await;
+            let status_results: Vec<_> = futures::stream::iter(
+                status_keys
+                    .into_iter()
+                    .map(|key| async move { db.get(&key).await }),
+            )
+            .buffered(STATUS_LOOKUP_CONCURRENCY)
+            .collect()
+            .await;
 
             let mut valid_requests: Vec<ScannedRequest> = Vec::new();
             for (req, status_result) in scanned.into_iter().zip(status_results.into_iter()) {
