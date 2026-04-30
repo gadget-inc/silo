@@ -462,11 +462,33 @@ message HeapProfileRequest {
   uint32 duration_seconds = 1;  // How long to wait before dumping the current live heap profile (1-300 seconds). Default 30.
 }
 
+// Snapshot of jemalloc memory stats at the time the heap profile was captured.
+// All values are bytes. See jemalloc's `stats.*` mallctl namespace for definitions.
+message JemallocStats {
+  uint64 allocated = 1;  // Bytes allocated by the application (live objects).
+  uint64 active = 2;     // Bytes in pages allocated by the application.
+  uint64 resident = 3;   // Bytes in physically resident pages (RSS-equivalent).
+  uint64 mapped = 4;     // Bytes in extents mapped from the OS.
+  uint64 metadata = 5;   // Bytes used by jemalloc internal metadata.
+  uint64 retained = 6;   // Bytes retained from the OS but not in active use.
+}
+
+// Per-cache record describing a SlateDB block/meta cache configured on this node.
+// `capacity_bytes` is the foyer cache's max capacity (an upper bound on the
+// in-RAM footprint of cached object-storage blocks for this shard).
+message ObjectCacheStat {
+  string shard = 1;           // Shard name/UUID that owns the cache.
+  string kind = 2;            // "block" or "meta".
+  uint64 capacity_bytes = 3;  // Configured max capacity in bytes.
+}
+
 // Heap profile data in jemalloc/jeprof format.
 // Analyze with `jeprof <path-to-silo-binary> <profile-file>`.
 message HeapProfileResponse {
   bytes profile_data = 1;       // jemalloc heap profile bytes.
   uint32 duration_seconds = 2;  // Actual duration profiled.
+  JemallocStats jemalloc_stats = 3;             // Allocator stats at capture time.
+  repeated ObjectCacheStat object_caches = 4;   // Per-shard SlateDB cache configurations.
 }
 
 // Request to initiate a shard split operation.

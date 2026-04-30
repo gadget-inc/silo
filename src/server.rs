@@ -1773,15 +1773,62 @@ impl Silo for SiloService {
 
         let profile_data = profile_data?;
 
-        tracing::info!(
-            duration_seconds = duration,
-            profile_bytes = profile_data.len(),
-            "heap profile completed"
-        );
+        let jemalloc_stats = match crate::heap_profile::read_stats() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read jemalloc stats for heap profile");
+                None
+            }
+        };
+
+        let object_caches = crate::heap_profile::read_object_cache_stats();
+
+        let object_cache_total: u64 = object_caches.iter().map(|c| c.capacity_bytes).sum();
+        if let Some(s) = jemalloc_stats.as_ref() {
+            tracing::info!(
+                duration_seconds = duration,
+                profile_bytes = profile_data.len(),
+                jemalloc_allocated = s.allocated,
+                jemalloc_active = s.active,
+                jemalloc_resident = s.resident,
+                jemalloc_mapped = s.mapped,
+                jemalloc_metadata = s.metadata,
+                jemalloc_retained = s.retained,
+                object_cache_capacity_total = object_cache_total,
+                object_cache_count = object_caches.len(),
+                "heap profile completed"
+            );
+        } else {
+            tracing::info!(
+                duration_seconds = duration,
+                profile_bytes = profile_data.len(),
+                object_cache_capacity_total = object_cache_total,
+                object_cache_count = object_caches.len(),
+                "heap profile completed"
+            );
+        }
+
+        let object_caches_pb = object_caches
+            .into_iter()
+            .map(|c| ObjectCacheStat {
+                shard: c.shard,
+                kind: c.kind.as_str().to_string(),
+                capacity_bytes: c.capacity_bytes,
+            })
+            .collect();
 
         Ok(Response::new(HeapProfileResponse {
             profile_data,
             duration_seconds: duration,
+            jemalloc_stats: jemalloc_stats.map(|s| JemallocStats {
+                allocated: s.allocated,
+                active: s.active,
+                resident: s.resident,
+                mapped: s.mapped,
+                metadata: s.metadata,
+                retained: s.retained,
+            }),
+            object_caches: object_caches_pb,
         }))
     }
 
