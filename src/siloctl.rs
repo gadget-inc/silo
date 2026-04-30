@@ -765,12 +765,32 @@ pub async fn heap_profile<W: Write>(
 
     std::fs::write(&output_file, &response.profile_data)?;
 
+    let object_cache_total: u64 = response
+        .object_caches
+        .iter()
+        .map(|c| c.capacity_bytes)
+        .sum();
+
     if opts.json {
         let json_output = serde_json::json!({
             "status": "completed",
             "output_file": output_file,
             "duration_seconds": response.duration_seconds,
             "profile_bytes": response.profile_data.len(),
+            "jemalloc_stats": response.jemalloc_stats.as_ref().map(|s| serde_json::json!({
+                "allocated": s.allocated,
+                "active": s.active,
+                "resident": s.resident,
+                "mapped": s.mapped,
+                "metadata": s.metadata,
+                "retained": s.retained,
+            })),
+            "object_caches": response.object_caches.iter().map(|c| serde_json::json!({
+                "shard": c.shard,
+                "kind": c.kind,
+                "capacity_bytes": c.capacity_bytes,
+            })).collect::<Vec<_>>(),
+            "object_cache_capacity_total": object_cache_total,
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
     } else {
@@ -782,6 +802,73 @@ pub async fn heap_profile<W: Write>(
             response.duration_seconds,
             response.profile_data.len()
         )?;
+
+        if let Some(s) = response.jemalloc_stats.as_ref() {
+            writeln!(out)?;
+            writeln!(out, "Jemalloc stats:")?;
+            writeln!(
+                out,
+                "  allocated: {:>14}  ({})",
+                s.allocated,
+                format_byte_size(s.allocated)
+            )?;
+            writeln!(
+                out,
+                "  active:    {:>14}  ({})",
+                s.active,
+                format_byte_size(s.active)
+            )?;
+            writeln!(
+                out,
+                "  resident:  {:>14}  ({})",
+                s.resident,
+                format_byte_size(s.resident)
+            )?;
+            writeln!(
+                out,
+                "  mapped:    {:>14}  ({})",
+                s.mapped,
+                format_byte_size(s.mapped)
+            )?;
+            writeln!(
+                out,
+                "  metadata:  {:>14}  ({})",
+                s.metadata,
+                format_byte_size(s.metadata)
+            )?;
+            writeln!(
+                out,
+                "  retained:  {:>14}  ({})",
+                s.retained,
+                format_byte_size(s.retained)
+            )?;
+        }
+
+        if !response.object_caches.is_empty() {
+            writeln!(out)?;
+            writeln!(
+                out,
+                "Object-storage caches ({} entries, configured capacity — actual RAM use is bounded by allocated above):",
+                response.object_caches.len()
+            )?;
+            for c in &response.object_caches {
+                writeln!(
+                    out,
+                    "  shard={} kind={:<5} capacity={} ({})",
+                    c.shard,
+                    c.kind,
+                    c.capacity_bytes,
+                    format_byte_size(c.capacity_bytes)
+                )?;
+            }
+            writeln!(
+                out,
+                "  total configured capacity: {} ({})",
+                object_cache_total,
+                format_byte_size(object_cache_total)
+            )?;
+        }
+
         writeln!(out)?;
         writeln!(out, "Analyze with:")?;
 
@@ -798,6 +885,22 @@ pub async fn heap_profile<W: Write>(
     }
 
     Ok(())
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b / KIB)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 /// Request a shard split operation

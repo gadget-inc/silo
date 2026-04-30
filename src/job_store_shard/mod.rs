@@ -333,18 +333,32 @@ impl JobStoreShard {
                 foyer::{FoyerCache, FoyerCacheOptions},
             };
 
+            let block_capacity = cache_cfg
+                .block_cache_bytes
+                .unwrap_or(DEFAULT_BLOCK_CACHE_CAPACITY);
+            let meta_capacity = cache_cfg
+                .meta_cache_bytes
+                .unwrap_or(DEFAULT_META_CACHE_CAPACITY);
+
             let block_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-                max_capacity: cache_cfg
-                    .block_cache_bytes
-                    .unwrap_or(DEFAULT_BLOCK_CACHE_CAPACITY),
+                max_capacity: block_capacity,
                 ..Default::default()
             }));
             let meta_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-                max_capacity: cache_cfg
-                    .meta_cache_bytes
-                    .unwrap_or(DEFAULT_META_CACHE_CAPACITY),
+                max_capacity: meta_capacity,
                 ..Default::default()
             }));
+
+            crate::heap_profile::register_object_cache(
+                name.clone(),
+                crate::heap_profile::ObjectCacheKind::Block,
+                block_capacity,
+            );
+            crate::heap_profile::register_object_cache(
+                name.clone(),
+                crate::heap_profile::ObjectCacheKind::Meta,
+                meta_capacity,
+            );
 
             let cache = SplitCache::new()
                 .with_block_cache(Some(block_cache))
