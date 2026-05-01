@@ -296,6 +296,8 @@ pub fn dst_turmoilfs_database_template(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        concurrency_status_lookup_concurrency:
+            silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
         slatedb: Some(dst_slatedb_settings()),
         memory_cache: None,
     }
@@ -323,6 +325,8 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: Some(dst_slatedb_settings()),
             memory_cache: None,
         },

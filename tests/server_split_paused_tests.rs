@@ -186,6 +186,8 @@ async fn create_test_service(paused: bool) -> (SiloService, Arc<MockPausedCoordi
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: None,
             memory_cache: None,
         },
@@ -601,6 +603,8 @@ async fn enqueue_fails_when_k8s_api_unreachable_during_split() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: None,
             memory_cache: None,
         },

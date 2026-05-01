@@ -86,12 +86,15 @@ impl From<crate::codec::CodecError> for ConcurrencyError {
     }
 }
 
-/// Max in-flight `db.get(job_status_key)` lookups during a single
-/// `process_grants` pass. Caps slatedb-side block-fetch fan-out so the
-/// scanner can't pin unbounded `Bytes` while validating a large pending
-/// backlog. Mirrors the `CONCURRENCY = 64` pattern used in
+/// Default cap on in-flight `db.get(job_status_key)` lookups during a single
+/// `process_grants` pass. Caps slatedb-side block-fetch fan-out so the scanner
+/// can't pin unbounded `Bytes` while validating a large pending backlog.
+/// Mirrors the `CONCURRENCY = 64` pattern used in
 /// `job_store_shard::get_jobs_status_batch` for the same reason.
-const STATUS_LOOKUP_CONCURRENCY: usize = 64;
+///
+/// Operators can override this per shard via the
+/// `database.concurrency_status_lookup_concurrency` TOML setting.
+pub const DEFAULT_STATUS_LOOKUP_CONCURRENCY: usize = 64;
 
 /// Result of attempting to enqueue a job with concurrency limits
 #[derive(Debug)]
@@ -377,6 +380,10 @@ pub struct ConcurrencyManager {
     /// In-memory cache of resolved concurrency limits per queue.
     /// Key: concurrency_counts_key(tenant, queue). Populated during enqueue and grant_next.
     limit_cache: Mutex<HashMap<Vec<u8>, CachedQueueLimit>>,
+    /// Cap on in-flight `db.get(job_status_key)` lookups during a single
+    /// `process_grants` pass. Configured at construction time and held for the
+    /// life of the manager. Always `>= 1`.
+    status_lookup_concurrency: usize,
 }
 
 impl Default for ConcurrencyManager {
@@ -387,13 +394,26 @@ impl Default for ConcurrencyManager {
 
 impl ConcurrencyManager {
     pub fn new() -> Self {
+        Self::with_status_lookup_concurrency(DEFAULT_STATUS_LOOKUP_CONCURRENCY)
+    }
+
+    /// Construct a `ConcurrencyManager` with a custom cap on in-flight
+    /// `db.get(job_status_key)` lookups in `process_grants`. Values < 1 are
+    /// clamped to 1.
+    pub fn with_status_lookup_concurrency(status_lookup_concurrency: usize) -> Self {
         Self {
             counts: ConcurrencyCounts::new(),
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
             limit_cache: Mutex::new(HashMap::new()),
+            status_lookup_concurrency: status_lookup_concurrency.max(1),
         }
+    }
+
+    /// The configured cap on in-flight status lookups in `process_grants`.
+    pub fn status_lookup_concurrency(&self) -> usize {
+        self.status_lookup_concurrency
     }
 
     pub fn counts(&self) -> &ConcurrencyCounts {
@@ -927,9 +947,9 @@ impl ConcurrencyManager {
 
             // --- Batch validate status ---
             // Use `buffered` (order-preserving) rather than `join_all` so that
-            // we cap in-flight slatedb reads at STATUS_LOOKUP_CONCURRENCY. Each
-            // db.get() can fan out to many SST block fetches; with thousands of
-            // pending requests, an unbounded join_all pinned multi-GB of Bytes.
+            // we cap in-flight slatedb reads at `self.status_lookup_concurrency`.
+            // Each db.get() can fan out to many SST block fetches; with thousands
+            // of pending requests, an unbounded join_all pinned multi-GB of Bytes.
             // `buffered` (not `buffer_unordered`) keeps results in scanned-order
             // for the zip below. Keys are materialized owned to avoid borrowing
             // `scanned` across await points (needed for HRTB on the async closure).
@@ -942,7 +962,7 @@ impl ConcurrencyManager {
                     .into_iter()
                     .map(|key| async move { db.get(&key).await }),
             )
-            .buffered(STATUS_LOOKUP_CONCURRENCY)
+            .buffered(self.status_lookup_concurrency)
             .collect()
             .await;
 
@@ -1183,4 +1203,34 @@ fn append_request_edits<W: WriteBatcher>(
     writer.merge(&counter_key, encode_counter(1))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_status_lookup_concurrency_matches_constant() {
+        let mgr = ConcurrencyManager::new();
+        assert_eq!(
+            mgr.status_lookup_concurrency(),
+            DEFAULT_STATUS_LOOKUP_CONCURRENCY,
+        );
+    }
+
+    #[test]
+    fn with_status_lookup_concurrency_stores_configured_value() {
+        let mgr = ConcurrencyManager::with_status_lookup_concurrency(8);
+        assert_eq!(mgr.status_lookup_concurrency(), 8);
+
+        let mgr = ConcurrencyManager::with_status_lookup_concurrency(256);
+        assert_eq!(mgr.status_lookup_concurrency(), 256);
+    }
+
+    #[test]
+    fn status_lookup_concurrency_is_clamped_to_at_least_one() {
+        // `buffered(0)` would deadlock the grant scanner — clamp invalid input.
+        let mgr = ConcurrencyManager::with_status_lookup_concurrency(0);
+        assert_eq!(mgr.status_lookup_concurrency(), 1);
+    }
 }

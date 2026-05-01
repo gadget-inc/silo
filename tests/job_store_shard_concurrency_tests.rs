@@ -1839,15 +1839,15 @@ async fn grant_scanner_interleaved_stale_and_valid_requests() {
 /// that drove production OOMs (heap profile showed ~5.5 GB pinned in
 /// `CachedObjectStore::read_part` from concurrent slatedb reads).
 ///
-/// Exercises the bounded `buffered(STATUS_LOOKUP_CONCURRENCY)` path with a
-/// pending backlog larger than the in-flight cap (currently 64). Verifies
+/// Exercises the bounded `buffered(self.status_lookup_concurrency)` path with a
+/// pending backlog larger than the in-flight cap (default 64). Verifies
 /// correctness — order-preserving validation must still pair each result
 /// with the right request — across more than one buffered batch.
 #[silo::test]
 async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
-    // Sized to be a multiple of STATUS_LOOKUP_CONCURRENCY (64) plus extras
-    // so we cross at least two buffered windows. Kept modest to keep the
-    // test fast while still beating the in-flight cap meaningfully.
+    // Sized to be a multiple of the default cap (64) plus extras so we cross
+    // at least two buffered windows. Kept modest to keep the test fast while
+    // still beating the in-flight cap meaningfully.
     const N: usize = 200;
 
     let (_tmp, shard) = open_temp_shard().await;
