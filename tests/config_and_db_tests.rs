@@ -35,6 +35,8 @@ async fn open_fs_db_from_config() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: None,
             memory_cache: None,
         },
@@ -312,6 +314,8 @@ async fn factory_close_all_flushes_all_shards_wal() {
         }),
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        concurrency_status_lookup_concurrency:
+            silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
         slatedb: None,
         memory_cache: None,
     };
@@ -569,6 +573,11 @@ path = "/tmp/silo-%shard%"
         cfg.database.concurrency_reconcile_interval_ms, 5000,
         "missing concurrency_reconcile_interval_ms should use default"
     );
+    assert_eq!(
+        cfg.database.concurrency_status_lookup_concurrency,
+        silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
+        "missing concurrency_status_lookup_concurrency should use default"
+    );
 }
 
 #[silo::test]
@@ -582,6 +591,78 @@ concurrency_reconcile_interval_ms = 25
 
     let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
     assert_eq!(cfg.database.concurrency_reconcile_interval_ms, 25);
+}
+
+#[silo::test]
+fn parse_toml_with_custom_concurrency_status_lookup_concurrency() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+concurrency_status_lookup_concurrency = 16
+"#;
+
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert_eq!(cfg.database.concurrency_status_lookup_concurrency, 16);
+}
+
+#[silo::test]
+async fn factory_propagates_status_lookup_concurrency_to_shard() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let template = DatabaseTemplate {
+        backend: Backend::Fs,
+        path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
+        concurrency_status_lookup_concurrency: 7,
+        slatedb: None,
+        memory_cache: None,
+    };
+
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let factory = ShardFactory::new(template, rate_limiter, None);
+    let shard_map = ShardMap::create_initial(1).expect("create shard map");
+    let shard_id = shard_map.shards()[0].id;
+    let shard = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+
+    assert_eq!(
+        shard.concurrency_status_lookup_concurrency(),
+        7,
+        "configured value should reach the ConcurrencyManager"
+    );
+}
+
+#[silo::test]
+async fn factory_clamps_zero_status_lookup_concurrency_to_one() {
+    // `buffered(0)` would deadlock. The factory clamps to 1 before reaching the manager.
+    let tmp = tempfile::tempdir().unwrap();
+
+    let template = DatabaseTemplate {
+        backend: Backend::Fs,
+        path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        concurrency_reconcile_interval_ms: 5000,
+        concurrency_status_lookup_concurrency: 0,
+        slatedb: None,
+        memory_cache: None,
+    };
+
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let factory = ShardFactory::new(template, rate_limiter, None);
+    let shard_map = ShardMap::create_initial(1).expect("create shard map");
+    let shard_id = shard_map.shards()[0].id;
+    let shard = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+
+    assert_eq!(shard.concurrency_status_lookup_concurrency(), 1);
 }
 
 #[silo::test]
@@ -801,6 +882,8 @@ async fn factory_passes_slatedb_settings_to_shards() {
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        concurrency_status_lookup_concurrency:
+            silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(std::time::Duration::from_millis(25)),
             l0_sst_size_bytes: 16777216, // 16MB

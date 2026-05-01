@@ -74,6 +74,8 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: None,
             memory_cache: None,
         };
@@ -744,6 +746,8 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: None,
             memory_cache: None,
         };
@@ -932,6 +936,8 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: None,
             memory_cache: None,
         };
@@ -1060,6 +1066,8 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            concurrency_status_lookup_concurrency:
+                silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             slatedb: None,
             memory_cache: None,
         };
@@ -1185,6 +1193,8 @@ async fn setup_test_server_production_path(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        concurrency_status_lookup_concurrency:
+            silo::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
         slatedb: None,
         memory_cache: None,
     };

@@ -76,6 +76,9 @@ pub struct OpenShardOptions {
     pub metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     pub concurrency_reconcile_interval: Duration,
+    /// Cap on in-flight `db.get(job_status_key)` lookups during a single
+    /// `process_grants` pass. See [`crate::concurrency::ConcurrencyManager`].
+    pub concurrency_status_lookup_concurrency: usize,
 }
 
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
@@ -271,6 +274,8 @@ impl JobStoreShard {
                 concurrency_reconcile_interval: Duration::from_millis(
                     crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
                 ),
+                concurrency_status_lookup_concurrency:
+                    crate::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
             },
             range,
         )
@@ -307,6 +312,7 @@ impl JobStoreShard {
             rate_limiter,
             metrics,
             concurrency_reconcile_interval,
+            concurrency_status_lookup_concurrency,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -356,7 +362,9 @@ impl JobStoreShard {
 
         let db = db_builder.build().await?;
         let db = Arc::new(db);
-        let concurrency = Arc::new(ConcurrencyManager::new());
+        let concurrency = Arc::new(ConcurrencyManager::with_status_lookup_concurrency(
+            concurrency_status_lookup_concurrency,
+        ));
 
         // Note: concurrency counts are hydrated lazily on first access to each queue.
         // This avoids blocking shard startup while scanning potentially large holder sets.
@@ -614,6 +622,13 @@ impl JobStoreShard {
     /// with manual `process_concurrency_grants` calls.
     pub fn stop_grant_scanner(&self) {
         self.concurrency.stop_grant_scanner();
+    }
+
+    /// The configured cap on in-flight `db.get(job_status_key)` lookups during a
+    /// single `process_grants` pass. Exposed for tests/diagnostics that verify
+    /// configuration plumbing.
+    pub fn concurrency_status_lookup_concurrency(&self) -> usize {
+        self.concurrency.status_lookup_concurrency()
     }
 
     /// Directly process pending concurrency grants for a single queue.

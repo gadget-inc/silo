@@ -182,6 +182,16 @@ fn default_concurrency_reconcile_interval_ms() -> u64 {
     DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS
 }
 
+/// Default cap on in-flight `db.get(job_status_key)` lookups during a single
+/// `process_grants` pass in the concurrency grant scanner. Bounds slatedb-side
+/// block-fetch fan-out so the scanner can't pin unbounded `Bytes` while
+/// validating a large pending backlog. See `concurrency::ConcurrencyManager`.
+pub const DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY: usize = 64;
+
+fn default_concurrency_status_lookup_concurrency() -> usize {
+    DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -206,6 +216,12 @@ pub struct DatabaseTemplate {
     /// to self-heal from missed in-memory notifications.
     #[serde(default = "default_concurrency_reconcile_interval_ms")]
     pub concurrency_reconcile_interval_ms: u64,
+    /// Cap on in-flight `db.get(job_status_key)` lookups during a single
+    /// `process_grants` pass in the concurrency grant scanner. Bounds slatedb-side
+    /// block-fetch fan-out so the scanner can't pin unbounded `Bytes` while
+    /// validating a large pending backlog. Defaults to 64.
+    #[serde(default = "default_concurrency_status_lookup_concurrency")]
+    pub concurrency_status_lookup_concurrency: usize,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -589,6 +605,8 @@ impl AppConfig {
                 wal: None,
                 apply_wal_on_close: true,
                 concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
+                concurrency_status_lookup_concurrency:
+                    default_concurrency_status_lookup_concurrency(),
                 slatedb: None,
                 memory_cache: None,
             },

@@ -93,6 +93,8 @@ impl ShardFactory {
                 wal: None,
                 apply_wal_on_close: false,
                 concurrency_reconcile_interval_ms: 5000,
+                concurrency_status_lookup_concurrency:
+                    crate::settings::DEFAULT_CONCURRENCY_STATUS_LOOKUP_CONCURRENCY,
                 slatedb: None,
                 memory_cache: None,
             },
@@ -196,6 +198,9 @@ impl ShardFactory {
                         concurrency_reconcile_interval: Duration::from_millis(
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
+                        concurrency_status_lookup_concurrency: template
+                            .concurrency_status_lookup_concurrency
+                            .max(1),
                     },
                     range.clone(),
                 )
