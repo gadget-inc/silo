@@ -14,7 +14,8 @@ use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, concurrency_holder_key, floating_limit_state_key, job_info_key, leased_task_key,
+    attempt_key, concurrency_holder_key, concurrency_holders_tenant_prefix, end_bound,
+    floating_limit_state_key, job_info_key, leased_task_key, parse_concurrency_holder_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
@@ -527,5 +528,71 @@ impl JobStoreShard {
         );
 
         Ok(())
+    }
+
+    /// Defensive cleanup: scan tenant-scoped concurrency holders and delete any
+    /// rows attributed to the given `task_id`, releasing the in-memory slot for
+    /// each. Used as a self-healing path when a worker reports outcome for a
+    /// task whose lease has already been reaped — if the reaper somehow failed
+    /// to release the holder atomically, this brings the system back to a
+    /// consistent state.
+    ///
+    /// Returns the number of holder rows deleted. Idempotent: zero deletions on
+    /// repeated calls.
+    pub async fn purge_orphaned_holders_for_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<usize, JobStoreShardError> {
+        let start = concurrency_holders_tenant_prefix(tenant);
+        let end = end_bound(&start);
+        let mut iter: DbIterator = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
+
+        let mut to_delete: Vec<(Vec<u8>, String)> = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
+                continue;
+            };
+            if parsed.task_id == task_id {
+                to_delete.push((kv.key.to_vec(), parsed.queue));
+            }
+        }
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let mut batch = WriteBatch::new();
+        for (key, _) in &to_delete {
+            batch.delete(key);
+        }
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await?;
+
+        // Post-commit: drop the in-memory reservation and wake the grant scanner
+        // so a queued requester can be admitted in place of the orphan.
+        for (_, queue) in &to_delete {
+            self.concurrency
+                .counts()
+                .atomic_release(tenant, queue, task_id);
+            self.concurrency.request_grant(tenant, queue);
+            tracing::warn!(
+                tenant = %tenant,
+                queue = %queue,
+                task_id = %task_id,
+                "purged orphaned concurrency holder during late report_outcome cleanup"
+            );
+        }
+
+        Ok(to_delete.len())
     }
 }

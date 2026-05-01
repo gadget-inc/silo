@@ -1339,10 +1339,29 @@ impl Silo for SiloService {
                 (AttemptOutcome::Cancelled, "cancelled")
             }
         };
-        shard
-            .report_attempt_outcome(&r.task_id, outcome)
-            .await
-            .map_err(map_err)?;
+        match shard.report_attempt_outcome(&r.task_id, outcome).await {
+            Ok(()) => {}
+            Err(e @ crate::job_store_shard::JobStoreShardError::LeaseNotFound(_)) => {
+                // The lease was already reaped server-side (worker SIGTERM,
+                // crashed mid-task, etc.). Self-heal any stranded concurrency
+                // holders attributed to this task_id so a leaked holder can be
+                // recovered by the worker simply retrying its ack.
+                if let Some(tenant) = r.tenant_id.as_deref().filter(|t| !t.is_empty())
+                    && let Err(purge_err) = shard
+                        .purge_orphaned_holders_for_task(tenant, &r.task_id)
+                        .await
+                {
+                    tracing::warn!(
+                        tenant = %tenant,
+                        task_id = %r.task_id,
+                        error = %purge_err,
+                        "best-effort orphan-holder purge failed during late report_outcome"
+                    );
+                }
+                return Err(map_err(e));
+            }
+            Err(e) => return Err(map_err(e)),
+        }
 
         // Record completion metrics
         if let Some(ref m) = self.metrics {
