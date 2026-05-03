@@ -355,6 +355,19 @@ impl JobStoreShard {
         }
 
         let db = db_builder.build().await?;
+
+        // Drain any post-WAL-replay memtable to L0 SSTs before announcing the
+        // shard ready. After a crash with unflushed WAL, slatedb's replay
+        // reconstructs the memtable from WAL SSTs; that memtable can be
+        // arbitrarily large (slatedb sets `max_memtable_bytes = usize::MAX`
+        // for replay). Without this flush, the first writes after open
+        // compete with the flusher still draining the replayed bytes and
+        // can trip `max_unflushed_bytes` backpressure immediately.
+        db.flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await?;
+
         let db = Arc::new(db);
         let concurrency = Arc::new(ConcurrencyManager::new());
 
