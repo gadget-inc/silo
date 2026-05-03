@@ -12,7 +12,7 @@ use storekey::{decode, encode_vec};
 
 use crate::job::{JobStatus, JobStatusKind};
 
-pub(crate) mod prefix {
+pub mod prefix {
     pub const JOB_INFO: u8 = 0x01;
     pub const JOB_STATUS: u8 = 0x02;
     pub const IDX_STATUS_TIME: u8 = 0x03;
