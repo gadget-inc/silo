@@ -182,6 +182,13 @@ fn default_concurrency_reconcile_interval_ms() -> u64 {
     DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS
 }
 
+/// Hardcoded interval for the per-shard counter reconciliation background
+/// task. The reconciler corrects counter drift caused by the standalone
+/// compactor dropping terminal job rows without a writable `Db` handle. There
+/// is no operational reason to tune it per-shard or per-deployment, so it is
+/// not exposed as a config field.
+pub const DEFAULT_COUNTER_RECONCILE_INTERVAL_MS: u64 = 60 * 60 * 1000;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
