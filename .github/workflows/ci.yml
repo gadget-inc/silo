@@ -322,28 +322,23 @@ jobs:
         with:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build silo Docker image with Nix
+      - name: Build Docker images with Nix
         run: |
-          nix build .#packages.${{ matrix.nix_system }}.silo-docker -L
+          nix build -L \
+            .#packages.${{ matrix.nix_system }}.silo-docker \
+            .#packages.${{ matrix.nix_system }}.silo-autoscaler-docker \
+            .#packages.${{ matrix.nix_system }}.silo-compactor-docker
+          # nix build creates result, result-1, result-2 for multiple installables
           docker load < result
-
-      - name: Build silo-autoscaler Docker image with Nix
-        run: |
-          nix build .#packages.${{ matrix.nix_system }}.silo-autoscaler-docker -L
-          docker load < result
-
-      - name: Build silo-compactor Docker image with Nix
-        run: |
-          nix build .#packages.${{ matrix.nix_system }}.silo-compactor-docker -L
-          docker load < result
+          docker load < result-1
+          docker load < result-2
 
       - name: Push to Cachix
-        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         env:
           CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
         run: |
-          # Push the silo binary and its dependencies to Cachix for future builds
-          cachix push silo result
+          # Push the silo binaries and their dependencies to Cachix for future builds
+          cachix push silo result result-1 result-2
 
       - name: Authenticate gcloud
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
