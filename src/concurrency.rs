@@ -61,6 +61,7 @@ use crate::keys::{
     concurrency_requests_prefix, end_bound, floating_limit_state_key, job_status_key,
     parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
 };
+use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 use crate::task_broker::TaskBrokerRegistry;
@@ -377,22 +378,24 @@ pub struct ConcurrencyManager {
     /// In-memory cache of resolved concurrency limits per queue.
     /// Key: concurrency_counts_key(tenant, queue). Populated during enqueue and grant_next.
     limit_cache: Mutex<HashMap<Vec<u8>, CachedQueueLimit>>,
+    metrics: Option<Metrics>,
 }
 
 impl Default for ConcurrencyManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl ConcurrencyManager {
-    pub fn new() -> Self {
+    pub fn new(metrics: Option<Metrics>) -> Self {
         Self {
             counts: ConcurrencyCounts::new(),
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
             limit_cache: Mutex::new(HashMap::new()),
+            metrics,
         }
     }
 
@@ -1099,6 +1102,12 @@ impl ConcurrencyManager {
                 task_group = %task_group,
                 "grant scanner: granted concurrency ticket"
             );
+        }
+
+        if let Some(ref m) = self.metrics {
+            for _ in 0..grants.len() {
+                m.record_concurrency_ticket_granted();
+            }
         }
 
         grants.into_iter().map(|(_, tg)| tg).collect()

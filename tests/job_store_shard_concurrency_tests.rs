@@ -1728,6 +1728,105 @@ async fn grant_scanner_handles_all_stale_requests() {
     );
 }
 
+/// Tests that the grant scanner increments the `silo_concurrency_tickets_granted_total`
+/// counter once per ticket it grants. Without this, the metric only reflects the
+/// synchronous dequeue path (handle_request_ticket) and goes silent the moment a
+/// queue first hits its concurrency limit, since all subsequent grants flow through
+/// the async grant scanner as holders are released.
+#[silo::test]
+async fn grant_scanner_records_concurrency_ticket_granted_metric() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let queue = "metric-q";
+    let tenant = "metric-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 2,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Fill the 2 concurrency slots
+    let mut holder_tasks = Vec::new();
+    for i in 0..2 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("holder-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        let tasks = shard.dequeue("w", "tg", 1).await.unwrap().tasks;
+        holder_tasks.push(tasks[0].attempt().task_id().to_string());
+    }
+
+    let baseline = read_concurrency_tickets_granted(&metrics);
+
+    // Enqueue 3 more jobs that will queue as concurrency requests (queue is full).
+    for i in 0..3 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("waiter-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+
+    // Free both slots so the grant scanner has capacity to grant the waiters.
+    for task_id in &holder_tasks {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .unwrap();
+    }
+
+    // Drive the async grant-scanner path directly.
+    let granted = shard.process_concurrency_grants(tenant, queue, 2).await;
+    assert_eq!(granted.len(), 2, "should grant 2 of the 3 waiters");
+
+    let after = read_concurrency_tickets_granted(&metrics);
+    assert_eq!(
+        after - baseline,
+        2.0,
+        "process_grants must increment the counter once per granted ticket"
+    );
+}
+
+/// Read the current value of the `silo_concurrency_tickets_granted_total` counter
+/// out of the Prometheus registry. The counter is unlabelled, so we just sum the
+/// single sample.
+fn read_concurrency_tickets_granted(metrics: &silo::metrics::Metrics) -> f64 {
+    metrics
+        .registry()
+        .gather()
+        .into_iter()
+        .find(|f| f.get_name() == "silo_concurrency_tickets_granted_total")
+        .map(|f| {
+            f.get_metric()
+                .iter()
+                .map(|m| m.get_counter().get_value())
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
 /// Tests that stale requests interleaved with valid ones are handled correctly:
 /// the grant scanner should skip stale ones and keep scanning to find valid ones.
 #[silo::test]

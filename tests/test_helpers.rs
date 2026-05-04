@@ -54,6 +54,36 @@ pub async fn open_temp_shard() -> (tempfile::TempDir, std::sync::Arc<JobStoreSha
     open_temp_shard_with_rate_limiter(rate_limiter).await
 }
 
+/// Open a temp shard wired to a fresh Metrics registry, returning both so tests
+/// can read counter values directly without going through the Prometheus endpoint.
+pub async fn open_temp_shard_with_metrics() -> (
+    tempfile::TempDir,
+    std::sync::Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        wal: None,
+        apply_wal_on_close: true,
+        slatedb: Some(fast_flush_slatedb_settings()),
+        memory_cache: None,
+    };
+    let metrics = silo::metrics::init().expect("init metrics");
+    let shard = JobStoreShard::open(
+        &cfg,
+        rate_limiter,
+        Some(metrics.clone()),
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+    (tmp, shard, metrics)
+}
+
 /// Open a temp shard with a custom periodic concurrency reconciliation interval.
 pub async fn open_temp_shard_with_reconcile_interval_ms(
     interval_ms: u64,
