@@ -34,7 +34,7 @@ use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
     TextEncoder, core::Collector,
 };
-use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
+use slatedb_common::metrics::{DefaultMetricsRecorder, LATENCY_BOUNDARIES, MetricValue};
 use tokio::sync::broadcast;
 use tower::{Layer, Service};
 use tracing::{debug, error};
@@ -60,6 +60,13 @@ const READY_TO_START_LATENCY_MS_BUCKETS: &[f64] = &[
     1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0, 60000.0, 300000.0, 600000.0,
     1800000.0, 3600000.0,
 ];
+
+// SlateDB's `instrumented_object_store::stats` module is `pub(crate)` upstream,
+// so we hardcode these names. Once https://github.com/slatedb/slatedb/pull/1628
+// lands and we upgrade, replace these with `slatedb::instrumented_object_store::stats::*`.
+const OS_REQUEST_COUNT: &str = "slatedb.object_store.request_count";
+const OS_ERROR_COUNT: &str = "slatedb.object_store.error_count";
+const OS_REQUEST_DURATION_SECONDS: &str = "slatedb.object_store.request_duration_seconds";
 
 /// Silo metrics handle containing all metric instruments.
 #[derive(Clone)]
@@ -143,10 +150,20 @@ pub struct SlatedbShardMetrics {
     cache_filter_hit: CounterVec,
     cache_filter_miss: CounterVec,
 
+    // Object store metrics (per component/store_type/op/api)
+    object_store_requests: CounterVec,
+    object_store_errors: CounterVec,
+    object_store_request_duration: HistogramVec,
+
     /// Tracks previous SlateDB counter values per (stat_name, shard) for delta computation.
     /// SlateDB exposes counters as absolute values via `stat.get()`, but Prometheus counters
     /// only support `inc_by(delta)`, so we compute deltas between polls.
     prev_values: Arc<Mutex<HashMap<(String, String), f64>>>,
+
+    /// Tracks previous cumulative bucket counts for SlateDB histograms, keyed
+    /// the same way as `prev_values`. Needed because the `prometheus` crate
+    /// exposes histograms only via `observe(x)`, so we re-observe deltas.
+    prev_histogram_buckets: Arc<Mutex<HashMap<(String, String), Vec<u64>>>>,
 }
 
 impl Metrics {
@@ -345,6 +362,25 @@ impl SlatedbShardMetrics {
                 GaugeVec::new(Opts::new(format!("{p}{name}"), help), &["shard"])?,
             ))
         };
+        let labeled_counter =
+            |name: &str, help: &str, labels: &[&str]| -> anyhow::Result<CounterVec> {
+                Ok(register(
+                    registry,
+                    CounterVec::new(Opts::new(format!("{p}{name}"), help), labels)?,
+                ))
+            };
+        let labeled_histogram =
+            |name: &str, help: &str, labels: &[&str]| -> anyhow::Result<HistogramVec> {
+                Ok(register(
+                    registry,
+                    HistogramVec::new(
+                        HistogramOpts::new(format!("{p}{name}"), help)
+                            .buckets(LATENCY_BOUNDARIES.to_vec()),
+                        labels,
+                    )?,
+                ))
+            };
+        let os_labels: &[&str] = &["shard", "component", "store_type", "op", "api"];
 
         Ok(Self {
             get_requests: counter(
@@ -439,7 +475,23 @@ impl SlatedbShardMetrics {
                 "slatedb_cache_filter_miss_total",
                 "Total SlateDB bloom filter cache misses",
             )?,
+            object_store_requests: labeled_counter(
+                "slatedb_object_store_requests_total",
+                "Total SlateDB object-store API calls (per component/store_type/op/api)",
+                os_labels,
+            )?,
+            object_store_errors: labeled_counter(
+                "slatedb_object_store_errors_total",
+                "Total SlateDB object-store API errors (per component/store_type/op/api)",
+                os_labels,
+            )?,
+            object_store_request_duration: labeled_histogram(
+                "slatedb_object_store_request_duration_seconds",
+                "SlateDB object-store API call latency (per component/store_type/op/api)",
+                os_labels,
+            )?,
             prev_values: Arc::new(Mutex::new(HashMap::new())),
+            prev_histogram_buckets: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -622,6 +674,116 @@ impl SlatedbShardMetrics {
                 gauge.with_label_values(&[shard]).set(value);
             }
         }
+
+        // Object-store metrics: variable label sets (component/store_type/op/api).
+        // Counters use the same delta-vs-previous trick as the rest of `update`;
+        // the histogram is delta-translated bucket-by-bucket through `observe()`
+        // since the `prometheus` crate has no public bucket-counter API.
+        {
+            let mut prev_values = self.prev_values.lock().expect("lock poisoned");
+            let mut prev_histogram_buckets =
+                self.prev_histogram_buckets.lock().expect("lock poisoned");
+
+            for (stat_name, counter_vec) in [
+                (OS_REQUEST_COUNT, &self.object_store_requests),
+                (OS_ERROR_COUNT, &self.object_store_errors),
+            ] {
+                for metric in snapshot.by_name(stat_name) {
+                    let current = match metric.value {
+                        MetricValue::Counter(v) => v as f64,
+                        _ => continue,
+                    };
+                    let vals = os_label_values(&metric.labels);
+                    let key = (os_prev_key(stat_name, &vals), shard.to_string());
+                    let prev = prev_values.get(&key).copied().unwrap_or(0.0);
+                    if current > prev {
+                        counter_vec
+                            .with_label_values(&[shard, &vals[0], &vals[1], &vals[2], &vals[3]])
+                            .inc_by(current - prev);
+                    }
+                    prev_values.insert(key, current);
+                }
+            }
+
+            for metric in snapshot.by_name(OS_REQUEST_DURATION_SECONDS) {
+                let (boundaries, bucket_counts) = match &metric.value {
+                    MetricValue::Histogram {
+                        boundaries,
+                        bucket_counts,
+                        ..
+                    } => (boundaries, bucket_counts),
+                    _ => continue,
+                };
+                let vals = os_label_values(&metric.labels);
+                let key = (
+                    os_prev_key(OS_REQUEST_DURATION_SECONDS, &vals),
+                    shard.to_string(),
+                );
+                let prev = prev_histogram_buckets
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                let prom_histogram = self
+                    .object_store_request_duration
+                    .with_label_values(&[shard, &vals[0], &vals[1], &vals[2], &vals[3]]);
+                for (i, &current_count) in bucket_counts.iter().enumerate() {
+                    let prev_count = prev.get(i).copied().unwrap_or(0);
+                    let delta = current_count.saturating_sub(prev_count);
+                    if delta == 0 {
+                        continue;
+                    }
+                    let observe_value = value_for_bucket(boundaries, i);
+                    for _ in 0..delta {
+                        prom_histogram.observe(observe_value);
+                    }
+                }
+                prev_histogram_buckets.insert(key, bucket_counts.clone());
+            }
+        }
+    }
+}
+
+/// Pull the four object-store label values out of a `slatedb_common` metric's
+/// labels, in the order our Prometheus instrument expects them.
+fn os_label_values(labels: &[(String, String)]) -> [String; 4] {
+    let lookup = |key: &str| {
+        labels
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    [
+        lookup("component"),
+        lookup("store_type"),
+        lookup("op"),
+        lookup("api"),
+    ]
+}
+
+/// Build a stable key for tracking previous values across polls for an
+/// object-store series.
+fn os_prev_key(stat_name: &str, vals: &[String; 4]) -> String {
+    format!(
+        "{stat_name}/component={},store_type={},op={},api={}",
+        vals[0], vals[1], vals[2], vals[3]
+    )
+}
+
+/// Pick a value strictly inside histogram bucket `idx` for both SlateDB's `<`
+/// bucketing semantics and Prometheus's `<=` semantics, given the bucket
+/// boundary list. SlateDB's `bucket_counts` has length `boundaries.len() + 1`
+/// (the last entry being the overflow bucket).
+fn value_for_bucket(boundaries: &[f64], idx: usize) -> f64 {
+    if boundaries.is_empty() {
+        return 0.0;
+    }
+    if idx == 0 {
+        boundaries[0] / 2.0
+    } else if idx < boundaries.len() {
+        (boundaries[idx - 1] + boundaries[idx]) / 2.0
+    } else {
+        boundaries[boundaries.len() - 1] * 1.5
     }
 }
 
