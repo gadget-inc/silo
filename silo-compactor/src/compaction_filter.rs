@@ -42,6 +42,8 @@ use slatedb::{
 };
 use tracing::{debug, info, warn};
 
+use crate::metrics::CompactorMetrics;
+
 /// Terminal status strings as stored in IDX_STATUS_TIME keys.
 const TERMINAL_STATUSES: &[&str] = &["Succeeded", "Failed", "Cancelled"];
 
@@ -153,6 +155,9 @@ pub struct CompletedJobCompactionFilterSupplier {
     /// Soft cap on the pre-scanned [`ExpiredSet`]. `0` disables the
     /// pre-scan entirely (every `is_job_expired` becomes a point read).
     expired_set_max_entries: usize,
+    /// Optional Prometheus metrics handle + the shard label to tag emitted
+    /// counters with. Both are populated together via [`with_metrics`].
+    metrics: Option<(Arc<CompactorMetrics>, String)>,
 }
 
 /// Everything needed to open a short-lived [`DbReader`].
@@ -171,6 +176,7 @@ impl CompletedJobCompactionFilterSupplier {
             retention,
             reader_ctx: Some(ReaderContext { db_path, store }),
             expired_set_max_entries: DEFAULT_EXPIRED_SET_MAX_ENTRIES,
+            metrics: None,
         }
     }
 
@@ -181,12 +187,21 @@ impl CompletedJobCompactionFilterSupplier {
         self
     }
 
+    /// Attach a Prometheus metrics handle. Counters/histograms emitted by
+    /// produced filters will carry `shard_label` so multi-shard pods share
+    /// one registry without collisions.
+    pub fn with_metrics(mut self, metrics: Arc<CompactorMetrics>, shard_label: String) -> Self {
+        self.metrics = Some((metrics, shard_label));
+        self
+    }
+
     #[cfg(test)]
     fn new_without_reader(retention: Duration) -> Self {
         Self {
             retention,
             reader_ctx: None,
             expired_set_max_entries: DEFAULT_EXPIRED_SET_MAX_ENTRIES,
+            metrics: None,
         }
     }
 }
@@ -230,20 +245,35 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
         let expired = match reader.as_ref() {
             Some(r) => {
                 let started = Instant::now();
-                match build_expired_set(r, cutoff_ms, self.expired_set_max_entries).await {
+                let result = build_expired_set(r, cutoff_ms, self.expired_set_max_entries).await;
+                let elapsed = started.elapsed();
+                match result {
                     Ok(Some(set)) => {
+                        if let Some((m, shard)) = &self.metrics {
+                            m.record_filter_pre_scan(
+                                shard,
+                                elapsed.as_secs_f64(),
+                                set.len() as u64,
+                            );
+                        }
                         info!(
                             entries = set.len(),
-                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            elapsed_ms = elapsed.as_millis() as u64,
                             cap = self.expired_set_max_entries,
                             "completed_jobs filter: pre-scan ready"
                         );
                         Some(Arc::new(set))
                     }
                     Ok(None) => {
+                        if let Some((m, shard)) = &self.metrics {
+                            // Pre-scan ran but exceeded the cap (or was disabled): record
+                            // wall-clock so dashboards show "pre-scan happened but didn't
+                            // build a set" without polluting entry counts.
+                            m.record_filter_pre_scan(shard, elapsed.as_secs_f64(), 0);
+                        }
                         warn!(
                             cap = self.expired_set_max_entries,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            elapsed_ms = elapsed.as_millis() as u64,
                             "completed_jobs filter: pre-scan exceeded cap or disabled, \
                              falling back to per-row point reads"
                         );
@@ -273,6 +303,7 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
             dropped_idx_metadata: 0,
             dropped_attempt: 0,
             dropped_job_cancelled: 0,
+            metrics: self.metrics.clone(),
         }))
     }
 }
@@ -300,6 +331,10 @@ pub struct CompletedJobCompactionFilter {
     dropped_idx_metadata: u64,
     dropped_attempt: u64,
     dropped_job_cancelled: u64,
+
+    /// Optional Prometheus metrics handle, paired with the shard label that
+    /// emitted counters/histograms should be tagged with.
+    metrics: Option<(Arc<CompactorMetrics>, String)>,
 }
 
 impl CompletedJobCompactionFilter {
@@ -451,6 +486,19 @@ impl CompactionFilter for CompletedJobCompactionFilter {
     async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
         let total = self.total_dropped();
 
+        if let Some((m, shard)) = &self.metrics {
+            for (prefix, n) in [
+                ("job_info", self.dropped_job_info),
+                ("job_status", self.dropped_status),
+                ("idx_status_time", self.dropped_idx_status_time),
+                ("idx_metadata", self.dropped_idx_metadata),
+                ("attempt", self.dropped_attempt),
+                ("job_cancelled", self.dropped_job_cancelled),
+            ] {
+                m.record_filter_rows_dropped(shard, prefix, n);
+            }
+        }
+
         if total > 0 {
             debug!(
                 total,
@@ -514,6 +562,7 @@ mod tests {
             dropped_idx_metadata: 0,
             dropped_attempt: 0,
             dropped_job_cancelled: 0,
+            metrics: None,
         }
     }
 

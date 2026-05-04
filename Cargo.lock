@@ -5486,6 +5486,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "object_store",
+ "prometheus",
  "serde",
  "serde_json",
  "silo",

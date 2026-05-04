@@ -3,6 +3,7 @@ pub mod compaction_filter;
 pub mod config;
 pub mod coordinator;
 pub mod error;
+pub mod metrics;
 pub mod pod_discovery;
 pub mod shard_loader;
 pub mod shard_map;

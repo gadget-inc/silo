@@ -23,6 +23,11 @@ worker_restart_backoff = "5s"
 [logging]
 format = "text"
 
+[metrics]
+enabled = true
+# silo-1/silo-2 already use 9090/9091; pick 9092 for the dev compactor.
+addr = "127.0.0.1:9092"
+
 [compactor_options]
 poll_interval = "5s"
 max_sst_size = 67108864

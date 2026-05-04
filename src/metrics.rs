@@ -100,39 +100,53 @@ pub struct Metrics {
     // Concurrency metrics
     concurrency_tickets_granted: Counter,
 
-    // SlateDB storage counters (per-shard, monotonically increasing in SlateDB)
-    slatedb_get_requests: CounterVec,
-    slatedb_scan_requests: CounterVec,
-    slatedb_write_ops: CounterVec,
-    slatedb_write_batch_count: CounterVec,
-    slatedb_backpressure_count: CounterVec,
-    slatedb_wal_buffer_flushes: CounterVec,
-    slatedb_immutable_memtable_flushes: CounterVec,
-    slatedb_sst_filter_positives: CounterVec,
-    slatedb_sst_filter_negatives: CounterVec,
-    slatedb_sst_filter_false_positives: CounterVec,
-    slatedb_bytes_compacted: CounterVec,
-    slatedb_flush_requests: CounterVec,
+    /// SlateDB per-shard counters and gauges. Shared with silo-compactor via
+    /// the `metric_prefix` constructor argument.
+    pub slatedb: SlatedbShardMetrics,
+}
 
-    // SlateDB storage gauges (per-shard, point-in-time values)
-    slatedb_wal_buffer_estimated_bytes: GaugeVec,
-    slatedb_running_compactions: GaugeVec,
-    slatedb_last_compaction_ts_sec: GaugeVec,
-    slatedb_l0_sst_count: GaugeVec,
-    slatedb_total_mem_size_bytes: GaugeVec,
+/// SlateDB per-shard metric instruments plus the previous-value map needed
+/// to translate SlateDB's absolute counters into Prometheus `inc_by(delta)`.
+///
+/// Registers a fixed set of `<prefix>slatedb_*` counters and gauges against a
+/// shared `Registry`. Used by both the silo server (prefix `silo_`) and the
+/// silo-compactor binary (prefix `silo_compactor_`) so the same translation
+/// logic powers both.
+#[derive(Clone)]
+pub struct SlatedbShardMetrics {
+    // Counters (monotonically increasing in SlateDB)
+    get_requests: CounterVec,
+    scan_requests: CounterVec,
+    write_ops: CounterVec,
+    write_batch_count: CounterVec,
+    backpressure_count: CounterVec,
+    wal_buffer_flushes: CounterVec,
+    immutable_memtable_flushes: CounterVec,
+    sst_filter_positives: CounterVec,
+    sst_filter_negatives: CounterVec,
+    sst_filter_false_positives: CounterVec,
+    bytes_compacted: CounterVec,
+    flush_requests: CounterVec,
 
-    // SlateDB cache counters (per-shard, monotonically increasing)
-    slatedb_cache_data_block_hit: CounterVec,
-    slatedb_cache_data_block_miss: CounterVec,
-    slatedb_cache_index_hit: CounterVec,
-    slatedb_cache_index_miss: CounterVec,
-    slatedb_cache_filter_hit: CounterVec,
-    slatedb_cache_filter_miss: CounterVec,
+    // Gauges (point-in-time)
+    wal_buffer_estimated_bytes: GaugeVec,
+    running_compactions: GaugeVec,
+    last_compaction_ts_sec: GaugeVec,
+    l0_sst_count: GaugeVec,
+    total_mem_size_bytes: GaugeVec,
+
+    // Cache counters
+    cache_data_block_hit: CounterVec,
+    cache_data_block_miss: CounterVec,
+    cache_index_hit: CounterVec,
+    cache_index_miss: CounterVec,
+    cache_filter_hit: CounterVec,
+    cache_filter_miss: CounterVec,
 
     /// Tracks previous SlateDB counter values per (stat_name, shard) for delta computation.
     /// SlateDB exposes counters as absolute values via `stat.get()`, but Prometheus counters
     /// only support `inc_by(delta)`, so we compute deltas between polls.
-    slatedb_prev_values: Arc<Mutex<HashMap<(String, String), f64>>>,
+    prev_values: Arc<Mutex<HashMap<(String, String), f64>>>,
 }
 
 impl Metrics {
@@ -308,58 +322,184 @@ impl Metrics {
     /// statistics to Prometheus metrics. Counter-type stats are tracked via deltas
     /// since Prometheus counters only support `inc_by()`, not `set()`.
     pub fn update_slatedb_stats(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
+        self.slatedb.update(shard, recorder);
+    }
+}
+
+impl SlatedbShardMetrics {
+    /// Register the full set of SlateDB per-shard counters and gauges against
+    /// `registry`. `metric_prefix` is prepended to every metric name so silo
+    /// (`silo_`) and silo-compactor (`silo_compactor_`) can coexist on the same
+    /// scrape config without collisions.
+    pub fn register(registry: &Registry, metric_prefix: &str) -> anyhow::Result<Self> {
+        let p = metric_prefix;
+        let counter = |name: &str, help: &str| -> anyhow::Result<CounterVec> {
+            Ok(register(
+                registry,
+                CounterVec::new(Opts::new(format!("{p}{name}"), help), &["shard"])?,
+            ))
+        };
+        let gauge = |name: &str, help: &str| -> anyhow::Result<GaugeVec> {
+            Ok(register(
+                registry,
+                GaugeVec::new(Opts::new(format!("{p}{name}"), help), &["shard"])?,
+            ))
+        };
+
+        Ok(Self {
+            get_requests: counter(
+                "slatedb_get_requests_total",
+                "Total number of GET (read) requests to SlateDB",
+            )?,
+            scan_requests: counter(
+                "slatedb_scan_requests_total",
+                "Total number of scan (range query) requests to SlateDB",
+            )?,
+            write_ops: counter(
+                "slatedb_write_ops_total",
+                "Total number of individual write operations to SlateDB",
+            )?,
+            write_batch_count: counter(
+                "slatedb_write_batch_count_total",
+                "Total number of write batches to SlateDB",
+            )?,
+            backpressure_count: counter(
+                "slatedb_backpressure_count_total",
+                "Number of times writes were blocked by back-pressure in SlateDB",
+            )?,
+            wal_buffer_flushes: counter(
+                "slatedb_wal_buffer_flushes_total",
+                "Total number of WAL buffer flushes in SlateDB",
+            )?,
+            immutable_memtable_flushes: counter(
+                "slatedb_immutable_memtable_flushes_total",
+                "Total number of immutable memtable flushes to SSTs in SlateDB",
+            )?,
+            sst_filter_positives: counter(
+                "slatedb_sst_filter_positives_total",
+                "Total SST filter true positives (key exists, filter says yes)",
+            )?,
+            sst_filter_negatives: counter(
+                "slatedb_sst_filter_negatives_total",
+                "Total SST filter true negatives (key absent, filter says no)",
+            )?,
+            sst_filter_false_positives: counter(
+                "slatedb_sst_filter_false_positives_total",
+                "Total SST filter false positives (key absent, but filter said yes)",
+            )?,
+            bytes_compacted: counter(
+                "slatedb_bytes_compacted_total",
+                "Total number of bytes compacted by SlateDB compactor",
+            )?,
+            flush_requests: counter(
+                "slatedb_flush_requests_total",
+                "Total number of flush requests to SlateDB",
+            )?,
+            wal_buffer_estimated_bytes: gauge(
+                "slatedb_wal_buffer_estimated_bytes",
+                "Estimated bytes buffered in the SlateDB WAL buffer",
+            )?,
+            running_compactions: gauge(
+                "slatedb_running_compactions",
+                "Number of compactions currently running in SlateDB",
+            )?,
+            last_compaction_ts_sec: gauge(
+                "slatedb_last_compaction_ts_seconds",
+                "Unix timestamp (seconds) of the last compaction in SlateDB",
+            )?,
+            l0_sst_count: gauge(
+                "slatedb_l0_sst_count",
+                "Number of Level-0 SSTs in SlateDB (high values indicate compaction lag)",
+            )?,
+            total_mem_size_bytes: gauge(
+                "slatedb_total_mem_size_bytes",
+                "Total memory usage of SlateDB",
+            )?,
+            cache_data_block_hit: counter(
+                "slatedb_cache_data_block_hit_total",
+                "Total SlateDB data block cache hits",
+            )?,
+            cache_data_block_miss: counter(
+                "slatedb_cache_data_block_miss_total",
+                "Total SlateDB data block cache misses",
+            )?,
+            cache_index_hit: counter(
+                "slatedb_cache_index_hit_total",
+                "Total SlateDB index block cache hits",
+            )?,
+            cache_index_miss: counter(
+                "slatedb_cache_index_miss_total",
+                "Total SlateDB index block cache misses",
+            )?,
+            cache_filter_hit: counter(
+                "slatedb_cache_filter_hit_total",
+                "Total SlateDB bloom filter cache hits",
+            )?,
+            cache_filter_miss: counter(
+                "slatedb_cache_filter_miss_total",
+                "Total SlateDB bloom filter cache misses",
+            )?,
+            prev_values: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Translate a snapshot of SlateDB's internal counters/gauges into the
+    /// registered Prometheus instruments. Counters are converted to deltas
+    /// against the previous snapshot since Prometheus counters only support
+    /// `inc_by()`.
+    pub fn update(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
         // Counter-type stats: monotonically increasing in SlateDB
         // REQUEST_COUNT uses an "op" label to distinguish get/scan/flush
         let labeled_counter_mappings: &[(&str, &[(&str, &str)], &CounterVec)] = &[
             (
                 slatedb::db_stats::REQUEST_COUNT,
                 &[("op", "get")],
-                &self.slatedb_get_requests,
+                &self.get_requests,
             ),
             (
                 slatedb::db_stats::REQUEST_COUNT,
                 &[("op", "scan")],
-                &self.slatedb_scan_requests,
+                &self.scan_requests,
             ),
             (
                 slatedb::db_stats::REQUEST_COUNT,
                 &[("op", "flush")],
-                &self.slatedb_flush_requests,
+                &self.flush_requests,
             ),
         ];
         let counter_mappings: &[(&str, &CounterVec)] = &[
-            (slatedb::db_stats::WRITE_OPS, &self.slatedb_write_ops),
+            (slatedb::db_stats::WRITE_OPS, &self.write_ops),
             (
                 slatedb::db_stats::WRITE_BATCH_COUNT,
-                &self.slatedb_write_batch_count,
+                &self.write_batch_count,
             ),
             (
                 slatedb::db_stats::BACKPRESSURE_COUNT,
-                &self.slatedb_backpressure_count,
+                &self.backpressure_count,
             ),
             (
                 slatedb::db_stats::WAL_BUFFER_FLUSHES,
-                &self.slatedb_wal_buffer_flushes,
+                &self.wal_buffer_flushes,
             ),
             (
                 slatedb::db_stats::IMMUTABLE_MEMTABLE_FLUSHES,
-                &self.slatedb_immutable_memtable_flushes,
+                &self.immutable_memtable_flushes,
             ),
             (
                 slatedb::db_stats::SST_FILTER_POSITIVE_COUNT,
-                &self.slatedb_sst_filter_positives,
+                &self.sst_filter_positives,
             ),
             (
                 slatedb::db_stats::SST_FILTER_NEGATIVE_COUNT,
-                &self.slatedb_sst_filter_negatives,
+                &self.sst_filter_negatives,
             ),
             (
                 slatedb::db_stats::SST_FILTER_FALSE_POSITIVE_COUNT,
-                &self.slatedb_sst_filter_false_positives,
+                &self.sst_filter_false_positives,
             ),
             (
                 slatedb::compactor::stats::BYTES_COMPACTED,
-                &self.slatedb_bytes_compacted,
+                &self.bytes_compacted,
             ),
         ];
 
@@ -368,32 +508,32 @@ impl Metrics {
             (
                 slatedb::db_cache_stats::ACCESS_COUNT,
                 &[("entry_kind", "data_block"), ("result", "hit")],
-                &self.slatedb_cache_data_block_hit,
+                &self.cache_data_block_hit,
             ),
             (
                 slatedb::db_cache_stats::ACCESS_COUNT,
                 &[("entry_kind", "data_block"), ("result", "miss")],
-                &self.slatedb_cache_data_block_miss,
+                &self.cache_data_block_miss,
             ),
             (
                 slatedb::db_cache_stats::ACCESS_COUNT,
                 &[("entry_kind", "index"), ("result", "hit")],
-                &self.slatedb_cache_index_hit,
+                &self.cache_index_hit,
             ),
             (
                 slatedb::db_cache_stats::ACCESS_COUNT,
                 &[("entry_kind", "index"), ("result", "miss")],
-                &self.slatedb_cache_index_miss,
+                &self.cache_index_miss,
             ),
             (
                 slatedb::db_cache_stats::ACCESS_COUNT,
                 &[("entry_kind", "filter"), ("result", "hit")],
-                &self.slatedb_cache_filter_hit,
+                &self.cache_filter_hit,
             ),
             (
                 slatedb::db_cache_stats::ACCESS_COUNT,
                 &[("entry_kind", "filter"), ("result", "miss")],
-                &self.slatedb_cache_filter_miss,
+                &self.cache_filter_miss,
             ),
         ];
 
@@ -401,27 +541,27 @@ impl Metrics {
         let gauge_mappings: &[(&str, &GaugeVec)] = &[
             (
                 slatedb::db_stats::WAL_BUFFER_ESTIMATED_BYTES,
-                &self.slatedb_wal_buffer_estimated_bytes,
+                &self.wal_buffer_estimated_bytes,
             ),
             (
                 slatedb::compactor::stats::RUNNING_COMPACTIONS,
-                &self.slatedb_running_compactions,
+                &self.running_compactions,
             ),
             (
                 slatedb::compactor::stats::LAST_COMPACTION_TS_SEC,
-                &self.slatedb_last_compaction_ts_sec,
+                &self.last_compaction_ts_sec,
             ),
-            (slatedb::db_stats::L0_SST_COUNT, &self.slatedb_l0_sst_count),
+            (slatedb::db_stats::L0_SST_COUNT, &self.l0_sst_count),
             (
                 slatedb::db_stats::TOTAL_MEM_SIZE_BYTES,
-                &self.slatedb_total_mem_size_bytes,
+                &self.total_mem_size_bytes,
             ),
         ];
 
         let snapshot = recorder.snapshot();
 
         {
-            let mut prev_values = self.slatedb_prev_values.lock().expect("lock poisoned");
+            let mut prev_values = self.prev_values.lock().expect("lock poisoned");
 
             // Helper to extract a numeric value from a metric
             let extract_value = |metric: &slatedb_common::metrics::Metric| -> Option<f64> {
@@ -736,261 +876,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
-    // SlateDB storage counters (monotonically increasing in SlateDB)
-    let slatedb_get_requests = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_get_requests_total",
-                "Total number of GET (read) requests to SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_scan_requests = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_scan_requests_total",
-                "Total number of scan (range query) requests to SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_write_ops = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_write_ops_total",
-                "Total number of individual write operations to SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_write_batch_count = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_write_batch_count_total",
-                "Total number of write batches to SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_backpressure_count = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_backpressure_count_total",
-                "Number of times writes were blocked by back-pressure in SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_wal_buffer_flushes = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_wal_buffer_flushes_total",
-                "Total number of WAL buffer flushes in SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_immutable_memtable_flushes = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_immutable_memtable_flushes_total",
-                "Total number of immutable memtable flushes to SSTs in SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_sst_filter_positives = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_sst_filter_positives_total",
-                "Total SST filter true positives (key exists, filter says yes)",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_sst_filter_negatives = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_sst_filter_negatives_total",
-                "Total SST filter true negatives (key absent, filter says no)",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_sst_filter_false_positives = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_sst_filter_false_positives_total",
-                "Total SST filter false positives (key absent, but filter said yes)",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_bytes_compacted = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_bytes_compacted_total",
-                "Total number of bytes compacted by SlateDB compactor",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    // SlateDB storage gauges (point-in-time values)
-    let slatedb_wal_buffer_estimated_bytes = register(
-        &registry,
-        GaugeVec::new(
-            Opts::new(
-                "silo_slatedb_wal_buffer_estimated_bytes",
-                "Estimated bytes buffered in the SlateDB WAL buffer",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_running_compactions = register(
-        &registry,
-        GaugeVec::new(
-            Opts::new(
-                "silo_slatedb_running_compactions",
-                "Number of compactions currently running in SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_last_compaction_ts_sec = register(
-        &registry,
-        GaugeVec::new(
-            Opts::new(
-                "silo_slatedb_last_compaction_ts_seconds",
-                "Unix timestamp (seconds) of the last compaction in SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_flush_requests = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_flush_requests_total",
-                "Total number of flush requests to SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_l0_sst_count = register(
-        &registry,
-        GaugeVec::new(
-            Opts::new(
-                "silo_slatedb_l0_sst_count",
-                "Number of Level-0 SSTs in SlateDB (high values indicate compaction lag)",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_total_mem_size_bytes = register(
-        &registry,
-        GaugeVec::new(
-            Opts::new(
-                "silo_slatedb_total_mem_size_bytes",
-                "Total memory usage of SlateDB",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    // SlateDB cache counters
-    let slatedb_cache_data_block_hit = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_cache_data_block_hit_total",
-                "Total SlateDB data block cache hits",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_cache_data_block_miss = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_cache_data_block_miss_total",
-                "Total SlateDB data block cache misses",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_cache_index_hit = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_cache_index_hit_total",
-                "Total SlateDB index block cache hits",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_cache_index_miss = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_cache_index_miss_total",
-                "Total SlateDB index block cache misses",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_cache_filter_hit = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_cache_filter_hit_total",
-                "Total SlateDB bloom filter cache hits",
-            ),
-            &["shard"],
-        )?,
-    );
-
-    let slatedb_cache_filter_miss = register(
-        &registry,
-        CounterVec::new(
-            Opts::new(
-                "silo_slatedb_cache_filter_miss_total",
-                "Total SlateDB bloom filter cache misses",
-            ),
-            &["shard"],
-        )?,
-    );
+    let slatedb = SlatedbShardMetrics::register(&registry, "silo_")?;
 
     Ok(Metrics {
         registry: Arc::new(registry),
@@ -1016,37 +902,14 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_duration,
         lease_reaper_scans_total,
         concurrency_tickets_granted,
-        slatedb_get_requests,
-        slatedb_scan_requests,
-        slatedb_write_ops,
-        slatedb_write_batch_count,
-        slatedb_backpressure_count,
-        slatedb_wal_buffer_flushes,
-        slatedb_immutable_memtable_flushes,
-        slatedb_sst_filter_positives,
-        slatedb_sst_filter_negatives,
-        slatedb_sst_filter_false_positives,
-        slatedb_bytes_compacted,
-        slatedb_flush_requests,
-        slatedb_wal_buffer_estimated_bytes,
-        slatedb_running_compactions,
-        slatedb_last_compaction_ts_sec,
-        slatedb_l0_sst_count,
-        slatedb_total_mem_size_bytes,
-        slatedb_cache_data_block_hit,
-        slatedb_cache_data_block_miss,
-        slatedb_cache_index_hit,
-        slatedb_cache_index_miss,
-        slatedb_cache_filter_hit,
-        slatedb_cache_filter_miss,
-        slatedb_prev_values: Arc::new(Mutex::new(HashMap::new())),
+        slatedb,
     })
 }
 
-/// Axum handler for the `/metrics` endpoint.
-async fn metrics_handler(State(metrics): State<Metrics>) -> impl IntoResponse {
+/// Axum handler that gathers a registry and encodes it in Prometheus text format.
+async fn registry_handler(State(registry): State<Arc<Registry>>) -> impl IntoResponse {
     let encoder = TextEncoder::new();
-    let metric_families = metrics.registry.gather();
+    let metric_families = registry.gather();
 
     let mut buffer = Vec::new();
     match encoder.encode(&metric_families, &mut buffer) {
@@ -1066,18 +929,17 @@ async fn metrics_handler(State(metrics): State<Metrics>) -> impl IntoResponse {
     }
 }
 
-/// Run the Prometheus metrics HTTP server.
+/// Serve a Prometheus `/metrics` endpoint backed by `registry`.
 ///
-/// Listens on the given address and serves metrics at `/metrics`.
-/// Shuts down gracefully when shutdown signal is received.
-pub async fn run_metrics_server(
+/// Used by both the silo server and silo-compactor binaries.
+pub async fn serve_registry(
     addr: SocketAddr,
-    metrics: Metrics,
+    registry: Arc<Registry>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
-        .route("/metrics", get(metrics_handler))
-        .with_state(metrics);
+        .route("/metrics", get(registry_handler))
+        .with_state(registry);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     debug!(addr = %addr, "metrics server started");
@@ -1090,6 +952,15 @@ pub async fn run_metrics_server(
         .await?;
 
     Ok(())
+}
+
+/// Run the Prometheus metrics HTTP server backed by silo's `Metrics` registry.
+pub async fn run_metrics_server(
+    addr: SocketAddr,
+    metrics: Metrics,
+    shutdown: broadcast::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_registry(addr, metrics.registry.clone(), shutdown).await
 }
 
 /// Map a tonic status code to a short uppercase label matching the gRPC spec

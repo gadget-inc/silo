@@ -29,6 +29,10 @@ worker_restart_backoff = "2s"
 [logging]
 format = "json"
 
+[metrics]
+enabled = true
+addr = "0.0.0.0:9090"
+
 [compactor_options]
 poll_interval = "5s"
 max_sst_size = 67108864

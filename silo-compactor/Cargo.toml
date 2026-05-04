@@ -12,6 +12,7 @@ path = "src/main.rs"
 slatedb = { version = "0.12.0", features = ["compaction_filters"] }
 slatedb-common = "0.12.0"
 object_store = { version = "0.12", features = ["gcp"] }
+prometheus = "0.13"
 
 # silo pulls in codec/keys/job types for the compaction filter. default-features
 # are disabled so we don't transitively pull kube/k8s through silo (silo-compactor

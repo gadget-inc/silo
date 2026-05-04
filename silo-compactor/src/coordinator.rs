@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 use crate::assignment::compute_assignment;
 use crate::config::{AppConfig, CompactionFilterConfig, CoordinatorMode, ShardDiscoveryBackend};
 use crate::error::CompactorError;
+use crate::metrics::CompactorMetrics;
 use crate::pod_discovery::{K8sPodDiscovery, PodDiscovery, StaticPodDiscovery};
 use crate::shard_loader::ShardMapLoader;
 use crate::shard_loader::etcd::EtcdShardMapLoader;
@@ -30,10 +31,14 @@ pub struct Coordinator {
     worker_backoff: Duration,
     workers: HashMap<ShardId, WorkerHandle>,
     pod_change_rx: Option<mpsc::Receiver<()>>,
+    metrics: Option<Arc<CompactorMetrics>>,
 }
 
 impl Coordinator {
-    pub async fn from_config(cfg: AppConfig) -> Result<Self, CompactorError> {
+    pub async fn from_config(
+        cfg: AppConfig,
+        metrics: Option<Arc<CompactorMetrics>>,
+    ) -> Result<Self, CompactorError> {
         let self_pod_name = cfg
             .resolve_self_pod_name()
             .map_err(|e| CompactorError::Config(e.to_string()))?;
@@ -125,6 +130,7 @@ impl Coordinator {
             worker_backoff: cfg.coordinator.worker_restart_backoff,
             workers: HashMap::new(),
             pod_change_rx,
+            metrics,
         })
     }
 
@@ -192,8 +198,14 @@ impl Coordinator {
                 Arc::clone(&self.compactor_options),
                 Arc::clone(&self.filter_config),
                 self.worker_backoff,
+                self.metrics.clone(),
             );
             self.workers.insert(*shard, handle);
+        }
+
+        if let Some(m) = &self.metrics {
+            m.set_shards_owned(desired.len());
+            m.set_workers_running(self.workers.len());
         }
 
         info!(
