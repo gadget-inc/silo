@@ -545,6 +545,143 @@ async fn test_metrics_slatedb_multiple_shards() {
 }
 
 #[silo::test]
+async fn test_metrics_slatedb_object_store() {
+    let (metrics, _app) = create_metrics_router();
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let object_store = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(tmpdir.path()).unwrap(),
+    );
+    let recorder = std::sync::Arc::new(slatedb_common::metrics::DefaultMetricsRecorder::new());
+    let db = slatedb::DbBuilder::new("test-db", object_store)
+        .with_metrics_recorder(recorder.clone())
+        .build()
+        .await
+        .unwrap();
+
+    // Drive WAL puts and a flush so we get object-store activity on the
+    // main store as well (SST writes), not just WAL writes.
+    for i in 0..32u32 {
+        db.put(format!("key{i}").as_bytes(), &vec![b'v'; 1024])
+            .await
+            .unwrap();
+    }
+    db.flush().await.unwrap();
+
+    metrics.update_slatedb_stats("0", &recorder);
+
+    let body = gather_metrics_text(&metrics);
+
+    // TYPE lines should be present.
+    assert!(
+        body.contains("# TYPE silo_slatedb_object_store_requests_total counter"),
+        "object_store_requests_total should be a counter type"
+    );
+    assert!(
+        body.contains("# TYPE silo_slatedb_object_store_errors_total counter"),
+        "object_store_errors_total should be a counter type"
+    );
+    assert!(
+        body.contains("# TYPE silo_slatedb_object_store_request_duration_seconds histogram"),
+        "object_store_request_duration_seconds should be a histogram type"
+    );
+
+    // At least one PUT request line should be present and non-zero. We don't
+    // pin down `store_type` here because either main or wal will have seen
+    // writes; both are valid signals.
+    let request_lines: Vec<&str> = body
+        .lines()
+        .filter(|l| {
+            !l.starts_with('#')
+                && l.contains("silo_slatedb_object_store_requests_total{")
+                && l.contains("shard=\"0\"")
+                && l.contains("op=\"put\"")
+        })
+        .collect();
+    assert!(
+        !request_lines.is_empty(),
+        "should have at least one put request series, body:\n{body}"
+    );
+    let any_nonzero = request_lines.iter().any(|l| !l.trim_end().ends_with(" 0"));
+    assert!(
+        any_nonzero,
+        "at least one put request series should be > 0, lines: {request_lines:?}"
+    );
+
+    // Histogram buckets and _count/_sum should be present and the count for at
+    // least one put series should be > 0.
+    let bucket_lines: Vec<&str> = body
+        .lines()
+        .filter(|l| {
+            !l.starts_with('#')
+                && l.contains("silo_slatedb_object_store_request_duration_seconds_bucket")
+                && l.contains("shard=\"0\"")
+                && l.contains("op=\"put\"")
+        })
+        .collect();
+    assert!(
+        !bucket_lines.is_empty(),
+        "should have histogram bucket lines for put"
+    );
+    let count_lines: Vec<&str> = body
+        .lines()
+        .filter(|l| {
+            !l.starts_with('#')
+                && l.contains("silo_slatedb_object_store_request_duration_seconds_count")
+                && l.contains("shard=\"0\"")
+                && l.contains("op=\"put\"")
+        })
+        .collect();
+    let any_count_nonzero = count_lines.iter().any(|l| !l.trim_end().ends_with(" 0"));
+    assert!(
+        any_count_nonzero,
+        "histogram count for at least one put series should be > 0, lines: {count_lines:?}"
+    );
+
+    // Label cardinality: we should see more than one (store_type, op, api)
+    // combination across the request counter — at minimum WAL puts and SST
+    // puts produce distinct `store_type` values, but reads of the manifest
+    // also produce `op="get"` series in `component="db"` style code paths.
+    let distinct_label_sets: std::collections::HashSet<&str> = body
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.contains("silo_slatedb_object_store_requests_total{"))
+        .filter_map(|l| {
+            l.split_once('{')
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(labels, _)| labels)
+        })
+        .collect();
+    assert!(
+        distinct_label_sets.len() >= 2,
+        "expected at least 2 distinct object-store label combinations, got {}: {:?}",
+        distinct_label_sets.len(),
+        distinct_label_sets
+    );
+
+    // Idempotency: calling update again without further activity must not
+    // double-count counters or histogram buckets.
+    metrics.update_slatedb_stats("0", &recorder);
+    let body2 = gather_metrics_text(&metrics);
+    let extract_first_count = |body: &str| -> Option<f64> {
+        body.lines()
+            .find(|l| {
+                !l.starts_with('#')
+                    && l.contains("silo_slatedb_object_store_request_duration_seconds_count")
+                    && l.contains("shard=\"0\"")
+                    && l.contains("op=\"put\"")
+            })
+            .and_then(|l| l.rsplit_once(' ').and_then(|(_, v)| v.parse::<f64>().ok()))
+    };
+    assert_eq!(
+        extract_first_count(&body),
+        extract_first_count(&body2),
+        "histogram count must be stable across no-op polls"
+    );
+
+    db.close().await.unwrap();
+}
+
+#[silo::test]
 async fn test_metrics_ready_to_start_latency() {
     let (metrics, _app) = create_metrics_router();
 
