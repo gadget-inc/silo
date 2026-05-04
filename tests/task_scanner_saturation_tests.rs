@@ -335,6 +335,15 @@ async fn scanner_breaks_on_first_future_task() {
                 .expect("enqueue");
         }
 
+        // enqueue() only wakes the broker for ready tasks (see enqueue.rs:388),
+        // so for a future-only workload we need to dequeue once to lazily
+        // create+start the broker for this task group.
+        let r = shard
+            .dequeue("worker", task_group, 1)
+            .await
+            .expect("dequeue");
+        assert!(r.tasks.is_empty(), "no ready tasks should be available");
+
         // Let the scanner make several passes. With backoff (50ms→100→200→…→2000ms),
         // a 1.5s window admits ~6 passes.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
