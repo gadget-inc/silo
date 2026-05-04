@@ -70,10 +70,15 @@ fn unique_prefix() -> String {
     format!("sim-{}", nanos)
 }
 
-async fn count_with_prefix(db: &slatedb::Db, prefix: &str) -> usize {
-    let start: Vec<u8> = prefix.as_bytes().to_vec();
-    let mut end: Vec<u8> = prefix.as_bytes().to_vec();
-    end.push(0xFF);
+/// Count rows under a binary key prefix. Note: the previous version of this
+/// helper accepted a `&str` and used `prefix.as_bytes()`, which silently
+/// scanned an unrelated ASCII range (e.g., "holders/" starts with 0x68 while
+/// the actual concurrency-holder prefix is 0x09). That made the simulator's
+/// holder/lease/request invariants vacuous. Always pass the binary prefix from
+/// `keys::*_prefix()`.
+async fn count_with_binary_prefix(db: &slatedb::Db, prefix: &[u8]) -> usize {
+    let start: Vec<u8> = prefix.to_vec();
+    let end: Vec<u8> = keys::end_bound(prefix);
     let mut iter = db.scan::<Vec<u8>, _>(start..end).await.expect("scan");
     let mut n = 0usize;
     loop {
@@ -399,7 +404,11 @@ async fn main() -> anyhow::Result<()> {
             while checker_running.load(Ordering::SeqCst) {
                 let mut holders_total = 0usize;
                 for shard in shards_for_check.values() {
-                    holders_total += count_with_prefix(shard.db(), "holders/").await;
+                    holders_total += count_with_binary_prefix(
+                        shard.db(),
+                        &keys::concurrency_holders_prefix(),
+                    )
+                    .await;
                 }
                 assert!(
                     holders_total <= upper_bound_total,
@@ -410,7 +419,11 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut requests_total = 0usize;
                 for shard in shards_for_check.values() {
-                    requests_total += count_with_prefix(shard.db(), "requests/").await;
+                    requests_total += count_with_binary_prefix(
+                        shard.db(),
+                        &keys::concurrency_requests_prefix(),
+                    )
+                    .await;
                 }
                 assert!(
                     requests_total < 2000,
@@ -558,9 +571,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     for (sid, shard) in shards_for_enq.iter() {
-        let h = count_with_prefix(shard.db(), "holders/").await;
-        let l = count_with_prefix(shard.db(), "leases/").await;
-        let r = count_with_prefix(shard.db(), "requests/").await;
+        let h = count_with_binary_prefix(shard.db(), &keys::concurrency_holders_prefix()).await;
+        let l = count_with_binary_prefix(shard.db(), &keys::leases_prefix()).await;
+        let r = count_with_binary_prefix(shard.db(), &keys::concurrency_requests_prefix()).await;
         assert_eq!(
             h, 0,
             "holders leak shard={} h={} l={} r={} seed={} leaked_acks={} job_info_deletes={}",

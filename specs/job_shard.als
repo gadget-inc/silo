@@ -251,20 +251,13 @@ fact wellFormed {
     -- Requests are only for queues the job requires
     all r: TicketRequest | r.tr_queue in jobQueues[r.tr_job]
     
-    -- A holder can only exist for a task that is either:
-    -- 1. In the DB queue as a RunAttempt (granted at enqueue), OR
-    -- 2. In the buffer as a RunAttempt (scanned from DB), OR
-    -- 3. Has a lease (running), OR
-    -- 4. In the DB queue as a CheckRateLimit task (chained Concurrency -> RateLimit), OR
-    -- 5. In the buffer as a CheckRateLimit task
-    -- This allows holders to exist before lease (granted at enqueue, leased at dequeue)
-    -- and persists across the CheckRateLimit chain phase.
-    all h: TicketHolder |
-        some dbQueuedAt[h.th_task, h.th_time] or
-        some bufferedAt[h.th_task, h.th_time] or
-        some leaseAt[h.th_task, h.th_time] or
-        some dbCheckRateLimitAt[h.th_task, h.th_time] or
-        some bufferedCheckRateLimitAt[h.th_task, h.th_time]
+    -- The holder/active-task invariant lives in `assert holdersRequireActiveTask`
+    -- (below), NOT here. Keeping it as a fact makes the assertion trivially
+    -- true and prevents Alloy from generating buggy traces — the assertion
+    -- could never catch a transition that drops a task without releasing
+    -- holders. Encoded as an assertion, the safety property is checked
+    -- against the modeled transitions: a forgotten release produces a
+    -- counterexample.
     
     -- A holder and request can never coexist for the same (task, queue) at the same time
     -- (This is enforced by transitions but stated explicitly for clarity)
@@ -395,6 +388,12 @@ pred taskHoldsAllQueues[tid: TaskId, j: Job, t: Time] {
 pred concurrencyUnchanged[t: Time, tnext: Time] {
     all q: Queue | requestTasksAt[q, tnext] = requestTasksAt[q, t]
     all q: Queue | holdersAt[q, tnext] = holdersAt[q, t]
+    -- CRL state is part of "concurrency state" for frame purposes — without
+    -- this clause, transitions that preserve holders could spuriously add or
+    -- remove CRL entries, breaking the holdersRequireActiveTask assertion via
+    -- a phantom orphan rather than a real bug.
+    all tid: TaskId | dbCheckRateLimitAt[tid, tnext] = dbCheckRateLimitAt[tid, t]
+    all tid: TaskId | bufferedCheckRateLimitAt[tid, tnext] = bufferedCheckRateLimitAt[tid, t]
 }
 
 /** Frame condition: requests unchanged, only specific holder changes */
@@ -439,11 +438,13 @@ pred init[t: Time] {
 pred enqueuePreConditions[tid: TaskId, j: Job, t: Time] {
     -- [SILO-ENQ-1] Pre: job does NOT exist yet (we're creating a new job)
     j not in jobExistsAt[t]
-    
-    -- Pre: task is not already in use (not in DB, buffer, or leased)
+
+    -- Pre: task is not already in use (not in DB, buffer, leased, or CRL)
     no dbQueuedAt[tid, t]
     no bufferedAt[tid, t]
     no leaseAt[tid, t]
+    no dbCheckRateLimitAt[tid, t]
+    no bufferedCheckRateLimitAt[tid, t]
 }
 
 /** Common postconditions for job creation (all enqueue variants) */
@@ -672,7 +673,7 @@ pred completeFrameConditions[tid: TaskId, t: Time, tnext: Time] {
     all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
 }
 
-/** 
+/**
  * Release a holder for a specific task/queue.
  */
 pred releaseHolder[tid: TaskId, q: Queue, t: Time, tnext: Time] {
@@ -681,6 +682,19 @@ pred releaseHolder[tid: TaskId, q: Queue, t: Time, tnext: Time] {
     -- Other queues unchanged
     all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
     -- Requests unchanged (grant_next is a separate transition)
+    requestsUnchanged[t, tnext]
+}
+
+/**
+ * Release a set of holders for a single task atomically. Use this when a
+ * transition must release every queue a task was carrying — `all q: ... |
+ * releaseHolder[tid, q, t, tnext]` is unsatisfiable for |qs| > 1 because
+ * each releaseHolder asserts other queues are unchanged, contradicting the
+ * release of the next queue in the same step.
+ */
+pred releaseHolders[tid: TaskId, qs: set Queue, t: Time, tnext: Time] {
+    all q: qs | holdersAt[q, tnext] = holdersAt[q, t] - tid
+    all q: Queue - qs | holdersAt[q, tnext] = holdersAt[q, t]
     requestsUnchanged[t, tnext]
 }
 
@@ -1768,7 +1782,11 @@ pred brokerScanCheckRateLimit[t: Time, tnext: Time] {
     attemptExistsAt[tnext] = attemptExistsAt[t]
     all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
     jobExistsAt[tnext] = jobExistsAt[t]
-    concurrencyUnchanged[t, tnext]
+    -- Holders/requests preserved (we don't use concurrencyUnchanged because
+    -- it would also preserve CRL state, contradicting the buffer mutation
+    -- above).
+    all q: Queue | requestTasksAt[q, tnext] = requestTasksAt[q, t]
+    all q: Queue | holdersAt[q, tnext] = holdersAt[q, t]
 }
 
 -- Transition: DEQUEUE_DROP_RUN_ATTEMPT
@@ -1797,10 +1815,7 @@ pred dequeueDropRunAttempt[tid: TaskId, t: Time, tnext: Time] {
     -- Post: release ALL queues this task was carrying. Without this clause
     -- the assertion `holdersRequireActiveTask` fails, which is the formal
     -- statement of the bug fixed in PR #255.
-    (no taskHeldQueuesAt[tid, t]) implies holdersUnchanged[t, tnext]
-    (some taskHeldQueuesAt[tid, t]) implies {
-        all q: taskHeldQueuesAt[tid, t] | releaseHolder[tid, q, t, tnext]
-    }
+    releaseHolders[tid, taskHeldQueuesAt[tid, t], t, tnext]
 
     -- Frame: leases, jobs, attempts, requests, CRL state unchanged
     all tid2: TaskId | {
@@ -1846,10 +1861,7 @@ pred dequeueDropCheckRateLimit[tid: TaskId, t: Time, tnext: Time] {
     -- kirin/fix-rate-limit-holder-leak and kirin/dst-holder-leak-coverage.
     -- Held queues are derived from TicketHolder (taskHeldQueuesAt), the
     -- authoritative record.
-    (no taskHeldQueuesAt[tid, t]) implies holdersUnchanged[t, tnext]
-    (some taskHeldQueuesAt[tid, t]) implies {
-        all q: taskHeldQueuesAt[tid, t] | releaseHolder[tid, q, t, tnext]
-    }
+    releaseHolders[tid, taskHeldQueuesAt[tid, t], t, tnext]
 
     -- Frame: other leases, jobs, attempts, requests unchanged
     all tid2: TaskId | {
@@ -1911,6 +1923,30 @@ pred step[t: Time, tnext: Time] {
 fact traces {
     init[first]
     all t: Time - last | step[t, t.next]
+}
+
+/**
+ * CRL state changes only when a CRL transition fires. Without this fact,
+ * existing transitions that bypass `concurrencyUnchanged` (e.g.,
+ * enqueueWithConcurrencyGranted, completion-with-release variants) leave CRL
+ * sigs unconstrained — Alloy can spuriously add or remove CRL entries,
+ * fabricating dangling-holder counterexamples that don't correspond to any
+ * real transition. This fact ties CRL mutation to the dedicated transitions.
+ */
+fact crlStateChangesOnlyViaCrlTransitions {
+    all t: Time - last | let tnext = t.next | {
+        (some tid: TaskId | dbCheckRateLimitAt[tid, tnext] != dbCheckRateLimitAt[tid, t])
+            implies (
+                (some tid: TaskId, j: Job, q: Queue |
+                    enqueueWithConcurrencyAndRateLimit[tid, j, q, t, tnext]) or
+                (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
+            )
+        (some tid: TaskId | bufferedCheckRateLimitAt[tid, tnext] != bufferedCheckRateLimitAt[tid, t])
+            implies (
+                brokerScanCheckRateLimit[t, tnext] or
+                (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
+            )
+    }
 }
 
 
