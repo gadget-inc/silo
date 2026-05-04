@@ -7,16 +7,16 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use crate::cluster_client::AuthInterceptor;
-use crate::pb::silo_client::SiloClient;
-use crate::pb::{
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use silo::cluster_client::AuthInterceptor;
+use silo::pb::silo_client::SiloClient;
+use silo::pb::{
     CancelJobRequest, CompactShardRequest, ConfigureShardRequest, CpuProfileRequest,
     DeleteJobRequest, ExpediteJobRequest, ForceReleaseShardRequest, GetClusterInfoRequest,
     GetJobRequest, GetJobResultRequest, GetSplitStatusRequest, HeapProfileRequest, QueryRequest,
     RequestSplitRequest, RestartJobRequest,
 };
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -349,7 +349,7 @@ pub async fn job_result<W: Write>(
     let status = job_status_to_string(response.status);
 
     match response.result {
-        Some(crate::pb::get_job_result_response::Result::SuccessData(data)) => {
+        Some(silo::pb::get_job_result_response::Result::SuccessData(data)) => {
             let raw = extract_serialized_bytes(&data);
             if opts.json {
                 let json_output = serde_json::json!({
@@ -366,7 +366,7 @@ pub async fn job_result<W: Write>(
                 writeln!(out, "{}", format_bytes(&raw, format)?)?;
             }
         }
-        Some(crate::pb::get_job_result_response::Result::Failure(failure)) => {
+        Some(silo::pb::get_job_result_response::Result::Failure(failure)) => {
             let error_data = failure
                 .error_data
                 .map(|d| extract_serialized_bytes(&d))
@@ -388,7 +388,7 @@ pub async fn job_result<W: Write>(
                 writeln!(out, "{}", format_bytes(&error_data, format)?)?;
             }
         }
-        Some(crate::pb::get_job_result_response::Result::Cancelled(cancelled)) => {
+        Some(silo::pb::get_job_result_response::Result::Cancelled(cancelled)) => {
             if opts.json {
                 let json_output = serde_json::json!({
                     "id": response.id,
@@ -414,9 +414,9 @@ pub async fn job_result<W: Write>(
     Ok(())
 }
 
-fn extract_serialized_bytes(data: &crate::pb::SerializedBytes) -> Vec<u8> {
+fn extract_serialized_bytes(data: &silo::pb::SerializedBytes) -> Vec<u8> {
     match &data.encoding {
-        Some(crate::pb::serialized_bytes::Encoding::Msgpack(bytes)) => bytes.clone(),
+        Some(silo::pb::serialized_bytes::Encoding::Msgpack(bytes)) => bytes.clone(),
         None => vec![],
     }
 }
@@ -564,7 +564,7 @@ pub async fn query<W: Write>(
             .iter()
             .filter_map(|row| {
                 row.encoding.as_ref().and_then(|enc| match enc {
-                    crate::pb::serialized_bytes::Encoding::Msgpack(data) => {
+                    silo::pb::serialized_bytes::Encoding::Msgpack(data) => {
                         rmp_serde::from_slice::<serde_json::Value>(data).ok()
                     }
                 })
@@ -597,7 +597,7 @@ pub async fn query<W: Write>(
             .iter()
             .filter_map(|row| {
                 row.encoding.as_ref().and_then(|enc| match enc {
-                    crate::pb::serialized_bytes::Encoding::Msgpack(data) => {
+                    silo::pb::serialized_bytes::Encoding::Msgpack(data) => {
                         rmp_serde::from_slice::<serde_json::Value>(data).ok()
                     }
                 })
@@ -834,7 +834,7 @@ pub async fn shard_split<W: Write>(
         point
     } else if auto {
         // Compute numeric midpoint of the shard's hash-space range
-        let range = crate::shard_range::ShardRange::new(
+        let range = silo::shard_range::ShardRange::new(
             shard_owner.range_start.clone(),
             shard_owner.range_end.clone(),
         );
@@ -845,7 +845,7 @@ pub async fn shard_split<W: Write>(
                 shard_owner.range_end
             )
         })?;
-        crate::shard_range::format_hash_boundary(mid)
+        silo::shard_range::format_hash_boundary(mid)
     } else {
         return Err(anyhow::anyhow!(
             "Either --at <split-point> or --auto must be specified"
@@ -1096,7 +1096,7 @@ pub async fn validate_config<W: Write>(
     out: &mut W,
     config_path: &Path,
 ) -> anyhow::Result<()> {
-    match crate::settings::AppConfig::load(Some(config_path)) {
+    match silo::settings::AppConfig::load(Some(config_path)) {
         Ok(_cfg) => {
             if opts.json {
                 writeln!(
@@ -1131,7 +1131,7 @@ pub fn tenant_hash<W: Write>(
     out: &mut W,
     tenant_id: &str,
 ) -> anyhow::Result<()> {
-    let hashed = crate::shard_range::hash_tenant(tenant_id);
+    let hashed = silo::shard_range::hash_tenant(tenant_id);
 
     if opts.json {
         let json_output = serde_json::json!({
@@ -1159,11 +1159,11 @@ pub async fn tenant_locate<W: Write>(
         .await?
         .into_inner();
 
-    let hashed = crate::shard_range::hash_tenant(tenant_id);
+    let hashed = silo::shard_range::hash_tenant(tenant_id);
 
     // Find the shard whose range contains the hashed tenant
     let owner = response.shard_owners.iter().find(|s| {
-        let range = crate::shard_range::ShardRange::new(s.range_start.clone(), s.range_end.clone());
+        let range = silo::shard_range::ShardRange::new(s.range_start.clone(), s.range_end.clone());
         range.contains(&hashed)
     });
 
@@ -1218,11 +1218,11 @@ pub async fn tenant_locate<W: Write>(
 
 /// Compute the midpoint of a hash-space range defined by hex-encoded u64 boundaries.
 ///
-/// Delegates to [`ShardRange::midpoint`](crate::shard_range::ShardRange::midpoint)
+/// Delegates to [`ShardRange::midpoint`](silo::shard_range::ShardRange::midpoint)
 /// and formats the result as a 16-character hex string.
 pub fn compute_midpoint(start: &str, end: &str) -> Option<String> {
-    let range = crate::shard_range::ShardRange::new(start, end);
+    let range = silo::shard_range::ShardRange::new(start, end);
     range
         .midpoint()
-        .map(crate::shard_range::format_hash_boundary)
+        .map(silo::shard_range::format_hash_boundary)
 }

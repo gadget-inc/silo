@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use silo::siloctl::{self, BytesOutputFormat, GlobalOptions};
+use siloctl::{self, BytesOutputFormat, GlobalOptions};
 
 #[derive(Parser, Debug)]
 #[command(name = "siloctl")]
