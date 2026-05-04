@@ -327,18 +327,18 @@ jobs:
           nix build -L \
             .#packages.${{ matrix.nix_system }}.silo-docker \
             .#packages.${{ matrix.nix_system }}.silo-autoscaler-docker \
-            .#packages.${{ matrix.nix_system }}.silo-compactor-docker \
-            -o result-silo -o result-autoscaler -o result-compactor
-          docker load < result-silo
-          docker load < result-autoscaler
-          docker load < result-compactor
+            .#packages.${{ matrix.nix_system }}.silo-compactor-docker
+          # nix build creates result, result-1, result-2 for multiple installables
+          docker load < result
+          docker load < result-1
+          docker load < result-2
 
       - name: Push to Cachix
         env:
           CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
         run: |
           # Push the silo binaries and their dependencies to Cachix for future builds
-          cachix push silo result-silo result-autoscaler result-compactor
+          cachix push silo result result-1 result-2
 
       - name: Authenticate gcloud
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
