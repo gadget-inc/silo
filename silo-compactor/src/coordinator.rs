@@ -21,6 +21,8 @@ pub struct Coordinator {
     self_pod_name: String,
     backend: Backend,
     path_template: Arc<String>,
+    wal_backend: Option<Backend>,
+    wal_path_template: Option<Arc<String>>,
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
     filter_config: Arc<CompactionFilterConfig>,
     discovery: Arc<dyn PodDiscovery>,
@@ -46,6 +48,10 @@ impl Coordinator {
 
         let backend = cfg.storage.backend.clone();
         let path_template = Arc::new(cfg.storage.path.clone());
+        let (wal_backend, wal_path_template) = match &cfg.storage.wal {
+            Some(wal) => (Some(wal.backend.clone()), Some(Arc::new(wal.path.clone()))),
+            None => (None, None),
+        };
         let compactor_options = Arc::new(cfg.compactor_options.clone());
         let filter_config = Arc::new(cfg.compaction_filter.clone());
 
@@ -120,6 +126,8 @@ impl Coordinator {
             self_pod_name,
             backend,
             path_template,
+            wal_backend,
+            wal_path_template,
             compactor_options,
             filter_config,
             discovery,
@@ -195,6 +203,8 @@ impl Coordinator {
                 *shard,
                 self.backend.clone(),
                 Arc::clone(&self.path_template),
+                self.wal_backend.clone(),
+                self.wal_path_template.as_ref().map(Arc::clone),
                 Arc::clone(&self.compactor_options),
                 Arc::clone(&self.filter_config),
                 self.worker_backoff,

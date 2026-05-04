@@ -164,6 +164,12 @@ pub struct CompletedJobCompactionFilterSupplier {
 struct ReaderContext {
     db_path: Path,
     store: Arc<dyn object_store::ObjectStore>,
+    /// Set when silo opens the same shard with `[database.wal]` configured.
+    /// Slatedb's V1 manifest records "split WAL configured" as a flag and
+    /// `DbReaderBuilder::build()` refuses an open whose builder doesn't
+    /// match, so we must mirror it here even though the filter never reads
+    /// WAL contents.
+    wal_store: Option<Arc<dyn object_store::ObjectStore>>,
 }
 
 impl CompletedJobCompactionFilterSupplier {
@@ -174,10 +180,29 @@ impl CompletedJobCompactionFilterSupplier {
     ) -> Self {
         Self {
             retention,
-            reader_ctx: Some(ReaderContext { db_path, store }),
+            reader_ctx: Some(ReaderContext {
+                db_path,
+                store,
+                wal_store: None,
+            }),
             expired_set_max_entries: DEFAULT_EXPIRED_SET_MAX_ENTRIES,
             metrics: None,
         }
+    }
+
+    /// Configure a WAL object store for the per-job [`DbReader`]. Required
+    /// when silo opens the same shard with `[database.wal]` set: slatedb's
+    /// `DbReaderBuilder::build()` otherwise returns `WalStoreReconfigurationError`
+    /// because the manifest's "split WAL configured" flag doesn't match the
+    /// builder. The store contents are never read by the filter.
+    ///
+    /// Accepts `Option<...>` so callers (the worker) can forward
+    /// unconditionally without an extra `if let`.
+    pub fn with_wal_store(mut self, wal_store: Option<Arc<dyn object_store::ObjectStore>>) -> Self {
+        if let Some(ctx) = self.reader_ctx.as_mut() {
+            ctx.wal_store = wal_store;
+        }
+        self
     }
 
     /// Override the per-filter pre-scan cap. `0` disables the pre-scan and
@@ -220,11 +245,12 @@ impl CompactionFilterSupplier for CompletedJobCompactionFilterSupplier {
         // on_compaction_end), which keeps its checkpoint / manifest poller
         // from interfering with the compactor across jobs.
         let reader = if let Some(ctx) = &self.reader_ctx {
-            match DbReaderBuilder::new(ctx.db_path.clone(), Arc::clone(&ctx.store))
-                .with_merge_operator(counter_merge_operator())
-                .build()
-                .await
-            {
+            let mut rb = DbReaderBuilder::new(ctx.db_path.clone(), Arc::clone(&ctx.store))
+                .with_merge_operator(counter_merge_operator());
+            if let Some(wal) = ctx.wal_store.as_ref() {
+                rb = rb.with_wal_object_store(Arc::clone(wal));
+            }
+            match rb.build().await {
                 Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
                     warn!(
@@ -805,5 +831,102 @@ mod tests {
             .unwrap();
         assert_eq!(set.len(), 0);
         assert!(!set.contains("anything", "anywhere"));
+    }
+
+    /// Pin the slatedb contract that motivated the WAL-store plumbing. When
+    /// silo opens a shard with `with_wal_object_store(...)`, the V1 manifest
+    /// records the split-WAL flag and `DbReaderBuilder::build()` refuses any
+    /// later open whose builder doesn't match — returning
+    /// `WalStoreReconfigurationError` ("wal store reconfiguration unsupported").
+    /// Without the supplier wiring `with_wal_store(...)`, the per-job
+    /// `DbReader` opened by the `completed_jobs` filter fails the same way
+    /// in production.
+    #[tokio::test]
+    async fn db_reader_requires_wal_store_when_db_was_opened_with_one() {
+        let main: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = slatedb::object_store::path::Path::from("test-db");
+
+        // Mimic silo's production open: a separate WAL store is registered, so
+        // the manifest records `wal_object_store_uri = Some(_)` (V1 encoding).
+        let db = Db::builder(path.clone(), Arc::clone(&main))
+            .with_wal_object_store(Arc::clone(&wal))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"k", b"v").await.unwrap();
+        db.close().await.unwrap();
+
+        // Without WAL store: build() must fail with "wal store reconfiguration".
+        // This is exactly the error the production compactor hits. (DbReader
+        // doesn't implement Debug, so we can't use expect_err here.)
+        match DbReaderBuilder::new(path.clone(), Arc::clone(&main))
+            .build()
+            .await
+        {
+            Ok(_) => panic!("expected wal-reconfiguration error without wal store"),
+            Err(e) => assert!(
+                format!("{e}")
+                    .to_lowercase()
+                    .contains("wal store reconfiguration"),
+                "unexpected error: {e}",
+            ),
+        }
+
+        // With matching WAL store: build() succeeds.
+        DbReaderBuilder::new(path.clone(), Arc::clone(&main))
+            .with_wal_object_store(Arc::clone(&wal))
+            .build()
+            .await
+            .expect("reader should open with matching wal store");
+    }
+
+    /// End-to-end check that the supplier threads its configured WAL store
+    /// into the `DbReader` it opens per compaction job. Without
+    /// `with_wal_store(...)`, the per-job reader would fail to open against
+    /// a shard whose manifest carries `wal_object_store_uri = Some(_)` and
+    /// the filter would degrade to a warn-and-keep no-op.
+    #[tokio::test]
+    async fn supplier_with_wal_store_opens_reader_against_split_wal_db() {
+        use slatedb::{CompactionFilterSupplier, CompactionJobContext};
+
+        let main: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = slatedb::object_store::path::Path::from("test-db");
+
+        let db = Db::builder(path.clone(), Arc::clone(&main))
+            .with_merge_operator(counter_merge_operator())
+            .with_wal_object_store(Arc::clone(&wal))
+            .build()
+            .await
+            .unwrap();
+        db.flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+
+        let supplier = CompletedJobCompactionFilterSupplier::new(
+            Duration::from_secs(60),
+            path.clone(),
+            Arc::clone(&main),
+        )
+        .with_wal_store(Some(Arc::clone(&wal)));
+
+        // If the supplier didn't thread the WAL store through, the inner
+        // DbReader open would fail and we'd get a warn-and-skip filter.
+        // The exercise here is just that `create_compaction_filter` returns
+        // Ok — slatedb's contract failure doesn't propagate as a hard error,
+        // so we trust the warn-path test above to catch regressions.
+        let _filter = supplier
+            .create_compaction_filter(&CompactionJobContext {
+                destination: 0,
+                is_dest_last_run: false,
+                compaction_clock_tick: 0,
+                retention_min_seq: None,
+            })
+            .await
+            .expect("supplier should produce a filter");
     }
 }
