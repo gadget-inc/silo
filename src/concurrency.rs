@@ -94,6 +94,16 @@ impl From<crate::codec::CodecError> for ConcurrencyError {
 /// `job_store_shard::get_jobs_status_batch` for the same reason.
 const STATUS_LOOKUP_CONCURRENCY: usize = 64;
 
+/// Max grants written in a single `process_grants` pass. A single
+/// `request_grant_count` accumulation can be arbitrarily large (every
+/// release between scanner wakeups adds to it), and without a per-pass
+/// cap the scanner would materialize `count` `ScannedRequest`s, issue
+/// `count` buffered status gets, and accumulate `count` edits in a
+/// single `WriteBatch` before committing. Capping per pass bounds peak
+/// memory; the outer loop iterates as many passes as needed to drain
+/// the requested count.
+const MAX_GRANTS_PER_PASS: usize = 256;
+
 /// Result of attempting to enqueue a job with concurrency limits
 #[derive(Debug)]
 pub enum RequestTicketOutcome {
@@ -812,18 +822,25 @@ impl ConcurrencyManager {
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
-        let mut batch = WriteBatch::new();
-        let mut grants: Vec<(String, String)> = Vec::new();
-        let mut stale_and_corrupt_count: usize = 0;
+        let mut all_granted_groups: Vec<String> = Vec::new();
+        let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
-        // granted `count` requests, or hit the end / capacity limit. Each iteration
-        // scans a batch of candidates, validates them concurrently, then reserves
-        // slots for valid ones. Stale/corrupt entries are cleaned up along the way.
-        while grants.len() < count as usize && !iter_exhausted && !capacity_exhausted {
-            let needed = count as usize - grants.len();
+        // granted `count` requests, or hit the end / capacity limit. Each pass
+        // scans up to `MAX_GRANTS_PER_PASS` candidates, validates them concurrently,
+        // reserves slots for valid ones, and commits the batch. Stale/corrupt entries
+        // are cleaned up along the way. Bounding per-pass scan size caps peak memory
+        // (the scanned Vec, buffered status results, and WriteBatch all scale with it),
+        // so a large accumulated `count` is drained over multiple bounded passes
+        // rather than one unbounded one.
+        while total_granted < count as usize && !iter_exhausted && !capacity_exhausted {
+            let needed = (count as usize - total_granted).min(MAX_GRANTS_PER_PASS);
+
+            let mut batch = WriteBatch::new();
+            let mut grants: Vec<(String, String)> = Vec::new();
+            let mut stale_and_corrupt_count: usize = 0;
 
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
@@ -924,10 +941,11 @@ impl ConcurrencyManager {
                 });
             }
 
-            if scanned.is_empty() {
-                break;
-            }
-
+            // If the scan yielded no candidates, fall through to the per-pass
+            // commit so any stale-delete edits accumulated above (malformed
+            // entries) still get written, then let the outer while guard
+            // (which checks `iter_exhausted`) terminate the loop.
+            //
             // --- Batch validate status ---
             // Use `buffered` (order-preserving) rather than `join_all` so that
             // we cap in-flight slatedb reads at STATUS_LOOKUP_CONCURRENCY. Each
@@ -1010,7 +1028,7 @@ impl ConcurrencyManager {
             // --- Reserve in-memory slots and accumulate grant edits ---
             let limit = max_concurrency.map(|(l, _)| l).unwrap_or(1);
             for req in &valid_requests {
-                if grants.len() >= count as usize {
+                if total_granted + grants.len() >= count as usize {
                     break;
                 }
 
@@ -1059,58 +1077,66 @@ impl ConcurrencyManager {
 
                 grants.push((req.request_id.clone(), req.task_group.clone()));
             }
-        }
 
-        // Single combined counter decrement for all grants + stale/corrupt deletions
-        let total_counter_decrement = grants.len() + stale_and_corrupt_count;
-        if total_counter_decrement > 0 {
-            batch.merge(
-                concurrency_requester_counter_key(tenant, queue),
-                encode_counter(-(total_counter_decrement as i64)),
-            );
-        }
-
-        if grants.is_empty() && stale_and_corrupt_count == 0 {
-            return Vec::new();
-        }
-
-        // --- Single durable write ---
-        if let Err(e) = db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: true,
-                },
-            )
-            .await
-        {
-            for (request_id, _) in &grants {
-                self.counts.release_reservation(tenant, queue, request_id);
+            // --- Per-pass commit ---
+            // Combined counter decrement for this pass's grants + stale/corrupt deletions.
+            let pass_decrement = grants.len() + stale_and_corrupt_count;
+            if pass_decrement > 0 {
+                batch.merge(
+                    concurrency_requester_counter_key(tenant, queue),
+                    encode_counter(-(pass_decrement as i64)),
+                );
             }
-            tracing::warn!(
-                error = %e,
-                count = grants.len(),
-                "grant scanner: batch write failed, rolled back all reservations"
-            );
-            return Vec::new();
-        }
 
-        for (request_id, task_group) in &grants {
-            tracing::debug!(
-                queue = %queue,
-                request_id = %request_id,
-                task_group = %task_group,
-                "grant scanner: granted concurrency ticket"
-            );
-        }
-
-        if let Some(ref m) = self.metrics {
-            for _ in 0..grants.len() {
-                m.record_concurrency_ticket_granted();
+            // Skip the durable write if this pass produced no edits (e.g. every
+            // scanned status lookup returned an error). The iterator has still
+            // advanced, so the outer loop continues until iter_exhausted.
+            if grants.is_empty() && stale_and_corrupt_count == 0 {
+                continue;
             }
+
+            if let Err(e) = db
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: true,
+                    },
+                )
+                .await
+            {
+                // Roll back only this pass's reservations; prior committed passes stand.
+                for (request_id, _) in &grants {
+                    self.counts.release_reservation(tenant, queue, request_id);
+                }
+                tracing::warn!(
+                    error = %e,
+                    pass_grants = grants.len(),
+                    prior_grants = total_granted,
+                    "grant scanner: batch write failed, rolled back this pass's reservations"
+                );
+                return all_granted_groups;
+            }
+
+            for (request_id, task_group) in &grants {
+                tracing::debug!(
+                    queue = %queue,
+                    request_id = %request_id,
+                    task_group = %task_group,
+                    "grant scanner: granted concurrency ticket"
+                );
+            }
+
+            if let Some(ref m) = self.metrics {
+                for _ in 0..grants.len() {
+                    m.record_concurrency_ticket_granted();
+                }
+            }
+
+            total_granted += grants.len();
+            all_granted_groups.extend(grants.into_iter().map(|(_, tg)| tg));
         }
 
-        grants.into_iter().map(|(_, tg)| tg).collect()
+        all_granted_groups
     }
 }
 
