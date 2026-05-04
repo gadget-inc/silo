@@ -560,6 +560,21 @@ impl JobStoreShard {
                         max_retries = max_retries,
                         "rate limit check exceeded max retries"
                     );
+                    // Drop the task and release any concurrency holders it
+                    // carries from earlier chained limits. Without this, a
+                    // stranded holder permanently consumes a slot for the
+                    // queue.
+                    for q in held_queues.iter() {
+                        let queue = q.clone();
+                        state
+                            .batch
+                            .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                        state.holder_releases.push((
+                            tenant.to_string(),
+                            queue,
+                            check_task_id.to_string(),
+                        ));
+                    }
                     return Ok(());
                 }
 
