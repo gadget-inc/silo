@@ -1,12 +1,12 @@
 [workspace]
-members = [".", "silo-macros", "silo-autoscaler", "silo-compactor"]
+members = [".", "silo-macros", "silo-autoscaler", "silo-compactor", "siloctl"]
 
 [package]
 authors = ["Harry Brundage <harry@gadget.dev>"]
 edition = "2024"
 name = "silo"
 description = "A background job server on top of object storage"
-version = "0.2.0"
+version = "0.3.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -63,7 +63,7 @@ datafusion = { version = "50", features = [
     "datetime_expressions",
     "regex_expressions",
     "recursive_protection",
-] }
+], optional = true }
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
@@ -73,7 +73,7 @@ askama_axum = "0.4"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["fs"] }
 rand = "0.9"
-datafusion-sql = "50"
+datafusion-sql = { version = "50", optional = true }
 hostname = "0.4"
 pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
@@ -86,11 +86,16 @@ base64 = "0.22"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [features]
-default = ["k8s"]
+default = ["k8s", "server"]
 dst = ["turmoil"]
 k8s = ["kube", "k8s-openapi", "chrono"]
+# `server` enables the modules required by the silo daemon (SQL query engine,
+# arrow IPC, web UI). Disable to build lightweight clients (siloctl, compactor)
+# without paying the datafusion compile cost.
+server = ["dep:datafusion", "dep:datafusion-sql"]
 
 [dev-dependencies]
+siloctl = { path = "siloctl" }
 mad-turmoil = "0.2"
 rand = "0.9"
 fastrand = "2"                                                      # For deterministic simulation - seed must be set explicitly
@@ -114,6 +119,13 @@ strip = false # do not strip symbols for profiling
 # frame pointers are preserved. Without this, production profiles will have
 # incomplete call stacks.
 
+[[bin]]
+name = "silo"
+path = "src/main.rs"
+# The silo daemon binary pulls in the gRPC server and SQL query engine,
+# which require the `server` feature (datafusion).
+required-features = ["server"]
+
 [[bench]]
 name = "job_shard_throughput"
 harness = false
@@ -121,6 +133,7 @@ harness = false
 [[bench]]
 name = "query_performance"
 harness = false
+required-features = ["server"]
 
 [[bench]]
 name = "big_shard_operations"
@@ -129,6 +142,7 @@ harness = false
 [[bench]]
 name = "query_profile"
 harness = false
+required-features = ["server"]
 
 [[bench]]
 name = "task_scanner_profile"

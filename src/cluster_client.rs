@@ -36,11 +36,13 @@ use tracing::{debug, trace, warn};
 
 use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
+#[cfg(feature = "server")]
+use crate::pb::QueryRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ColumnInfo, CompactShardRequest, GetJobRequest, GetJobResponse,
     GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse, JobStatus,
-    QueryRequest, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
+    RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -438,6 +440,7 @@ impl ClusterClient {
     }
 
     /// Query a specific shard, routing to the appropriate node
+    #[cfg(feature = "server")]
     pub async fn query_shard(
         &self,
         shard_id: &ShardId,
@@ -456,6 +459,7 @@ impl ClusterClient {
     }
 
     /// Query a local shard directly
+    #[cfg(feature = "server")]
     async fn query_local_shard(
         &self,
         shard_id: &ShardId,
@@ -510,6 +514,7 @@ impl ClusterClient {
     }
 
     /// Query a remote shard via gRPC
+    #[cfg(feature = "server")]
     async fn query_remote_shard(
         &self,
         shard_id: &ShardId,
@@ -548,6 +553,7 @@ impl ClusterClient {
     }
 
     /// Query all shards in the cluster and combine results
+    #[cfg(feature = "server")]
     pub async fn query_all_shards(
         &self,
         sql: &str,
@@ -576,6 +582,7 @@ impl ClusterClient {
     }
 
     /// Get all shard IDs in the cluster
+    #[cfg(feature = "server")]
     async fn get_all_shard_ids(&self) -> Result<Vec<ShardId>, ClusterClientError> {
         if let Some(coordinator) = &self.coordinator {
             let owner_map = coordinator
@@ -678,7 +685,7 @@ impl ClusterClient {
                     .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
                 attempt_views
                     .into_iter()
-                    .map(|a| crate::server::job_attempt_view_to_proto(&a))
+                    .map(|a| crate::pb_convert::job_attempt_view_to_proto(&a))
                     .collect()
             } else {
                 Vec::new()
@@ -687,14 +694,14 @@ impl ClusterClient {
             // For succeeded jobs, populate the result field
             let result = if job_status.kind == crate::job::JobStatusKind::Succeeded {
                 if !attempts.is_empty() {
-                    crate::server::result_from_proto_attempts(&attempts)
+                    crate::pb_convert::result_from_proto_attempts(&attempts)
                 } else {
                     let latest = shard
                         .get_latest_job_attempt(tenant, job_id)
                         .await
                         .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
                     latest.and_then(|a| {
-                        let proto = crate::server::job_attempt_view_to_proto(&a);
+                        let proto = crate::pb_convert::job_attempt_view_to_proto(&a);
                         proto.result
                     })
                 }
@@ -715,7 +722,7 @@ impl ClusterClient {
                 limits: job_view
                     .limits()
                     .into_iter()
-                    .map(crate::server::job_limit_to_proto_limit)
+                    .map(crate::pb_convert::job_limit_to_proto_limit)
                     .collect(),
                 metadata: job_view.metadata().into_iter().collect(),
                 status: status.into(),

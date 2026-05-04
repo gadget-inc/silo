@@ -13,7 +13,7 @@ use grpc_integration_helpers::{
 use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::settings::AppConfig;
-use silo::siloctl::{self, BytesOutputFormat, GlobalOptions};
+use siloctl::{self, BytesOutputFormat, GlobalOptions};
 
 // Global mutex to serialize profiler tests - both profilers use process-global state.
 static PROFILE_TEST_MUTEX: Mutex<()> = Mutex::new(());

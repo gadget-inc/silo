@@ -32,7 +32,9 @@ pub use helpers::now_epoch_ms;
 
 use slatedb::Db;
 use slatedb_common::metrics::DefaultMetricsRecorder;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "server")]
+use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +46,7 @@ use crate::job::{JobStatus, JobStatusKind, JobView};
 use crate::job_attempt::JobAttemptView;
 use crate::keys::{attempt_key, job_info_key, job_status_key};
 use crate::metrics::Metrics;
+#[cfg(feature = "server")]
 use crate::query::ShardQueryEngine;
 use crate::settings::DatabaseConfig;
 use crate::shard_range::ShardRange;
@@ -94,6 +97,7 @@ pub struct JobStoreShard {
     pub(crate) db: Arc<Db>,
     pub(crate) brokers: Arc<TaskBrokerRegistry>,
     pub(crate) concurrency: Arc<ConcurrencyManager>,
+    #[cfg(feature = "server")]
     query_engine: OnceLock<ShardQueryEngine>,
     pub(crate) rate_limiter: Arc<dyn RateLimitClient>,
     /// Optional WAL close configuration - present when using local WAL storage
@@ -379,6 +383,7 @@ impl JobStoreShard {
             db,
             brokers,
             concurrency,
+            #[cfg(feature = "server")]
             query_engine: OnceLock::new(),
             rate_limiter,
             wal_close_config,
@@ -411,6 +416,7 @@ impl JobStoreShard {
     ///
     /// This is the low-level query engine for single-shard queries, typically used
     /// by gRPC handlers. For cluster-wide queries, use `ClusterQueryEngine`.
+    #[cfg(feature = "server")]
     pub fn query_engine(self: &Arc<Self>) -> &ShardQueryEngine {
         self.query_engine.get_or_init(|| {
             ShardQueryEngine::new(Arc::clone(self), "jobs").expect("Failed to create query engine")

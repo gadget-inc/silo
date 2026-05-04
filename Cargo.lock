@@ -5377,7 +5377,7 @@ dependencies = [
 
 [[package]]
 name = "silo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -5423,6 +5423,7 @@ dependencies = [
  "serde",
  "serde_json",
  "silo-macros",
+ "siloctl",
  "slatedb",
  "slatedb-common",
  "storekey",
@@ -5511,6 +5512,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
+]
+
+[[package]]
+name = "siloctl"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "flate2",
+ "hex",
+ "rmp-serde",
+ "serde_json",
+ "silo",
+ "tokio",
+ "tonic 0.12.3",
 ]
 
 [[package]]

@@ -20,7 +20,7 @@ use crate::cluster_client::{
     ClientConfig, InterceptedSiloClient, create_silo_client_lazy, ensure_http_scheme,
 };
 use crate::pb::GetClusterInfoRequest;
-use crate::server::SHARD_OWNER_ADDR_METADATA_KEY;
+use crate::pb_convert::SHARD_OWNER_ADDR_METADATA_KEY;
 
 /// Information about a shard owner in the cluster.
 #[derive(Debug, Clone)]

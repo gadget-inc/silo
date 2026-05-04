@@ -1,5 +1,7 @@
+#[cfg(feature = "server")]
 pub mod arrow_ipc;
 pub mod cluster_client;
+#[cfg(feature = "server")]
 pub mod cluster_query;
 pub mod codec;
 pub mod concurrency;
@@ -13,6 +15,8 @@ pub mod job_attempt;
 pub mod job_store_shard;
 pub mod keys;
 pub mod metrics;
+pub mod pb_convert;
+#[cfg(feature = "server")]
 pub mod query;
 pub mod retry;
 pub mod routing_client;
@@ -24,6 +28,7 @@ pub mod task_broker;
 pub mod trace;
 #[cfg(feature = "dst")]
 pub mod turmoil_object_store;
+#[cfg(feature = "server")]
 pub mod webui;
 pub use silo_macros::test;
 pub mod fb {
@@ -40,8 +45,8 @@ pub mod pb {
         include!(concat!(env!("OUT_DIR"), "/pb.gubernator.rs"));
     }
 }
+#[cfg(feature = "server")]
 pub mod server;
-pub mod siloctl;
 
 #[cfg(unix)]
 #[global_allocator]
