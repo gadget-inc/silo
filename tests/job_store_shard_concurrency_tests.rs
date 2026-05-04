@@ -2034,3 +2034,103 @@ async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
     );
     assert_eq!(count_concurrency_holders(shard.db()).await, N);
 }
+
+/// Regression test for `MAX_GRANTS_PER_PASS` bounding in `process_grants`.
+///
+/// A single `request_grant_count` accumulation can be arbitrarily large (every
+/// release between scanner wakeups adds to it). Without a per-pass cap, the
+/// scanner would materialize `count` `ScannedRequest`s, issue `count` buffered
+/// status gets, and accumulate `count` edits in one `WriteBatch` before
+/// committing. The cap forces the scanner to drain a large `count` over multiple
+/// bounded passes — this test verifies that an end-to-end drain of a backlog
+/// larger than `MAX_GRANTS_PER_PASS` (256) still grants every waiter.
+#[silo::test]
+async fn grant_scanner_drains_backlog_larger_than_max_per_pass() {
+    // Sized to cross the per-pass cap (256) by enough to require at least three
+    // passes, exercising the multi-pass commit path.
+    const N: usize = 600;
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "max-per-pass-q";
+    let tenant = "max-per-pass-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: N as u32,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Fill all N slots with holders.
+    for i in 0..N {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("holder-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    let mut holder_tasks = Vec::with_capacity(N);
+    while holder_tasks.len() < N {
+        let tasks = shard.dequeue("w", "tg", N).await.unwrap().tasks;
+        assert!(!tasks.is_empty(), "dequeue should return holders");
+        for t in tasks {
+            holder_tasks.push(t.attempt().task_id().to_string());
+        }
+    }
+
+    // Enqueue N waiters — each becomes a request (capacity is full).
+    for i in 0..N {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("waiter-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, N);
+
+    // Release all holders to free capacity.
+    for task_id in &holder_tasks {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .unwrap();
+    }
+
+    // One process_grants call asks for N grants. Internally this must run as
+    // multiple bounded passes (each ≤ MAX_GRANTS_PER_PASS = 256) and still
+    // return all N grants.
+    let granted = shard
+        .process_concurrency_grants(tenant, queue, N as u32)
+        .await;
+    assert_eq!(
+        granted.len(),
+        N,
+        "all {} waiters should be granted via multiple bounded passes",
+        N
+    );
+
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "all request records should be consumed"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, N);
+}
