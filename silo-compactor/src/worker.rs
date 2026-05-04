@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use slatedb_common::metrics::DefaultMetricsRecorder;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -8,8 +9,13 @@ use tracing::{info, warn};
 use crate::compaction_filter::CompletedJobCompactionFilterSupplier;
 use crate::config::CompactionFilterConfig;
 use crate::error::CompactorError;
+use crate::metrics::CompactorMetrics;
 use crate::shard_map::ShardId;
 use crate::storage::{Backend, path_for_shard, resolve_object_store};
+
+/// Period at which per-shard slatedb stats are polled and translated into
+/// Prometheus instruments. Roughly matches silo's per-shard cadence.
+const SLATEDB_STAT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Handle to a per-shard compactor task. Drop the handle to stop the worker:
 /// call `shutdown().await` first to wait for graceful shutdown.
@@ -28,6 +34,7 @@ impl WorkerHandle {
 
 /// Spawn a tokio task that runs slatedb's standalone compactor for `shard_id`,
 /// restarting on transient errors with `restart_backoff` between attempts.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     shard_id: ShardId,
     backend: Backend,
@@ -35,6 +42,7 @@ pub fn spawn_worker(
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
     filter_config: Arc<CompactionFilterConfig>,
     restart_backoff: Duration,
+    metrics: Option<Arc<CompactorMetrics>>,
 ) -> WorkerHandle {
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
@@ -46,6 +54,7 @@ pub fn spawn_worker(
             compactor_options,
             filter_config,
             restart_backoff,
+            metrics,
             cancel_for_task,
         )
         .await;
@@ -57,6 +66,7 @@ pub fn spawn_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     shard_id: ShardId,
     backend: Backend,
@@ -64,8 +74,10 @@ async fn run_supervisor(
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
     filter_config: Arc<CompactionFilterConfig>,
     restart_backoff: Duration,
+    metrics: Option<Arc<CompactorMetrics>>,
     cancel: CancellationToken,
 ) {
+    let shard_label = shard_id.to_string();
     loop {
         if cancel.is_cancelled() {
             return;
@@ -76,6 +88,7 @@ async fn run_supervisor(
             &path_template,
             compactor_options.as_ref().clone(),
             filter_config.as_ref(),
+            metrics.as_ref(),
             &cancel,
         )
         .await
@@ -85,6 +98,10 @@ async fn run_supervisor(
                 return;
             }
             Err(e) => {
+                if let Some(m) = &metrics {
+                    m.record_compactor_run_error(&shard_label);
+                    m.record_worker_restart(&shard_label);
+                }
                 warn!(
                     shard = %shard_id,
                     error = %e,
@@ -106,8 +123,10 @@ async fn run_once(
     path_template: &str,
     compactor_options: Option<slatedb::config::CompactorOptions>,
     filter_config: &CompactionFilterConfig,
+    metrics: Option<&Arc<CompactorMetrics>>,
     cancel: &CancellationToken,
 ) -> Result<(), CompactorError> {
+    let shard_label = shard_id.to_string();
     let shard_path = path_for_shard(path_template, shard_id);
     let resolved = resolve_object_store(backend, &shard_path)?;
 
@@ -120,10 +139,22 @@ async fn run_once(
 
     let canonical_path = resolved.canonical_path;
     let store = resolved.store;
+    // Per-shard slatedb metrics recorder: passed to the CompactorBuilder so
+    // slatedb populates it during `compactor.run()`, then translated into our
+    // Prometheus registry by the poller task below.
+    let recorder = metrics
+        .is_some()
+        .then(|| Arc::new(DefaultMetricsRecorder::new()));
+
     let mut builder = slatedb::CompactorBuilder::new(canonical_path.clone(), Arc::clone(&store))
         .with_merge_operator(silo::job_store_shard::counter_merge_operator());
     if let Some(opts) = compactor_options {
         builder = builder.with_options(opts);
+    }
+    if let Some(rec) = &recorder {
+        builder = builder.with_metrics_recorder(
+            Arc::clone(rec) as Arc<dyn slatedb_common::metrics::MetricsRecorder>
+        );
     }
     if let CompactionFilterConfig::CompletedJobs {
         retention_secs,
@@ -138,6 +169,9 @@ async fn run_once(
         if let Some(cap) = expired_set_max_entries {
             supplier = supplier.with_max_expired_entries(*cap);
         }
+        if let Some(m) = metrics {
+            supplier = supplier.with_metrics(Arc::clone(m), shard_label.clone());
+        }
         info!(
             shard = %shard_id,
             retention_secs = *retention_secs,
@@ -148,12 +182,41 @@ async fn run_once(
     }
     let compactor = builder.build();
 
+    if let Some(m) = metrics {
+        m.record_compactor_started(&shard_label);
+    }
+
+    // Poller task: every SLATEDB_STAT_POLL_INTERVAL, snapshot the slatedb
+    // recorder and translate into our Prometheus registry. Stops when the
+    // worker is cancelled or the compactor exits.
+    let poller = match (metrics, &recorder) {
+        (Some(m), Some(rec)) => {
+            let m = Arc::clone(m);
+            let rec = Arc::clone(rec);
+            let shard_label = shard_label.clone();
+            let poller_cancel = cancel.clone();
+            Some(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(SLATEDB_STAT_POLL_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            m.slatedb.update(&shard_label, &rec);
+                        }
+                        _ = poller_cancel.cancelled() => break,
+                    }
+                }
+            }))
+        }
+        _ => None,
+    };
+
     let mut run_task = tokio::spawn({
         let compactor = compactor.clone();
         async move { compactor.run().await }
     });
 
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut run_task => match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(CompactorError::Slatedb(e.to_string())),
@@ -168,5 +231,18 @@ async fn run_once(
             let _ = run_task.await;
             Ok(())
         }
+    };
+
+    // Stop the poller and flush one final snapshot so trailing counter
+    // deltas (e.g. the last compaction's bytes_compacted) make it into
+    // Prometheus before the recorder is dropped.
+    if let Some(handle) = poller {
+        handle.abort();
+        let _ = handle.await;
     }
+    if let (Some(m), Some(rec)) = (metrics, &recorder) {
+        m.slatedb.update(&shard_label, rec);
+    }
+
+    result
 }

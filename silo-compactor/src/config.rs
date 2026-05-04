@@ -19,6 +19,34 @@ pub struct AppConfig {
     pub compactor_options: Option<slatedb::config::CompactorOptions>,
     #[serde(default)]
     pub compaction_filter: CompactionFilterConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Prometheus metrics endpoint configuration. Mirrors `silo::settings::MetricsConfig`
+/// so operators see the same `[metrics]` block in compactor and silo configs.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MetricsConfig {
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_addr")]
+    pub addr: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            addr: default_metrics_addr(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+fn default_metrics_addr() -> String {
+    "0.0.0.0:9090".into()
 }
 
 /// Compaction filter selection. Defaults to [`CompactionFilterConfig::None`]
@@ -292,6 +320,29 @@ mod tests {
         assert_eq!(cfg.coordinator.mode, CoordinatorMode::K8sDeployment);
         assert!(cfg.compactor_options.is_none());
         assert_eq!(cfg.compaction_filter, CompactionFilterConfig::None);
+        assert!(cfg.metrics.enabled);
+        assert_eq!(cfg.metrics.addr, "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn parses_explicit_metrics_block() {
+        let toml_str = r#"
+            [storage]
+            backend = "fs"
+            path = "/tmp/silo/%shard%"
+
+            [shard_discovery]
+            backend = "etcd"
+            cluster_prefix = "silo-dev"
+            etcd_endpoints = ["http://127.0.0.1:2379"]
+
+            [metrics]
+            enabled = false
+            addr = "127.0.0.1:9091"
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.metrics.enabled);
+        assert_eq!(cfg.metrics.addr, "127.0.0.1:9091");
     }
 
     #[test]
