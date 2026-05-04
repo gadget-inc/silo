@@ -301,3 +301,197 @@ async fn buffer_fills_to_target_under_concurrent_dequeue() {
         );
     });
 }
+
+/// Task keys sort ascending by start_time_ms within a task group, so the scanner
+/// can break on the first future-dated key instead of walking the entire future
+/// tail. This test enqueues a large batch of future-dated tasks with no ready
+/// work and asserts that the per-pass `skipped_future` count stays bounded by
+/// the number of scan passes (one per pass), not by the number of future tasks.
+#[silo::test]
+async fn scanner_breaks_on_first_future_task() {
+    with_timeout!(TIMEOUT_MS, {
+        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let payload = msgpack_payload(&serde_json::json!({"test": true}));
+        let now = now_ms();
+        let future_count = 500;
+        let task_group = "default";
+
+        // Enqueue only future-dated tasks. With no ready work, the buffer
+        // never fills, so the scanner runs continuously (modulo backoff).
+        for i in 0..future_count {
+            shard
+                .enqueue(
+                    "t1",
+                    Some(format!("future-task-{:04}", i)),
+                    50,
+                    now + 60_000_000 + i as i64, // ~16 hours from now, well past test runtime
+                    None,
+                    payload.clone(),
+                    vec![],
+                    None,
+                    task_group,
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        // enqueue() only wakes the broker for ready tasks (see enqueue.rs:388),
+        // so for a future-only workload we need to dequeue once to lazily
+        // create+start the broker for this task group.
+        let r = shard
+            .dequeue("worker", task_group, 1)
+            .await
+            .expect("dequeue");
+        assert!(r.tasks.is_empty(), "no ready tasks should be available");
+
+        // Let the scanner make several passes. With backoff (50ms→100→200→…→2000ms),
+        // a 1.5s window admits ~6 passes.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let body = gather_metrics_text(&metrics);
+        let skipped_future = extract_metric_value(
+            &body,
+            &[
+                "silo_broker_scan_tasks_read_total",
+                &format!("task_group=\"{}\"", task_group),
+                "outcome=\"skipped_future\"",
+            ],
+        );
+        let inserted = extract_metric_value(
+            &body,
+            &[
+                "silo_broker_scan_tasks_read_total",
+                &format!("task_group=\"{}\"", task_group),
+                "outcome=\"inserted\"",
+            ],
+        );
+
+        eprintln!(
+            "skipped_future={}, inserted={}, future_count={}",
+            skipped_future, inserted, future_count
+        );
+
+        assert_eq!(
+            inserted, 0.0,
+            "no future-dated task should be inserted into the buffer"
+        );
+        // Pre-fix this would be >= future_count (500) per scan pass — many
+        // thousands by 1.5s. Post-fix it is at most one per pass; even with
+        // an aggressive scan rate during the wait, well under 100.
+        assert!(
+            skipped_future < future_count as f64,
+            "scanner should break on first future task, not walk the whole tail \
+             (skipped_future={}, future_count={})",
+            skipped_future,
+            future_count
+        );
+        assert_eq!(
+            shard.broker_buffer_len(),
+            0,
+            "buffer should remain empty when only future tasks exist"
+        );
+    });
+}
+
+/// Mixed ready + future tasks: ready ones at the head of the range get scanned
+/// and buffered normally, then the scanner breaks on the first future-dated key.
+#[silo::test]
+async fn scanner_buffers_ready_then_breaks_on_future() {
+    with_timeout!(TIMEOUT_MS, {
+        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let payload = msgpack_payload(&serde_json::json!({"test": true}));
+        let now = now_ms();
+        let ready_count = 5;
+        let future_count = 500;
+        let task_group = "default";
+
+        for i in 0..ready_count {
+            shard
+                .enqueue(
+                    "t1",
+                    Some(format!("ready-{:04}", i)),
+                    50,
+                    now - 1000 + i as i64,
+                    None,
+                    payload.clone(),
+                    vec![],
+                    None,
+                    task_group,
+                )
+                .await
+                .expect("enqueue ready");
+        }
+        for i in 0..future_count {
+            shard
+                .enqueue(
+                    "t1",
+                    Some(format!("future-{:04}", i)),
+                    50,
+                    now + 60_000_000 + i as i64,
+                    None,
+                    payload.clone(),
+                    vec![],
+                    None,
+                    task_group,
+                )
+                .await
+                .expect("enqueue future");
+        }
+
+        // Wait for the scanner to populate the buffer with the ready tasks.
+        let mut buf_len = 0usize;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            buf_len = shard.broker_buffer_len();
+            if buf_len >= ready_count {
+                break;
+            }
+        }
+        assert_eq!(
+            buf_len, ready_count,
+            "buffer should contain exactly the ready tasks, got {}",
+            buf_len
+        );
+
+        let body = gather_metrics_text(&metrics);
+        let skipped_future = extract_metric_value(
+            &body,
+            &[
+                "silo_broker_scan_tasks_read_total",
+                &format!("task_group=\"{}\"", task_group),
+                "outcome=\"skipped_future\"",
+            ],
+        );
+        eprintln!(
+            "skipped_future={}, future_count={}, buffered_ready={}",
+            skipped_future, future_count, buf_len
+        );
+        assert!(
+            skipped_future < future_count as f64,
+            "scanner should not walk the entire future tail (skipped_future={}, future_count={})",
+            skipped_future,
+            future_count
+        );
+    });
+}
+
+fn gather_metrics_text(metrics: &silo::metrics::Metrics) -> String {
+    use prometheus::{Encoder, TextEncoder};
+    let encoder = TextEncoder::new();
+    let metric_families = metrics.registry().gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
+}
+
+fn extract_metric_value(body: &str, substrings: &[&str]) -> f64 {
+    let line = body
+        .lines()
+        .find(|l| !l.starts_with('#') && substrings.iter().all(|s| l.contains(s)))
+        .unwrap_or_else(|| panic!("metric line not found for substrings {:?}", substrings));
+    line.rsplit_once(' ')
+        .unwrap_or_else(|| panic!("no space-separated value in line: {}", line))
+        .1
+        .parse::<f64>()
+        .unwrap_or_else(|_| panic!("could not parse metric value from line: {}", line))
+}
