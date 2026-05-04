@@ -11,7 +11,9 @@ use crate::job::{JobStatus, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
-use crate::keys::{attempt_key, job_info_key, leased_task_key, parse_task_key};
+use crate::keys::{
+    attempt_key, concurrency_holder_key, job_info_key, leased_task_key, parse_task_key,
+};
 use crate::shard_range::ShardRange;
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::BrokerTask;
@@ -26,6 +28,10 @@ struct DequeueIterationState {
     grants_to_rollback: Vec<(String, String, String)>,
     leased_tasks_for_dst: Vec<(String, String, String)>,
     pending_attempts: Vec<(String, JobView, Vec<u8>)>,
+    /// Holders that were deleted in this iteration's batch and need their
+    /// in-memory slot released + the grant scanner notified after commit.
+    /// Format: (tenant, queue, task_id).
+    holder_releases: Vec<(String, String, String)>,
     processed_internal: bool,
 }
 
@@ -38,6 +44,7 @@ impl DequeueIterationState {
             grants_to_rollback: Vec::new(),
             leased_tasks_for_dst: Vec::new(),
             pending_attempts: Vec::new(),
+            holder_releases: Vec::new(),
             processed_internal: false,
         }
     }
@@ -84,6 +91,9 @@ impl JobStoreShard {
         // Track leased tasks for DST event emission after commit
         // Format: (tenant, job_id, task_id)
         let mut leased_tasks_for_dst: Vec<(String, String, String)> = Vec::new();
+        // Track holders deleted in the batch that need post-commit in-memory
+        // release + grant-scanner wakeup. Format: (tenant, queue, task_id).
+        let mut holder_releases: Vec<(String, String, String)> = Vec::new();
 
         // Loop to process internal tasks until we have tasks that are destined for the worker, or no more ready tasks at all.
         const MAX_INTERNAL_ITERATIONS: usize = 10;
@@ -173,6 +183,7 @@ impl JobStoreShard {
 
             // Merge iteration state into outer accumulators
             grants_to_rollback.append(&mut state.grants_to_rollback);
+            holder_releases.append(&mut state.holder_releases);
 
             // Two-phase DST events: emit before write for correct causal ordering,
             // confirm after write succeeds, cancel if write fails.
@@ -226,6 +237,17 @@ impl JobStoreShard {
 
             // DB write succeeded - clear rollback lists for next iteration
             grants_to_rollback.clear();
+
+            // Post-commit: drop in-memory slots for any holders we removed in
+            // this batch (e.g. a RunAttempt task we dropped because its job_info
+            // was missing) and wake the grant scanner so a queued requester
+            // can take the freed slot.
+            for (tenant, queue, task_id) in holder_releases.drain(..) {
+                self.concurrency
+                    .counts()
+                    .atomic_release(&tenant, &queue, &task_id);
+                self.concurrency.request_grant(&tenant, &queue);
+            }
 
             // Collect pending attempts from this iteration
             pending_attempts.append(&mut state.pending_attempts);
@@ -655,9 +677,28 @@ impl JobStoreShard {
         let job_key = job_info_key(tenant, job_id);
         let maybe_job = self.db.get(&job_key).await?;
         let Some(job_bytes) = maybe_job else {
-            // If job missing, delete task key to clean up
+            // Job missing — drop the task and release any concurrency holders
+            // it acquired at enqueue time. Without this, a stranded holder
+            // permanently consumes a slot for the queue.
             state.batch.delete(task_key);
             state.ack_deleted(task_key);
+            if let Some(held) = ra.held_queues() {
+                for q in held.iter() {
+                    let queue = q.to_string();
+                    state
+                        .batch
+                        .delete(concurrency_holder_key(tenant, &queue, task_id));
+                    state
+                        .holder_releases
+                        .push((tenant.to_string(), queue, task_id.to_string()));
+                }
+            }
+            tracing::warn!(
+                tenant = %tenant,
+                job_id = %job_id,
+                task_id = %task_id,
+                "dropped RunAttempt for missing job_info; released held concurrency queues",
+            );
             return Ok(());
         };
 
