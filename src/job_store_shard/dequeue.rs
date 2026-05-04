@@ -512,9 +512,40 @@ impl JobStoreShard {
         let job_view = match maybe_job {
             Some(bytes) => match JobView::new(bytes) {
                 Ok(v) => v,
-                Err(_) => return Ok(()), // Skip malformed job
+                Err(_) => {
+                    // Drop the task and release any concurrency holders it
+                    // carries from earlier chained limits. Symmetric with the
+                    // missing-job_info path below and with handle_run_attempt.
+                    for q in held_queues.iter() {
+                        let queue = q.clone();
+                        state
+                            .batch
+                            .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                        state.holder_releases.push((
+                            tenant.to_string(),
+                            queue,
+                            check_task_id.to_string(),
+                        ));
+                    }
+                    return Ok(());
+                }
             },
-            None => return Ok(()), // Job deleted, skip
+            None => {
+                // Job missing — drop the task and release any concurrency
+                // holders it carries from earlier chained limits.
+                for q in held_queues.iter() {
+                    let queue = q.clone();
+                    state
+                        .batch
+                        .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                    state.holder_releases.push((
+                        tenant.to_string(),
+                        queue,
+                        check_task_id.to_string(),
+                    ));
+                }
+                return Ok(());
+            }
         };
 
         // Check the rate limit via Gubernator
