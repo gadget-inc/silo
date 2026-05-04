@@ -159,13 +159,10 @@ impl TaskBroker {
                 continue;
             };
 
-            // Filter out future tasks. Task keys sort ascending by start_time_ms
-            // within a task group (see keys.rs::task_key — timestamp is stored as a
-            // plain u64, not inverted), so the first future-dated key implies every
-            // remaining key in the range is also future-dated.
+            // Filter out future tasks
             if parsed_key.start_time_ms > now_ms as u64 {
                 skipped_future += 1;
-                break;
+                continue;
             }
 
             let key_bytes = kv.key.to_vec();
