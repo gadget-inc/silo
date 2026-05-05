@@ -39,6 +39,8 @@ pub fn spawn_worker(
     shard_id: ShardId,
     backend: Backend,
     path_template: Arc<String>,
+    wal_backend: Option<Backend>,
+    wal_path_template: Option<Arc<String>>,
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
     filter_config: Arc<CompactionFilterConfig>,
     restart_backoff: Duration,
@@ -51,6 +53,8 @@ pub fn spawn_worker(
             shard_id,
             backend,
             path_template,
+            wal_backend,
+            wal_path_template,
             compactor_options,
             filter_config,
             restart_backoff,
@@ -71,6 +75,8 @@ async fn run_supervisor(
     shard_id: ShardId,
     backend: Backend,
     path_template: Arc<String>,
+    wal_backend: Option<Backend>,
+    wal_path_template: Option<Arc<String>>,
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
     filter_config: Arc<CompactionFilterConfig>,
     restart_backoff: Duration,
@@ -86,6 +92,8 @@ async fn run_supervisor(
             &shard_id,
             &backend,
             &path_template,
+            wal_backend.as_ref(),
+            wal_path_template.as_deref().map(String::as_str),
             compactor_options.as_ref().clone(),
             filter_config.as_ref(),
             metrics.as_ref(),
@@ -117,10 +125,13 @@ async fn run_supervisor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     shard_id: &ShardId,
     backend: &Backend,
     path_template: &str,
+    wal_backend: Option<&Backend>,
+    wal_path_template: Option<&str>,
     compactor_options: Option<slatedb::config::CompactorOptions>,
     filter_config: &CompactionFilterConfig,
     metrics: Option<&Arc<CompactorMetrics>>,
@@ -136,6 +147,25 @@ async fn run_once(
         canonical = %resolved.canonical_path,
         "opening compactor",
     );
+
+    // Resolve the per-shard WAL store when configured. The standalone slatedb
+    // compactor doesn't need this — only the per-job DbReader inside the
+    // completed_jobs filter does, because slatedb's manifest validator
+    // refuses a reader open whose split-WAL flag doesn't match what silo
+    // wrote into the manifest.
+    let wal_store = match (wal_backend, wal_path_template) {
+        (Some(wb), Some(wpt)) => {
+            let wal_shard_path = path_for_shard(wpt, shard_id);
+            let resolved_wal = resolve_object_store(wb, &wal_shard_path)?;
+            info!(
+                shard = %shard_id,
+                wal_root = %resolved_wal.root_path,
+                "resolved wal store",
+            );
+            Some(resolved_wal.store)
+        }
+        _ => None,
+    };
 
     let canonical_path = resolved.canonical_path;
     let store = resolved.store;
@@ -165,7 +195,8 @@ async fn run_once(
             Duration::from_secs(*retention_secs),
             object_store::path::Path::from(canonical_path.as_str()),
             Arc::clone(&store),
-        );
+        )
+        .with_wal_store(wal_store.clone());
         if let Some(cap) = expired_set_max_entries {
             supplier = supplier.with_max_expired_entries(*cap);
         }

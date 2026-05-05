@@ -80,6 +80,28 @@ pub struct StorageConfig {
     pub backend: Backend,
     /// Path with `%shard%` placeholder, replaced by the shard UUID at runtime.
     pub path: String,
+    /// Optional separate WAL object store, mirroring silo's `[database.wal]`.
+    /// Required whenever silo opens the same shards with split WAL configured:
+    /// the per-job `DbReader` opened by the `completed_jobs` compaction filter
+    /// otherwise fails with "wal store reconfiguration unsupported" because
+    /// slatedb's V1 manifest records that the DB was created with a separate
+    /// WAL store.
+    ///
+    /// The compactor never reads or writes WAL contents — only SSTs in the
+    /// main store — so the path here only needs to satisfy slatedb's
+    /// flag-level check. When silo's WAL lives on a per-pod local disk the
+    /// compactor pod can't reach (e.g. `fs:///var/silo/wal-%shard%`), point
+    /// this at any reachable backend (`backend = "memory"` is fine).
+    #[serde(default)]
+    pub wal: Option<WalStorageConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WalStorageConfig {
+    pub backend: Backend,
+    /// Path with `%shard%` placeholder, replaced by the shard UUID at runtime.
+    /// Same shape as `[storage].path`.
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -322,6 +344,44 @@ mod tests {
         assert_eq!(cfg.compaction_filter, CompactionFilterConfig::None);
         assert!(cfg.metrics.enabled);
         assert_eq!(cfg.metrics.addr, "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn parses_storage_wal_block() {
+        let toml_str = r#"
+            [storage]
+            backend = "gcs"
+            path = "gs://bucket/silo/%shard%"
+
+            [storage.wal]
+            backend = "memory"
+            path = "memory://wal/%shard%"
+
+            [shard_discovery]
+            backend = "etcd"
+            cluster_prefix = "silo-dev"
+            etcd_endpoints = ["http://127.0.0.1:2379"]
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let wal = cfg.storage.wal.expect("wal block parsed");
+        assert_eq!(wal.backend, Backend::Memory);
+        assert_eq!(wal.path, "memory://wal/%shard%");
+    }
+
+    #[test]
+    fn storage_wal_defaults_to_none() {
+        let toml_str = r#"
+            [storage]
+            backend = "fs"
+            path = "/tmp/silo/%shard%"
+
+            [shard_discovery]
+            backend = "etcd"
+            cluster_prefix = "silo-dev"
+            etcd_endpoints = ["http://127.0.0.1:2379"]
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.storage.wal.is_none());
     }
 
     #[test]
