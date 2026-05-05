@@ -283,9 +283,7 @@ async fn main() -> anyhow::Result<()> {
                 let limits: Vec<Limit> = if roll < rate_limit_fraction {
                     // Pure RateLimit job. Half configured to deny so the
                     // CheckRateLimit max-retries early return fires.
-                    vec![Limit::RateLimit(rate_limit_for(
-                        q_name, i, force_deny, 2,
-                    ))]
+                    vec![Limit::RateLimit(rate_limit_for(q_name, i, force_deny, 2))]
                 } else if roll < rate_limit_fraction + chained_fraction {
                     // Chained Concurrency -> RateLimit (Bug 2 / Bug 3 shape).
                     vec![
@@ -396,19 +394,16 @@ async fn main() -> anyhow::Result<()> {
     // FloatingConcurrency jobs can produce holders independent of that cap, so
     // the steady-state ceiling is approximate — keep a generous slack so the
     // mid-run check still bites on egregious over-grant.
-    let upper_bound_total =
-        queues.iter().map(|(_, lim)| *lim as usize).sum::<usize>() + 256;
+    let upper_bound_total = queues.iter().map(|(_, lim)| *lim as usize).sum::<usize>() + 256;
     let check_handle = {
         let checker_running = checker_running.clone();
         tokio::spawn(async move {
             while checker_running.load(Ordering::SeqCst) {
                 let mut holders_total = 0usize;
                 for shard in shards_for_check.values() {
-                    holders_total += count_with_binary_prefix(
-                        shard.db(),
-                        &keys::concurrency_holders_prefix(),
-                    )
-                    .await;
+                    holders_total +=
+                        count_with_binary_prefix(shard.db(), &keys::concurrency_holders_prefix())
+                            .await;
                 }
                 assert!(
                     holders_total <= upper_bound_total,
@@ -419,11 +414,9 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut requests_total = 0usize;
                 for shard in shards_for_check.values() {
-                    requests_total += count_with_binary_prefix(
-                        shard.db(),
-                        &keys::concurrency_requests_prefix(),
-                    )
-                    .await;
+                    requests_total +=
+                        count_with_binary_prefix(shard.db(), &keys::concurrency_requests_prefix())
+                            .await;
                 }
                 assert!(
                     requests_total < 2000,
@@ -475,8 +468,7 @@ async fn main() -> anyhow::Result<()> {
                 if shard_ids.is_empty() {
                     continue;
                 }
-                let pick_idx: usize =
-                    rng.lock().unwrap().random_range(0..shard_ids.len());
+                let pick_idx: usize = rng.lock().unwrap().random_range(0..shard_ids.len());
                 let Some(shard) = shards.get(&shard_ids[pick_idx]) else {
                     continue;
                 };
@@ -497,8 +489,7 @@ async fn main() -> anyhow::Result<()> {
                 if sampled.is_empty() {
                     continue;
                 }
-                let pick: usize =
-                    rng.lock().unwrap().random_range(0..sampled.len());
+                let pick: usize = rng.lock().unwrap().random_range(0..sampled.len());
                 let mut batch = WriteBatch::new();
                 batch.delete(&sampled[pick]);
                 if shard.db().write(batch).await.is_ok() {
