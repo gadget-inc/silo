@@ -540,7 +540,45 @@ impl CompactionFilter for CompletedJobCompactionFilter {
             );
         }
 
+        // Slatedb's `DbReader` has no `Drop` impl: its manifest poller holds an
+        // independent `Arc<DbReaderInner>` clone, so dropping our `Arc<DbReader>`
+        // doesn't stop the poller. Without this `close()` every compaction job
+        // would leak a poller that keeps refreshing its checkpoint every
+        // `checkpoint_lifetime / 2` (~5 min) forever, flooding logs and
+        // contending on the manifest store.
+        if let Some(reader) = self.reader.take() {
+            close_reader(reader).await;
+        }
+
         Ok(())
+    }
+}
+
+/// Best-effort close of a per-job [`DbReader`].
+///
+/// `Arc::try_unwrap` only succeeds when this filter is the sole owner of the
+/// reader — that's the expected path because the filter never hands the `Arc`
+/// out. If something has somehow cloned it (e.g. a future test), fall back to
+/// a borrowed close so the poller still shuts down.
+async fn close_reader(reader: Arc<DbReader>) {
+    let result = match Arc::try_unwrap(reader) {
+        Ok(owned) => owned.close().await,
+        Err(shared) => shared.close().await,
+    };
+    if let Err(e) = result {
+        warn!(error = %e, "completed_jobs filter: reader close failed");
+    }
+}
+
+impl Drop for CompletedJobCompactionFilter {
+    /// Backstop for the close in [`on_compaction_end`]: if the compaction
+    /// errored before `on_compaction_end` ran, or slatedb dropped the filter
+    /// without calling it, spawn a detached task to close the reader so the
+    /// manifest poller still shuts down.
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            tokio::spawn(close_reader(reader));
+        }
     }
 }
 
@@ -879,6 +917,62 @@ mod tests {
             .build()
             .await
             .expect("reader should open with matching wal store");
+    }
+
+    /// Regression test for the per-job DbReader leak. Slatedb's `DbReader`
+    /// has no `Drop` impl: the manifest poller it spawns holds an independent
+    /// `Arc<DbReaderInner>` clone, so dropping our `Arc<DbReader>` does *not*
+    /// stop the poller — it keeps refreshing its checkpoint every
+    /// `checkpoint_lifetime / 2` forever. This test pins that
+    /// `on_compaction_end` calls `close()` so the established checkpoint is
+    /// deleted (which is observable as the poller's only side effect on the
+    /// manifest).
+    #[tokio::test]
+    async fn on_compaction_end_closes_db_reader() {
+        use slatedb::{CompactionFilterSupplier, CompactionJobContext};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = slatedb::object_store::path::Path::from("test-db");
+
+        let db = Db::builder(path.clone(), Arc::clone(&store))
+            .with_merge_operator(counter_merge_operator())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"k", b"v").await.unwrap();
+        db.close().await.unwrap();
+
+        let supplier = CompletedJobCompactionFilterSupplier::new(
+            Duration::from_secs(60),
+            path.clone(),
+            Arc::clone(&store),
+        );
+        let mut filter = supplier
+            .create_compaction_filter(&CompactionJobContext {
+                destination: 0,
+                is_dest_last_run: false,
+                compaction_clock_tick: 0,
+                retention_min_seq: None,
+            })
+            .await
+            .unwrap();
+
+        let admin = slatedb::admin::Admin::builder(path.clone(), Arc::clone(&store)).build();
+        let before = admin.list_checkpoints(None).await.unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "filter creation should register exactly one checkpoint"
+        );
+
+        filter.on_compaction_end().await.unwrap();
+
+        let after = admin.list_checkpoints(None).await.unwrap();
+        assert!(
+            after.is_empty(),
+            "on_compaction_end must close the reader so its checkpoint is deleted; \
+             still present: {after:?}"
+        );
     }
 
     /// End-to-end check that the supplier threads its configured WAL store
