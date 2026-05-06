@@ -419,6 +419,7 @@ async fn create_shard_with_uncleaned_data(
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -619,6 +620,7 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };

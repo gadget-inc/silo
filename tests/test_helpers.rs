@@ -69,6 +69,7 @@ pub async fn open_temp_shard_with_metrics() -> (
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -104,6 +105,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             rate_limiter,
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
+            enable_counter_reconciliation: false,
         },
         ShardRange::full(),
     )
@@ -124,6 +126,7 @@ pub async fn open_temp_shard_with_range(
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -145,6 +148,7 @@ pub async fn open_temp_shard_with_rate_limiter(
         wal: None,
         apply_wal_on_close: true,
         // Use fast flush interval for tests to speed them up
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -188,6 +192,7 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: flush_on_close,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };

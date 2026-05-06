@@ -64,6 +64,7 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        enable_counter_reconciliation: false,
         slatedb: None,
         memory_cache: None,
     };
@@ -104,6 +105,7 @@ pub async fn setup_multi_shard_server(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        enable_counter_reconciliation: false,
         slatedb: None,
         memory_cache: None,
     };
