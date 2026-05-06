@@ -1620,6 +1620,29 @@ export interface CompactShardResponse {
     status: string; // Status message describing the compaction result.
 }
 /**
+ * Request to flush a shard's SlateDB instance to object storage.
+ * Returns once the flush has completed durably.
+ *
+ * @generated from protobuf message silo.v1.FlushShardRequest
+ */
+export interface FlushShardRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // The shard ID (UUID) to flush.
+}
+/**
+ * Response after the flush has completed.
+ *
+ * @generated from protobuf message silo.v1.FlushShardResponse
+ */
+export interface FlushShardResponse {
+    /**
+     * @generated from protobuf field: string status = 1
+     */
+    status: string; // Status message describing the flush result.
+}
+/**
  * Request to get a shard's LSM tree / storage state from its owning node.
  *
  * @generated from protobuf message silo.v1.GetShardStorageInfoRequest
@@ -6755,6 +6778,100 @@ class CompactShardResponse$Type extends MessageType<CompactShardResponse> {
  */
 export const CompactShardResponse = new CompactShardResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
+class FlushShardRequest$Type extends MessageType<FlushShardRequest> {
+    constructor() {
+        super("silo.v1.FlushShardRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<FlushShardRequest>): FlushShardRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<FlushShardRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: FlushShardRequest): FlushShardRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: FlushShardRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.FlushShardRequest
+ */
+export const FlushShardRequest = new FlushShardRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class FlushShardResponse$Type extends MessageType<FlushShardResponse> {
+    constructor() {
+        super("silo.v1.FlushShardResponse", [
+            { no: 1, name: "status", kind: "scalar", T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<FlushShardResponse>): FlushShardResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.status = "";
+        if (value !== undefined)
+            reflectionMergePartial<FlushShardResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: FlushShardResponse): FlushShardResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string status */ 1:
+                    message.status = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: FlushShardResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string status = 1; */
+        if (message.status !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.status);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.FlushShardResponse
+ */
+export const FlushShardResponse = new FlushShardResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
 class GetShardStorageInfoRequest$Type extends MessageType<GetShardStorageInfoRequest> {
     constructor() {
         super("silo.v1.GetShardStorageInfoRequest", [
@@ -6972,5 +7089,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ResetShards", options: {}, I: ResetShardsRequest, O: ResetShardsResponse },
     { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse },
     { name: "CompactShard", options: {}, I: CompactShardRequest, O: CompactShardResponse },
+    { name: "FlushShard", options: {}, I: FlushShardRequest, O: FlushShardResponse },
     { name: "GetShardStorageInfo", options: {}, I: GetShardStorageInfoRequest, O: GetShardStorageInfoResponse }
 ]);

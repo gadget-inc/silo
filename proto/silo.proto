@@ -600,6 +600,17 @@ message CompactShardResponse {
   string status = 1; // Status message describing the compaction result.
 }
 
+// Request to flush a shard's SlateDB instance to object storage.
+// Returns once the flush has completed durably.
+message FlushShardRequest {
+  string shard = 1; // The shard ID (UUID) to flush.
+}
+
+// Response after the flush has completed.
+message FlushShardResponse {
+  string status = 1; // Status message describing the flush result.
+}
+
 // Request to get a shard's LSM tree / storage state from its owning node.
 message GetShardStorageInfoRequest {
   string shard = 1; // The shard ID (UUID).
@@ -743,6 +754,10 @@ service Silo {
   // Merges all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
   // This is useful for reclaiming space after bulk deletes or high job throughput.
   rpc CompactShard(CompactShardRequest) returns (CompactShardResponse);
+
+  // Flush a shard's SlateDB instance to object storage and wait for durability.
+  // The shard must be owned by this node. Returns only after the flush completes.
+  rpc FlushShard(FlushShardRequest) returns (FlushShardResponse);
 
   // Get storage (LSM tree) information for a shard.
   // Returns details about L0 SSTs, sorted runs, and sizes.

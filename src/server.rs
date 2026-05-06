@@ -1916,6 +1916,28 @@ impl Silo for SiloService {
         }))
     }
 
+    async fn flush_shard(
+        &self,
+        req: Request<FlushShardRequest>,
+    ) -> Result<Response<FlushShardResponse>, Status> {
+        let r = req.into_inner();
+        let shard_id = Self::parse_shard_id(&r.shard)?;
+
+        let shard = self.factory.get(&shard_id).ok_or_else(|| {
+            Status::not_found(format!("shard {} not found on this node", r.shard))
+        })?;
+
+        shard
+            .db()
+            .flush()
+            .await
+            .map_err(|e| Status::internal(format!("flush failed: {}", e)))?;
+
+        Ok(Response::new(FlushShardResponse {
+            status: format!("flushed shard {}", r.shard),
+        }))
+    }
+
     async fn get_shard_storage_info(
         &self,
         req: Request<GetShardStorageInfoRequest>,

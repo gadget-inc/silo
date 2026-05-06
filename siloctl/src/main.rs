@@ -155,6 +155,11 @@ enum ShardAction {
         /// Shard ID (UUID) to compact
         shard: String,
     },
+    /// Flush a shard's slatedb to object storage and wait for completion
+    Flush {
+        /// Shard ID (UUID) to flush
+        shard: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -299,6 +304,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ShardAction::Compact { shard } => {
                 siloctl::shard_compact(&opts, &mut stdout, shard).await
             }
+            ShardAction::Flush { shard } => siloctl::shard_flush(&opts, &mut stdout, shard).await,
         },
         Command::Tenant { action } => match action {
             TenantAction::Locate { tenant_id } => {

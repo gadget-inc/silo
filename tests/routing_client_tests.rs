@@ -223,6 +223,13 @@ impl Silo for CountingClusterInfoService {
         Self::unimplemented("compact_shard")
     }
 
+    async fn flush_shard(
+        &self,
+        _request: Request<FlushShardRequest>,
+    ) -> Result<Response<FlushShardResponse>, Status> {
+        Self::unimplemented("flush_shard")
+    }
+
     async fn get_shard_storage_info(
         &self,
         _request: Request<GetShardStorageInfoRequest>,

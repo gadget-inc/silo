@@ -13,9 +13,9 @@ use silo::cluster_client::AuthInterceptor;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{
     CancelJobRequest, CompactShardRequest, ConfigureShardRequest, CpuProfileRequest,
-    DeleteJobRequest, ExpediteJobRequest, ForceReleaseShardRequest, GetClusterInfoRequest,
-    GetJobRequest, GetJobResultRequest, GetSplitStatusRequest, HeapProfileRequest, QueryRequest,
-    RequestSplitRequest, RestartJobRequest,
+    DeleteJobRequest, ExpediteJobRequest, FlushShardRequest, ForceReleaseShardRequest,
+    GetClusterInfoRequest, GetJobRequest, GetJobResultRequest, GetSplitStatusRequest,
+    HeapProfileRequest, QueryRequest, RequestSplitRequest, RestartJobRequest,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -1072,6 +1072,40 @@ pub async fn shard_compact<W: Write>(
 
     let response = client
         .compact_shard(CompactShardRequest {
+            shard: shard.to_string(),
+        })
+        .await?
+        .into_inner();
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "shard_id": shard,
+            "status": response.status,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out, "{}", response.status)?;
+    }
+
+    Ok(())
+}
+
+/// Flush a shard's slatedb to object storage and wait for the flush to complete.
+pub async fn shard_flush<W: Write>(
+    opts: &GlobalOptions,
+    out: &mut W,
+    shard: &str,
+) -> anyhow::Result<()> {
+    let mut client =
+        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+
+    if !opts.json {
+        writeln!(out, "Flushing shard {}...", shard)?;
+        out.flush()?;
+    }
+
+    let response = client
+        .flush_shard(FlushShardRequest {
             shard: shard.to_string(),
         })
         .await?
