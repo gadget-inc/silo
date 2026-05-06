@@ -653,10 +653,8 @@ async fn counters_survive_close_and_reopen() {
                 backend: Backend::Fs,
                 path: config.wal_dir.path().to_string_lossy().to_string(),
             }),
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard2 = silo::job_store_shard::JobStoreShard::open(

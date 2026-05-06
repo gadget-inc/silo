@@ -578,11 +578,8 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -627,11 +624,8 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -705,11 +699,8 @@ async fn shard_created_at_preserved_across_reopen() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -734,11 +725,8 @@ async fn shard_created_at_preserved_across_reopen() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())

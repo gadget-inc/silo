@@ -417,11 +417,8 @@ async fn create_shard_with_uncleaned_data(
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, ShardRange::full())
@@ -618,11 +615,8 @@ async fn concurrency_hydration_ignores_uncleaned_holders() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     // Phase 1: Create jobs with concurrency limits for both in-range and out-of-range tenants

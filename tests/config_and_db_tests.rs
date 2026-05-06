@@ -32,12 +32,7 @@ async fn open_fs_db_from_config() {
         database: DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
     };
 
@@ -81,10 +76,8 @@ async fn shard_with_local_wal_has_wal_close_config() {
             backend: Backend::Fs,
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -114,11 +107,8 @@ async fn shard_without_local_wal_has_no_wal_close_config() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: data_dir.path().to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -147,10 +137,8 @@ async fn close_with_flush_wal_removes_local_wal_directory() {
             backend: Backend::Fs,
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -197,9 +185,8 @@ async fn close_without_flush_wal_preserves_local_wal_directory() {
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: false, // Disable apply on close
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -244,10 +231,8 @@ async fn data_persists_after_close_with_flush_and_reopen() {
                 backend: Backend::Fs,
                 path: wal_dir.path().to_string_lossy().to_string(),
             }),
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -278,10 +263,8 @@ async fn data_persists_after_close_with_flush_and_reopen() {
                 backend: Backend::Fs,
                 path: new_wal_dir.path().to_string_lossy().to_string(),
             }),
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let rate_limiter = MockGubernatorClient::new_arc();
@@ -317,11 +300,7 @@ async fn factory_close_all_flushes_all_shards_wal() {
             backend: Backend::Fs,
             path: wal_dir.path().join("%shard%").to_string_lossy().to_string(),
         }),
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
-        slatedb: None,
-        memory_cache: None,
+        ..Default::default()
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -618,6 +597,37 @@ enable_counter_reconciliation = true
     assert!(cfg.database.enable_counter_reconciliation);
 }
 
+/// Guards against the manual `Default` impl on `DatabaseTemplate` drifting away
+/// from the serde defaults. If a future field is added with a `#[serde(default)]`
+/// but is not mirrored in the `Default` impl (or vice versa), this fails.
+#[silo::test]
+fn database_template_default_matches_toml_defaults() {
+    let from_default = DatabaseTemplate::default();
+    let from_toml: AppConfig = toml::from_str(
+        r#"
+[database]
+backend = "memory"
+path = "/tmp/silo-%shard%"
+"#,
+    )
+    .expect("parse TOML");
+    assert_eq!(
+        from_default.apply_wal_on_close,
+        from_toml.database.apply_wal_on_close
+    );
+    assert_eq!(
+        from_default.concurrency_reconcile_interval_ms,
+        from_toml.database.concurrency_reconcile_interval_ms
+    );
+    assert_eq!(
+        from_default.enable_counter_reconciliation,
+        from_toml.database.enable_counter_reconciliation
+    );
+    assert!(from_default.wal.is_none() && from_toml.database.wal.is_none());
+    assert!(from_default.slatedb.is_none() && from_toml.database.slatedb.is_none());
+    assert!(from_default.memory_cache.is_none() && from_toml.database.memory_cache.is_none());
+}
+
 #[silo::test]
 fn parse_toml_server_statement_timeout_uses_default() {
     let toml_str = r#"
@@ -832,16 +842,12 @@ async fn factory_passes_slatedb_settings_to_shards() {
     let template = DatabaseTemplate {
         backend: Backend::Fs,
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(std::time::Duration::from_millis(25)),
             l0_sst_size_bytes: 16777216, // 16MB
             ..Default::default()
         }),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let rate_limiter = MockGubernatorClient::new_arc();

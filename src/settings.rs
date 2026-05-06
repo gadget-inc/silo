@@ -238,6 +238,21 @@ pub struct DatabaseTemplate {
     pub memory_cache: Option<MemoryCacheConfig>,
 }
 
+impl Default for DatabaseTemplate {
+    fn default() -> Self {
+        Self {
+            backend: Backend::default(),
+            path: "/tmp/silo-%shard%".to_string(),
+            wal: None,
+            apply_wal_on_close: default_apply_wal_on_close(),
+            concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
+            enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            slatedb: None,
+            memory_cache: None,
+        }
+    }
+}
+
 /// Configuration for SlateDB's in-memory caches.
 ///
 /// SlateDB maintains two separate in-memory caches:
@@ -499,6 +514,21 @@ pub struct DatabaseConfig {
     pub memory_cache: Option<MemoryCacheConfig>,
 }
 
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            name: "shard".to_string(),
+            backend: Backend::default(),
+            path: "/tmp/silo-shard".to_string(),
+            wal: None,
+            apply_wal_on_close: default_apply_wal_on_close(),
+            enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            slatedb: None,
+            memory_cache: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
@@ -511,6 +541,15 @@ pub enum Backend {
     /// Only available when the `dst` feature is enabled.
     #[cfg(feature = "dst")]
     TurmoilFs,
+}
+
+impl Default for Backend {
+    /// In-memory backend is the natural default for tests and benches; production
+    /// deployments specify `backend` explicitly via TOML, which still requires the
+    /// field (no `#[serde(default)]` is added).
+    fn default() -> Self {
+        Backend::Memory
+    }
 }
 
 impl Backend {

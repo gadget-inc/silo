@@ -85,12 +85,7 @@ async fn main() -> anyhow::Result<()> {
                 .join("node-a-%shard%")
                 .to_string_lossy()
                 .to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         rate_limiter.clone(),
         None,
@@ -103,12 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 .join("node-b-%shard%")
                 .to_string_lossy()
                 .to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         rate_limiter.clone(),
         None,
@@ -156,15 +146,12 @@ async fn main() -> anyhow::Result<()> {
                 .join(shard_id.to_string())
                 .to_string_lossy()
                 .to_string(),
-            wal: None,
-            apply_wal_on_close: true,
             // Fast flushes for simulation
-            enable_counter_reconciliation: false,
             slatedb: Some(slatedb::config::Settings {
                 flush_interval: Some(Duration::from_millis(10)),
                 ..Default::default()
             }),
-            memory_cache: None,
+            ..Default::default()
         };
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range).await?;
         shards.insert(*shard_id, shard);
@@ -321,12 +308,7 @@ async fn main() -> anyhow::Result<()> {
                 .join("node-c-%shard%")
                 .to_string_lossy()
                 .to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         rate_limiter.clone(),
         None,

@@ -13,12 +13,7 @@ fn make_fs_factory(tmp: &tempfile::TempDir) -> Arc<ShardFactory> {
     let template = DatabaseTemplate {
         backend: Backend::Fs,
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
-        slatedb: None,
-        memory_cache: None,
+        ..Default::default()
     };
     Arc::new(ShardFactory::new(
         template,
@@ -43,11 +38,7 @@ fn make_fs_factory_with_wal(
             backend: Backend::Fs,
             path: wal_tmp.path().join("%shard%").to_string_lossy().to_string(),
         }),
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
-        slatedb: None,
-        memory_cache: None,
+        ..Default::default()
     };
     Arc::new(ShardFactory::new(
         template,
@@ -356,12 +347,7 @@ async fn open_invalid_template_no_placeholder() {
         DatabaseTemplate {
             backend: Backend::Fs,
             path: "/tmp/no-placeholder-here".to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -385,12 +371,7 @@ async fn open_invalid_template_bad_boundary() {
         DatabaseTemplate {
             backend: Backend::Fs,
             path: "/tmp/prefix%shard%".to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,

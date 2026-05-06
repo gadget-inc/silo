@@ -4,19 +4,13 @@ use std::time::Duration;
 use silo::coordination::{Coordinator, NoneCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
-use silo::settings::{Backend, DatabaseTemplate};
+use silo::settings::DatabaseTemplate;
 
 fn make_test_factory() -> Arc<ShardFactory> {
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
-            backend: Backend::Memory,
             path: "unused".to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,

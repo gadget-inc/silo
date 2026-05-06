@@ -20,14 +20,8 @@ fn make_test_factory_with_shards(num_shards: u32) -> (Arc<ShardFactory>, ShardMa
     let tmpdir = tempfile::tempdir().unwrap();
     let factory = Arc::new(ShardFactory::new(
         DatabaseTemplate {
-            backend: Backend::Memory,
             path: tmpdir.path().join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -781,12 +775,7 @@ fn make_test_app_config(tmp: &tempfile::TempDir) -> AppConfig {
         database: DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
     }
 }

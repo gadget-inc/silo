@@ -67,11 +67,8 @@ pub async fn open_temp_shard_with_metrics() -> (
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
     let metrics = silo::metrics::init().expect("init metrics");
     let shard = JobStoreShard::open(
@@ -124,11 +121,8 @@ pub async fn open_temp_shard_with_range(
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, range)
         .await
@@ -145,12 +139,9 @@ pub async fn open_temp_shard_with_rate_limiter(
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
         // Use fast flush interval for tests to speed them up
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
         .await
@@ -192,9 +183,8 @@ pub async fn open_temp_shard_with_local_wal_and_rate_limiter(
             path: wal_dir.path().to_string_lossy().to_string(),
         }),
         apply_wal_on_close: flush_on_close,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())

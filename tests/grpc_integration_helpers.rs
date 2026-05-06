@@ -61,12 +61,7 @@ pub async fn create_test_factory() -> anyhow::Result<(Arc<ShardFactory>, tempfil
     let template = DatabaseTemplate {
         backend: Backend::Fs,
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
-        slatedb: None,
-        memory_cache: None,
+        ..Default::default()
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = ShardFactory::new(template, rate_limiter, None);
@@ -102,12 +97,7 @@ pub async fn setup_multi_shard_server(
     let template = DatabaseTemplate {
         backend: Backend::Fs,
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
-        slatedb: None,
-        memory_cache: None,
+        ..Default::default()
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));
