@@ -13,6 +13,7 @@ async fn open_temp_shard(flush_interval_ms: u64) -> (tempfile::TempDir, Arc<JobS
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(Duration::from_millis(flush_interval_ms)),
             ..Default::default()
