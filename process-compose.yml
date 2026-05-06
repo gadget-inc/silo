@@ -76,7 +76,10 @@ processes:
         --ignore target \
         --ignore tmp \
         --ignore '*.lock' \
-        -- cargo run --bin silo -- -c example_configs/dev-node1.toml
+        -- cargo run --bin silo --features tokio-console -- -c example_configs/dev-node1.toml
+    environment:
+      - RUSTFLAGS=--cfg tokio_unstable -C force-frame-pointers=yes
+      - TOKIO_CONSOLE_BIND=127.0.0.1:6669
     depends_on:
       etcd:
         condition: process_healthy
@@ -107,7 +110,10 @@ processes:
         --ignore target \
         --ignore tmp \
         --ignore '*.lock' \
-        -- cargo run --bin silo -- -c example_configs/dev-node2.toml
+        -- cargo run --bin silo --features tokio-console -- -c example_configs/dev-node2.toml
+    environment:
+      - RUSTFLAGS=--cfg tokio_unstable -C force-frame-pointers=yes
+      - TOKIO_CONSOLE_BIND=127.0.0.1:6670
     depends_on:
       etcd:
         condition: process_healthy

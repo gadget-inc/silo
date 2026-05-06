@@ -63,6 +63,8 @@
             pkgs.jq
             # grpcurl for testing gRPC endpoints
             pkgs.grpcurl
+            # tokio-console for inspecting silo's async runtime
+            pkgs.tokio-console
             # Archive tools
             pkgs.gnutar
             pkgs.gzip
