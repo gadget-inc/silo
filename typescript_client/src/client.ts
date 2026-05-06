@@ -1,4 +1,10 @@
-import { type Counter, type Meter, metrics } from "@opentelemetry/api";
+import {
+  context as otelContext,
+  type Counter,
+  type Meter,
+  metrics,
+  propagation,
+} from "@opentelemetry/api";
 import xxhashInit from "xxhash-wasm";
 import type { ClientOptions } from "@grpc/grpc-js";
 import { ChannelCredentials, credentials, Metadata } from "@grpc/grpc-js";
@@ -1188,6 +1194,39 @@ function protoAttemptToPublic(attempt: ProtoJobAttempt): JobAttempt {
   };
 }
 
+/**
+ * Inject the active OpenTelemetry context (W3C `traceparent` / `tracestate`,
+ * Baggage, etc.) into outgoing gRPC metadata so the silo server can stitch
+ * its spans/log lines into the caller's trace.
+ *
+ * Always-on: when no propagator is configured globally, OTel's default is a
+ * noop and this is a few extra function calls per RPC. When a propagator IS
+ * configured but no span is active, the carrier is left untouched.
+ */
+const tracePropagationInterceptor: RpcInterceptor = {
+  interceptUnary(next, method, input, rpcOptions) {
+    injectTraceContext(rpcOptions);
+    return next(method, input, rpcOptions);
+  },
+  interceptServerStreaming(next, method, input, rpcOptions) {
+    injectTraceContext(rpcOptions);
+    return next(method, input, rpcOptions);
+  },
+};
+
+function injectTraceContext(rpcOptions: RpcOptions): void {
+  if (!rpcOptions.meta) {
+    rpcOptions.meta = {};
+  }
+  // Setter targets the `meta` plain-object carrier used by protobuf-ts; lower-case
+  // keys are required by HTTP/2 and what the silo Rust extractor expects.
+  propagation.inject(otelContext.active(), rpcOptions.meta, {
+    set(carrier, key, value) {
+      (carrier as Record<string, string>)[key.toLowerCase()] = value;
+    },
+  });
+}
+
 /** Connection to a single server */
 interface ServerConnection {
   address: string;
@@ -1446,11 +1485,15 @@ export class SiloGRPCClient {
   private _getOrCreateConnection(address: string): ServerConnection {
     let conn = this._connections.get(address);
     if (!conn) {
+      const interceptors: RpcInterceptor[] = [tracePropagationInterceptor];
+      if (this._authInterceptor) {
+        interceptors.push(this._authInterceptor);
+      }
       const transport = new GrpcTransport({
         host: address,
         channelCredentials: this._channelCredentials,
         clientOptions: this._grpcClientOptions,
-        ...(this._authInterceptor ? { interceptors: [this._authInterceptor] } : {}),
+        interceptors,
       });
       const client = new SiloClient(transport);
       conn = { address, transport, client };
