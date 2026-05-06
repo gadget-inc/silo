@@ -103,6 +103,8 @@ pub struct Metrics {
     ready_to_start_latency_ms: HistogramVec,
     lease_reaper_duration: HistogramVec,
     lease_reaper_scans_total: CounterVec,
+    lease_reaper_leases_reaped_total: CounterVec,
+    lease_reaper_errors_total: CounterVec,
 
     // Concurrency metrics
     concurrency_tickets_granted: Counter,
@@ -324,6 +326,20 @@ impl Metrics {
             .with_label_values(&[shard])
             .observe(duration_secs);
         self.lease_reaper_scans_total
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record the number of expired leases reaped during a scan.
+    pub fn record_lease_reaper_reaped(&self, shard: &str, count: u64) {
+        self.lease_reaper_leases_reaped_total
+            .with_label_values(&[shard])
+            .inc_by(count as f64);
+    }
+
+    /// Record a lease reaper scan failure.
+    pub fn record_lease_reaper_error(&self, shard: &str) {
+        self.lease_reaper_errors_total
             .with_label_values(&[shard])
             .inc();
     }
@@ -1029,6 +1045,28 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let lease_reaper_leases_reaped_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_lease_reaper_leases_reaped_total",
+                "Total number of expired leases reaped",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let lease_reaper_errors_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_lease_reaper_errors_total",
+                "Total number of expired lease reaper scan failures",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // Concurrency metrics
     let concurrency_tickets_granted = register(
         &registry,
@@ -1063,6 +1101,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         ready_to_start_latency_ms,
         lease_reaper_duration,
         lease_reaper_scans_total,
+        lease_reaper_leases_reaped_total,
+        lease_reaper_errors_total,
         concurrency_tickets_granted,
         slatedb,
     })
