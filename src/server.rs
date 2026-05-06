@@ -2043,6 +2043,9 @@ where
                                 }
                             }
                             Err(e) => {
+                                if let Some(ref m) = reaper_metrics {
+                                    m.record_lease_reaper_error(&shard_label);
+                                }
                                 warn!(
                                     shard = %shard_label,
                                     error = %e,
