@@ -628,6 +628,34 @@ path = "/tmp/silo-%shard%"
     assert!(from_default.memory_cache.is_none() && from_toml.database.memory_cache.is_none());
 }
 
+/// Parallel drift guard for `DatabaseConfig`. Although it isn't deserialized
+/// from TOML on any production path, it derives `Deserialize` and shares the
+/// same `#[serde(default = ...)]` free functions as `DatabaseTemplate`, so the
+/// invariant is symmetric and worth pinning explicitly.
+#[silo::test]
+fn database_config_default_matches_toml_defaults() {
+    let from_default = DatabaseConfig::default();
+    let from_toml: DatabaseConfig = toml::from_str(
+        r#"
+name = "shard"
+backend = "memory"
+path = "/tmp/silo-shard"
+"#,
+    )
+    .expect("parse TOML");
+    assert_eq!(
+        from_default.apply_wal_on_close,
+        from_toml.apply_wal_on_close
+    );
+    assert_eq!(
+        from_default.enable_counter_reconciliation,
+        from_toml.enable_counter_reconciliation
+    );
+    assert!(from_default.wal.is_none() && from_toml.wal.is_none());
+    assert!(from_default.slatedb.is_none() && from_toml.slatedb.is_none());
+    assert!(from_default.memory_cache.is_none() && from_toml.memory_cache.is_none());
+}
+
 #[silo::test]
 fn parse_toml_server_statement_timeout_uses_default() {
     let toml_str = r#"

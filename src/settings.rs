@@ -645,14 +645,9 @@ impl AppConfig {
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             database: DatabaseTemplate {
+                // Override the test-friendly Memory default with Fs for production fallback.
                 backend: Backend::Fs,
-                path: "/tmp/silo-%shard%".to_string(),
-                wal: None,
-                apply_wal_on_close: true,
-                concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
-                enable_counter_reconciliation: default_enable_counter_reconciliation(),
-                slatedb: None,
-                memory_cache: None,
+                ..Default::default()
             },
         };
 
