@@ -101,6 +101,21 @@
         cargoArtifacts = cargoArtifactsCompactor;
         doCheck = false;
       });
+
+      # Administration CLI. Builds only the siloctl crate, which depends on
+      # silo with default-features = false — skipping the datafusion compile
+      # so downstream flake consumers that just want siloctl build much faster.
+      siloctlArgs = {
+        inherit src;
+        strictDeps = true;
+        nativeBuildInputs = [ pkgs.protobuf pkgs.flatbuffers ];
+        cargoExtraArgs = "--package siloctl";
+      };
+      cargoArtifactsSiloctl = craneLib.buildDepsOnly siloctlArgs;
+      siloctl = craneLib.buildPackage (siloctlArgs // {
+        cargoArtifacts = cargoArtifactsSiloctl;
+        doCheck = false;
+      });
     in
     {
       packages.default = silo;
@@ -108,5 +123,6 @@
       packages.silo-debug = silo-debug;
       packages.silo-autoscaler = silo-autoscaler;
       packages.silo-compactor = silo-compactor;
+      packages.siloctl = siloctl;
     };
 }
