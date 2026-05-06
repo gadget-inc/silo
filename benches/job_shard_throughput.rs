@@ -11,14 +11,11 @@ async fn open_temp_shard(flush_interval_ms: u64) -> (tempfile::TempDir, Arc<JobS
         name: "bench-shard".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(Duration::from_millis(flush_interval_ms)),
             ..Default::default()
         }),
-        memory_cache: None,
+        ..Default::default()
     };
     let shard = JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
         .await

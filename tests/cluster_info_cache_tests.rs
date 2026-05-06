@@ -173,12 +173,7 @@ async fn create_test_service() -> (SiloService, Arc<HangingCoordinator>) {
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,

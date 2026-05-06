@@ -183,12 +183,7 @@ async fn create_test_service(paused: bool) -> (SiloService, Arc<MockPausedCoordi
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -599,12 +594,7 @@ async fn enqueue_fails_when_k8s_api_unreachable_during_split() {
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,

@@ -62,11 +62,8 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -97,11 +94,8 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -163,11 +157,8 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -193,11 +184,8 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -251,11 +239,8 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -277,11 +262,8 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -320,11 +302,8 @@ async fn no_cleanup_when_already_complete() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -349,11 +328,8 @@ async fn no_cleanup_when_already_complete() {
             name: "test".to_string(),
             backend: Backend::Fs,
             path: path.clone(),
-            wal: None,
-            apply_wal_on_close: true,
-            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         };
 
         let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -391,11 +367,8 @@ async fn cleanup_cancelled_on_shard_close() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: path.clone(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -452,11 +425,8 @@ async fn cleanup_progress_saved_on_cancellation() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: path.clone(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     // Create shard with data
@@ -547,11 +517,8 @@ async fn cleanup_result_indicates_cancellation() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: path.clone(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -614,11 +581,8 @@ async fn cleanup_handles_multiple_close_calls() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: path.clone(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     let shard = JobStoreShard::open(&cfg, rate_limiter.clone(), None, range.clone())
@@ -657,11 +621,8 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: path.clone(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     // Phase 1: Create shard, enqueue data, simulate split state
@@ -770,11 +731,8 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: path.clone(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     };
 
     // Phase 1: Start cleanup and interrupt it

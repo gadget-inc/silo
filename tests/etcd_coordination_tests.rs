@@ -38,12 +38,7 @@ fn make_test_factory(node_id: &str) -> Arc<ShardFactory> {
             // Use Fs backend for split tests because SlateDB cloning requires a real object store
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -3750,12 +3745,7 @@ async fn etcd_shard_close_failure_keeps_ownership() {
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -3839,12 +3829,7 @@ async fn etcd_shard_close_failure_during_shutdown_keeps_ownership() {
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,

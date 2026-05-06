@@ -14,7 +14,7 @@ use silo::gubernator::MockGubernatorClient;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{EnqueueRequest, SerializedBytes, serialized_bytes};
 use silo::server::run_server;
-use silo::settings::{Backend, DatabaseTemplate};
+use silo::settings::DatabaseTemplate;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,14 +37,8 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
         std::env::temp_dir().join(format!("silo-cluster-query-test-{}-{}", prefix, node_id));
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
-            backend: Backend::Memory,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,

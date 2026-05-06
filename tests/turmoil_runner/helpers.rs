@@ -293,12 +293,8 @@ pub fn dst_turmoilfs_database_template(
     silo::settings::DatabaseTemplate {
         backend: Backend::TurmoilFs,
         path,
-        wal: None,
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
         slatedb: Some(dst_slatedb_settings()),
-        memory_cache: None,
+        ..Default::default()
     }
 }
 
@@ -319,14 +315,9 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
         logging: LoggingConfig::default(),
         metrics: silo::settings::MetricsConfig::default(),
         database: silo::settings::DatabaseTemplate {
-            backend: Backend::Memory,
             path: "mem://shard-{shard}".to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
             slatedb: Some(dst_slatedb_settings()),
-            memory_cache: None,
+            ..Default::default()
         },
     };
 

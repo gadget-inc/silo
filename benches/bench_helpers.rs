@@ -339,14 +339,11 @@ async fn open_shard_at_path(path: &str, flush_interval_ms: u64) -> Arc<JobStoreS
         name: "golden-bench".to_string(),
         backend: silo::settings::Backend::Fs,
         path: path.to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        enable_counter_reconciliation: false,
         slatedb: Some(slatedb::config::Settings {
             flush_interval: Some(Duration::from_millis(flush_interval_ms)),
             ..Default::default()
         }),
-        memory_cache: None,
+        ..Default::default()
     };
     JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
         .await

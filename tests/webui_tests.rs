@@ -32,12 +32,7 @@ async fn setup_test_state_with_tenancy(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         rate_limiter,
         None,
@@ -408,12 +403,7 @@ async fn setup_multi_shard_state_with_tenancy(
         DatabaseTemplate {
             backend: Backend::Fs,
             path: path_with_shard,
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         rate_limiter,
         None,

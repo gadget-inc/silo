@@ -71,12 +71,7 @@ async fn grpc_server_lease_tasks_multi_shard() -> anyhow::Result<()> {
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -742,12 +737,7 @@ async fn grpc_server_reset_shards_clears_fs_backend_data() -> anyhow::Result<()>
         let template = DatabaseTemplate {
             backend: Backend::Fs,
             path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -931,12 +921,7 @@ async fn grpc_server_reset_shards_with_relative_path() -> anyhow::Result<()> {
             // Use the path as-is (could be absolute from tempdir, but the key is
             // to ensure path handling is consistent)
             path: format!("{}/%shard%", relative_path),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -1058,14 +1043,8 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
 
         // Use Memory backend to exercise the object store deletion path
         let template = DatabaseTemplate {
-            backend: Backend::Memory,
             path: "test-memory-%shard%".to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         };
         let rate_limiter = MockGubernatorClient::new_arc();
         let factory = ShardFactory::new(template, rate_limiter, None);
@@ -1186,12 +1165,7 @@ async fn setup_test_server_production_path(
     let template = DatabaseTemplate {
         backend: Backend::Fs,
         path: tmp.path().join("%shard%").to_string_lossy().to_string(),
-        wal: None,
-        apply_wal_on_close: true,
-        concurrency_reconcile_interval_ms: 5000,
-        enable_counter_reconciliation: false,
-        slatedb: None,
-        memory_cache: None,
+        ..Default::default()
     };
     let rate_limiter = MockGubernatorClient::new_arc();
     let factory = Arc::new(ShardFactory::new(template, rate_limiter, None));

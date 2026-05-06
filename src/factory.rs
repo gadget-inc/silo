@@ -83,19 +83,13 @@ impl ShardFactory {
     #[doc(hidden)]
     pub fn new_noop() -> Self {
         use crate::gubernator::NullGubernatorClient;
-        use crate::settings::Backend;
 
         Self {
             instances: DashMap::new(),
             template: DatabaseTemplate {
-                backend: Backend::Memory,
                 path: "/noop".to_string(),
-                wal: None,
                 apply_wal_on_close: false,
-                concurrency_reconcile_interval_ms: 5000,
-                enable_counter_reconciliation: false,
-                slatedb: None,
-                memory_cache: None,
+                ..Default::default()
             },
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,

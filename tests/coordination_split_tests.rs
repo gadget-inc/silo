@@ -34,12 +34,7 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
             // Use Fs backend for split tests because SlateDB cloning requires a real object store
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-            wal: None,
-            apply_wal_on_close: true,
-            concurrency_reconcile_interval_ms: 5000,
-            enable_counter_reconciliation: false,
-            slatedb: None,
-            memory_cache: None,
+            ..Default::default()
         },
         MockGubernatorClient::new_arc(),
         None,
@@ -1997,12 +1992,7 @@ mod splitter_unit_tests {
             DatabaseTemplate {
                 backend: Backend::Fs,
                 path: tmpdir.join("%shard%").to_string_lossy().to_string(),
-                wal: None,
-                apply_wal_on_close: true,
-                concurrency_reconcile_interval_ms: 5000,
-                enable_counter_reconciliation: false,
-                slatedb: None,
-                memory_cache: None,
+                ..Default::default()
             },
             MockGubernatorClient::new_arc(),
             None,
