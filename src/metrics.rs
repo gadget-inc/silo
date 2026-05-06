@@ -109,6 +109,14 @@ pub struct Metrics {
     // Concurrency metrics
     concurrency_tickets_granted: Counter,
 
+    // SlateDB watcher metrics (driven by Db::subscribe)
+    slatedb_durable_seq: GaugeVec,
+    slatedb_manifest_revisions: CounterVec,
+    slatedb_manifest_last_l0_seq: GaugeVec,
+    slatedb_manifest_l0_count: GaugeVec,
+    slatedb_manifest_compacted_count: GaugeVec,
+    slatedb_manifest_checkpoints_count: GaugeVec,
+
     /// SlateDB per-shard counters and gauges. Shared with silo-compactor via
     /// the `metric_prefix` constructor argument.
     pub slatedb: SlatedbShardMetrics,
@@ -245,6 +253,41 @@ impl Metrics {
         self.broker_inflight_size
             .with_label_values(&[shard, task_group])
             .set(size as f64);
+    }
+
+    /// Record a SlateDB `DbStatus` snapshot observed via `Db::subscribe`.
+    ///
+    /// `manifest_changed` should be `true` only when `status.current_manifest`
+    /// differs from the previously-observed manifest for this shard, so the
+    /// `silo_slatedb_manifest_revisions_total` counter increments once per
+    /// distinct manifest revision rather than on every status update.
+    pub fn record_db_status(
+        &self,
+        shard: &str,
+        status: &slatedb::DbStatus,
+        manifest_changed: bool,
+    ) {
+        let manifest = &status.current_manifest.manifest;
+        self.slatedb_durable_seq
+            .with_label_values(&[shard])
+            .set(status.durable_seq as f64);
+        self.slatedb_manifest_last_l0_seq
+            .with_label_values(&[shard])
+            .set(manifest.last_l0_seq as f64);
+        self.slatedb_manifest_l0_count
+            .with_label_values(&[shard])
+            .set(manifest.l0.len() as f64);
+        self.slatedb_manifest_compacted_count
+            .with_label_values(&[shard])
+            .set(manifest.compacted.len() as f64);
+        self.slatedb_manifest_checkpoints_count
+            .with_label_values(&[shard])
+            .set(manifest.checkpoints.len() as f64);
+        if manifest_changed {
+            self.slatedb_manifest_revisions
+                .with_label_values(&[shard])
+                .inc();
+        }
     }
 
     /// Record broker scan duration in seconds.
@@ -1076,6 +1119,73 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    // SlateDB watcher metrics (driven by Db::subscribe)
+    let slatedb_durable_seq = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_durable_seq",
+                "SlateDB durable sequence number from Db::subscribe (last seq persisted to object storage)",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_manifest_revisions = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_slatedb_manifest_revisions_total",
+                "Number of distinct SlateDB manifest revisions observed via Db::subscribe",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_manifest_last_l0_seq = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_manifest_last_l0_seq",
+                "last_l0_seq field of the current SlateDB manifest",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_manifest_l0_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_manifest_l0_count",
+                "Number of L0 SSTs in the current SlateDB manifest",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_manifest_compacted_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_manifest_compacted_count",
+                "Number of compacted sorted runs in the current SlateDB manifest",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let slatedb_manifest_checkpoints_count = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_slatedb_manifest_checkpoints_count",
+                "Number of active checkpoints in the current SlateDB manifest",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let slatedb = SlatedbShardMetrics::register(&registry, "silo_")?;
 
     Ok(Metrics {
@@ -1104,6 +1214,12 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
         concurrency_tickets_granted,
+        slatedb_durable_seq,
+        slatedb_manifest_revisions,
+        slatedb_manifest_last_l0_seq,
+        slatedb_manifest_l0_count,
+        slatedb_manifest_compacted_count,
+        slatedb_manifest_checkpoints_count,
         slatedb,
     })
 }

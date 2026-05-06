@@ -407,6 +407,11 @@ impl JobStoreShard {
         // missed in-memory notifications or transient scanner failures.
         shard.spawn_concurrency_reconcile_task(range.clone());
 
+        // Watch slatedb's status channel and emit prometheus metrics on each
+        // change (durable_seq advances, manifest revisions). No-op when
+        // metrics are disabled.
+        shard.spawn_db_status_watcher();
+
         // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth.
         // Only enabled when the deployment runs the standalone compactor, which
         // drops terminal job rows without a writable Db handle and therefore
@@ -517,6 +522,59 @@ impl JobStoreShard {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Spawn a background task that mirrors slatedb's `Db::subscribe` watch
+    /// channel into prometheus gauges and a manifest-revision counter. Exits
+    /// when the shard's cancellation token is cancelled (during `close()`)
+    /// or when the underlying `Db` is dropped (sender side closes).
+    ///
+    /// No-op when metrics are disabled — avoids spawning an idle task per
+    /// shard in test/bench configurations that opt out of metrics.
+    fn spawn_db_status_watcher(self: &Arc<Self>) {
+        let Some(metrics) = self.metrics.clone() else {
+            return;
+        };
+        let shard_name = self.name.clone();
+        let cancellation = self.cancellation.clone();
+        let mut rx = self.db.subscribe();
+
+        tokio::spawn(async move {
+            // Emit initial values so gauges aren't empty until the first
+            // change. The first watch read also seeds the manifest-revision
+            // dedup key without bumping the counter.
+            let initial = rx.borrow_and_update().clone();
+            let mut prev_manifest_id = initial.current_manifest.id;
+            metrics.record_db_status(&shard_name, &initial, false);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        tracing::debug!(
+                            shard = %shard_name,
+                            "stopping slatedb status watcher (shard closing)"
+                        );
+                        break;
+                    }
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            // Sender dropped — the Db was dropped without a
+                            // close(). Treat the same as cancellation.
+                            tracing::debug!(
+                                shard = %shard_name,
+                                "stopping slatedb status watcher (db dropped)"
+                            );
+                            break;
+                        }
+                        let status = rx.borrow_and_update().clone();
+                        let manifest_changed = status.current_manifest.id != prev_manifest_id;
+                        prev_manifest_id = status.current_manifest.id;
+                        metrics.record_db_status(&shard_name, &status, manifest_changed);
+                    }
+                }
+            }
+        });
     }
 
     fn spawn_concurrency_reconcile_task(self: &Arc<Self>, range: ShardRange) {
