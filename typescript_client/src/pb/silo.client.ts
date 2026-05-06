@@ -6,6 +6,8 @@ import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
 import type { GetShardStorageInfoResponse } from "./silo";
 import type { GetShardStorageInfoRequest } from "./silo";
+import type { FlushShardResponse } from "./silo";
+import type { FlushShardRequest } from "./silo";
 import type { CompactShardResponse } from "./silo";
 import type { CompactShardRequest } from "./silo";
 import type { ForceReleaseShardResponse } from "./silo";
@@ -262,6 +264,13 @@ export interface ISiloClient {
      * @generated from protobuf rpc: CompactShard
      */
     compactShard(input: CompactShardRequest, options?: RpcOptions): UnaryCall<CompactShardRequest, CompactShardResponse>;
+    /**
+     * Flush a shard's SlateDB instance to object storage and wait for durability.
+     * The shard must be owned by this node. Returns only after the flush completes.
+     *
+     * @generated from protobuf rpc: FlushShard
+     */
+    flushShard(input: FlushShardRequest, options?: RpcOptions): UnaryCall<FlushShardRequest, FlushShardResponse>;
     /**
      * Get storage (LSM tree) information for a shard.
      * Returns details about L0 SSTs, sorted runs, and sizes.
@@ -554,6 +563,16 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<CompactShardRequest, CompactShardResponse>("unary", this._transport, method, opt, input);
     }
     /**
+     * Flush a shard's SlateDB instance to object storage and wait for durability.
+     * The shard must be owned by this node. Returns only after the flush completes.
+     *
+     * @generated from protobuf rpc: FlushShard
+     */
+    flushShard(input: FlushShardRequest, options?: RpcOptions): UnaryCall<FlushShardRequest, FlushShardResponse> {
+        const method = this.methods[25], opt = this._transport.mergeOptions(options);
+        return stackIntercept<FlushShardRequest, FlushShardResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * Get storage (LSM tree) information for a shard.
      * Returns details about L0 SSTs, sorted runs, and sizes.
      * The shard must be owned by this node.
@@ -561,7 +580,7 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * @generated from protobuf rpc: GetShardStorageInfo
      */
     getShardStorageInfo(input: GetShardStorageInfoRequest, options?: RpcOptions): UnaryCall<GetShardStorageInfoRequest, GetShardStorageInfoResponse> {
-        const method = this.methods[25], opt = this._transport.mergeOptions(options);
+        const method = this.methods[26], opt = this._transport.mergeOptions(options);
         return stackIntercept<GetShardStorageInfoRequest, GetShardStorageInfoResponse>("unary", this._transport, method, opt, input);
     }
 }
