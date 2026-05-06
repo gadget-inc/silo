@@ -189,6 +189,10 @@ fn default_concurrency_reconcile_interval_ms() -> u64 {
 /// not exposed as a config field.
 pub const DEFAULT_COUNTER_RECONCILE_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
+fn default_enable_counter_reconciliation() -> bool {
+    false
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -213,6 +217,13 @@ pub struct DatabaseTemplate {
     /// to self-heal from missed in-memory notifications.
     #[serde(default = "default_concurrency_reconcile_interval_ms")]
     pub concurrency_reconcile_interval_ms: u64,
+    /// When true, enables the periodic counter reconciliation background task
+    /// that re-derives counter truth from JOB_INFO/JOB_STATUS to correct drift
+    /// caused by the standalone compactor dropping terminal job rows. Other
+    /// counter writes (in transactions, in `reconcile_pending_requests`, etc.)
+    /// are unaffected. Defaults to false (reconciliation disabled).
+    #[serde(default = "default_enable_counter_reconciliation")]
+    pub enable_counter_reconciliation: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -470,6 +481,10 @@ pub struct DatabaseConfig {
     /// Defaults to true when WAL is configured.
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
+    /// When true, enables the periodic counter reconciliation background task.
+    /// See `DatabaseTemplate::enable_counter_reconciliation` for details.
+    #[serde(default = "default_enable_counter_reconciliation")]
+    pub enable_counter_reconciliation: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -596,6 +611,7 @@ impl AppConfig {
                 wal: None,
                 apply_wal_on_close: true,
                 concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
+                enable_counter_reconciliation: default_enable_counter_reconciliation(),
                 slatedb: None,
                 memory_cache: None,
             },

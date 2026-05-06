@@ -296,6 +296,7 @@ pub fn dst_turmoilfs_database_template(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        enable_counter_reconciliation: false,
         slatedb: Some(dst_slatedb_settings()),
         memory_cache: None,
     }
@@ -323,6 +324,7 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            enable_counter_reconciliation: false,
             slatedb: Some(dst_slatedb_settings()),
             memory_cache: None,
         },

@@ -42,6 +42,7 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            enable_counter_reconciliation: false,
             slatedb: None,
             memory_cache: None,
         },

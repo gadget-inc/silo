@@ -580,6 +580,7 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -628,6 +629,7 @@ async fn reopening_shard_after_cleanup_preserves_status() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -705,6 +707,7 @@ async fn shard_created_at_preserved_across_reopen() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -733,6 +736,7 @@ async fn shard_created_at_preserved_across_reopen() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
             memory_cache: None,
         };

@@ -1580,6 +1580,7 @@ async fn concurrency_lazy_hydration_on_shard_reopen() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -1715,6 +1716,7 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
         path: tmp.path().to_string_lossy().to_string(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
         memory_cache: None,
     };

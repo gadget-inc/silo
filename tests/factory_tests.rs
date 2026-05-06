@@ -16,6 +16,7 @@ fn make_fs_factory(tmp: &tempfile::TempDir) -> Arc<ShardFactory> {
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        enable_counter_reconciliation: false,
         slatedb: None,
         memory_cache: None,
     };
@@ -44,6 +45,7 @@ fn make_fs_factory_with_wal(
         }),
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        enable_counter_reconciliation: false,
         slatedb: None,
         memory_cache: None,
     };
@@ -357,6 +359,7 @@ async fn open_invalid_template_no_placeholder() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            enable_counter_reconciliation: false,
             slatedb: None,
             memory_cache: None,
         },
@@ -385,6 +388,7 @@ async fn open_invalid_template_bad_boundary() {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            enable_counter_reconciliation: false,
             slatedb: None,
             memory_cache: None,
         },

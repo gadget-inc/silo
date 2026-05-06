@@ -31,6 +31,7 @@ async fn create_multi_shard_factory(
         wal: None,
         apply_wal_on_close: true,
         concurrency_reconcile_interval_ms: 5000,
+        enable_counter_reconciliation: false,
         slatedb: None,
         memory_cache: None,
     };

@@ -64,6 +64,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -98,6 +99,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -163,6 +165,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -192,6 +195,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -249,6 +253,7 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -274,6 +279,7 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -316,6 +322,7 @@ async fn no_cleanup_when_already_complete() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -344,6 +351,7 @@ async fn no_cleanup_when_already_complete() {
             path: path.clone(),
             wal: None,
             apply_wal_on_close: true,
+            enable_counter_reconciliation: false,
             slatedb: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
         };
@@ -385,6 +393,7 @@ async fn cleanup_cancelled_on_shard_close() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -445,6 +454,7 @@ async fn cleanup_progress_saved_on_cancellation() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -539,6 +549,7 @@ async fn cleanup_result_indicates_cancellation() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -605,6 +616,7 @@ async fn cleanup_handles_multiple_close_calls() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -647,6 +659,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };
@@ -759,6 +772,7 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
         path: path.clone(),
         wal: None,
         apply_wal_on_close: true,
+        enable_counter_reconciliation: false,
         slatedb: Some(fast_flush_slatedb_settings()),
         memory_cache: None,
     };

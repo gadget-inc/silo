@@ -93,6 +93,7 @@ impl ShardFactory {
                 wal: None,
                 apply_wal_on_close: false,
                 concurrency_reconcile_interval_ms: 5000,
+                enable_counter_reconciliation: false,
                 slatedb: None,
                 memory_cache: None,
             },
@@ -196,6 +197,7 @@ impl ShardFactory {
                         concurrency_reconcile_interval: Duration::from_millis(
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
+                        enable_counter_reconciliation: template.enable_counter_reconciliation,
                     },
                     range.clone(),
                 )

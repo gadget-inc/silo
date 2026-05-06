@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            enable_counter_reconciliation: false,
             slatedb: None,
             memory_cache: None,
         },
@@ -105,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            enable_counter_reconciliation: false,
             slatedb: None,
             memory_cache: None,
         },
@@ -157,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             // Fast flushes for simulation
+            enable_counter_reconciliation: false,
             slatedb: Some(slatedb::config::Settings {
                 flush_interval: Some(Duration::from_millis(10)),
                 ..Default::default()
@@ -321,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
             wal: None,
             apply_wal_on_close: true,
             concurrency_reconcile_interval_ms: 5000,
+            enable_counter_reconciliation: false,
             slatedb: None,
             memory_cache: None,
         },

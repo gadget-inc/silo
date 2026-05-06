@@ -82,6 +82,11 @@ pub struct OpenShardOptions {
     pub metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     pub concurrency_reconcile_interval: Duration,
+    /// When true, spawns the per-shard counter reconciliation background
+    /// task. The reconciler exists to correct counter drift caused by the
+    /// standalone compactor dropping terminal job rows; deployments that run
+    /// the standalone compactor enable it. Defaults to off.
+    pub enable_counter_reconciliation: bool,
 }
 
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
@@ -278,6 +283,7 @@ impl JobStoreShard {
                 concurrency_reconcile_interval: Duration::from_millis(
                     crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
                 ),
+                enable_counter_reconciliation: cfg.enable_counter_reconciliation,
             },
             range,
         )
@@ -314,6 +320,7 @@ impl JobStoreShard {
             rate_limiter,
             metrics,
             concurrency_reconcile_interval,
+            enable_counter_reconciliation,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -401,10 +408,12 @@ impl JobStoreShard {
         shard.spawn_concurrency_reconcile_task(range.clone());
 
         // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth.
-        // Required because the standalone compactor drops terminal job rows
-        // without a writable Db handle and therefore cannot decrement counters
-        // at drop time.
-        shard.spawn_counter_reconcile_task(range);
+        // Only enabled when the deployment runs the standalone compactor, which
+        // drops terminal job rows without a writable Db handle and therefore
+        // cannot decrement counters at drop time.
+        if enable_counter_reconciliation {
+            shard.spawn_counter_reconcile_task(range);
+        }
 
         // Set the shard creation timestamp if this is the first time opening
         shard.set_created_at_ms_if_unset().await?;
