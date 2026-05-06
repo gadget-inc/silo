@@ -2007,8 +2007,7 @@ where
         .set_serving::<SiloServer<SiloService>>()
         .await;
 
-    // Periodic reaper that iterates all shards every 1s for lease reaping,
-    // and collects SlateDB metrics from each shard.
+    // Periodic reaper that iterates all shards every 1s for lease reaping.
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
     let reaper_metrics = metrics.clone();
@@ -2053,15 +2052,32 @@ where
                                 );
                             }
                         }
+                    }
+                }
+                _ = tick_rx.recv() => { break; }
+            }
+        }
+    });
 
-                        // Collect SlateDB storage metrics for this shard
-                        if let Some(ref m) = reaper_metrics {
+    // Periodic SlateDB metrics scrape, decoupled from the reaper so a
+    // backpressured write in `reap_expired_leases` can't stall observability.
+    let metrics_factory = factory.clone();
+    let metrics_for_scrape = metrics.clone();
+    let mut metrics_tick_rx = tick_tx.subscribe();
+    let metrics_scrape: JoinHandle<()> = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                biased;
+                _ = interval.tick() => {
+                    if let Some(ref m) = metrics_for_scrape {
+                        for (shard_id, shard) in metrics_factory.instances().iter() {
                             let recorder = shard.slatedb_metrics_recorder();
                             m.update_slatedb_stats(&shard_id.to_string(), recorder);
                         }
                     }
                 }
-                _ = tick_rx.recv() => { break; }
+                _ = metrics_tick_rx.recv() => { break; }
             }
         }
     });
@@ -2101,5 +2117,6 @@ where
     // handles the ordered close→release-lease sequence, which is critical for
     // permanent leases. factory.close_all() in main.rs serves as a safety net.
     reaper.await.ok();
+    metrics_scrape.await.ok();
     Ok(())
 }
