@@ -601,6 +601,57 @@ async fn test_queues_page_shows_queues_from_all_shards() {
 }
 
 #[silo::test]
+async fn test_queues_page_shows_unavailable_shards_and_partial_results() {
+    use silo::job::{ConcurrencyLimit, Limit};
+
+    let (_tmp, state, shard_map) = setup_multi_shard_state(2).await;
+
+    let live_shard_id = shard_map.shards()[0].id;
+    let unavailable_shard_id = shard_map.shards()[1].id;
+    let live_shard = state.factory.get(&live_shard_id).expect("live shard");
+    let _ = live_shard
+        .enqueue(
+            "-",
+            Some("queue-live-job".to_string()),
+            50,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "queue-live".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue live queue job");
+    let _ = live_shard.dequeue("worker-live", "default", 1).await;
+
+    state
+        .factory
+        .close(&unavailable_shard_id)
+        .await
+        .expect("close unavailable shard");
+
+    let (status, body) = make_request(state, "GET", "/queues").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("queue-live"),
+        "live shard data should still render"
+    );
+    assert!(
+        body.contains("Unavailable shards"),
+        "page should explain partial results"
+    );
+    assert!(
+        body.contains(&unavailable_shard_id.to_string()),
+        "page should list the unavailable shard"
+    );
+}
+
+#[silo::test]
 async fn test_job_view_with_correct_shard_and_tenant_hint() {
     // Test that providing correct shard and tenant makes job lookup work efficiently
     let (_tmp, state, shard_map) = setup_multi_shard_state(3).await;
@@ -1146,6 +1197,60 @@ async fn test_tenants_index_shows_tenant_data() {
 }
 
 #[silo::test]
+async fn test_tenants_page_shows_unavailable_shards_and_partial_results() {
+    let (_tmp, state, shard_map) = setup_multi_shard_state_with_tenancy(2, true).await;
+
+    let live_shard_id = shard_map.shards()[0].id;
+    let unavailable_shard_id = shard_map.shards()[1].id;
+    let live_tenant = (0..1024)
+        .map(|i| format!("tenant-live-{}", i))
+        .find(|tenant| {
+            shard_map
+                .shard_for_tenant(tenant)
+                .map(|shard| shard.id == live_shard_id)
+                .unwrap_or(false)
+        })
+        .expect("find tenant routed to live shard");
+    let live_shard = state.factory.get(&live_shard_id).expect("live shard");
+    let _ = live_shard
+        .enqueue(
+            &live_tenant,
+            Some("tenant-live-job".to_string()),
+            50,
+            test_helpers::now_ms() + 60_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"tenant":"live"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue tenant job");
+
+    state
+        .factory
+        .close(&unavailable_shard_id)
+        .await
+        .expect("close unavailable shard");
+
+    let (status, body) = make_request(state, "GET", "/tenants").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&live_tenant),
+        "live tenant data should still render"
+    );
+    assert!(
+        body.contains("Unavailable shards"),
+        "page should explain partial results"
+    );
+    assert!(
+        body.contains(&unavailable_shard_id.to_string()),
+        "page should list the unavailable shard"
+    );
+}
+
+#[silo::test]
 async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
     use silo::job::{ConcurrencyLimit, Limit};
 
@@ -1223,4 +1328,22 @@ async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
         !body.contains("Tenant counts query failed"),
         "tenant detail should render tenant status counts via tenant_counts"
     );
+}
+
+#[silo::test]
+async fn test_cluster_page_marks_active_unavailable_shard() {
+    let (_tmp, state, shard_map) = setup_multi_shard_state(2).await;
+
+    let unavailable_shard_id = shard_map.shards()[1].id;
+    state
+        .factory
+        .close(&unavailable_shard_id)
+        .await
+        .expect("close unavailable shard");
+
+    let (status, body) = make_request(state, "GET", "/cluster").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Active (Unavailable)"));
+    assert!(body.contains(&unavailable_shard_id.to_string()));
 }
