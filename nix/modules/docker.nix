@@ -37,6 +37,7 @@
           paths = [
             # use debug silo for faster builds
             self'.packages.silo-debug
+            self'.packages.siloctl
             pkgs.cacert
             # Shell and core utilities
             pkgs.bashInteractive
