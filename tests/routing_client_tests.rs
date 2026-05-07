@@ -236,6 +236,13 @@ impl Silo for CountingClusterInfoService {
     ) -> Result<Response<GetShardStorageInfoResponse>, Status> {
         Self::unimplemented("get_shard_storage_info")
     }
+
+    async fn dump_tasks(
+        &self,
+        _request: Request<DumpTasksRequest>,
+    ) -> Result<Response<DumpTasksResponse>, Status> {
+        Self::unimplemented("dump_tasks")
+    }
 }
 
 async fn setup_counting_cluster_info_server(

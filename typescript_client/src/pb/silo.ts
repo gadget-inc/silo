@@ -1700,6 +1700,28 @@ export interface GetShardStorageInfoResponse {
     sortedRuns: SortedRunInfo[]; // Details of each sorted run.
 }
 /**
+ * Request to dump all in-flight tokio async task backtraces.
+ *
+ * @generated from protobuf message silo.v1.DumpTasksRequest
+ */
+export interface DumpTasksRequest {
+}
+/**
+ * Response containing formatted async task backtraces.
+ *
+ * @generated from protobuf message silo.v1.DumpTasksResponse
+ */
+export interface DumpTasksResponse {
+    /**
+     * @generated from protobuf field: string dump = 1
+     */
+    dump: string; // Formatted async task backtraces.
+    /**
+     * @generated from protobuf field: uint32 task_count = 2
+     */
+    taskCount: number; // Number of tasks captured.
+}
+/**
  * Rate limiting algorithm for Gubernator-based limits.
  *
  * @generated from protobuf enum silo.v1.GubernatorAlgorithm
@@ -7060,6 +7082,99 @@ class GetShardStorageInfoResponse$Type extends MessageType<GetShardStorageInfoRe
  * @generated MessageType for protobuf message silo.v1.GetShardStorageInfoResponse
  */
 export const GetShardStorageInfoResponse = new GetShardStorageInfoResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class DumpTasksRequest$Type extends MessageType<DumpTasksRequest> {
+    constructor() {
+        super("silo.v1.DumpTasksRequest", []);
+    }
+    create(value?: PartialMessage<DumpTasksRequest>): DumpTasksRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        if (value !== undefined)
+            reflectionMergePartial<DumpTasksRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: DumpTasksRequest): DumpTasksRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: DumpTasksRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.DumpTasksRequest
+ */
+export const DumpTasksRequest = new DumpTasksRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class DumpTasksResponse$Type extends MessageType<DumpTasksResponse> {
+    constructor() {
+        super("silo.v1.DumpTasksResponse", [
+            { no: 1, name: "dump", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "task_count", kind: "scalar", T: 13 /*ScalarType.UINT32*/ }
+        ]);
+    }
+    create(value?: PartialMessage<DumpTasksResponse>): DumpTasksResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.dump = "";
+        message.taskCount = 0;
+        if (value !== undefined)
+            reflectionMergePartial<DumpTasksResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: DumpTasksResponse): DumpTasksResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string dump */ 1:
+                    message.dump = reader.string();
+                    break;
+                case /* uint32 task_count */ 2:
+                    message.taskCount = reader.uint32();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: DumpTasksResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string dump = 1; */
+        if (message.dump !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.dump);
+        /* uint32 task_count = 2; */
+        if (message.taskCount !== 0)
+            writer.tag(2, WireType.Varint).uint32(message.taskCount);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.DumpTasksResponse
+ */
+export const DumpTasksResponse = new DumpTasksResponse$Type();
 /**
  * @generated ServiceType for protobuf service silo.v1.Silo
  */
@@ -7090,5 +7205,6 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "ForceReleaseShard", options: {}, I: ForceReleaseShardRequest, O: ForceReleaseShardResponse },
     { name: "CompactShard", options: {}, I: CompactShardRequest, O: CompactShardResponse },
     { name: "FlushShard", options: {}, I: FlushShardRequest, O: FlushShardResponse },
-    { name: "GetShardStorageInfo", options: {}, I: GetShardStorageInfoRequest, O: GetShardStorageInfoResponse }
+    { name: "GetShardStorageInfo", options: {}, I: GetShardStorageInfoRequest, O: GetShardStorageInfoResponse },
+    { name: "DumpTasks", options: {}, I: DumpTasksRequest, O: DumpTasksResponse }
 ]);

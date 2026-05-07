@@ -108,6 +108,8 @@ enum Command {
         #[arg(short = 'c', long = "config")]
         config: PathBuf,
     },
+    /// Dump all in-flight async task backtraces from a Silo node
+    DumpTasks,
 }
 
 #[derive(Subcommand, Debug)]
@@ -324,6 +326,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Command::ValidateConfig { config } => {
             siloctl::validate_config(&opts, &mut stdout, config).await
         }
+        Command::DumpTasks => siloctl::dump_tasks(&opts, &mut stdout).await,
     }
 }
 
