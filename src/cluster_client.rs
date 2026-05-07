@@ -29,10 +29,13 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use futures::future::join_all;
+use opentelemetry::propagation::Injector;
+use tonic::metadata::{MetadataKey, MetadataMap};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status, metadata::MetadataValue};
 use tracing::{debug, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
@@ -144,8 +147,30 @@ pub fn ensure_http_scheme(addr: &str) -> String {
     }
 }
 
-/// Client-side gRPC interceptor that injects a Bearer auth token into outgoing requests.
-/// When `header_value` is `None`, this is a no-op pass-through.
+/// `Injector` view over `tonic::metadata::MetadataMap` so the OTel propagator
+/// can write `traceparent` / `tracestate` straight into outgoing gRPC metadata.
+struct MetadataMapInjector<'a>(&'a mut MetadataMap);
+
+impl<'a> Injector for MetadataMapInjector<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        // gRPC metadata keys must be lower-case ASCII. The OTel propagator
+        // already emits lower-case W3C keys, but be defensive and skip
+        // anything that won't parse rather than panic.
+        if let (Ok(name), Ok(val)) = (
+            MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes()),
+            value.parse::<MetadataValue<tonic::metadata::Ascii>>(),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
+
+/// Client-side gRPC interceptor that decorates every outbound request:
+///   - injects W3C Trace Context (`traceparent`/`tracestate`) from the active
+///     OTel context, so peer silo servers stitch their spans under the caller's
+///     trace_id (paired with `crate::grpc_trace::GrpcTraceLayer` on the
+///     server). Always-on; a no-op when no propagator/span is active.
+///   - injects a Bearer auth token when `token` is set.
 #[derive(Clone)]
 pub struct AuthInterceptor {
     header_value: Option<MetadataValue<tonic::metadata::Ascii>>,
@@ -165,6 +190,16 @@ impl AuthInterceptor {
 
 impl tonic::service::Interceptor for AuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        // Inject the active span's OTel context into the request metadata.
+        // tracing::Span::current() reflects whatever span the calling task is
+        // running inside; for an inbound request being forwarded to a peer,
+        // that's typically the GrpcTraceLayer's span carrying the caller's
+        // parent trace.
+        let cx = tracing::Span::current().context();
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&cx, &mut MetadataMapInjector(req.metadata_mut()));
+        });
+
         if let Some(ref val) = self.header_value {
             req.metadata_mut().insert("authorization", val.clone());
         }

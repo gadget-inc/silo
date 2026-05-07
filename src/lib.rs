@@ -8,6 +8,7 @@ pub mod concurrency;
 pub mod coordination;
 pub mod dst_events;
 pub mod factory;
+pub mod grpc_trace;
 pub mod gubernator;
 pub mod heap_profile;
 pub mod job;

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, Once};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::{Resource, runtime, trace as sdktrace};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, prelude::*};
@@ -50,6 +51,12 @@ impl<'a> MakeWriter<'a> for DebugFileWriter {
 pub fn init(log_format: LogFormat) -> anyhow::Result<()> {
     let mut init_result: Option<anyhow::Result<()>> = None;
     INIT.call_once(|| {
+        // Install the W3C Trace Context propagator regardless of whether OTLP
+        // export is configured. This is what lets the gRPC trace layer extract
+        // `traceparent` from incoming requests and link silo spans to the
+        // caller's trace. With no propagator installed, `extract` returns an
+        // empty context and the layer is a no-op.
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
         let result = {
             let env_filter = build_env_filter();
 
