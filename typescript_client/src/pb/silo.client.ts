@@ -4,6 +4,8 @@
 import type { RpcTransport } from "@protobuf-ts/runtime-rpc";
 import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { Silo } from "./silo";
+import type { DumpTasksResponse } from "./silo";
+import type { DumpTasksRequest } from "./silo";
 import type { GetShardStorageInfoResponse } from "./silo";
 import type { GetShardStorageInfoRequest } from "./silo";
 import type { FlushShardResponse } from "./silo";
@@ -279,6 +281,13 @@ export interface ISiloClient {
      * @generated from protobuf rpc: GetShardStorageInfo
      */
     getShardStorageInfo(input: GetShardStorageInfoRequest, options?: RpcOptions): UnaryCall<GetShardStorageInfoRequest, GetShardStorageInfoResponse>;
+    /**
+     * Dump all in-flight tokio async task backtraces from this node.
+     * Used for diagnosing deadlocks and stuck tasks in production.
+     *
+     * @generated from protobuf rpc: DumpTasks
+     */
+    dumpTasks(input: DumpTasksRequest, options?: RpcOptions): UnaryCall<DumpTasksRequest, DumpTasksResponse>;
 }
 /**
  * The Silo job queue service.
@@ -582,5 +591,15 @@ export class SiloClient implements ISiloClient, ServiceInfo {
     getShardStorageInfo(input: GetShardStorageInfoRequest, options?: RpcOptions): UnaryCall<GetShardStorageInfoRequest, GetShardStorageInfoResponse> {
         const method = this.methods[26], opt = this._transport.mergeOptions(options);
         return stackIntercept<GetShardStorageInfoRequest, GetShardStorageInfoResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
+     * Dump all in-flight tokio async task backtraces from this node.
+     * Used for diagnosing deadlocks and stuck tasks in production.
+     *
+     * @generated from protobuf rpc: DumpTasks
+     */
+    dumpTasks(input: DumpTasksRequest, options?: RpcOptions): UnaryCall<DumpTasksRequest, DumpTasksResponse> {
+        const method = this.methods[27], opt = this._transport.mergeOptions(options);
+        return stackIntercept<DumpTasksRequest, DumpTasksResponse>("unary", this._transport, method, opt, input);
     }
 }

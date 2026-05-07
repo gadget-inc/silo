@@ -1970,14 +1970,14 @@ impl Silo for SiloService {
         {
             let handle = tokio::runtime::Handle::current();
             let dump = handle.dump().await;
-            let tasks = dump.tasks();
-            let task_count = tasks.len() as u32;
 
             let mut output = String::new();
-            for (i, task) in tasks.iter().enumerate() {
+            let mut task_count: u32 = 0;
+            for (i, task) in dump.tasks().iter().enumerate() {
                 use std::fmt::Write;
                 writeln!(output, "task {i}:").unwrap();
                 writeln!(output, "{}", task.trace()).unwrap();
+                task_count = (i + 1) as u32;
             }
 
             tracing::info!(task_count, "async task dump captured");
