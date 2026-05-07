@@ -1,4 +1,10 @@
-import type { Meter } from "@opentelemetry/api";
+import {
+  context as otelContext,
+  type Meter,
+  SpanStatusCode,
+  trace,
+  type Tracer,
+} from "@opentelemetry/api";
 import PQueue from "p-queue";
 import { serializeError } from "serialize-error";
 import type { Task as ProtoTask } from "./pb/silo";
@@ -260,6 +266,8 @@ export class SiloWorker<
   private _pollCounter: number = 0;
   /** OpenTelemetry metrics */
   private readonly _metrics: WorkerMetrics;
+  /** OpenTelemetry tracer for per-task lifecycle spans */
+  private readonly _tracer: Tracer;
 
   public constructor(options: SiloWorkerOptions<Payload, Metadata, Result>) {
     this._client = options.client;
@@ -284,6 +292,10 @@ export class SiloWorker<
     // Initialize metrics
     const meter = getWorkerMeter(options.meter);
     this._metrics = new WorkerMetrics(meter, this._taskGroup, () => this.availableTaskSlots);
+    // Tracer for per-task lifecycle spans. Uses the global TracerProvider; when
+    // none is configured this resolves to a noop tracer and all the span calls
+    // below are zero-cost.
+    this._tracer = trace.getTracer("silo-worker");
   }
 
   /**
@@ -516,29 +528,57 @@ export class SiloWorker<
   private _enqueueTask(protoTask: ProtoTask): void {
     const task = transformTask<Payload, Metadata>(protoTask);
 
+    // Open a per-task lifecycle span that covers heartbeats, the user
+    // handler, and the eventual reportOutcome. LeaseTasks intentionally sits
+    // outside this span — a single batch lease can produce N tasks and they
+    // shouldn't share a span. The gRPC client interceptor reads
+    // otelContext.active() on each outbound RPC, so any silo call made while
+    // taskContext is active will carry traceparent for this span.
+    const span = this._tracer.startSpan("silo.task.lifecycle", {
+      attributes: {
+        "silo.task_id": task.id,
+        "silo.shard": task.shard,
+        "silo.tenant": task.tenantId ?? "",
+        "silo.worker_id": this._workerId,
+        "silo.job_id": task.jobId,
+        "silo.task_group": this._taskGroup,
+        "silo.attempt_number": task.attemptNumber,
+      },
+    });
+    const taskContext = trace.setSpan(otelContext.active(), span);
+
     // Create TaskExecution to manage this task's state
     const execution = new TaskExecution(task, this._workerId, this._client);
     this._activeExecutions.set(task.id, execution);
 
-    // Start heartbeat for this task immediately
-    const heartbeatInterval = setInterval(() => {
+    // Start heartbeat for this task immediately. setInterval callbacks fire at
+    // the top of the event loop and don't inherit any context that was active
+    // when setInterval was called, so we explicitly bind the heartbeat fn to
+    // taskContext — without this every Heartbeat RPC would be its own root
+    // trace instead of a child of the lifecycle span.
+    const heartbeatFn = otelContext.bind(taskContext, () => {
       this._sendHeartbeatForTask(execution).catch((error) => {
         this._onError(error instanceof Error ? error : new Error(String(error)), {
           taskId: task.id,
         });
       });
-    }, this._heartbeatIntervalMs);
+    });
+    const heartbeatInterval = setInterval(heartbeatFn, this._heartbeatIntervalMs);
     this._heartbeatIntervals.set(task.id, heartbeatInterval);
 
-    // Add task to the queue for execution
+    // Add task to the queue for execution. Bind the queued callback so the
+    // await chain inside (handler invocation + reportOutcome) inherits
+    // taskContext even though p-queue defers execution to a future microtask.
+    const queuedFn = otelContext.bind(taskContext, async () => {
+      await this._executeTaskWithExecution(execution);
+    });
     this._taskQueue
-      .add(async () => {
-        await this._executeTaskWithExecution(execution);
-      })
+      .add(queuedFn)
       .catch((error) => {
-        this._onError(error instanceof Error ? error : new Error(String(error)), {
-          taskId: task.id,
-        });
+        const e = error instanceof Error ? error : new Error(String(error));
+        span.recordException(e);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: e.message });
+        this._onError(e, { taskId: task.id });
       })
       .finally(() => {
         // Stop heartbeat for this task
@@ -549,6 +589,7 @@ export class SiloWorker<
         }
         // Remove from active executions
         this._activeExecutions.delete(task.id);
+        span.end();
       });
   }
 
