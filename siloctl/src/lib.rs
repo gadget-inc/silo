@@ -60,7 +60,8 @@ async fn connect(address: &str, auth_token: Option<&str>) -> anyhow::Result<Auth
     let url = ensure_http_scheme(address);
     let channel = Channel::from_shared(url)?.connect().await?;
     let interceptor = AuthInterceptor::new(auth_token.map(|s| s.to_string()));
-    Ok(SiloClient::with_interceptor(channel, interceptor))
+    Ok(SiloClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(128 * 1024 * 1024))
 }
 
 /// Connect to the node that owns a specific shard.
