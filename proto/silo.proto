@@ -632,6 +632,15 @@ message GetShardStorageInfoResponse {
   repeated SortedRunInfo sorted_runs = 5; // Details of each sorted run.
 }
 
+// Request to dump all in-flight tokio async task backtraces.
+message DumpTasksRequest {}
+
+// Response containing formatted async task backtraces.
+message DumpTasksResponse {
+  string dump = 1;          // Formatted async task backtraces.
+  uint32 task_count = 2;    // Number of tasks captured.
+}
+
 // The Silo job queue service.
 service Silo {
   // Get cluster topology for client-side routing.
@@ -763,4 +772,8 @@ service Silo {
   // Returns details about L0 SSTs, sorted runs, and sizes.
   // The shard must be owned by this node.
   rpc GetShardStorageInfo(GetShardStorageInfoRequest) returns (GetShardStorageInfoResponse);
+
+  // Dump all in-flight tokio async task backtraces from this node.
+  // Used for diagnosing deadlocks and stuck tasks in production.
+  rpc DumpTasks(DumpTasksRequest) returns (DumpTasksResponse);
 }

@@ -1956,6 +1956,49 @@ impl Silo for SiloService {
 
         Ok(Response::new(lsm.into()))
     }
+
+    async fn dump_tasks(
+        &self,
+        _req: Request<DumpTasksRequest>,
+    ) -> Result<Response<DumpTasksResponse>, Status> {
+        #[cfg(all(
+            tokio_unstable,
+            tokio_taskdump,
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+        ))]
+        {
+            let handle = tokio::runtime::Handle::current();
+            let dump = handle.dump().await;
+            let tasks = dump.tasks();
+            let task_count = tasks.len() as u32;
+
+            let mut output = String::new();
+            for (i, task) in tasks.iter().enumerate() {
+                use std::fmt::Write;
+                writeln!(output, "task {i}:").unwrap();
+                writeln!(output, "{}", task.trace()).unwrap();
+            }
+
+            tracing::info!(task_count, "async task dump captured");
+            Ok(Response::new(DumpTasksResponse {
+                dump: output,
+                task_count,
+            }))
+        }
+
+        #[cfg(not(all(
+            tokio_unstable,
+            tokio_taskdump,
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+        )))]
+        {
+            Err(Status::unimplemented(
+                "task dump requires Linux (aarch64/x86_64) with --cfg tokio_unstable --cfg tokio_taskdump",
+            ))
+        }
+    }
 }
 
 /// Create an auth interceptor that validates Bearer tokens on incoming gRPC requests.

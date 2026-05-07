@@ -13,9 +13,10 @@ use silo::cluster_client::AuthInterceptor;
 use silo::pb::silo_client::SiloClient;
 use silo::pb::{
     CancelJobRequest, CompactShardRequest, ConfigureShardRequest, CpuProfileRequest,
-    DeleteJobRequest, ExpediteJobRequest, FlushShardRequest, ForceReleaseShardRequest,
-    GetClusterInfoRequest, GetJobRequest, GetJobResultRequest, GetSplitStatusRequest,
-    HeapProfileRequest, QueryRequest, RequestSplitRequest, RestartJobRequest,
+    DeleteJobRequest, DumpTasksRequest, ExpediteJobRequest, FlushShardRequest,
+    ForceReleaseShardRequest, GetClusterInfoRequest, GetJobRequest, GetJobResultRequest,
+    GetSplitStatusRequest, HeapProfileRequest, QueryRequest, RequestSplitRequest,
+    RestartJobRequest,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -1259,4 +1260,23 @@ pub fn compute_midpoint(start: &str, end: &str) -> Option<String> {
     range
         .midpoint()
         .map(silo::shard_range::format_hash_boundary)
+}
+
+pub async fn dump_tasks<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow::Result<()> {
+    let mut client = connect(&opts.address, opts.auth_token.as_deref()).await?;
+    let response = client.dump_tasks(DumpTasksRequest {}).await?.into_inner();
+
+    if opts.json {
+        let json_output = serde_json::json!({
+            "task_count": response.task_count,
+            "dump": response.dump,
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&json_output)?)?;
+    } else {
+        writeln!(out, "Async Task Dump ({} tasks)", response.task_count)?;
+        writeln!(out, "{}", "=".repeat(40))?;
+        write!(out, "{}", response.dump)?;
+    }
+
+    Ok(())
 }

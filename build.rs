@@ -1,4 +1,7 @@
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(tokio_unstable)");
+    println!("cargo::rustc-check-cfg=cfg(tokio_taskdump)");
+
     // Tell cargo to only rerun this build script if the proto files change
     println!("cargo:rerun-if-changed=proto/silo.proto");
     println!("cargo:rerun-if-changed=proto/gubernator.proto");

@@ -95,7 +95,7 @@
         # Match RUSTFLAGS with rust.nix to avoid cache invalidation between nix build and local dev
         shellHook = ''
           export SILO_PROJECT_ROOT="$(pwd)"
-          export RUSTFLAGS="-C force-frame-pointers=yes"
+          export RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes"
           export TOXIPROXY_CONFIG="${toxiproxyConfig}"
           # Only use sccache locally -- in CI it has no warm cache and adds overhead
           if [ -z "''${CI:-}" ]; then
