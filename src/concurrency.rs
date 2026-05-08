@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use dashmap::DashMap;
 use futures::StreamExt;
 
 use slatedb::config::WriteOptions;
@@ -131,8 +132,10 @@ pub enum RequestTicketTaskOutcome {
 
 /// In-memory counts for concurrency holders
 pub struct ConcurrencyCounts {
-    // Composite key: storekey-encoded (tenant, queue) -> set of task ids holding tickets
-    holders: Mutex<HashMap<Vec<u8>, HashSet<String>>>,
+    // Composite key: storekey-encoded (tenant, queue) -> set of task ids holding tickets.
+    // Uses DashMap so each queue's holder set is locked at shard granularity instead of
+    // serializing all queues behind a single global Mutex.
+    holders: DashMap<Vec<u8>, HashSet<String>>,
     // Track which (tenant, queue) keys have been hydrated from durable storage
     hydrated_queues: Mutex<HashSet<Vec<u8>>>,
 }
@@ -146,7 +149,7 @@ impl Default for ConcurrencyCounts {
 impl ConcurrencyCounts {
     pub fn new() -> Self {
         Self {
-            holders: Mutex::new(HashMap::new()),
+            holders: DashMap::new(),
             hydrated_queues: Mutex::new(HashSet::new()),
         }
     }
@@ -171,9 +174,11 @@ impl ConcurrencyCounts {
             .await?;
 
         let mut task_ids = Vec::new();
+        let mut iterated = 0usize;
         loop {
             let maybe = iter.next().await?;
             let Some(kv) = maybe else { break };
+            iterated += 1;
 
             // Parse holder key to extract tenant, queue, task_id
             let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
@@ -193,14 +198,20 @@ impl ConcurrencyCounts {
             }
 
             task_ids.push(parsed.task_id);
+
+            // Yield periodically: slatedb iter.next().await is a no-op poll for
+            // cached rows, so a long run of cached results would otherwise never
+            // yield the executor.
+            if iterated % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
 
-        // Update holders map
+        // Update holders map (per-queue shard lock via DashMap entry)
         {
-            let mut h = self.holders.lock().unwrap();
-            let set = h.entry(key.clone()).or_default();
+            let mut entry = self.holders.entry(key.clone()).or_default();
             for task_id in task_ids {
-                set.insert(task_id);
+                entry.insert(task_id);
             }
         }
 
@@ -272,16 +283,15 @@ impl ConcurrencyCounts {
     ) -> bool {
         let key = concurrency_counts_key(tenant, queue);
         let reserved = {
-            let mut h = self.holders.lock().unwrap();
-            let set = h.entry(key).or_default();
+            let mut entry = self.holders.entry(key).or_default();
 
             // Check if we're at capacity
-            if set.len() >= limit {
+            if entry.len() >= limit {
                 return false;
             }
 
             // Reserve the slot atomically
-            set.insert(task_id.to_string());
+            entry.insert(task_id.to_string());
             true
         };
 
@@ -324,8 +334,7 @@ impl ConcurrencyCounts {
     /// Release a reservation made by `try_reserve` if the DB write fails.
     pub fn release_reservation(&self, tenant: &str, queue: &str, task_id: &str) {
         let key = concurrency_counts_key(tenant, queue);
-        let mut h = self.holders.lock().unwrap();
-        if let Some(set) = h.get_mut(&key) {
+        if let Some(mut set) = self.holders.get_mut(&key) {
             set.remove(task_id);
         }
     }
@@ -335,8 +344,7 @@ impl ConcurrencyCounts {
     pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
         let key = concurrency_counts_key(tenant, queue);
         {
-            let mut h = self.holders.lock().unwrap();
-            if let Some(set) = h.get_mut(&key) {
+            if let Some(mut set) = self.holders.get_mut(&key) {
                 set.remove(task_id);
             }
         }
@@ -352,9 +360,8 @@ impl ConcurrencyCounts {
     /// Get the current holder count for a queue.
     /// Useful for testing and debugging.
     pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
-        let h = self.holders.lock().unwrap();
         let key = concurrency_counts_key(tenant, queue);
-        h.get(&key).map(|s| s.len()).unwrap_or(0)
+        self.holders.get(&key).map(|s| s.len()).unwrap_or(0)
     }
 }
 
@@ -734,6 +741,7 @@ impl ConcurrencyManager {
 
         // Count pending requests per (tenant, queue)
         let mut queue_counts: BTreeMap<Vec<u8>, (String, String, u32)> = BTreeMap::new();
+        let mut iterated = 0usize;
         loop {
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
@@ -746,6 +754,7 @@ impl ConcurrencyManager {
                     break;
                 }
             };
+            iterated += 1;
 
             let Some(parsed) = parse_concurrency_request_key(&kv.key) else {
                 continue;
@@ -761,6 +770,13 @@ impl ConcurrencyManager {
                 .entry(key)
                 .or_insert_with(|| (parsed.tenant.clone(), parsed.queue.clone(), 0));
             entry.2 += 1;
+
+            // Yield periodically: this scan is unbounded across the whole shard
+            // and runs at startup / on a periodic reconcile, so a large pending
+            // request set could otherwise monopolize the executor.
+            if iterated % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
 
         // Trigger grants for each queue with pending requests
@@ -846,6 +862,7 @@ impl ConcurrencyManager {
 
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
+            let mut iterated = 0usize;
             while scanned.len() < needed {
                 let kv = match iter.next().await {
                     Ok(Some(kv)) => kv,
@@ -859,6 +876,13 @@ impl ConcurrencyManager {
                         break;
                     }
                 };
+                iterated += 1;
+                // Yield periodically: continue branches on stale/corrupt entries
+                // can extend this loop well past `needed` without otherwise hitting
+                // a yield point.
+                if iterated % 32 == 0 {
+                    tokio::task::yield_now().await;
+                }
 
                 let parsed_req = parse_concurrency_request_key(&kv.key);
 
