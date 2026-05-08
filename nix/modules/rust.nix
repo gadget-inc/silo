@@ -45,6 +45,9 @@
         # based unwinding, which requires the compiler to actually preserve them
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";  # Better inlining visibility
         RUSTFLAGS = "--cfg tokio_unstable --cfg tokio_taskdump -C force-frame-pointers=yes";
+        # Enable tokio-console in production so staging deployments expose the
+        # console_subscriber gRPC endpoint for live runtime inspection.
+        cargoExtraArgs = "--features tokio-console";
       };
       
       # Build dependencies separately for caching
