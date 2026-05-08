@@ -55,6 +55,7 @@ impl JobStoreShard {
     ///
     /// Uses a transaction with optimistic concurrency control to detect if the job state
     /// changes during the restart flow. Retries automatically on conflict.
+    #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn restart_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
         retry_on_txn_conflict("restart_job", || self.restart_job_inner(tenant, id)).await
     }

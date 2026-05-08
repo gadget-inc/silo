@@ -50,6 +50,7 @@ impl JobStoreShard {
     /// Uses a transaction with optimistic concurrency control to atomically
     /// read the job state, delete the pending task, create a lease, and
     /// update the status.
+    #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn lease_task(
         &self,
         tenant: &str,

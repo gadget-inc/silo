@@ -4,7 +4,7 @@ use std::time::Duration;
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{Instrument, info, info_span, warn};
 
 use crate::compaction_filter::CompletedJobCompactionFilterSupplier;
 use crate::config::CompactionFilterConfig;
@@ -242,9 +242,15 @@ async fn run_once(
         _ => None,
     };
 
+    // Run slatedb's compactor inside a span carrying the shard so its log-bridged
+    // events (e.g. "finished compaction" from slatedb::compactor_state) are tagged
+    // with the shard. Note: slatedb spawns internal tokio tasks that don't
+    // propagate the parent span, so logs emitted from those subtasks won't carry
+    // the shard field.
+    let run_span = info_span!("slatedb_compactor", shard = %shard_id);
     let mut run_task = tokio::spawn({
         let compactor = compactor.clone();
-        async move { compactor.run().await }
+        async move { compactor.run().await }.instrument(run_span)
     });
 
     let result = tokio::select! {

@@ -38,6 +38,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use tracing::info_span;
+
+use crate::instrumented_db::InstrumentedDb;
 
 use crate::codec::CodecError;
 use crate::concurrency::ConcurrencyManager;
@@ -99,7 +102,7 @@ pub struct DequeueResult {
 /// Represents a single shard of the system. Owns the SlateDB instance.
 pub struct JobStoreShard {
     pub(crate) name: String,
-    pub(crate) db: Arc<Db>,
+    pub(crate) db: Arc<InstrumentedDb>,
     pub(crate) brokers: Arc<TaskBrokerRegistry>,
     pub(crate) concurrency: Arc<ConcurrencyManager>,
     #[cfg(feature = "server")]
@@ -368,8 +371,9 @@ impl JobStoreShard {
             db_builder = db_builder.with_db_cache(Arc::new(cache));
         }
 
+        let shard_span = info_span!("shard", shard = %name);
         let db = db_builder.build().await?;
-        let db = Arc::new(db);
+        let db = InstrumentedDb::new(Arc::new(db), shard_span);
         let concurrency = Arc::new(ConcurrencyManager::new(metrics.clone()));
 
         // Note: concurrency counts are hydrated lazily on first access to each queue.
@@ -382,8 +386,14 @@ impl JobStoreShard {
             range.clone(),
         );
 
-        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready
-        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
+        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready.
+        // The grant scanner takes a raw `Arc<Db>` (no shard instrumentation) — its own
+        // logging path doesn't need it.
+        concurrency.start_grant_scanner(
+            Arc::clone(db.inner()),
+            Arc::clone(&brokers),
+            range.clone(),
+        );
 
         let shard = Arc::new(Self {
             name,

@@ -88,6 +88,7 @@ impl JobStoreShard {
     /// Import a batch of jobs, returning per-job results.
     /// Each job is imported independently; failures don't affect other jobs in the batch.
     /// Returns an error if any job in the batch already exists and is currently Running.
+    #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn import_jobs(
         &self,
         tenant: &str,
