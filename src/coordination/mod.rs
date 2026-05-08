@@ -193,6 +193,14 @@ pub struct ShardGuardState<T> {
     pub desired: bool,
     pub phase: ShardPhase,
     pub ownership_token: Option<T>,
+    /// Number of consecutive failed release attempts. Used by the Releasing
+    /// branch to drive exponential backoff and force_reopen retries when a
+    /// shard's close keeps failing (e.g., WAL flush blocked on object store).
+    /// Reset to 0 when desired flips back to true or after a successful release.
+    pub release_attempts: u32,
+    /// If Some, the Releasing branch should sleep until this instant before
+    /// the next close attempt. None means no pending backoff.
+    pub next_release_attempt: Option<std::time::Instant>,
 }
 
 impl<T> ShardGuardState<T> {
@@ -202,6 +210,8 @@ impl<T> ShardGuardState<T> {
             desired: false,
             phase: ShardPhase::Idle,
             ownership_token: None,
+            release_attempts: 0,
+            next_release_attempt: None,
         }
     }
 
@@ -243,6 +253,28 @@ impl<T> Default for ShardGuardState<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Compute the backoff delay for the Nth (1-indexed) consecutive release
+/// attempt that has failed. Schedule: 5s, 10s, 20s, 40s, 80s, 160s, then
+/// capped at 300s (5min). A small per-shard jitter is layered on at the
+/// call site using the shard ID as a deterministic seed (DST-friendly).
+pub fn release_backoff_delay(attempts: u32) -> Duration {
+    if attempts == 0 {
+        return Duration::ZERO;
+    }
+    let exp = (attempts - 1).min(6);
+    let secs = 5u64 << exp; // 5, 10, 20, 40, 80, 160, 320 -> capped below
+    Duration::from_secs(secs.min(300))
+}
+
+/// Add deterministic 0-10% jitter to a backoff duration using the shard ID
+/// as a seed. Keeps DST replays stable while spreading retries across shards.
+pub fn jitter_backoff(base: Duration, shard_id: &ShardId) -> Duration {
+    let seed = shard_id.as_uuid().as_u64_pair().0;
+    let jitter_pct = (seed % 11) as u32; // 0..=10
+    let jitter_ms = (base.as_millis() as u64 * jitter_pct as u64) / 100;
+    base + Duration::from_millis(jitter_ms)
 }
 
 /// Common context for a shard guard that's shared across backends.
@@ -296,6 +328,23 @@ impl<T> ShardGuardContext<T> {
         }
     }
 
+    /// Sleep until `deadline`, returning early if a notification (e.g.,
+    /// `desired` flipped) or shutdown signal arrives.
+    pub async fn wait_until_or_change(&self, deadline: std::time::Instant) {
+        let now = std::time::Instant::now();
+        if deadline <= now {
+            return;
+        }
+        let dur = deadline - now;
+        let mut shutdown_rx = self.shutdown.clone();
+        tokio::select! {
+            biased;
+            _ = self.notify.notified() => {}
+            _ = shutdown_rx.changed() => {}
+            _ = tokio::time::sleep(dur) => {}
+        }
+    }
+
     /// Set the desired ownership state for this shard guard.
     /// No-op if the guard is already shutting down or shut down.
     pub async fn set_desired(&self, desired: bool) {
@@ -309,6 +358,12 @@ impl<T> ShardGuardContext<T> {
             let prev_desired = st.desired;
             let prev_phase = st.phase;
             st.desired = desired;
+            if desired {
+                // We want this shard back — clear any pending release backoff so
+                // that if it flips false again later, we start fresh from attempt 0.
+                st.release_attempts = 0;
+                st.next_release_attempt = None;
+            }
             debug!(shard_id = %self.shard_id, prev_desired = prev_desired, desired = desired, phase = %prev_phase, "shard: set_desired");
             self.notify.notify_one();
         }

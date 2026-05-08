@@ -126,6 +126,25 @@ sig ShardLease {
 }
 
 /**
+ * Marker that a shard's local SlateDB instance has finished flushing
+ * its WAL to durable storage and the lease holder can safely release.
+ *
+ * In the implementation this corresponds to a successful `factory.close`
+ * that completed within the close timeout. If close fails (e.g., object
+ * storage unreachable), the closeable marker is dropped — the lease
+ * holder must retry by force-reopening the shard (fresh SlateDB instance
+ * with WAL recovery) and then attempting close again.
+ *
+ * [SILO-COORD-INV-15] A node may only release a shard lease while the
+ * shard is closeable. This makes the close-before-release invariant
+ * explicit at the spec level.
+ */
+sig ShardCloseable {
+    closeable_shard: one Shard,
+    closeable_time: one Time
+}
+
+/**
  * Tracks an in-progress shard split operation.
  * The split creates two child shards from one parent.
  */
@@ -451,6 +470,14 @@ fun shardsHeldBy[n: Node, t: Time]: set Shard {
 /** Check if a shard has any lease holder at time t */
 pred hasLeaseHolder[s: Shard, t: Time] {
     some leaseHolder[s, t]
+}
+
+/**
+ * Check if a shard's data is closeable (flushed to durable storage and
+ * ready to release) at time t. See ShardCloseable.
+ */
+pred shardCloseable[s: Shard, t: Time] {
+    some c: ShardCloseable | c.closeable_shard = s and c.closeable_time = t
 }
 
 /**
@@ -1300,19 +1327,22 @@ fact wellFormed {
 pred init[t: Time] {
     -- No node memberships
     no m: NodeMembership | m.member_time = t
-    
+
     -- No flapped nodes
     no f: NodeFlapped | f.flapped_time = t
-    
+
     -- No shards in shard map
     no sme: ShardMapEntry | sme.sme_time = t
-    
+
     -- No leases
     no l: ShardLease | l.lease_time = t
-    
+
+    -- No closeable markers (no lease holders means no closeable shards either)
+    no c: ShardCloseable | c.closeable_time = t
+
     -- No splits in progress
     no sp: SplitInProgress | sp.split_time = t
-    
+
     -- No worker state
     no c: WorkerRouteCache | c.wrc_time = t
     no r: WorkerRequest | r.wreq_time = t
@@ -1371,6 +1401,16 @@ pred leaseFrame[t: Time, tnext: Time] {
     all s: Shard | leaseHolder[s, tnext] = leaseHolder[s, t]
 }
 
+/** Closeable state unchanged for all shards except the specified one */
+pred closeableFrameExcept[s: Shard, t: Time, tnext: Time] {
+    all s2: Shard | s2 != s implies (shardCloseable[s2, tnext] iff shardCloseable[s2, t])
+}
+
+/** All closeable state unchanged */
+pred closeableFrame[t: Time, tnext: Time] {
+    all s: Shard | shardCloseable[s, tnext] iff shardCloseable[s, t]
+}
+
 /** Split state unchanged for all shards except the specified one */
 pred splitFrameExcept[s: Shard, t: Time, tnext: Time] {
     all s2: Shard | s2 != s implies {
@@ -1406,6 +1446,7 @@ pred stutter[t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1427,6 +1468,12 @@ pred step[t: Time, tnext: Time] {
     or (some n: Node, s: Shard | leaseAcquireStep[n, s, t, tnext])
     or (some n: Node, s: Shard | leaseReleaseStep[n, s, t, tnext])
     or (some s: Shard | forceReleaseLeaseStep[s, t, tnext])
+
+    -- Close lifecycle (per [SILO-COORD-INV-15]): a node can fail a
+    -- close attempt (closeable -> not-closeable) and later force-reopen
+    -- to recover (not-closeable -> closeable).
+    or (some n: Node, s: Shard | closeAttemptFailedStep[n, s, t, tnext])
+    or (some n: Node, s: Shard | forceReopenStep[n, s, t, tnext])
     
     -- Split transitions
     or (some n: Node, s: Shard, sp: SplitPoint, left, right: Shard | 
@@ -1465,6 +1512,7 @@ pred nodeJoinStep[n: Node, addr: Addr, t: Time, tnext: Time] {
     membershipFrameExcept[n, t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1485,6 +1533,7 @@ pred nodeLeaveStep[n: Node, t: Time, tnext: Time] {
     membershipFrameExcept[n, t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1502,8 +1551,11 @@ pred nodeFlapStep[n: Node, t: Time, tnext: Time] {
     not isMember[n, tnext]
     hasFlapped[n, tnext]
 
-    -- Permanent leases: all leases are preserved through flap
+    -- Permanent leases: all leases are preserved through flap.
+    -- Closeable state is also preserved (a flap doesn't change WAL flush
+    -- progress; on recovery the node can resume close attempts).
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
 
     -- All incomplete splits are abandoned when the node crashes.
     -- The shard map update is the commit point - if children don't exist in the shard map,
@@ -1544,6 +1596,7 @@ pred nodeRecoverStep[n: Node, t: Time, tnext: Time] {
     membershipFrameExcept[n, t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1565,25 +1618,33 @@ pred shardCreateInitialStep[s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrameExcept[s, t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
 
-/** Lease acquire with full frame conditions */
+/** Lease acquire with full frame conditions.
+ *
+ * A freshly acquired shard is `closeable` — the local SlateDB instance has
+ * just been opened (or recovered from WAL) and there is no half-flushed
+ * state. Subsequent close attempts may flip closeable false; force-reopen
+ * brings it back true. */
 pred leaseAcquireStep[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     shardExists[s, t]
     not hasLeaseHolder[s, t]
     isMember[n, t]
     not hasFlapped[n, t]
-    
+
     -- Postconditions
     holdsLease[n, s, tnext]
-    
+    shardCloseable[s, tnext]
+
     -- Frame conditions
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrameExcept[s, t, tnext]
+    closeableFrameExcept[s, t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1592,37 +1653,111 @@ pred leaseAcquireStep[n: Node, s: Shard, t: Time, tnext: Time] {
  * [SILO-COORD-INV-4] A partitioned node cannot release its leases: mutation
  * requires current membership. The node retains the lease through the partition
  * and must re-establish membership before it can release (or an operator can
- * force-release via forceReleaseLeaseStep). */
+ * force-release via forceReleaseLeaseStep).
+ *
+ * [SILO-COORD-INV-15] Release requires the shard to be `closeable` —
+ * i.e., a successful close (WAL flushed) has occurred since the last
+ * acquire/force-reopen. This makes close-before-release explicit in the
+ * spec and rules out releasing a lease while WAL data remains unflushed. */
 pred leaseReleaseStep[n: Node, s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     holdsLease[n, s, t]
+    shardCloseable[s, t]
     isMember[n, t]
     not hasFlapped[n, t]
 
     -- Postconditions
     not hasLeaseHolder[s, tnext]
+    not shardCloseable[s, tnext]
 
     -- Frame conditions
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrameExcept[s, t, tnext]
+    closeableFrameExcept[s, t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
 
 /** Force-release a shard lease with full frame conditions.
- * Operator escape hatch for permanently lost nodes. */
+ * Operator escape hatch for permanently lost nodes. Force-release does NOT
+ * require closeable (that's the whole point — the operator is overriding
+ * a stuck lease) and clears closeable on the way out. */
 pred forceReleaseLeaseStep[s: Shard, t: Time, tnext: Time] {
     -- Preconditions
     hasLeaseHolder[s, t]
 
     -- Postconditions
     not hasLeaseHolder[s, tnext]
+    not shardCloseable[s, tnext]
 
     -- Frame conditions
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrameExcept[s, t, tnext]
+    closeableFrameExcept[s, t, tnext]
+    splitFrame[t, tnext]
+    workerFrame[t, tnext]
+}
+
+/**
+ * Close attempt failed: the lease holder tried to flush the shard's WAL
+ * (e.g., during a release because the node is no longer the desired
+ * owner) but the close timed out or errored — typically because the
+ * object store is unreachable. The shard becomes not-closeable until a
+ * subsequent `forceReopenStep` re-opens it fresh.
+ *
+ * Pre: holds lease and shard is currently closeable.
+ * Post: still holds lease, no longer closeable.
+ */
+pred closeAttemptFailedStep[n: Node, s: Shard, t: Time, tnext: Time] {
+    -- Preconditions
+    holdsLease[n, s, t]
+    shardCloseable[s, t]
+
+    -- Postconditions
+    holdsLease[n, s, tnext]
+    not shardCloseable[s, tnext]
+
+    -- Frame conditions
+    membershipFrame[t, tnext]
+    shardMapFrame[t, tnext]
+    leaseFrame[t, tnext]
+    closeableFrameExcept[s, t, tnext]
+    splitFrame[t, tnext]
+    workerFrame[t, tnext]
+}
+
+/**
+ * Force-reopen + successful close: the lease holder re-opens the shard
+ * fresh (triggering WAL recovery) and successfully flushes to durable
+ * storage. This is the retry path that unsticks a lease after a previous
+ * close failure. The lease itself does not change — only the closeable
+ * marker flips back true.
+ *
+ * Pre: holds lease and shard is currently NOT closeable.
+ * Post: still holds lease, now closeable.
+ *
+ * Models a *successful* iteration of the periodic re-open + close retry
+ * loop. Failed iterations are stutters with respect to lease state and
+ * leave closeable false (so the loop will keep firing).
+ */
+pred forceReopenStep[n: Node, s: Shard, t: Time, tnext: Time] {
+    -- Preconditions
+    holdsLease[n, s, t]
+    not shardCloseable[s, t]
+    isMember[n, t]
+    not hasFlapped[n, t]
+
+    -- Postconditions
+    holdsLease[n, s, tnext]
+    shardCloseable[s, tnext]
+
+    -- Frame conditions
+    membershipFrame[t, tnext]
+    shardMapFrame[t, tnext]
+    leaseFrame[t, tnext]
+    closeableFrameExcept[s, t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1653,6 +1788,7 @@ pred splitRequestStep[n: Node, s: Shard, sp: SplitPoint, leftChild: Shard, right
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
@@ -1678,6 +1814,7 @@ pred splitPauseTrafficStep[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
@@ -1703,6 +1840,7 @@ pred splitCloneDbStep[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
@@ -1767,6 +1905,15 @@ pred splitUpdateMapStep[n: Node, s: Shard, t: Time, tnext: Time] {
         all s2: Shard | s2 != s and s2 != orig.split_leftChild and s2 != orig.split_rightChild implies
             leaseHolder[s2, tnext] = leaseHolder[s2, t]
     }
+    -- The parent's closeable marker is dropped along with its lease; children
+    -- have no closeable state until acquired.
+    not shardCloseable[s, tnext]
+    some orig: splitFor[s, t] | {
+        not shardCloseable[orig.split_leftChild, tnext]
+        not shardCloseable[orig.split_rightChild, tnext]
+        all s2: Shard | s2 != s and s2 != orig.split_leftChild and s2 != orig.split_rightChild implies
+            (shardCloseable[s2, tnext] iff shardCloseable[s2, t])
+    }
     splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
@@ -1781,11 +1928,12 @@ pred splitCleanupStep[n: Node, s: Shard, t: Time, tnext: Time] {
     
     -- Postconditions: Split record deleted
     not splitInProgressFor[s, tnext]
-    
+
     -- Frame conditions
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     workerFrame[t, tnext]
 }
 
@@ -1823,6 +1971,7 @@ pred splitAbandonStep[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
@@ -1873,6 +2022,7 @@ pred splitResumeStep_UNUSED[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrameExcept[s, t, tnext]
     workerFrame[t, tnext]
 }
@@ -1906,6 +2056,7 @@ pred splitCleanupStartStep[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrameExcept[s, t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1929,6 +2080,7 @@ pred splitCleanupCompleteStep[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrameExcept[s, t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1952,6 +2104,7 @@ pred compactShardStep[n: Node, s: Shard, t: Time, tnext: Time] {
     membershipFrame[t, tnext]
     shardMapFrameExcept[s, t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     workerFrame[t, tnext]
 }
@@ -1969,6 +2122,7 @@ pred workerCacheInitStep[w: Worker, tenant: TenantId, s: Shard, t: Time, tnext: 
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     -- Worker frame except for this (worker, tenant) pair
     all w2: Worker, t2: TenantId | (w2 != w or t2 != tenant) implies
@@ -1996,6 +2150,7 @@ pred workerRefreshTopologyStep[w: Worker, tenant: TenantId, t: Time, tnext: Time
     membershipFrame[t, tnext]
     shardMapFrame[t, tnext]
     leaseFrame[t, tnext]
+    closeableFrame[t, tnext]
     splitFrame[t, tnext]
     -- Worker frame except for this (worker, tenant) pair
     all w2: Worker, t2: TenantId | (w2 != w or t2 != tenant) implies
@@ -2101,6 +2256,30 @@ assert flapPreservesLeases {
     all n: Node, t: Time, tnext: Time |
         nodeFlapStep[n, t, tnext] implies
             (all s: Shard | leaseHolder[s, tnext] = leaseHolder[s, t])
+}
+
+/**
+ * [SILO-COORD-INV-15] Close-before-release: a normal lease release can
+ * only fire while the shard is closeable, i.e., immediately after a
+ * successful close (or fresh acquire). This rules out releasing a lease
+ * while WAL data remains unflushed. The retry path makes this property
+ * eventually achievable: closeAttemptFailedStep flips closeable false,
+ * but forceReopenStep can flip it back true once the underlying object
+ * store is reachable again.
+ */
+assert closeableBeforeRelease {
+    all n: Node, s: Shard, t: Time, tnext: Time |
+        leaseReleaseStep[n, s, t, tnext] implies shardCloseable[s, t]
+}
+
+/**
+ * Force-reopen preserves the lease: only `closeable` flips. This
+ * prevents the retry path from accidentally handing the shard to
+ * another node mid-recovery.
+ */
+assert forceReopenPreservesLease {
+    all n: Node, s: Shard, t: Time, tnext: Time |
+        forceReopenStep[n, s, t, tnext] implies leaseHolder[s, tnext] = leaseHolder[s, t]
 }
 
 /**
@@ -2763,4 +2942,16 @@ check runtimeSplitAbandonPreservesParent for 3 but
     6 NodeMembership, 6 NodeFlapped, 12 ShardMapEntry, 6 ShardLease,
     6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest, 0 WorkerRetryableError,
     8 TenantOrder
+
+check closeableBeforeRelease for 3 but
+    2 Node, 2 Shard, 2 Addr, 3 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
+    6 NodeMembership, 6 NodeFlapped, 6 ShardMapEntry, 6 ShardLease,
+    6 ShardCloseable, 6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest,
+    0 WorkerRetryableError, 6 TenantOrder
+
+check forceReopenPreservesLease for 3 but
+    2 Node, 2 Shard, 2 Addr, 3 TenantId, 6 Time, 1 SplitPoint, 0 Worker,
+    6 NodeMembership, 6 NodeFlapped, 6 ShardMapEntry, 6 ShardLease,
+    6 ShardCloseable, 6 SplitInProgress, 0 WorkerRouteCache, 0 WorkerRequest,
+    0 WorkerRetryableError, 6 TenantOrder
 

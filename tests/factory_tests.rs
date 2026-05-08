@@ -82,6 +82,70 @@ async fn close_shard_after_open() {
     );
 }
 
+// --- force_reopen tests ---
+
+#[silo::test]
+async fn force_reopen_returns_fresh_instance_preserving_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory(&tmp);
+    let shard_id = ShardId::new();
+
+    let original = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+
+    // Enqueue a job so we can verify WAL recovery preserves state.
+    original
+        .enqueue(
+            "test-tenant",
+            Some("job-fr-1".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"key": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job");
+
+    let reopened = factory
+        .force_reopen(&shard_id, &ShardRange::full())
+        .await
+        .expect("force_reopen shard");
+
+    // The Arc returned must be a different allocation than the original —
+    // factory.force_reopen drops the cached entry and creates fresh.
+    assert!(
+        !Arc::ptr_eq(&original, &reopened),
+        "force_reopen should return a fresh JobStoreShard instance"
+    );
+
+    // Data must survive the re-open via WAL recovery.
+    let counters = reopened.get_counters().await.expect("get counters");
+    assert_eq!(counters.total_jobs, 1);
+    assert!(factory.owns_shard(&shard_id));
+}
+
+#[silo::test]
+async fn force_reopen_on_unopened_shard_creates_fresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory(&tmp);
+    let shard_id = ShardId::new();
+
+    // Shard was never opened — force_reopen should still produce a working shard.
+    let shard = factory
+        .force_reopen(&shard_id, &ShardRange::full())
+        .await
+        .expect("force_reopen un-opened shard");
+
+    let counters = shard.get_counters().await.expect("get counters");
+    assert_eq!(counters.total_jobs, 0);
+    assert!(factory.owns_shard(&shard_id));
+}
+
 // --- reset tests ---
 
 #[silo::test]

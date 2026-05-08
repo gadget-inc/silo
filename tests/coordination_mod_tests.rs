@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use silo::coordination::{
     CoordinationError, CoordinatorBase, MemberInfo, ShardGuardState, ShardOwnerMap, ShardPhase,
+    jitter_backoff, release_backoff_delay,
 };
 use silo::factory::ShardFactory;
 use silo::shard_range::{ShardId, ShardMap};
@@ -97,6 +98,35 @@ fn shard_guard_state_default() {
     assert!(!state.desired);
     assert!(!state.has_token());
     assert!(state.ownership_token.is_none());
+    assert_eq!(state.release_attempts, 0);
+    assert!(state.next_release_attempt.is_none());
+}
+
+#[silo::test]
+fn release_backoff_delay_grows_then_caps() {
+    assert_eq!(release_backoff_delay(0), Duration::ZERO);
+    assert_eq!(release_backoff_delay(1), Duration::from_secs(5));
+    assert_eq!(release_backoff_delay(2), Duration::from_secs(10));
+    assert_eq!(release_backoff_delay(3), Duration::from_secs(20));
+    assert_eq!(release_backoff_delay(4), Duration::from_secs(40));
+    assert_eq!(release_backoff_delay(5), Duration::from_secs(80));
+    assert_eq!(release_backoff_delay(6), Duration::from_secs(160));
+    // Cap at 300s.
+    assert_eq!(release_backoff_delay(7), Duration::from_secs(300));
+    assert_eq!(release_backoff_delay(20), Duration::from_secs(300));
+}
+
+#[silo::test]
+fn jitter_backoff_is_deterministic_and_within_10pct() {
+    let shard_id = ShardId::new();
+    let base = Duration::from_secs(60);
+    let jittered_a = jitter_backoff(base, &shard_id);
+    let jittered_b = jitter_backoff(base, &shard_id);
+    // Determinism: same input → same output (DST-friendly).
+    assert_eq!(jittered_a, jittered_b);
+    // Bounded: jitter is non-negative and at most 10% of base.
+    assert!(jittered_a >= base);
+    assert!(jittered_a <= base + Duration::from_secs(6));
 }
 
 // --- ShardOwnerMap tests ---

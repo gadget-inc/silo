@@ -1001,6 +1001,8 @@ impl EtcdShardGuard {
                     desired: true,
                     phase: ShardPhase::Held,
                     ownership_token: Some(()),
+                    release_attempts: 0,
+                    next_release_attempt: None,
                 },
             ),
             client,
@@ -1068,6 +1070,25 @@ impl EtcdShardGuard {
 
         let _ = self.client.kv_client().txn(txn).await?;
         Ok(())
+    }
+
+    /// Record a failed close-during-release: increment the attempt counter,
+    /// schedule the next retry per `release_backoff_delay` (with jitter), and
+    /// revert phase to Held so the run loop tries again after the backoff.
+    async fn record_release_failure(&self, err: &str) {
+        let mut st = self.ctx.state.lock().await;
+        st.release_attempts = st.release_attempts.saturating_add(1);
+        let base = crate::coordination::release_backoff_delay(st.release_attempts);
+        let delay = crate::coordination::jitter_backoff(base, &self.ctx.shard_id);
+        st.next_release_attempt = Some(std::time::Instant::now() + delay);
+        st.phase = ShardPhase::Held;
+        warn!(
+            shard_id = %self.ctx.shard_id,
+            error = %err,
+            attempts = st.release_attempts,
+            retry_in_secs = delay.as_secs(),
+            "failed to close shard for release; reverting to Held with backoff"
+        );
     }
 
     pub async fn run(
@@ -1199,8 +1220,17 @@ impl EtcdShardGuard {
                         debug!(shard_id = %self.ctx.shard_id, "shard: release start (delay)");
                         tokio::time::sleep(Duration::from_millis(100)).await;
 
+                        // If a previous release attempt failed, honour the
+                        // exponential backoff before trying again. Wakes early
+                        // on shutdown or if `desired` flips back to true.
+                        let pending_deadline =
+                            self.ctx.state.lock().await.next_release_attempt;
+                        if let Some(deadline) = pending_deadline {
+                            self.ctx.wait_until_or_change(deadline).await;
+                        }
+
                         let mut cancelled = false;
-                        let was_held = {
+                        let (was_held, attempts) = {
                             let mut st = self.ctx.state.lock().await;
                             if st.phase == ShardPhase::ShuttingDown {
                                 // fall through
@@ -1209,12 +1239,55 @@ impl EtcdShardGuard {
                                 cancelled = true;
                                 debug!(shard_id = %self.ctx.shard_id, "shard: release cancelled");
                             }
-                            st.has_token()
+                            (st.has_token(), st.release_attempts)
                         };
                         if cancelled {
                             return;
                         }
                         if was_held {
+                            // On retry attempts (after a previous close failed),
+                            // give ourselves a fresh SlateDB instance via
+                            // factory.force_reopen so the new close has a real
+                            // chance of flushing the WAL. The first attempt
+                            // (attempts == 0) skips this — the shard is already
+                            // open from acquire/reclaim.
+                            if attempts > 0 {
+                                let range = {
+                                    let map = shard_map.lock().await;
+                                    map.get_shard(&self.ctx.shard_id)
+                                        .map(|info| info.range.clone())
+                                };
+                                if let Some(range) = range {
+                                    match factory
+                                        .force_reopen(&self.ctx.shard_id, &range)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            dst_events::emit(DstEvent::ShardForceReopened {
+                                                node_id: self.node_id.clone(),
+                                                shard_id: self.ctx.shard_id.to_string(),
+                                            });
+                                            debug!(
+                                                shard_id = %self.ctx.shard_id,
+                                                attempts = attempts,
+                                                "shard: force-reopened for close retry"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            // Re-open failed; treat as another
+                                            // close failure and back off.
+                                            self.record_release_failure(&e.to_string()).await;
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    debug!(
+                                        shard_id = %self.ctx.shard_id,
+                                        "shard: not in shard map; skipping force_reopen and trying close directly"
+                                    );
+                                }
+                            }
+
                             // Close the shard before releasing ownership
                             match factory.close(&self.ctx.shard_id).await {
                                 Ok(()) => {
@@ -1229,6 +1302,8 @@ impl EtcdShardGuard {
                                         let mut st = self.ctx.state.lock().await;
                                         st.ownership_token = None;
                                         st.phase = ShardPhase::Idle;
+                                        st.release_attempts = 0;
+                                        st.next_release_attempt = None;
                                     }
                                     {
                                         let mut owned = owned_arc.lock().await;
@@ -1241,19 +1316,14 @@ impl EtcdShardGuard {
                                     debug!(shard_id = %self.ctx.shard_id, "shard: release done");
                                 }
                                 Err(e) => {
-                                    // Close failed - revert to Held so reconciliation retries
-                                    tracing::error!(
-                                        shard_id = %self.ctx.shard_id,
-                                        error = %e,
-                                        "failed to close shard, reverting to Held to prevent data loss"
-                                    );
-                                    let mut st = self.ctx.state.lock().await;
-                                    st.phase = ShardPhase::Held;
+                                    self.record_release_failure(&e.to_string()).await;
                                 }
                             }
                         } else {
                             let mut st = self.ctx.state.lock().await;
                             st.phase = ShardPhase::Idle;
+                            st.release_attempts = 0;
+                            st.next_release_attempt = None;
                             debug!(shard_id = %self.ctx.shard_id, "shard: release noop");
                         }
                     }

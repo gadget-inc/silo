@@ -68,6 +68,14 @@ pub enum DstEvent {
     /// A node successfully closed a shard's storage (flushed to object storage).
     ShardClosed { node_id: String, shard_id: String },
 
+    /// A node force-reopened a shard after a failed close, to retry flushing
+    /// against a fresh SlateDB instance. Emitted from the coordination layer's
+    /// release-retry path when the previous close failed (e.g., WAL flush
+    /// blocked on object storage). Invalidates any prior `ShardClosed` for
+    /// the same (node, shard) — a fresh `ShardClosed` must precede the next
+    /// `ShardReleased`.
+    ShardForceReopened { node_id: String, shard_id: String },
+
     /// A node released ownership of a shard.
     ShardReleased { node_id: String, shard_id: String },
 }

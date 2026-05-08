@@ -897,6 +897,9 @@ pub struct ShardOwnershipTracker {
     /// acquired by another node, it is not considered split-brain since the crashed
     /// node is no longer running (even though it never emitted ShardReleased events).
     crashed_nodes: Mutex<HashSet<String>>,
+    /// Per-(node, shard) count of force-reopens after a failed close. Useful for
+    /// scenario tests that assert the retry path actually fired.
+    force_reopens: Mutex<HashMap<(String, String), u32>>,
 }
 
 impl ShardOwnershipTracker {
@@ -973,6 +976,44 @@ impl ShardOwnershipTracker {
             timestamp = timestamp,
             "shard_closed"
         );
+    }
+
+    /// Record that a node force-reopened a shard after a previous close failed.
+    /// A force-reopen invalidates any prior ShardClosed for the same (node, shard):
+    /// the shard is now back to "open" state and a fresh ShardClosed must precede
+    /// the next ShardReleased.
+    pub fn shard_force_reopened(&self, node_id: &str, shard_id: &str) {
+        let timestamp = self
+            .event_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let key = (node_id.to_string(), shard_id.to_string());
+        // Drop any stale "closed but not released" record — the close was
+        // invalidated by the re-open.
+        {
+            let mut pending = self.pending_closes.lock().unwrap();
+            pending.remove(&key);
+        }
+        {
+            let mut counts = self.force_reopens.lock().unwrap();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        tracing::trace!(
+            shard_id = %shard_id,
+            node_id = %node_id,
+            timestamp = timestamp,
+            "shard_force_reopened"
+        );
+    }
+
+    /// Get the number of force-reopens recorded for a (node, shard) pair.
+    #[allow(dead_code)]
+    pub fn force_reopen_count(&self, node_id: &str, shard_id: &str) -> u32 {
+        let counts = self.force_reopens.lock().unwrap();
+        counts
+            .get(&(node_id.to_string(), shard_id.to_string()))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Record that a node released ownership of a shard.
@@ -1550,6 +1591,12 @@ impl InvariantTracker {
                     ref shard_id,
                 } => {
                     self.shards.shard_closed(node_id, shard_id);
+                }
+                DstEvent::ShardForceReopened {
+                    ref node_id,
+                    ref shard_id,
+                } => {
+                    self.shards.shard_force_reopened(node_id, shard_id);
                 }
                 DstEvent::ShardReleased {
                     ref node_id,

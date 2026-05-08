@@ -359,6 +359,38 @@ impl ShardFactory {
         Ok(())
     }
 
+    /// Force a fresh re-open of a shard after a failed close.
+    ///
+    /// Used by the coordination layer when a shard's close has failed (e.g., the
+    /// WAL flush is blocked because object storage is unreachable) and the in-memory
+    /// SlateDB instance is in a half-closed state where retrying close on the same
+    /// instance won't make progress. Drops the cached entry, gives the old shard
+    /// a brief window to release file locks, then re-opens via the normal `open`
+    /// path. Re-open triggers SlateDB WAL recovery, so any unflushed data on the
+    /// local WAL is replayed and a subsequent `close` has a fresh attempt at
+    /// flushing it to object storage.
+    ///
+    /// External holders of the previous `Arc<JobStoreShard>` will continue to see
+    /// the old (cancelled) instance until they drop their reference — same as
+    /// after a successful `close`.
+    pub async fn force_reopen(
+        &self,
+        shard_id: &ShardId,
+        range: &ShardRange,
+    ) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
+        if let Some((_, entry)) = self.instances.remove(shard_id) {
+            if let Some(shard) = entry.get() {
+                // Best-effort drain with a short timeout. We don't care if this
+                // succeeds — the point is to give SlateDB a chance to release
+                // file locks before we open a fresh instance against the same
+                // data path. Drop the Arc immediately after.
+                let drain_timeout = Duration::from_secs(2);
+                let _ = tokio::time::timeout(drain_timeout, shard.close()).await;
+            }
+        }
+        self.open(shard_id, range).await
+    }
+
     /// Reset a specific shard: close it, delete all data, and reopen fresh.
     /// This is intended for testing/development only.
     pub async fn reset(

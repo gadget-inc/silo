@@ -1591,6 +1591,8 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         resource_version,
                         lease_uid,
                     }),
+                    release_attempts: 0,
+                    next_release_attempt: None,
                 },
             ),
             backend,
@@ -1604,6 +1606,25 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
     fn lease_name(&self) -> String {
         keys::k8s_shard_lease_name(&self.cluster_prefix, &self.ctx.shard_id)
+    }
+
+    /// Record a failed close-during-release: increment the attempt counter,
+    /// schedule the next retry per `release_backoff_delay` (with jitter), and
+    /// revert phase to Held so the run loop tries again after the backoff.
+    async fn record_release_failure(&self, err: &str) {
+        let mut st = self.ctx.state.lock().await;
+        st.release_attempts = st.release_attempts.saturating_add(1);
+        let base = crate::coordination::release_backoff_delay(st.release_attempts);
+        let delay = crate::coordination::jitter_backoff(base, &self.ctx.shard_id);
+        st.next_release_attempt = Some(std::time::Instant::now() + delay);
+        st.phase = ShardPhase::Held;
+        warn!(
+            shard_id = %self.ctx.shard_id,
+            error = %err,
+            attempts = st.release_attempts,
+            retry_in_secs = delay.as_secs(),
+            "failed to close shard for release; reverting to Held with backoff"
+        );
     }
 
     pub async fn run(
@@ -1804,19 +1825,62 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         (self.ctx.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(17)) % 20;
                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
 
-                    let cancelled = {
+                    // If a previous release attempt failed, honour exponential
+                    // backoff before retrying. Wakes early on shutdown / desired flip.
+                    let pending_deadline = self.ctx.state.lock().await.next_release_attempt;
+                    if let Some(deadline) = pending_deadline {
+                        self.ctx.wait_until_or_change(deadline).await;
+                    }
+
+                    let (cancelled, attempts) = {
                         let mut st = self.ctx.state.lock().await;
                         if st.phase == ShardPhase::ShuttingDown {
-                            false
+                            (false, st.release_attempts)
                         } else if st.desired {
                             st.phase = ShardPhase::Held;
-                            true
+                            (true, st.release_attempts)
                         } else {
-                            false
+                            (false, st.release_attempts)
                         }
                     };
 
                     if !cancelled {
+                        // On retry attempts (after a previous close failed),
+                        // give ourselves a fresh SlateDB instance via
+                        // factory.force_reopen so the new close has a real
+                        // chance of flushing the WAL.
+                        if attempts > 0 {
+                            let range = {
+                                let map = shard_map.lock().await;
+                                map.get_shard(&self.ctx.shard_id)
+                                    .map(|info| info.range.clone())
+                            };
+                            if let Some(range) = range {
+                                match factory.force_reopen(&self.ctx.shard_id, &range).await {
+                                    Ok(_) => {
+                                        dst_events::emit(DstEvent::ShardForceReopened {
+                                            node_id: self.node_id.clone(),
+                                            shard_id: self.ctx.shard_id.to_string(),
+                                        });
+                                        debug!(
+                                            shard_id = %self.ctx.shard_id,
+                                            attempts = attempts,
+                                            "k8s shard: force-reopened for close retry"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.record_release_failure(&e.to_string()).await;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                debug!(
+                                    shard_id = %self.ctx.shard_id,
+                                    "k8s shard: not in shard map; skipping force_reopen and trying close directly"
+                                );
+                            }
+                        }
+
                         // Close the shard before releasing the lease
                         match factory.close(&self.ctx.shard_id).await {
                             Ok(()) => {
@@ -1859,6 +1923,8 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                     let mut st = self.ctx.state.lock().await;
                                     st.ownership_token = None;
                                     st.phase = ShardPhase::Idle;
+                                    st.release_attempts = 0;
+                                    st.next_release_attempt = None;
                                 }
                                 let mut owned = owned_arc.lock().await;
                                 owned.remove(&self.ctx.shard_id);
@@ -1869,14 +1935,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                 debug!(shard_id = %self.ctx.shard_id, "k8s shard: released");
                             }
                             Err(e) => {
-                                // Close failed - revert to Held so reconciliation retries
-                                tracing::error!(
-                                    shard_id = %self.ctx.shard_id,
-                                    error = %e,
-                                    "failed to close shard, reverting to Held to prevent data loss"
-                                );
-                                let mut st = self.ctx.state.lock().await;
-                                st.phase = ShardPhase::Held;
+                                self.record_release_failure(&e.to_string()).await;
                             }
                         }
                     }
