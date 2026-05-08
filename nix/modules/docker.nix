@@ -9,6 +9,10 @@
         self'.packages.silo
         # Include CA certificates for TLS
         pkgs.cacert
+        # tokio-console for inspecting silo's async runtime via `docker exec`
+        pkgs.tokio-console
+        # Minimal shell + coreutils so `docker exec -it ... sh` works for debugging
+        pkgs.busybox
       ];
 
       # pprof CPU profiler needs /tmp for temporary files during profile collection
