@@ -387,13 +387,8 @@ impl JobStoreShard {
         );
 
         // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready.
-        // The grant scanner takes a raw `Arc<Db>` (no shard instrumentation) — its own
-        // logging path doesn't need it.
-        concurrency.start_grant_scanner(
-            Arc::clone(db.inner()),
-            Arc::clone(&brokers),
-            range.clone(),
-        );
+        // It takes the instrumented db so its writes are tagged with the shard span too.
+        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
 
         let shard = Arc::new(Self {
             name,

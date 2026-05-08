@@ -14,6 +14,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
+use slatedb::config::WriteOptions;
 use slatedb::{Db, WriteBatch, WriteHandle};
 use tracing::{Instrument, Span};
 
@@ -33,6 +34,17 @@ impl InstrumentedDb {
 
     pub async fn write(&self, batch: WriteBatch) -> Result<WriteHandle, slatedb::Error> {
         self.inner.write(batch).instrument(self.span.clone()).await
+    }
+
+    pub async fn write_with_options(
+        &self,
+        batch: WriteBatch,
+        options: &WriteOptions,
+    ) -> Result<WriteHandle, slatedb::Error> {
+        self.inner
+            .write_with_options(batch, options)
+            .instrument(self.span.clone())
+            .await
     }
 
     pub async fn put<K, V>(&self, key: K, value: V) -> Result<WriteHandle, slatedb::Error>
