@@ -6,13 +6,21 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use silo::coordination::{Coordinator, EtcdCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
-use silo::job::{ConcurrencyLimit, Limit};
+use silo::job::{
+    ConcurrencyLimit, FloatingConcurrencyLimit, GubernatorAlgorithm, GubernatorRateLimit, Limit,
+    RateLimitRetryPolicy,
+};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
+use silo::keys;
 use silo::settings::{AppConfig, Backend, DatabaseConfig, DatabaseTemplate, LogFormat};
+use slatedb::WriteBatch;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -31,6 +39,27 @@ struct Args {
     /// Concurrency limit for q-gamma
     #[arg(long, default_value = "8")]
     gamma: u32,
+    /// RNG seed (random if unset). Echoed at startup so failures are reproducible.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Fraction of jobs enqueued with a single RateLimit limit
+    #[arg(long, default_value = "0.10")]
+    rate_limit_fraction: f64,
+    /// Fraction of jobs enqueued with chained Concurrency + RateLimit limits
+    #[arg(long, default_value = "0.15")]
+    chained_fraction: f64,
+    /// Fraction of jobs enqueued with a single FloatingConcurrency limit
+    #[arg(long, default_value = "0.05")]
+    floating_fraction: f64,
+    /// Per-task probability that a worker abandons the lease without acking
+    #[arg(long, default_value = "0.005")]
+    worker_crash_prob: f64,
+    /// Per-tick probability the injector deletes a random job_info row
+    #[arg(long, default_value = "0.002")]
+    job_info_delete_prob: f64,
+    /// Whether to spawn a background lease reaper
+    #[arg(long, default_value_t = true)]
+    spawn_reaper: bool,
 }
 
 fn unique_prefix() -> String {
@@ -41,10 +70,15 @@ fn unique_prefix() -> String {
     format!("sim-{}", nanos)
 }
 
-async fn count_with_prefix(db: &slatedb::Db, prefix: &str) -> usize {
-    let start: Vec<u8> = prefix.as_bytes().to_vec();
-    let mut end: Vec<u8> = prefix.as_bytes().to_vec();
-    end.push(0xFF);
+/// Count rows under a binary key prefix. Note: the previous version of this
+/// helper accepted a `&str` and used `prefix.as_bytes()`, which silently
+/// scanned an unrelated ASCII range (e.g., "holders/" starts with 0x68 while
+/// the actual concurrency-holder prefix is 0x09). That made the simulator's
+/// holder/lease/request invariants vacuous. Always pass the binary prefix from
+/// `keys::*_prefix()`.
+async fn count_with_binary_prefix(db: &slatedb::Db, prefix: &[u8]) -> usize {
+    let start: Vec<u8> = prefix.to_vec();
+    let end: Vec<u8> = keys::end_bound(prefix);
     let mut iter = db.scan::<Vec<u8>, _>(start..end).await.expect("scan");
     let mut n = 0usize;
     loop {
@@ -64,6 +98,28 @@ async fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Build a `GubernatorRateLimit` for the simulator. With `force_deny`, the
+/// limit is set to 0 so the mock returns `under_limit:false` and the
+/// CheckRateLimit task exhausts retries and exercises the max-retries early
+/// return path. Otherwise the limit is high enough that the mock approves.
+fn rate_limit_for(q_name: &str, i: u64, force_deny: bool, max_retries: u32) -> GubernatorRateLimit {
+    GubernatorRateLimit {
+        name: format!("{}-rl", q_name),
+        unique_key: format!("{}-{}", q_name, i),
+        limit: if force_deny { 0 } else { 1_000_000 },
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 25,
+            max_backoff_ms: 250,
+            backoff_multiplier: 2.0,
+            max_retries,
+        },
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     silo::trace::init(LogFormat::Text)?;
@@ -74,6 +130,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = AppConfig::load(None).expect("load default config");
     let tmpdir = tempfile::tempdir()?;
+
+    let seed = args.seed.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    });
+    eprintln!("silo-sim: seed={}", seed);
+    let rng: Arc<Mutex<StdRng>> = Arc::new(Mutex::new(StdRng::seed_from_u64(seed)));
 
     // Create dummy factories for the coordinators - sim manages shards itself
     let rate_limiter = MockGubernatorClient::new_arc();
@@ -172,10 +237,14 @@ async fn main() -> anyhow::Result<()> {
     let c2_owned = c2.clone();
     let enq_running = Arc::new(AtomicBool::new(true));
     let queues_enq = queues.clone();
+    let rate_limit_fraction = args.rate_limit_fraction;
+    let chained_fraction = args.chained_fraction;
+    let floating_fraction = args.floating_fraction;
     let enq_handle = {
         let shards = Arc::clone(&shards_for_enq);
         let _shard_ids = Arc::clone(&shard_ids_for_enq);
         let enq_running = enq_running.clone();
+        let rng = Arc::clone(&rng);
         tokio::spawn(async move {
             let mut i: u64 = 0;
             loop {
@@ -196,6 +265,38 @@ async fn main() -> anyhow::Result<()> {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 };
+
+                let (roll, force_deny): (f64, bool) = {
+                    let mut g = rng.lock().unwrap();
+                    (g.random::<f64>(), g.random::<f64>() < 0.5)
+                };
+                let limits: Vec<Limit> = if roll < rate_limit_fraction {
+                    // Pure RateLimit job. Half configured to deny so the
+                    // CheckRateLimit max-retries early return fires.
+                    vec![Limit::RateLimit(rate_limit_for(q_name, i, force_deny, 2))]
+                } else if roll < rate_limit_fraction + chained_fraction {
+                    // Chained Concurrency -> RateLimit (Bug 2 / Bug 3 shape).
+                    vec![
+                        Limit::Concurrency(ConcurrencyLimit {
+                            key: q_name.clone(),
+                            max_concurrency: *q_limit,
+                        }),
+                        Limit::RateLimit(rate_limit_for(q_name, i, force_deny, 2)),
+                    ]
+                } else if roll < rate_limit_fraction + chained_fraction + floating_fraction {
+                    vec![Limit::FloatingConcurrency(FloatingConcurrencyLimit {
+                        key: format!("{}-float", q_name),
+                        default_max_concurrency: *q_limit,
+                        refresh_interval_ms: 5_000,
+                        metadata: vec![],
+                    })]
+                } else {
+                    vec![Limit::Concurrency(ConcurrencyLimit {
+                        key: q_name.clone(),
+                        max_concurrency: *q_limit,
+                    })]
+                };
+
                 let payload = serde_json::json!({"i": i, "queue": q_name});
                 let payload_bytes = rmp_serde::to_vec(&payload).unwrap();
                 let _ = shard
@@ -206,10 +307,7 @@ async fn main() -> anyhow::Result<()> {
                         now_ms().await,
                         None,
                         payload_bytes,
-                        vec![Limit::Concurrency(ConcurrencyLimit {
-                            key: q_name.clone(),
-                            max_concurrency: *q_limit,
-                        })],
+                        limits,
                         None,
                         "default",
                     )
@@ -223,6 +321,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let workers_running = Arc::new(AtomicBool::new(true));
+    let leaked_acks = Arc::new(AtomicUsize::new(0));
+    let worker_crash_prob = args.worker_crash_prob;
     let mut worker_handles = Vec::new();
     for (idx, shard_id) in shard_ids.iter().enumerate() {
         let shard = shards_for_enq
@@ -232,6 +332,8 @@ async fn main() -> anyhow::Result<()> {
         let workers_running = workers_running.clone();
         let seen = Arc::clone(&seen_attempt_ids);
         let processed = Arc::clone(&processed_total);
+        let leaked_acks = Arc::clone(&leaked_acks);
+        let rng = Arc::clone(&rng);
         let handle = tokio::spawn(async move {
             let wid = format!("w-{}", idx);
             loop {
@@ -253,6 +355,16 @@ async fn main() -> anyhow::Result<()> {
                             tid
                         );
                     }
+                    // Crash injection: with low probability, abandon the lease
+                    // without acking. The reaper must recover holders.
+                    let should_crash = {
+                        let mut g = rng.lock().unwrap();
+                        g.random::<f64>() < worker_crash_prob
+                    };
+                    if should_crash {
+                        leaked_acks.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     let _ = shard
                         .report_attempt_outcome(
                             &tid,
@@ -268,14 +380,20 @@ async fn main() -> anyhow::Result<()> {
 
     let checker_running = Arc::new(AtomicBool::new(true));
     let shards_for_check = Arc::clone(&shards_for_enq);
-    let upper_bound_total = queues.iter().map(|(_, lim)| *lim as usize).sum::<usize>();
+    // Concurrency-typed jobs cap holders at the per-queue limit. RateLimit and
+    // FloatingConcurrency jobs can produce holders independent of that cap, so
+    // the steady-state ceiling is approximate — keep a generous slack so the
+    // mid-run check still bites on egregious over-grant.
+    let upper_bound_total = queues.iter().map(|(_, lim)| *lim as usize).sum::<usize>() + 256;
     let check_handle = {
         let checker_running = checker_running.clone();
         tokio::spawn(async move {
             while checker_running.load(Ordering::SeqCst) {
                 let mut holders_total = 0usize;
                 for shard in shards_for_check.values() {
-                    holders_total += count_with_prefix(shard.db(), "holders/").await;
+                    holders_total +=
+                        count_with_binary_prefix(shard.db(), &keys::concurrency_holders_prefix())
+                            .await;
                 }
                 assert!(
                     holders_total <= upper_bound_total,
@@ -286,7 +404,9 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut requests_total = 0usize;
                 for shard in shards_for_check.values() {
-                    requests_total += count_with_prefix(shard.db(), "requests/").await;
+                    requests_total +=
+                        count_with_binary_prefix(shard.db(), &keys::concurrency_requests_prefix())
+                            .await;
                 }
                 assert!(
                     requests_total < 2000,
@@ -297,6 +417,79 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     };
+
+    // Background lease reaper — without it, worker-crash injection has no
+    // recovery path and end-of-run holder count won't drain.
+    let reaper_running = Arc::new(AtomicBool::new(true));
+    let reaper_handle = if args.spawn_reaper {
+        let shards = Arc::clone(&shards_for_enq);
+        let running = reaper_running.clone();
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            while running.load(Ordering::SeqCst) {
+                tick.tick().await;
+                for shard in shards.values() {
+                    let _ = shard.reap_expired_leases("-").await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // job_info deletion injector — exercises the missing-job_info dequeue
+    // paths in handle_run_attempt and handle_check_rate_limit.
+    let injector_running = Arc::new(AtomicBool::new(true));
+    let injector_handle = {
+        let shards = Arc::clone(&shards_for_enq);
+        let running = injector_running.clone();
+        let rng = Arc::clone(&rng);
+        let prob = args.job_info_delete_prob;
+        let job_info_deletes = Arc::new(AtomicUsize::new(0));
+        let job_info_deletes_for_task = Arc::clone(&job_info_deletes);
+        let handle = tokio::spawn(async move {
+            while running.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let roll: f64 = rng.lock().unwrap().random();
+                if roll >= prob {
+                    continue;
+                }
+                let shard_ids: Vec<_> = shards.keys().copied().collect();
+                if shard_ids.is_empty() {
+                    continue;
+                }
+                let pick_idx: usize = rng.lock().unwrap().random_range(0..shard_ids.len());
+                let Some(shard) = shards.get(&shard_ids[pick_idx]) else {
+                    continue;
+                };
+                // Collect a small sample of job_info keys; pick one and delete.
+                let prefix = keys::jobs_prefix();
+                let end = keys::end_bound(&prefix);
+                let mut iter = match shard.db().scan::<Vec<u8>, _>(prefix..end).await {
+                    Ok(it) => it,
+                    Err(_) => continue,
+                };
+                let mut sampled: Vec<Vec<u8>> = Vec::with_capacity(16);
+                while sampled.len() < 16 {
+                    match iter.next().await {
+                        Ok(Some(kv)) => sampled.push(kv.key.to_vec()),
+                        _ => break,
+                    }
+                }
+                if sampled.is_empty() {
+                    continue;
+                }
+                let pick: usize = rng.lock().unwrap().random_range(0..sampled.len());
+                let mut batch = WriteBatch::new();
+                batch.delete(&sampled[pick]);
+                if shard.db().write(batch).await.is_ok() {
+                    job_info_deletes_for_task.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        (handle, job_info_deletes)
+    };
+    let (injector_handle, job_info_deletes) = injector_handle;
 
     // Add third coordinator mid-run
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -328,27 +521,45 @@ async fn main() -> anyhow::Result<()> {
     // Run for desired duration
     tokio::time::sleep(Duration::from_secs(args.duration_secs)).await;
 
-    // Stop producers/consumers and invariant checker
+    // Stop fault sources first so the reaper has a chance to drain.
     enq_running.store(false, Ordering::SeqCst);
+    injector_running.store(false, Ordering::SeqCst);
     let _ = enq_handle.await;
+    let _ = injector_handle.await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     workers_running.store(false, Ordering::SeqCst);
     for h in worker_handles {
         let _ = h.await;
     }
+    // Give the reaper time to recover any leases abandoned by crashed workers.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    reaper_running.store(false, Ordering::SeqCst);
+    if let Some(h) = reaper_handle {
+        let _ = h.await;
+    }
     checker_running.store(false, Ordering::SeqCst);
     let _ = check_handle.await;
 
-    for shard in shards_for_enq.values() {
+    let leaked_acks_final = leaked_acks.load(Ordering::Relaxed);
+    let job_info_deletes_final = job_info_deletes.load(Ordering::Relaxed);
+    eprintln!(
+        "silo-sim: leaked_acks={} job_info_deletes={}",
+        leaked_acks_final, job_info_deletes_final
+    );
+
+    for (sid, shard) in shards_for_enq.iter() {
+        let h = count_with_binary_prefix(shard.db(), &keys::concurrency_holders_prefix()).await;
+        let l = count_with_binary_prefix(shard.db(), &keys::leases_prefix()).await;
+        let r = count_with_binary_prefix(shard.db(), &keys::concurrency_requests_prefix()).await;
         assert_eq!(
-            count_with_prefix(shard.db(), "holders/").await,
-            0,
-            "holders must be empty at end"
+            h, 0,
+            "holders leak shard={} h={} l={} r={} seed={} leaked_acks={} job_info_deletes={}",
+            sid, h, l, r, seed, leaked_acks_final, job_info_deletes_final
         );
         assert_eq!(
-            count_with_prefix(shard.db(), "requests/").await,
-            0,
-            "requests must be empty at end"
+            r, 0,
+            "requests leak shard={} h={} l={} r={} seed={}",
+            sid, h, l, r, seed
         );
     }
 

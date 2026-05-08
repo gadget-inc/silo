@@ -5,12 +5,12 @@
 
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_holder, encode_lease};
+use silo::codec::{decode_lease, encode_holder, encode_lease, encode_task};
 use silo::job::{FloatingConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
-use silo::keys::{concurrency_holder_key, job_info_key};
-use silo::task::{HolderRecord, LeaseRecord};
+use silo::keys::{concurrency_holder_key, job_info_key, task_key};
+use silo::task::{GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 use test_helpers::*;
 
@@ -206,14 +206,213 @@ async fn holder_leaked_when_run_attempt_finds_missing_job_info() {
     );
 }
 
-// NOTE: there is a separate dormant holder-leak bug at `dequeue.rs:534-541`
-// (handle_check_rate_limit's max-retries early return drops the task without
-// releasing `held_queues`). It cannot be exercised today because
-// `record_grant_outcome` at `src/job_store_shard/enqueue.rs:67-80` swaps the
-// None/Some arms relative to what `concurrency::handle_enqueue` returns, so
-// chained limits never advance past the first grant — `held_queues` therefore
-// never accumulate inside a CheckRateLimit task. The two should be fixed
-// together; flagging here so a follow-up PR can do both.
+// NOTE: `handle_check_rate_limit`'s max-retries early return now releases
+// `held_queues` symmetrically with `handle_run_attempt`. The path remains
+// dormant in production today because `record_grant_outcome` at
+// `src/job_store_shard/enqueue.rs:67-80` swaps the None/Some arms relative to
+// what `concurrency::handle_enqueue` returns, so chained limits never advance
+// past the first grant and `held_queues` never accumulate inside a
+// CheckRateLimit task. The release is in place defensively; a follow-up that
+// fixes `record_grant_outcome` should add an end-to-end repro test.
+
+/// Regression test for the `handle_check_rate_limit` max-retries early return.
+/// `record_grant_outcome` cannot drive a CheckRateLimit task with non-empty
+/// `held_queues` end-to-end today, so we plant the task and a matching holder
+/// row directly. With the rate-limit mock returning `under_limit:false` and
+/// `retry_count == max_retries`, the dequeue must hit the early-return branch
+/// and release the holder. Without the fix at `dequeue.rs`, the holder leaks
+/// and `count_concurrency_holders` stays at 1.
+#[silo::test]
+async fn check_rate_limit_max_retries_releases_held_queues() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "rl-max-retries-q";
+    let task_group = "default";
+    let priority: u8 = 10;
+
+    // Baseline enqueue gives us a real `job_info` row so the dequeue handler's
+    // job lookup succeeds and we exercise the rate-limit branch (not the
+    // separate missing-job_info early return).
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            priority,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"baseline": true})),
+            vec![],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue baseline");
+
+    // Plant the orphan-to-be holder under a synthetic task_id.
+    let task_id = format!("crl-orphan-{}", uuid::Uuid::new_v4());
+    let holder = encode_holder(&HolderRecord {
+        granted_at_ms: now_ms(),
+    });
+    shard
+        .db()
+        .put(&concurrency_holder_key(tenant, queue, &task_id), &holder)
+        .await
+        .expect("plant holder");
+
+    // Plant a CheckRateLimit task already at retry_count == max_retries with
+    // a non-empty held_queues. The mock gubernator with limit=0 will report
+    // under_limit:false → the over-limit branch fires → max-retries arm hit.
+    let max_retries = 3u32;
+    let rl = GubernatorRateLimitData {
+        name: "api".to_string(),
+        unique_key: format!("u-{}", uuid::Uuid::new_v4()),
+        limit: 0,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: 0,
+        behavior: 0,
+        retry_initial_backoff_ms: 10,
+        retry_max_backoff_ms: 1000,
+        retry_backoff_multiplier: 2.0,
+        retry_max_retries: max_retries,
+    };
+    let attempt_number = 7u32;
+    let crl = Task::CheckRateLimit {
+        task_id: task_id.clone(),
+        tenant: tenant.to_string(),
+        job_id: job_id.clone(),
+        attempt_number,
+        relative_attempt_number: 1,
+        limit_index: 0,
+        rate_limit: rl,
+        retry_count: max_retries,
+        started_at_ms: now_ms(),
+        priority,
+        held_queues: vec![queue.to_string()],
+        task_group: task_group.to_string(),
+    };
+    let crl_key = task_key(task_group, now_ms(), priority, &job_id, attempt_number);
+    shard
+        .db()
+        .put(&crl_key, &encode_task(&crl))
+        .await
+        .expect("plant CheckRateLimit task");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "holder must exist before dequeue"
+    );
+
+    // The broker may already have buffered the baseline RunAttempt before we
+    // planted the CheckRateLimit, so loop until either the holder is released
+    // or we run out of attempts.
+    for _ in 0..20 {
+        let _ = shard.dequeue("w1", task_group, 4).await.expect("dequeue");
+        if count_concurrency_holders(shard.db()).await == 0 {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "max-retries early return must release held concurrency holders \
+         (regression for dequeue.rs handle_check_rate_limit)"
+    );
+}
+
+/// Regression test for `handle_check_rate_limit`'s missing-job_info early
+/// return. Same shape as `holder_leaked_when_run_attempt_finds_missing_job_info`
+/// but in the CheckRateLimit handler: a CRL task carries `held_queues` from a
+/// prior chained limit, the job_info row is gone by the time the broker scans
+/// it (cleanup race / split / partial restore), and the dequeue handler's
+/// `None => return Ok(())` arm drops the task without releasing the holders.
+#[silo::test]
+async fn check_rate_limit_missing_job_info_releases_held_queues() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "crl-missing-job-q";
+    let task_group = "default";
+    let priority: u8 = 10;
+
+    // Use a synthetic job_id with no corresponding job_info row. The handler
+    // will load job_info, hit None, and take the early-return arm.
+    let job_id = format!("ghost-job-{}", uuid::Uuid::new_v4());
+    let task_id = format!("crl-orphan-{}", uuid::Uuid::new_v4());
+
+    // Plant the held concurrency holder we'll prove gets released.
+    let holder = encode_holder(&HolderRecord {
+        granted_at_ms: now_ms(),
+    });
+    shard
+        .db()
+        .put(&concurrency_holder_key(tenant, queue, &task_id), &holder)
+        .await
+        .expect("plant holder");
+
+    // Plant a CheckRateLimit task whose job_info doesn't exist. With
+    // retry_count well below max_retries the gubernator branch would normally
+    // proceed, but we never get there because job_info is missing first.
+    let rl = GubernatorRateLimitData {
+        name: "api".to_string(),
+        unique_key: format!("u-{}", uuid::Uuid::new_v4()),
+        limit: 100,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: 0,
+        behavior: 0,
+        retry_initial_backoff_ms: 10,
+        retry_max_backoff_ms: 1000,
+        retry_backoff_multiplier: 2.0,
+        retry_max_retries: 3,
+    };
+    let attempt_number = 1u32;
+    let crl = Task::CheckRateLimit {
+        task_id: task_id.clone(),
+        tenant: tenant.to_string(),
+        job_id: job_id.clone(),
+        attempt_number,
+        relative_attempt_number: 1,
+        limit_index: 0,
+        rate_limit: rl,
+        retry_count: 0,
+        started_at_ms: now_ms(),
+        priority,
+        held_queues: vec![queue.to_string()],
+        task_group: task_group.to_string(),
+    };
+    let crl_key = task_key(task_group, now_ms(), priority, &job_id, attempt_number);
+    shard
+        .db()
+        .put(&crl_key, &encode_task(&crl))
+        .await
+        .expect("plant CheckRateLimit task");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "holder must exist before dequeue"
+    );
+
+    for _ in 0..20 {
+        let _ = shard.dequeue("w1", task_group, 4).await.expect("dequeue");
+        if count_concurrency_holders(shard.db()).await == 0 {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "missing-job_info early return must release held concurrency holders \
+         (regression for dequeue.rs handle_check_rate_limit)"
+    );
+}
 
 /// Defensive idempotency: a stranded holder (no corresponding lease and no
 /// task) must be removable by an explicit purge call. This is the recovery hook

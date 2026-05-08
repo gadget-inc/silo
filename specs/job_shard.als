@@ -80,6 +80,31 @@ sig BufferedTask {
     buf_qtime: one Time
 }
 
+/**
+ * A CheckRateLimit task in the durable DB queue. Held queues are tracked
+ * authoritatively in TicketHolder; this sig just records that the task is
+ * in the CheckRateLimit phase rather than the RunAttempt phase.
+ *
+ * Models src/job_store_shard/dequeue.rs::handle_check_rate_limit's input.
+ * See src/task.rs::Task::CheckRateLimit.
+ */
+sig DbCheckRateLimitTask {
+    crl_task: one TaskId,
+    crl_job: one Job,
+    crl_time: one Time
+}
+
+/**
+ * A CheckRateLimit task pulled from DB into the broker buffer. Same role as
+ * BufferedTask but for CheckRateLimit tasks (which the dequeue handler
+ * processes internally without returning to a worker).
+ */
+sig BufferedCheckRateLimitTask {
+    bcrl_task: one TaskId,
+    bcrl_job: one Job,
+    bcrl_time: one Time
+}
+
 /** Active lease at a given time */
 sig Lease {
     ltask: one TaskId,
@@ -150,20 +175,37 @@ fact wellFormed {
     
     -- A task can be in DB queue for at most one job at each time
     all taskid: TaskId, t: Time | lone qt: DbQueuedTask | qt.db_qtask = taskid and qt.db_qtime = t
-    
+
     -- A task can be in Buffer for at most one job at each time
     all taskid: TaskId, t: Time | lone bt: BufferedTask | bt.buf_qtask = taskid and bt.buf_qtime = t
-    
+
+    -- A task can be a CheckRateLimit DB row for at most one job at each time
+    all taskid: TaskId, t: Time | lone ct: DbCheckRateLimitTask | ct.crl_task = taskid and ct.crl_time = t
+
+    -- A task can be a CheckRateLimit Buffer row for at most one job at each time
+    all taskid: TaskId, t: Time | lone bct: BufferedCheckRateLimitTask | bct.bcrl_task = taskid and bct.bcrl_time = t
+
+    -- A task is either a RunAttempt OR a CheckRateLimit at any given time, not both.
+    -- (handle_check_rate_limit advances the task to a RunAttempt by clearing the CRL row
+    --  and inserting a DbQueuedTask in the same batch.)
+    all taskid: TaskId, t: Time |
+        not (some dbQueuedAt[taskid, t] and some dbCheckRateLimitAt[taskid, t])
+    all taskid: TaskId, t: Time |
+        not (some bufferedAt[taskid, t] and some bufferedCheckRateLimitAt[taskid, t])
+
     -- A task can be leased to at most one worker at each time
     all taskid: TaskId, t: Time | lone l: Lease | l.ltask = taskid and l.ltime = t
-    
+
     -- Task-job binding is permanent: if a task is ever associated with a job
-    -- (in DB, buffer, lease, or request), it can only be associated with that same job
-    -- (In Rust, the task's key contains job_id which is immutable)
+    -- (in DB, buffer, lease, request, or CheckRateLimit row), it can only be
+    -- associated with that same job. (In Rust the task's key contains job_id
+    -- which is immutable.)
     all taskid: TaskId | lone j: Job |
         (some t: Time | some dbQueuedAt[taskid, t] and dbQueuedAt[taskid, t] = j) or
         (some t: Time | some bufferedAt[taskid, t] and bufferedAt[taskid, t] = j) or
         (some t: Time | some leaseJobAt[taskid, t] and leaseJobAt[taskid, t] = j) or
+        (some t: Time | some dbCheckRateLimitAt[taskid, t] and dbCheckRateLimitAt[taskid, t] = j) or
+        (some t: Time | some bufferedCheckRateLimitAt[taskid, t] and bufferedCheckRateLimitAt[taskid, t] = j) or
         (some r: TicketRequest | r.tr_task = taskid and r.tr_job = j)
     
     -- Existential tracking: one tracker per time
@@ -209,15 +251,13 @@ fact wellFormed {
     -- Requests are only for queues the job requires
     all r: TicketRequest | r.tr_queue in jobQueues[r.tr_job]
     
-    -- A holder can only exist for a task that is either:
-    -- 1. In the DB queue (just granted at enqueue), OR
-    -- 2. In the buffer (scanned from DB), OR  
-    -- 3. Has a lease (running)
-    -- This allows holders to exist before lease (granted at enqueue, leased at dequeue)
-    all h: TicketHolder | 
-        some dbQueuedAt[h.th_task, h.th_time] or 
-        some bufferedAt[h.th_task, h.th_time] or 
-        some leaseAt[h.th_task, h.th_time]
+    -- The holder/active-task invariant lives in `assert holdersRequireActiveTask`
+    -- (below), NOT here. Keeping it as a fact makes the assertion trivially
+    -- true and prevents Alloy from generating buggy traces — the assertion
+    -- could never catch a transition that drops a task without releasing
+    -- holders. Encoded as an assertion, the safety property is checked
+    -- against the modeled transitions: a forgotten release produces a
+    -- counterexample.
     
     -- A holder and request can never coexist for the same (task, queue) at the same time
     -- (This is enforced by transitions but stated explicitly for clarity)
@@ -256,6 +296,16 @@ fun dbQueuedAt[taskid: TaskId, t: Time]: set Job {
 
 fun bufferedAt[taskid: TaskId, t: Time]: set Job {
     ((buf_qtask.taskid) & (buf_qtime.t)).buf_qjob
+}
+
+/** A CheckRateLimit task in DB at time t (returns the job it belongs to). */
+fun dbCheckRateLimitAt[taskid: TaskId, t: Time]: set Job {
+    ((crl_task.taskid) & (crl_time.t)).crl_job
+}
+
+/** A CheckRateLimit task in the buffer at time t (returns the job it belongs to). */
+fun bufferedCheckRateLimitAt[taskid: TaskId, t: Time]: set Job {
+    ((bcrl_task.taskid) & (bcrl_time.t)).bcrl_job
 }
 
 fun leaseAt[taskid: TaskId, t: Time]: set Worker {
@@ -338,6 +388,12 @@ pred taskHoldsAllQueues[tid: TaskId, j: Job, t: Time] {
 pred concurrencyUnchanged[t: Time, tnext: Time] {
     all q: Queue | requestTasksAt[q, tnext] = requestTasksAt[q, t]
     all q: Queue | holdersAt[q, tnext] = holdersAt[q, t]
+    -- CRL state is part of "concurrency state" for frame purposes — without
+    -- this clause, transitions that preserve holders could spuriously add or
+    -- remove CRL entries, breaking the holdersRequireActiveTask assertion via
+    -- a phantom orphan rather than a real bug.
+    all tid: TaskId | dbCheckRateLimitAt[tid, tnext] = dbCheckRateLimitAt[tid, t]
+    all tid: TaskId | bufferedCheckRateLimitAt[tid, tnext] = bufferedCheckRateLimitAt[tid, t]
 }
 
 /** Frame condition: requests unchanged, only specific holder changes */
@@ -370,6 +426,8 @@ pred init[t: Time] {
     no jobExistsAt[t]
     no qt: DbQueuedTask | qt.db_qtime = t
     no bt: BufferedTask | bt.buf_qtime = t
+    no ct: DbCheckRateLimitTask | ct.crl_time = t
+    no bct: BufferedCheckRateLimitTask | bct.bcrl_time = t
     no l: Lease | l.ltime = t
     no attemptExistsAt[t] -- No attempts exist initially
     -- No concurrency state initially
@@ -380,11 +438,13 @@ pred init[t: Time] {
 pred enqueuePreConditions[tid: TaskId, j: Job, t: Time] {
     -- [SILO-ENQ-1] Pre: job does NOT exist yet (we're creating a new job)
     j not in jobExistsAt[t]
-    
-    -- Pre: task is not already in use (not in DB, buffer, or leased)
+
+    -- Pre: task is not already in use (not in DB, buffer, leased, or CRL)
     no dbQueuedAt[tid, t]
     no bufferedAt[tid, t]
     no leaseAt[tid, t]
+    no dbCheckRateLimitAt[tid, t]
+    no bufferedCheckRateLimitAt[tid, t]
 }
 
 /** Common postconditions for job creation (all enqueue variants) */
@@ -613,7 +673,7 @@ pred completeFrameConditions[tid: TaskId, t: Time, tnext: Time] {
     all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
 }
 
-/** 
+/**
  * Release a holder for a specific task/queue.
  */
 pred releaseHolder[tid: TaskId, q: Queue, t: Time, tnext: Time] {
@@ -622,6 +682,19 @@ pred releaseHolder[tid: TaskId, q: Queue, t: Time, tnext: Time] {
     -- Other queues unchanged
     all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
     -- Requests unchanged (grant_next is a separate transition)
+    requestsUnchanged[t, tnext]
+}
+
+/**
+ * Release a set of holders for a single task atomically. Use this when a
+ * transition must release every queue a task was carrying — `all q: ... |
+ * releaseHolder[tid, q, t, tnext]` is unsatisfiable for |qs| > 1 because
+ * each releaseHolder asserts other queues are unchanged, contradicting the
+ * release of the next queue in the same step.
+ */
+pred releaseHolders[tid: TaskId, qs: set Queue, t: Time, tnext: Time] {
+    all q: qs | holdersAt[q, tnext] = holdersAt[q, t] - tid
+    all q: Queue - qs | holdersAt[q, tnext] = holdersAt[q, t]
     requestsUnchanged[t, tnext]
 }
 
@@ -1627,6 +1700,183 @@ pred reimportNonTerminalConcurrencyQueued[newTid: TaskId, j: Job, q: Queue, t: T
     }
 }
 
+--------------------------------------------------------------------
+-- CheckRateLimit transitions
+--
+-- Models the chain Concurrency -> RateLimit, where the Concurrency
+-- holder is granted at enqueue time but the resulting task is a
+-- CheckRateLimit task (not a RunAttempt) until the rate-limit check
+-- passes. The handler in `src/job_store_shard/dequeue.rs::handle_check_rate_limit`
+-- can drop this task without going through completion (max retries,
+-- missing job_info, malformed job_info). All such drops MUST release
+-- every queue the task was carrying or `holdersRequireActiveTask`
+-- breaks. These transitions encode that contract symbolically.
+--------------------------------------------------------------------
+
+-- Transition: ENQUEUE_WITH_CONCURRENCY_AND_RATE_LIMIT
+-- Job has a chained limit list (Concurrency, then RateLimit). The
+-- Concurrency limit is granted immediately, so a holder is created;
+-- the resulting task is a CheckRateLimit DB row (not a RunAttempt)
+-- carrying that holder.
+pred enqueueWithConcurrencyAndRateLimit[tid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
+    enqueuePreConditions[tid, j, t]
+    enqueueJobCreated[j, t, tnext]
+    enqueueFrameConditions[tid, t, tnext]
+
+    -- Pre: Job requires this queue
+    q in jobQueues[j]
+
+    -- Pre: Queue has capacity
+    queueHasCapacity[q, t]
+
+    -- Post: Holder created at q
+    holdersAt[q, tnext] = tid
+    -- Frame: other holders unchanged, requests unchanged
+    all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
+    requestsUnchanged[t, tnext]
+
+    -- Post: NO RunAttempt task in DB; instead a CheckRateLimit DB row
+    no qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qtime = tnext
+    all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+
+    one ct: DbCheckRateLimitTask |
+        ct.crl_task = tid and ct.crl_job = j and ct.crl_time = tnext
+    all tid2: TaskId | tid2 != tid implies dbCheckRateLimitAt[tid2, tnext] = dbCheckRateLimitAt[tid2, t]
+
+    -- Frame: CRL buffer unchanged
+    all tid2: TaskId | bufferedCheckRateLimitAt[tid2, tnext] = bufferedCheckRateLimitAt[tid2, t]
+}
+
+-- Transition: BROKER_SCAN_CHECK_RATE_LIMIT
+-- Mirror of brokerScan but for CheckRateLimit DB rows.
+pred brokerScanCheckRateLimit[t: Time, tnext: Time] {
+    -- Pre: a CRL task in DB is not yet in the buffer
+    some tid: TaskId | some dbCheckRateLimitAt[tid, t] and no bufferedCheckRateLimitAt[tid, t]
+
+    -- Effect: copy (some) CRL tasks from DB to buffer, preserving held queues
+    all tid: TaskId | {
+        some bufferedCheckRateLimitAt[tid, t] implies
+            bufferedCheckRateLimitAt[tid, tnext] = bufferedCheckRateLimitAt[tid, t]
+        no bufferedCheckRateLimitAt[tid, t] implies
+            bufferedCheckRateLimitAt[tid, tnext] in dbCheckRateLimitAt[tid, t]
+    }
+    -- Progress: at least one task moves
+    some tid: TaskId | no bufferedCheckRateLimitAt[tid, t] and some bufferedCheckRateLimitAt[tid, tnext]
+
+    -- Frame: DB CRL state unchanged
+    all tid: TaskId | dbCheckRateLimitAt[tid, tnext] = dbCheckRateLimitAt[tid, t]
+
+    -- Frame: held-queues annotation preserved when buffered (modeled by the
+    -- inclusion above; held-queues equality follows from sig identity).
+
+    -- Frame: RunAttempt DB/buffer, leases, jobs, attempts, concurrency state unchanged
+    all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+    all j: Job | statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+    -- Holders/requests preserved (we don't use concurrencyUnchanged because
+    -- it would also preserve CRL state, contradicting the buffer mutation
+    -- above).
+    all q: Queue | requestTasksAt[q, tnext] = requestTasksAt[q, t]
+    all q: Queue | holdersAt[q, tnext] = holdersAt[q, t]
+}
+
+-- Transition: DEQUEUE_DROP_RUN_ATTEMPT
+-- Models the dequeue-handler early-return paths for a RunAttempt task
+-- where the handler decides to drop the task without going through
+-- completion (e.g., handle_run_attempt's missing-job_info path at
+-- src/job_store_shard/dequeue.rs:679). This is the formal envelope
+-- of Bug 1: any such drop MUST release the queues this task held.
+pred dequeueDropRunAttempt[tid: TaskId, t: Time, tnext: Time] {
+    -- Pre: task is buffered as a RunAttempt
+    some bufferedAt[tid, t]
+    -- Pre: task is not currently leased (not running)
+    no leaseAt[tid, t]
+
+    -- Post: task removed from DB queue and buffer
+    no dbQueuedAt[tid, tnext]
+    no bufferedAt[tid, tnext]
+    -- No lease created
+    no leaseAt[tid, tnext]
+    -- Frame: other tasks' RunAttempt DB/buffer rows unchanged
+    all tid2: TaskId | tid2 != tid implies {
+        dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+        bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
+    }
+
+    -- Post: release ALL queues this task was carrying. Without this clause
+    -- the assertion `holdersRequireActiveTask` fails, which is the formal
+    -- statement of the bug fixed in PR #255.
+    releaseHolders[tid, taskHeldQueuesAt[tid, t], t, tnext]
+
+    -- Frame: leases, jobs, attempts, requests, CRL state unchanged
+    all tid2: TaskId | {
+        leaseAt[tid2, tnext] = leaseAt[tid2, t]
+        leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
+        leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
+    }
+    all j: Job | statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+    requestsUnchanged[t, tnext]
+    all tid2: TaskId | dbCheckRateLimitAt[tid2, tnext] = dbCheckRateLimitAt[tid2, t]
+    all tid2: TaskId | bufferedCheckRateLimitAt[tid2, tnext] = bufferedCheckRateLimitAt[tid2, t]
+}
+
+-- Transition: DEQUEUE_DROP_CHECK_RATE_LIMIT
+-- Models the dequeue-handler early-return paths for a CheckRateLimit
+-- task: the max-retries arm (Bug 2, dequeue.rs:556-577) and the
+-- missing/malformed job_info arms (Bug 3, dequeue.rs:512-518). All
+-- such drops MUST release the queues this CRL task carries.
+pred dequeueDropCheckRateLimit[tid: TaskId, t: Time, tnext: Time] {
+    -- Pre: task is buffered as a CheckRateLimit
+    some bufferedCheckRateLimitAt[tid, t]
+    -- Pre: not leased (CRL tasks aren't leased to workers)
+    no leaseAt[tid, t]
+
+    -- Post: CRL DB and buffer rows removed for this task
+    no dbCheckRateLimitAt[tid, tnext]
+    no bufferedCheckRateLimitAt[tid, tnext]
+    all tid2: TaskId | tid2 != tid implies {
+        dbCheckRateLimitAt[tid2, tnext] = dbCheckRateLimitAt[tid2, t]
+        bufferedCheckRateLimitAt[tid2, tnext] = bufferedCheckRateLimitAt[tid2, t]
+    }
+    -- No RunAttempt task created (this is the drop, not the advance)
+    all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
+    no leaseAt[tid, tnext]
+
+    -- Post: release ALL queues this CRL task was carrying. Without this
+    -- clause the assertion breaks — exactly the bugs fixed in branches
+    -- kirin/fix-rate-limit-holder-leak and kirin/dst-holder-leak-coverage.
+    -- Held queues are derived from TicketHolder (taskHeldQueuesAt), the
+    -- authoritative record.
+    releaseHolders[tid, taskHeldQueuesAt[tid, t], t, tnext]
+
+    -- Frame: other leases, jobs, attempts, requests unchanged
+    all tid2: TaskId | {
+        leaseAt[tid2, tnext] = leaseAt[tid2, t]
+        leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
+        leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
+    }
+    all j: Job | statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+    requestsUnchanged[t, tnext]
+}
+
 -- System Trace
 pred step[t: Time, tnext: Time] {
     -- Job lifecycle (no concurrency)
@@ -1661,6 +1911,11 @@ pred step[t: Time, tnext: Time] {
     or (some newTid: TaskId, j: Job | reimportNonTerminal[newTid, j, t, tnext])
     or (some newTid: TaskId, j: Job, q: Queue | reimportNonTerminalConcurrencyGranted[newTid, j, q, t, tnext])
     or (some newTid: TaskId, j: Job, q: Queue | reimportNonTerminalConcurrencyQueued[newTid, j, q, t, tnext])
+    -- CheckRateLimit lifecycle (chained Concurrency -> RateLimit + early-return drops)
+    or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyAndRateLimit[tid, j, q, t, tnext])
+    or (brokerScanCheckRateLimit[t, tnext])
+    or (some tid: TaskId | dequeueDropRunAttempt[tid, t, tnext])
+    or (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
     -- Stutter
     or stutter[t, tnext]
 }
@@ -1668,6 +1923,30 @@ pred step[t: Time, tnext: Time] {
 fact traces {
     init[first]
     all t: Time - last | step[t, t.next]
+}
+
+/**
+ * CRL state changes only when a CRL transition fires. Without this fact,
+ * existing transitions that bypass `concurrencyUnchanged` (e.g.,
+ * enqueueWithConcurrencyGranted, completion-with-release variants) leave CRL
+ * sigs unconstrained — Alloy can spuriously add or remove CRL entries,
+ * fabricating dangling-holder counterexamples that don't correspond to any
+ * real transition. This fact ties CRL mutation to the dedicated transitions.
+ */
+fact crlStateChangesOnlyViaCrlTransitions {
+    all t: Time - last | let tnext = t.next | {
+        (some tid: TaskId | dbCheckRateLimitAt[tid, tnext] != dbCheckRateLimitAt[tid, t])
+            implies (
+                (some tid: TaskId, j: Job, q: Queue |
+                    enqueueWithConcurrencyAndRateLimit[tid, j, q, t, tnext]) or
+                (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
+            )
+        (some tid: TaskId | bufferedCheckRateLimitAt[tid, tnext] != bufferedCheckRateLimitAt[tid, t])
+            implies (
+                brokerScanCheckRateLimit[t, tnext] or
+                (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
+            )
+    }
 }
 
 
@@ -1788,18 +2067,33 @@ assert queueLimitEnforced {
 }
 
 /**
- * Holders only exist for tasks that are active (in DB queue, buffer, or leased).
- * A ticket holder is created at enqueue (granted) or grant_next, and released when:
+ * Holders only exist for tasks that are active in some form (in DB queue, in
+ * buffer, leased, or carried by a CheckRateLimit task).
+ *
+ * A ticket holder is created at enqueue (granted), at grant_next, or by an
+ * enqueue-with-concurrency-and-rate-limit (where the task is a CheckRateLimit
+ * carrying the holder), and released when:
  * - Task completes successfully or fails: [SILO-REL-1]
  * - Lease expires: [SILO-REAP-*] releases via completion path
  * - Job cancelled with task in queue: [SILO-CXL-3] eagerly removes holders
+ * - Dequeue handler drops the task on an early-return path (max retries,
+ *   missing job_info, malformed job_info): dequeueDropRunAttempt /
+ *   dequeueDropCheckRateLimit
+ *
+ * If a future drop-path forgets to release the held queues, this assertion
+ * produces a counterexample — that's exactly the bug shape fixed in PR #255
+ * and on branches kirin/fix-rate-limit-holder-leak,
+ * kirin/dst-holder-leak-coverage.
+ *
  * See: [SILO-ENQ-CONC-2], [SILO-GRANT-3], [SILO-REL-1], [SILO-CXL-3]
  */
 assert holdersRequireActiveTask {
-    all h: TicketHolder | 
-        some dbQueuedAt[h.th_task, h.th_time] or 
-        some bufferedAt[h.th_task, h.th_time] or 
-        some leaseAt[h.th_task, h.th_time]
+    all h: TicketHolder |
+        some dbQueuedAt[h.th_task, h.th_time] or
+        some bufferedAt[h.th_task, h.th_time] or
+        some leaseAt[h.th_task, h.th_time] or
+        some dbCheckRateLimitAt[h.th_task, h.th_time] or
+        some bufferedCheckRateLimitAt[h.th_task, h.th_time]
 }
 
 /**
@@ -2528,6 +2822,65 @@ pred exampleRetryReleasesTicketForOtherJob {
     }
 }
 
+-- ========== CHECK-RATE-LIMIT DROP EXAMPLES ==========
+
+/**
+ * Scenario: a chained Concurrency -> RateLimit job is granted the
+ * Concurrency holder at enqueue time, the broker scans the CRL task
+ * into its buffer, then the dequeue handler drops the CheckRateLimit
+ * task on an early-return path. The holder MUST be released by the
+ * drop transition.
+ */
+pred exampleCheckRateLimitDropReleasesHolder {
+    some tid: TaskId, j: Job, q: Queue, t1, t2, t3, t4: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4]
+        q in jobQueues[j]
+
+        -- t1 -> t2: enqueue with chained Concurrency + RateLimit creates
+        --          the CRL DB row and a holder.
+        enqueueWithConcurrencyAndRateLimit[tid, j, q, t1, t2]
+        some dbCheckRateLimitAt[tid, t2]
+        tid in holdersAt[q, t2]
+
+        -- t2 -> t3: broker scan moves CRL row to buffer.
+        brokerScanCheckRateLimit[t2, t3]
+        some bufferedCheckRateLimitAt[tid, t3]
+        tid in holdersAt[q, t3]
+
+        -- t3 -> t4: drop the CRL task; holder for q is released.
+        dequeueDropCheckRateLimit[tid, t3, t4]
+        no dbCheckRateLimitAt[tid, t4]
+        no bufferedCheckRateLimitAt[tid, t4]
+        tid not in holdersAt[q, t4]
+    }
+}
+
+/**
+ * Scenario: a RunAttempt task with held queues is dropped by the
+ * dequeue handler (e.g., the missing-job_info path in
+ * handle_run_attempt). All held queues are released.
+ */
+pred exampleDequeueDropRunAttemptReleasesHolder {
+    some tid: TaskId, j: Job, q: Queue, t1, t2, t3, t4: Time | {
+        lt[t1, t2] and lt[t2, t3] and lt[t3, t4]
+        q in jobQueues[j]
+
+        -- t1: enqueue with concurrency granted creates a holder + RunAttempt
+        enqueueWithConcurrencyGranted[tid, j, q, t1, t2]
+        some dbQueuedAt[tid, t2]
+        tid in holdersAt[q, t2]
+
+        -- t2: broker scan moves it to buffer
+        brokerScan[t2, t3]
+        some bufferedAt[tid, t3]
+
+        -- t3: drop the buffered task; t4 has no holder for q.
+        dequeueDropRunAttempt[tid, t3, t4]
+        no bufferedAt[tid, t4]
+        tid not in holdersAt[q, t4]
+    }
+}
+
 -- ========== IMPORT/REIMPORT EXAMPLES ==========
 
 /**
@@ -2874,21 +3227,31 @@ check cancellationClearedRequiresRestartable for 4 but 2 Job, 2 Worker, 3 TaskId
 check restartedJobIsScheduledWithTask for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 16 JobCancelled
 
--- Concurrency ticket assertions (with Queue, TicketRequest, TicketHolder, JobQueueRequirement bounds)
+-- Concurrency ticket assertions (with Queue, TicketRequest, TicketHolder, JobQueueRequirement bounds).
+-- Scopes admit DbCheckRateLimitTask / BufferedCheckRateLimitTask so the new
+-- CheckRateLimit transitions can produce witnesses.
 check queueLimitEnforced for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
-    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check holdersRequireActiveTask for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
-    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check grantedMeansNoRequest for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
-    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check noHoldersForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
-    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 -- Expedite assertions
@@ -2945,3 +3308,18 @@ check reimportPreservesCancellation for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attem
 
 check importRejectsExistingJobs for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+
+-- CheckRateLimit drop witnesses. Each must produce a satisfying instance
+-- (SAT) — confirms the new transitions are reachable. If they go UNSAT
+-- something in the surrounding well-formedness is over-constrained.
+run exampleCheckRateLimitDropReleasesHolder for 4 but exactly 1 Job, 1 Worker, 2 TaskId, 1 Attempt, 8 Time, 1 Queue,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease,
+    4 DbCheckRateLimitTask, 4 BufferedCheckRateLimitTask,
+    8 AttemptExists, 8 JobExists, 1 JobAttemptRelation, 8 JobCancelled,
+    2 JobQueueRequirement, 6 TicketRequest, 6 TicketHolder
+
+run exampleDequeueDropRunAttemptReleasesHolder for 4 but exactly 1 Job, 1 Worker, 2 TaskId, 1 Attempt, 8 Time, 1 Queue,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease,
+    4 DbCheckRateLimitTask, 4 BufferedCheckRateLimitTask,
+    8 AttemptExists, 8 JobExists, 1 JobAttemptRelation, 8 JobCancelled,
+    2 JobQueueRequirement, 6 TicketRequest, 6 TicketHolder
