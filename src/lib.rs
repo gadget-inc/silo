@@ -11,6 +11,7 @@ pub mod factory;
 pub mod grpc_trace;
 pub mod gubernator;
 pub mod heap_profile;
+pub mod instrumented_db;
 pub mod job;
 pub mod job_attempt;
 pub mod job_store_shard;

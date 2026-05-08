@@ -89,6 +89,7 @@ impl JobStoreShard {
     /// When no ID is provided (auto-generated UUID), uses a faster WriteBatch path
     /// since UUID collisions are not a concern.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn enqueue(
         &self,
         tenant: &str,

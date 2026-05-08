@@ -44,6 +44,7 @@ impl JobStoreShard {
     /// - Returns error if the task is already ready to run (in buffer) or running (has lease)
     ///
     /// Uses a transaction with optimistic concurrency control to detect if the job state changes during the expedite flow. Retries automatically on conflict.
+    #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn expedite_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
         retry_on_txn_conflict("expedite_job", || self.expedite_job_inner(tenant, id)).await
     }

@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
-use slatedb::{Db, WriteBatch};
+use slatedb::WriteBatch;
+
+use crate::instrumented_db::InstrumentedDb;
 use tokio::sync::Notify;
 
 use crate::codec::{DecodedTask, decode_task_validated};
@@ -37,7 +39,7 @@ pub struct TaskBroker {
     // The task group this broker is responsible for
     task_group: String,
     // The SlateDB database to read tasks from
-    db: Arc<Db>,
+    db: Arc<InstrumentedDb>,
     // The buffer of tasks read out of the DB and ready to be claimed by a dequeue-ing worker
     buffer: Arc<SkipMap<Vec<u8>, BrokerTask>>,
     // The set of tasks already read out of the DB and claimed by a worker but not yet durably leased. Required so that the scanner doesn't re-add tasks that are in the middle of being dequeued to the buffer.
@@ -73,7 +75,7 @@ impl TaskBroker {
 
     fn new(
         task_group: String,
-        db: Arc<Db>,
+        db: Arc<InstrumentedDb>,
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
@@ -493,7 +495,7 @@ impl Drop for TaskBroker {
 /// Registry of per-task-group brokers. Lazily creates a broker for each task group
 /// on first access, scoping each broker's DB scan to its task group's key range.
 pub struct TaskBrokerRegistry {
-    db: Arc<Db>,
+    db: Arc<InstrumentedDb>,
     shard_name: String,
     metrics: Option<Metrics>,
     range: ShardRange,
@@ -502,7 +504,7 @@ pub struct TaskBrokerRegistry {
 
 impl TaskBrokerRegistry {
     pub fn new(
-        db: Arc<Db>,
+        db: Arc<InstrumentedDb>,
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,

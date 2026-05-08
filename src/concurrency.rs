@@ -45,6 +45,8 @@ use futures::StreamExt;
 use slatedb::config::WriteOptions;
 use slatedb::{Db, DbIterator, WriteBatch};
 
+use crate::instrumented_db::InstrumentedDb;
+
 use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::WriteBatcher;
 
@@ -660,7 +662,7 @@ impl ConcurrencyManager {
     /// Then enters an event-driven loop, woken by `request_grant` calls.
     pub fn start_grant_scanner(
         self: &Arc<Self>,
-        db: Arc<Db>,
+        db: Arc<InstrumentedDb>,
         brokers: Arc<TaskBrokerRegistry>,
         range: ShardRange,
     ) {
@@ -713,7 +715,7 @@ impl ConcurrencyManager {
     ///
     /// This is used at grant-scanner startup and by the shard's periodic
     /// reconciliation task to self-heal from missed notifications.
-    pub async fn reconcile_pending_requests(&self, db: &Db, range: &ShardRange) {
+    pub async fn reconcile_pending_requests(&self, db: &InstrumentedDb, range: &ShardRange) {
         let start = concurrency_requests_prefix();
         let end = end_bound(&start);
         let mut iter = match db
@@ -778,7 +780,7 @@ impl ConcurrencyManager {
     /// request queue is exhausted.
     pub(crate) async fn process_grants(
         &self,
-        db: &Db,
+        db: &InstrumentedDb,
         range: &ShardRange,
         tenant: &str,
         queue: &str,
