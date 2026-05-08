@@ -392,32 +392,42 @@ impl TaskBroker {
     /// Claim up to `max` ready tasks from the buffer.
     ///
     /// Since each broker is scoped to a single task group, no prefix filtering is needed.
-    fn claim_ready(&self, max: usize) -> Vec<BrokerTask> {
-        let candidate_keys: Vec<Vec<u8>> = {
-            let mut inflight = self.inflight.lock().unwrap();
-            let mut keys = Vec::with_capacity(max);
-            for entry in self.buffer.iter() {
-                if keys.len() >= max {
-                    break;
-                }
-                let key = entry.key();
-                if inflight.contains(key) {
-                    continue;
-                }
-                inflight.insert(key.clone());
-                keys.push(key.clone());
+    /// Yields periodically so a large `buffer` or `max` doesn't monopolize the executor,
+    /// and acquires `inflight` briefly per key rather than across the whole iteration so
+    /// the scanner's `scan_tasks` loop is not blocked by a long claim pass.
+    async fn claim_ready(&self, max: usize) -> Vec<BrokerTask> {
+        let mut candidate_keys: Vec<Vec<u8>> = Vec::with_capacity(max);
+        let mut iterated: usize = 0;
+        for entry in self.buffer.iter() {
+            if candidate_keys.len() >= max {
+                break;
             }
-            keys
-        };
+            let key = entry.key();
+            {
+                let mut inflight = self.inflight.lock().unwrap();
+                if !inflight.contains(key) {
+                    inflight.insert(key.clone());
+                    candidate_keys.push(key.clone());
+                }
+            }
+            drop(entry);
+            iterated += 1;
+            if iterated % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
 
         // Remove claimed entries from buffer
         let mut claimed = Vec::with_capacity(candidate_keys.len());
-        for key in candidate_keys {
+        for (i, key) in candidate_keys.into_iter().enumerate() {
             if let Some(entry) = self.buffer.remove(&key) {
                 claimed.push(entry.value().clone());
             } else {
                 // Entry was removed between scan and removal, undo inflight reservation
                 self.inflight.lock().unwrap().remove(&key);
+            }
+            if (i + 1) % 32 == 0 {
+                tokio::task::yield_now().await;
             }
         }
 
@@ -427,7 +437,7 @@ impl TaskBroker {
     /// Try to claim tasks. If none available, wait briefly for scanner to populate.
     async fn claim_ready_or_nudge(&self, max: usize) -> Vec<BrokerTask> {
         // Try fast path first
-        let claimed = self.claim_ready(max);
+        let claimed = self.claim_ready(max).await;
         if !claimed.is_empty() {
             return claimed;
         }
@@ -436,7 +446,7 @@ impl TaskBroker {
         self.wakeup();
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            let claimed = self.claim_ready(max);
+            let claimed = self.claim_ready(max).await;
             if !claimed.is_empty() {
                 return claimed;
             }
@@ -540,11 +550,6 @@ impl TaskBrokerRegistry {
                 b
             });
         Arc::clone(broker.value())
-    }
-
-    /// Claim up to `max` ready tasks for a task group.
-    pub fn claim_ready(&self, task_group: &str, max: usize) -> Vec<BrokerTask> {
-        self.get_or_create(task_group).claim_ready(max)
     }
 
     /// Try to claim tasks for a task group. If none available, wait briefly for scanner to populate.
