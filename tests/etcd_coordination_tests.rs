@@ -3723,13 +3723,9 @@ fn restore_dir_tree_writable(path: &std::path::Path) {
     }
 }
 
-/// If factory.close() fails during a normal release, the guard should keep retrying
-/// and the ownership key should persist in etcd until close succeeds.
-///
-/// With slatedb's current close semantics, a timed-out close internally marks the DB
-/// as closed. On the guard's next retry cycle, factory.close() detects the
-/// "already closed" state and treats it as a successful close. The shard is then
-/// released normally. This verifies the graceful recovery path.
+/// If factory.close() fails during a normal release, the guard should keep ownership
+/// and retry with backoff. Once the underlying issue is resolved, a subsequent
+/// force_reopen + close cycle drains the WAL and the ownership key is removed from etcd.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn etcd_shard_close_failure_keeps_ownership() {
     let prefix = unique_prefix();
@@ -3777,26 +3773,54 @@ async fn etcd_shard_close_failure_keeps_ownership() {
     guard.ctx.set_desired(false).await;
     guard.ctx.notify.notify_one();
 
-    // The first close attempt will time out (3s) because the directory is read-only
-    // and slatedb's retrying_object_store retries indefinitely. After the timeout,
-    // the guard reverts to Held and retries. On the second attempt, slatedb reports
-    // the DB as already closed (it internally closed during the timeout), and
-    // factory.close() treats this as success.
-    //
-    // Wait for the shard to be fully released after the close timeout + retry cycle.
-    let released = wait_until(Duration::from_secs(15), || async {
+    // The first close attempt times out (3s) because the directory is read-only and
+    // slatedb's retrying_object_store retries indefinitely. The guard records a
+    // release failure (release_attempts >= 1) and reverts to Held with backoff.
+    let release_failed = wait_until(Duration::from_secs(10), || async {
+        let st = guard.ctx.state.lock().await;
+        st.has_token() && st.release_attempts >= 1
+    })
+    .await;
+    assert!(
+        release_failed,
+        "guard should record a failed release attempt and keep ownership"
+    );
+    assert!(
+        owned.lock().await.contains(&shard_id),
+        "shard should remain in owned set while close keeps failing"
+    );
+
+    // Verify the owner key still exists in etcd (lease retained on close failure)
+    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
+    let resp = coord
+        .client()
+        .get(owner_key.as_bytes(), None)
+        .await
+        .expect("etcd get");
+    assert!(
+        !resp.kvs().is_empty(),
+        "owner key should persist in etcd while close is failing"
+    );
+
+    // Restore writability so the next retry's force_reopen + close can succeed.
+    restore_dir_tree_writable(&shard_data_path);
+
+    // Wait for the next backoff cycle to fire force_reopen + close. With a 5s
+    // initial backoff plus jitter and the close timeout, allow generous time.
+    let released = wait_until(Duration::from_secs(45), || async {
         let st = guard.ctx.state.lock().await;
         st.phase == ShardPhase::Idle && !st.has_token()
     })
     .await;
-    assert!(released, "guard should release after close retry succeeds");
+    assert!(
+        released,
+        "guard should release once close succeeds on retry"
+    );
     assert!(
         !owned.lock().await.contains(&shard_id),
-        "shard should be removed from owned set"
+        "shard should be removed from owned set after successful release"
     );
 
-    // Verify the owner key was cleaned up in etcd
-    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
     let resp = coord
         .client()
         .get(owner_key.as_bytes(), None)
@@ -3808,7 +3832,6 @@ async fn etcd_shard_close_failure_keeps_ownership() {
     );
 
     handle.abort();
-    restore_dir_tree_writable(&shard_data_path);
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
