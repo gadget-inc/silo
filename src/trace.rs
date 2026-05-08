@@ -16,6 +16,20 @@ fn build_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
+#[cfg(feature = "tokio-console")]
+fn console_layer() -> Option<console_subscriber::ConsoleLayer> {
+    let (layer, server) = console_subscriber::ConsoleLayer::builder()
+        .with_default_env()
+        .build();
+    tokio::spawn(async move { server.serve().await.expect("console subscriber server") });
+    Some(layer)
+}
+
+#[cfg(not(feature = "tokio-console"))]
+fn console_layer() -> Option<tracing_subscriber::layer::Identity> {
+    None
+}
+
 /// A thread-safe file writer for the debug log layer.
 #[derive(Clone)]
 struct DebugFileWriter {
@@ -124,7 +138,9 @@ fn init_fmt_only<L>(fmt_layer: L) -> anyhow::Result<()>
 where
     L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
 {
-    let base = tracing_subscriber::registry().with(fmt_layer);
+    let base = tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(console_layer());
 
     if let Some(path) = std::env::var_os("SILO_PERFETTO") {
         let file = std::fs::File::create(path)?;
@@ -175,7 +191,8 @@ where
 
     let base = tracing_subscriber::registry()
         .with(fmt_layer)
-        .with(file_layer);
+        .with(file_layer)
+        .with(console_layer());
 
     // Note: Perfetto and OTEL are not supported when using debug file logging
     // to keep the type system manageable. This is fine for CI debugging use case.

@@ -38,6 +38,7 @@ prost-types = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-perfetto = "0.1"
+console-subscriber = { version = "0.4", optional = true }
 silo-macros = { path = "silo-macros" }
 tokio-stream = "0.1"
 tokio-util = "0.7"
@@ -93,6 +94,7 @@ k8s = ["kube", "k8s-openapi", "chrono"]
 # arrow IPC, web UI). Disable to build lightweight clients (siloctl, compactor)
 # without paying the datafusion compile cost.
 server = ["dep:datafusion", "dep:datafusion-sql"]
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [dev-dependencies]
 siloctl = { path = "siloctl" }

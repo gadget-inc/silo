@@ -273,7 +273,13 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build silo server
         shell: bash
-        run: cargo build
+        # Match the feature flags + RUSTFLAGS that process-compose uses for
+        # silo-1/silo-2 so the cargo run in process-compose hits the cache
+        # instead of triggering a fresh dep recompile under watchexec (which
+        # starves the silo nodes and causes topology refresh to fail).
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable -C force-frame-pointers=yes"
+        run: cargo build -p silo --features tokio-console --bin silo
       - name: Run background processes
         shell: bash
         # Start only the processes the TS tests need. silo-compactor is not

@@ -86,6 +86,7 @@
           pnpm # Package manager for TypeScript client
           kubectl # for interacting with local K8S API server
           watchexec # Auto-reload for development
+          tokio-console # tokio task inspector; pairs with --features tokio-console builds
           grpcurl # For health checking gRPC servers
           toxiproxy # Network fault injection proxy for testing
           sccache # Shared compilation cache across worktrees
