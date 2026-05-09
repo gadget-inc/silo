@@ -120,11 +120,45 @@ pub fn init(log_format: LogFormat) -> anyhow::Result<()> {
     }
 }
 
+/// Default bind for the tokio-console gRPC listener. Picked to be reachable
+/// via `kubectl port-forward` against production pods. Override with the
+/// standard `TOKIO_CONSOLE_BIND=host:port` env var.
+#[cfg(feature = "tokio-console")]
+const TOKIO_CONSOLE_DEFAULT_BIND: ([u8; 4], u16) = ([127, 0, 0, 1], 6399);
+
+/// Builds the `console-subscriber` layer and spawns its gRPC server when the
+/// `tokio-console` feature is enabled. Returns `None` otherwise so callers
+/// can attach unconditionally — `Option<L>: Layer<S>` is a no-op when `None`.
+///
+/// We use `.build()` + manual `tokio::spawn` (instead of the convenience
+/// `.spawn()` helper) so the returned type is the concrete `ConsoleLayer`
+/// rather than `impl Layer<S>`, which cannot be wrapped in `Option<...>`.
+#[cfg(feature = "tokio-console")]
+fn console_layer() -> Option<console_subscriber::ConsoleLayer> {
+    let (layer, server) = console_subscriber::ConsoleLayer::builder()
+        .server_addr(std::net::SocketAddr::from(TOKIO_CONSOLE_DEFAULT_BIND))
+        .with_default_env()
+        .build();
+    tokio::spawn(async move {
+        if let Err(err) = server.serve().await {
+            eprintln!("tokio-console server exited: {err}");
+        }
+    });
+    Some(layer)
+}
+
+#[cfg(not(feature = "tokio-console"))]
+fn console_layer() -> Option<tracing_subscriber::layer::Identity> {
+    None
+}
+
 fn init_fmt_only<L>(fmt_layer: L) -> anyhow::Result<()>
 where
     L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
 {
-    let base = tracing_subscriber::registry().with(fmt_layer);
+    let base = tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(console_layer());
 
     if let Some(path) = std::env::var_os("SILO_PERFETTO") {
         let file = std::fs::File::create(path)?;
@@ -175,7 +209,8 @@ where
 
     let base = tracing_subscriber::registry()
         .with(fmt_layer)
-        .with(file_layer);
+        .with(file_layer)
+        .with(console_layer());
 
     // Note: Perfetto and OTEL are not supported when using debug file logging
     // to keep the type system manageable. This is fine for CI debugging use case.

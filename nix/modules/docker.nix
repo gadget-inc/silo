@@ -22,6 +22,9 @@
         ExposedPorts = {
           "7450/tcp" = { };
           "8080/tcp" = { };
+          # tokio-console gRPC listener — reach via `kubectl port-forward`
+          # against the running pod, then `tokio-console` to inspect tasks.
+          "6399/tcp" = { };
         };
         Env = [
           "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"

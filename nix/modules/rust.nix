@@ -45,6 +45,11 @@
         # based unwinding, which requires the compiler to actually preserve them
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";  # Better inlining visibility
         RUSTFLAGS = "--cfg tokio_unstable --cfg tokio_taskdump -C force-frame-pointers=yes";
+        # Enable the tokio-console subscriber so we can attach `tokio-console`
+        # against running pods to investigate task starvation. The listener
+        # binds to 127.0.0.1:6399 (see `TOKIO_CONSOLE_DEFAULT_BIND` in
+        # `src/trace.rs`); reach it via `kubectl port-forward`.
+        cargoExtraArgs = "--features tokio-console";
       };
       
       # Build dependencies separately for caching
@@ -67,6 +72,14 @@
         # debug -O0 + jemalloc's -Werror combine into a hard error in glibc's
         # features.h ("_FORTIFY_SOURCE requires compiling with optimization").
         hardeningDisable = [ "fortify" ];
+        # tokio-console requires `--cfg tokio_unstable` to compile (and
+        # `tokio_taskdump` is harmless if also set). The repo-level
+        # `.cargo/config.toml` already sets `tokio_unstable`, but set it
+        # explicitly here so crane sandboxing can't strip it.
+        RUSTFLAGS = "--cfg tokio_unstable --cfg tokio_taskdump";
+        # Match the release build so `silo-docker-dev` also exposes the
+        # tokio-console listener.
+        cargoExtraArgs = "--features tokio-console";
       };
       cargoArtifactsDebug = craneLib.buildDepsOnly debugArgs;
       silo-debug = craneLib.buildPackage (debugArgs // {

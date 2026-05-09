@@ -26,3 +26,6 @@ clap = { version = "4.3", features = ["derive", "env"] }
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

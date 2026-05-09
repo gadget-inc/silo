@@ -1,6 +1,26 @@
 [workspace]
 members = [".", "silo-macros", "silo-autoscaler", "silo-compactor", "siloctl"]
 
+# Workspace-wide lint configuration.
+#
+# Goal: catch the "lock held across await" / "blocking primitive in async
+# context" patterns that caused the task starvation incident in PR #285,
+# where a `std::sync::Mutex<HashSet>` guard was held across long iteration
+# in a code path called from async dequeue tasks.
+#
+# Set to `warn` workspace-wide because existing tests intentionally hold
+# locks across awaits in mock harnesses. CI escalates these to `deny` for
+# `--lib --bins` only (see `clippy` job in `.github/workflows/ci.yml`),
+# which is where the production hot paths live.
+#
+# `await_holding_invalid_type` is configured in `clippy.toml` to also flag
+# `parking_lot` and `spin` mutex guards held across `.await`, in case those
+# crates are introduced later.
+[workspace.lints.clippy]
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+await_holding_invalid_type = "warn"
+
 [package]
 authors = ["Harry Brundage <harry@gadget.dev>"]
 edition = "2024"
@@ -84,6 +104,11 @@ storekey = { version = "0.11", features = ["storekey-derive"] }
 hex = "0.4"
 base64 = "0.22"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# `console-subscriber` is gated behind the `tokio-console` feature so the
+# tokio-console runtime instrumentation (and its TCP listener) only ship when
+# we want to debug task starvation locally or in staging. Requires
+# `--cfg tokio_unstable`, which is already set in `.cargo/config.toml`.
+console-subscriber = { version = "0.4", optional = true }
 
 [features]
 default = ["k8s", "server"]
@@ -93,6 +118,11 @@ k8s = ["kube", "k8s-openapi", "chrono"]
 # arrow IPC, web UI). Disable to build lightweight clients (siloctl, compactor)
 # without paying the datafusion compile cost.
 server = ["dep:datafusion", "dep:datafusion-sql"]
+# Enables the tokio-console subscriber. Use to investigate task starvation:
+# build with `--features tokio-console` and connect with `tokio-console`.
+# The TCP listener binds to 127.0.0.1:6669 by default; override with
+# `TOKIO_CONSOLE_BIND`. See https://github.com/tokio-rs/console.
+tokio-console = ["dep:console-subscriber"]
 
 [dev-dependencies]
 siloctl = { path = "siloctl" }
@@ -152,3 +182,6 @@ harness = false
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"
 required-features = ["dst"]
+
+[lints]
+workspace = true

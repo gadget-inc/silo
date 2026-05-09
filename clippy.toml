@@ -1,0 +1,11 @@
+# Extra types that should never be held across `.await`.
+# Catches the same bug class as the std::sync::Mutex guard in PR #285,
+# but for parking_lot / spin guards if those crates are later adopted.
+await-holding-invalid-types = [
+    "parking_lot::MutexGuard",
+    "parking_lot::RwLockReadGuard",
+    "parking_lot::RwLockWriteGuard",
+    "spin::MutexGuard",
+    "spin::RwLockReadGuard",
+    "spin::RwLockWriteGuard",
+]

@@ -21,6 +21,27 @@ jobs:
       - name: Validate SILO sigils synchronized
         run: node scripts/validate-silo-sigils.js
 
+  clippy:
+    name: Rust clippy (lib + bins)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      # Enforce the await_holding_* lints as errors for production code only.
+      # Tests intentionally hold locks across awaits in mock harnesses; the
+      # workspace-level lint config keeps them as warnings (visible in output)
+      # without breaking the test build. See `[workspace.lints.clippy]` in
+      # the root Cargo.toml.
+      - name: Run cargo clippy on lib + bins
+        run: |
+          cargo clippy --workspace --lib --bins --all-features -- \
+            -D clippy::await_holding_lock \
+            -D clippy::await_holding_refcell_ref \
+            -D clippy::await_holding_invalid_type
+
   test:
     name: Rust tests
     runs-on: blacksmith-8vcpu-ubuntu-2404

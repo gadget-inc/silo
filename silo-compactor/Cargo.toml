@@ -45,3 +45,6 @@ anyhow = "1"
 [dev-dependencies]
 tempfile = "3"
 ulid = "1"
+
+[lints]
+workspace = true
