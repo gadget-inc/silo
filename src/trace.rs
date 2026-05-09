@@ -120,11 +120,16 @@ pub fn init(log_format: LogFormat) -> anyhow::Result<()> {
     }
 }
 
-/// Default bind for the tokio-console gRPC listener. Picked to be reachable
-/// via `kubectl port-forward` against production pods. Override with the
-/// standard `TOKIO_CONSOLE_BIND=host:port` env var.
+/// Default bind for the tokio-console gRPC listener. Binds to all interfaces
+/// (`0.0.0.0:6399`) so it's reachable from sibling pods in the same k8s
+/// namespace (e.g. the dev console pod) — not just localhost via
+/// `kubectl port-forward`. Override with the standard
+/// `TOKIO_CONSOLE_BIND=host:port` env var.
+///
+/// The console gRPC protocol has no auth; rely on NetworkPolicy / namespace
+/// isolation to keep this off the public network.
 #[cfg(feature = "tokio-console")]
-const TOKIO_CONSOLE_DEFAULT_BIND: ([u8; 4], u16) = ([127, 0, 0, 1], 6399);
+const TOKIO_CONSOLE_DEFAULT_BIND: ([u8; 4], u16) = ([0, 0, 0, 0], 6399);
 
 /// Builds the `console-subscriber` layer and spawns its gRPC server when the
 /// `tokio-console` feature is enabled. Returns `None` otherwise so callers
