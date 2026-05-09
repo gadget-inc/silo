@@ -22,6 +22,8 @@
         ExposedPorts = {
           "7450/tcp" = { };
           "8080/tcp" = { };
+          # tokio-console gRPC endpoint (set TOKIO_CONSOLE_BIND to expose).
+          "6669/tcp" = { };
         };
         Env = [
           "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
