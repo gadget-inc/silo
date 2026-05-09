@@ -549,7 +549,7 @@ impl JobStoreShard {
             // change. The first watch read also seeds the manifest-revision
             // dedup key without bumping the counter.
             let initial = rx.borrow_and_update().clone();
-            let mut prev_manifest_id = initial.current_manifest.id;
+            let mut prev_manifest_id = initial.current_manifest.id();
             metrics.record_db_status(&shard_name, &initial, false);
 
             loop {
@@ -573,8 +573,8 @@ impl JobStoreShard {
                             break;
                         }
                         let status = rx.borrow_and_update().clone();
-                        let manifest_changed = status.current_manifest.id != prev_manifest_id;
-                        prev_manifest_id = status.current_manifest.id;
+                        let manifest_changed = status.current_manifest.id() != prev_manifest_id;
+                        prev_manifest_id = status.current_manifest.id();
                         metrics.record_db_status(&shard_name, &status, manifest_changed);
                     }
                 }
@@ -732,7 +732,7 @@ impl JobStoreShard {
         let manifest = state.manifest();
 
         let l0_ssts: Vec<LsmSstInfo> = manifest
-            .l0
+            .l0()
             .iter()
             .map(|sst| LsmSstInfo {
                 id: format!("{:?}", sst.id),
@@ -741,7 +741,7 @@ impl JobStoreShard {
             .collect();
 
         let sorted_runs: Vec<LsmSortedRunInfo> = manifest
-            .compacted
+            .compacted()
             .iter()
             .map(|sr| LsmSortedRunInfo {
                 id: sr.id,

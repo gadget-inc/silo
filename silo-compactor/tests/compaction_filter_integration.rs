@@ -217,7 +217,7 @@ async fn drops_old_completed_jobs_on_compaction() {
     let state = admin.read_compactor_state_view().await.unwrap();
     let l0_ids: Vec<Ulid> = state
         .manifest()
-        .l0
+        .l0()
         .iter()
         .map(|s| s.sst.id.unwrap_compacted_id())
         .collect();
@@ -395,11 +395,16 @@ async fn submit_and_wait(admin: &slatedb::admin::Admin, spec: CompactionSpec, ti
         let state = admin.read_compactor_state_view().await.unwrap();
         let current_l0: HashSet<Ulid> = state
             .manifest()
-            .l0
+            .l0()
             .iter()
             .map(|s| s.sst.id.unwrap_compacted_id())
             .collect();
-        let current_srs: HashSet<u32> = state.manifest().compacted.iter().map(|sr| sr.id).collect();
+        let current_srs: HashSet<u32> = state
+            .manifest()
+            .compacted()
+            .iter()
+            .map(|sr| sr.id)
+            .collect();
         let l0_done = expected_l0.iter().all(|id| !current_l0.contains(id));
         let srs_done = expected_srs.iter().all(|id| !current_srs.contains(id));
         if l0_done && srs_done {
