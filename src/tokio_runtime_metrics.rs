@@ -19,6 +19,9 @@ use tokio::runtime::RuntimeMetrics;
 use tokio::sync::broadcast;
 use tracing::debug;
 
+/// Sentinel worker index for global (non-per-worker) counters in `prev_values`.
+const GLOBAL: usize = usize::MAX;
+
 /// Prometheus instruments for tokio runtime metrics, plus the previous-value
 /// table needed to translate absolute counters into `inc_by(delta)`.
 #[derive(Clone)]
@@ -49,9 +52,9 @@ pub struct TokioRuntimeMetrics {
     budget_forced_yield_count: Counter,
     io_driver_ready_count: Counter,
 
-    /// Previous absolute counter values, keyed by (stat_name, worker_label).
-    /// `worker_label` is the worker index as a string, or `""` for globals.
-    prev_values: Arc<Mutex<HashMap<(&'static str, String), u64>>>,
+    /// Previous absolute counter values, keyed by `(stat_name, worker_index)`.
+    /// `worker_index` is `GLOBAL` for non-per-worker counters.
+    prev_values: Arc<Mutex<HashMap<(&'static str, usize), u64>>>,
 }
 
 impl TokioRuntimeMetrics {
@@ -210,55 +213,63 @@ impl TokioRuntimeMetrics {
 
         for w in 0..num_workers {
             let label = w.to_string();
-            self.inc_worker_counter(
+
+            if let Some(delta) = self.delta(
                 "worker_busy_ns",
                 w,
                 duration_to_nanos(rm.worker_total_busy_duration(w)),
-                |delta| {
-                    self.worker_busy_seconds
-                        .with_label_values(&[&label])
-                        .inc_by((delta as f64) / 1e9);
-                },
-            );
-            self.inc_worker_simple(
+            ) {
+                self.worker_busy_seconds
+                    .with_label_values(&[&label])
+                    .inc_by((delta as f64) / 1e9);
+            }
+
+            self.inc_worker_counter(
                 "worker_park",
                 w,
+                &label,
                 rm.worker_park_count(w),
                 &self.worker_park_count,
             );
-            self.inc_worker_simple(
+            self.inc_worker_counter(
                 "worker_poll",
                 w,
+                &label,
                 rm.worker_poll_count(w),
                 &self.worker_poll_count,
             );
-            self.inc_worker_simple(
+            self.inc_worker_counter(
                 "worker_noop",
                 w,
+                &label,
                 rm.worker_noop_count(w),
                 &self.worker_noop_count,
             );
-            self.inc_worker_simple(
+            self.inc_worker_counter(
                 "worker_steal",
                 w,
+                &label,
                 rm.worker_steal_count(w),
                 &self.worker_steal_count,
             );
-            self.inc_worker_simple(
+            self.inc_worker_counter(
                 "worker_steal_ops",
                 w,
+                &label,
                 rm.worker_steal_operations(w),
                 &self.worker_steal_operations,
             );
-            self.inc_worker_simple(
+            self.inc_worker_counter(
                 "worker_local_sched",
                 w,
+                &label,
                 rm.worker_local_schedule_count(w),
                 &self.worker_local_schedule_count,
             );
-            self.inc_worker_simple(
+            self.inc_worker_counter(
                 "worker_overflow",
                 w,
+                &label,
                 rm.worker_overflow_count(w),
                 &self.worker_overflow_count,
             );
@@ -273,21 +284,8 @@ impl TokioRuntimeMetrics {
     }
 
     fn inc_global_counter(&self, key: &'static str, current: u64, counter: &Counter) {
-        if let Some(delta) = self.delta(key, "", current) {
+        if let Some(delta) = self.delta(key, GLOBAL, current) {
             counter.inc_by(delta as f64);
-        }
-    }
-
-    fn inc_worker_simple(
-        &self,
-        key: &'static str,
-        worker: usize,
-        current: u64,
-        counter: &CounterVec,
-    ) {
-        let label = worker.to_string();
-        if let Some(delta) = self.delta(key, &label, current) {
-            counter.with_label_values(&[&label]).inc_by(delta as f64);
         }
     }
 
@@ -295,23 +293,22 @@ impl TokioRuntimeMetrics {
         &self,
         key: &'static str,
         worker: usize,
+        label: &str,
         current: u64,
-        apply: impl FnOnce(u64),
+        counter: &CounterVec,
     ) {
-        let label = worker.to_string();
-        if let Some(delta) = self.delta(key, &label, current) {
-            apply(delta);
+        if let Some(delta) = self.delta(key, worker, current) {
+            counter.with_label_values(&[label]).inc_by(delta as f64);
         }
     }
 
-    /// Compute `current - prev` for `(key, label)` and remember `current`.
+    /// Compute `current - prev` for `(key, worker)` and remember `current`.
     /// Returns `None` on the first observation (no baseline yet) so we don't
     /// emit a spike from process startup. A counter that goes backwards (e.g.
     /// runtime restart in tests) is treated as a fresh baseline.
-    fn delta(&self, key: &'static str, label: &str, current: u64) -> Option<u64> {
+    fn delta(&self, key: &'static str, worker: usize, current: u64) -> Option<u64> {
         let mut prev = self.prev_values.lock().expect("prev_values poisoned");
-        let entry = prev.entry((key, label.to_string()));
-        match entry {
+        match prev.entry((key, worker)) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(current);
                 None
@@ -372,17 +369,46 @@ mod tests {
     use super::*;
     use prometheus::{Encoder, TextEncoder};
 
+    fn worker_counter_total(metric: &CounterVec, num_workers: usize) -> f64 {
+        (0..num_workers)
+            .map(|w| metric.with_label_values(&[&w.to_string()]).get())
+            .sum()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scrape_populates_registry() {
+    async fn first_scrape_does_not_emit_startup_spike() {
         let registry = Registry::new();
         let metrics = TokioRuntimeMetrics::register(&registry).unwrap();
         let handle = tokio::runtime::Handle::current();
 
-        // First scrape establishes baseline; counters stay at 0 (no spike from
-        // accumulated process startup work) but gauges populate immediately.
+        // Burn through some work *before* the first scrape so the runtime's
+        // absolute counters are non-zero. The first scrape should still leave
+        // every Prometheus counter at zero — it's just establishing a baseline.
+        for _ in 0..16 {
+            tokio::spawn(async { tokio::task::yield_now().await })
+                .await
+                .unwrap();
+        }
+
         metrics.scrape(&handle.metrics());
 
-        // Generate some work so the second scrape sees non-zero deltas.
+        assert_eq!(metrics.spawned_tasks.get(), 0.0);
+        assert_eq!(metrics.budget_forced_yield_count.get(), 0.0);
+        assert_eq!(metrics.io_driver_ready_count.get(), 0.0);
+        assert_eq!(worker_counter_total(&metrics.worker_poll_count, 2), 0.0);
+        assert_eq!(worker_counter_total(&metrics.worker_busy_seconds, 2), 0.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scrape_records_deltas_after_baseline() {
+        let registry = Registry::new();
+        let metrics = TokioRuntimeMetrics::register(&registry).unwrap();
+        let handle = tokio::runtime::Handle::current();
+
+        // Establish baseline.
+        metrics.scrape(&handle.metrics());
+
+        // Generate work so the second scrape sees non-zero deltas.
         let mut joins = Vec::new();
         for _ in 0..32 {
             joins.push(tokio::spawn(async {
@@ -395,18 +421,27 @@ mod tests {
 
         metrics.scrape(&handle.metrics());
 
+        // Spawned-task counter must reflect the 32 tasks we just spawned.
+        assert!(
+            metrics.spawned_tasks.get() >= 32.0,
+            "spawned_tasks={} should be >= 32",
+            metrics.spawned_tasks.get()
+        );
+
+        // Workers actually polled tasks, so poll-count delta must be non-zero.
+        let polls = worker_counter_total(&metrics.worker_poll_count, 2);
+        assert!(polls > 0.0, "worker_poll_count_total={polls} should be > 0");
+
+        // Gauges should populate without needing a baseline.
+        assert_eq!(metrics.num_workers.get(), 2.0);
+
+        // Sanity-check the encoded output as well.
         let mut buf = Vec::new();
         TextEncoder::new()
             .encode(&registry.gather(), &mut buf)
             .unwrap();
         let body = String::from_utf8(buf).unwrap();
-
-        assert!(body.contains("silo_tokio_workers"));
-        assert!(body.contains("silo_tokio_alive_tasks"));
-        assert!(body.contains("silo_tokio_worker_busy_seconds_total"));
         assert!(body.contains("silo_tokio_worker_poll_count_total"));
-        assert!(body.contains("silo_tokio_spawned_tasks_total"));
-        // Two workers => labels "0" and "1".
         assert!(body.contains("worker=\"0\""));
         assert!(body.contains("worker=\"1\""));
     }
