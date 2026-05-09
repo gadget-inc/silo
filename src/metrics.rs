@@ -172,11 +172,13 @@ pub struct SlatedbShardMetrics {
     /// Tracks previous SlateDB counter values per (stat_name, shard) for delta computation.
     /// SlateDB exposes counters as absolute values via `stat.get()`, but Prometheus counters
     /// only support `inc_by(delta)`, so we compute deltas between polls.
+    #[allow(clippy::type_complexity)]
     prev_values: Arc<Mutex<HashMap<(String, String), f64>>>,
 
     /// Tracks previous cumulative bucket counts for SlateDB histograms, keyed
     /// the same way as `prev_values`. Needed because the `prometheus` crate
     /// exposes histograms only via `observe(x)`, so we re-observe deltas.
+    #[allow(clippy::type_complexity)]
     prev_histogram_buckets: Arc<Mutex<HashMap<(String, String), Vec<u64>>>>,
 }
 
@@ -302,6 +304,7 @@ impl Metrics {
         self.broker_scans_total.with_label_values(&[shard]).inc();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_broker_scan_tasks(
         &self,
         shard: &str,
@@ -562,6 +565,7 @@ impl SlatedbShardMetrics {
     /// registered Prometheus instruments. Counters are converted to deltas
     /// against the previous snapshot since Prometheus counters only support
     /// `inc_by()`.
+    #[allow(clippy::type_complexity)]
     pub fn update(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
         // Counter-type stats: monotonically increasing in SlateDB
         // REQUEST_COUNT uses an "op" label to distinguish get/scan/flush

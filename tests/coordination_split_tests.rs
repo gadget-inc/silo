@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use silo::coordination::SplitPhase;
@@ -7,16 +7,14 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
 use silo::shard_range::ShardId;
+use tokio::sync::Mutex;
 
-// Global mutex to serialize coordination tests
-// Note: If a test panics, this mutex becomes poisoned. Use lock().unwrap_or_else()
-static COORDINATION_TEST_MUTEX: Mutex<()> = Mutex::new(());
+// Global mutex to serialize coordination tests. Async-aware so the guard can
+// be held across `.await` points (clippy::await_holding_lock).
+static COORDINATION_TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
-/// Helper to acquire the test mutex, handling poisoned state
-fn acquire_test_mutex() -> std::sync::MutexGuard<'static, ()> {
-    COORDINATION_TEST_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+async fn acquire_test_mutex() -> tokio::sync::MutexGuard<'static, ()> {
+    COORDINATION_TEST_MUTEX.lock().await
 }
 
 fn unique_prefix() -> String {
@@ -44,7 +42,7 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
 /// Test that request_split creates a split record
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_split_creates_split_record() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -103,7 +101,7 @@ async fn request_split_creates_split_record() {
 /// Test that request_split fails if node doesn't own the shard
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_split_fails_if_not_owner() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     // Use 32 shards to ensure statistically even distribution across 2 nodes via rendezvous hashing.
@@ -170,7 +168,7 @@ async fn request_split_fails_if_not_owner() {
 /// Test that request_split fails if split is already in progress
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_split_fails_if_already_in_progress() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -215,7 +213,7 @@ async fn request_split_fails_if_already_in_progress() {
 /// Test that request_split fails for invalid split point
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_split_fails_for_invalid_split_point() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 2;
@@ -270,7 +268,7 @@ async fn request_split_fails_for_invalid_split_point() {
 /// Test that is_shard_paused returns correct values
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn is_shard_paused_returns_correct_values() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -318,7 +316,7 @@ async fn is_shard_paused_returns_correct_values() {
 /// Test that split state is persisted across coordinator restarts
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn split_state_persists_across_restart() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -400,7 +398,7 @@ async fn split_state_persists_across_restart() {
 /// Test split state for nonexistent shard returns None
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_split_status_returns_none_for_nonexistent() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -440,7 +438,7 @@ async fn get_split_status_returns_none_for_nonexistent() {
 /// Test that execute_split completes a full split cycle
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn execute_split_completes_full_cycle() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -543,7 +541,7 @@ async fn execute_split_completes_full_cycle() {
 /// Test that is_shard_paused returns true during pausing phases
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shard_paused_during_split_execution() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -621,7 +619,7 @@ async fn shard_paused_during_split_execution() {
 /// Test execute_split fails when no split in progress
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn execute_split_fails_without_request() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -662,7 +660,7 @@ async fn execute_split_fails_without_request() {
 /// Test that execute_split can resume from a partially completed split
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn execute_split_resumes_from_partial_state() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -730,7 +728,7 @@ async fn execute_split_resumes_from_partial_state() {
 /// Test sequential splits (split, then split a child)
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sequential_splits_work_correctly() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -827,7 +825,7 @@ async fn sequential_splits_work_correctly() {
 /// Test that split works correctly in a multi-node cluster
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn split_in_multi_node_cluster() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     // Use 32 shards to ensure statistically even distribution across 2 nodes via rendezvous hashing.
@@ -947,7 +945,7 @@ async fn split_in_multi_node_cluster() {
 /// the split record is cleaned up and the parent shard resumes service.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn execute_split_abandons_on_clone_failure() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -1033,7 +1031,7 @@ async fn execute_split_abandons_on_clone_failure() {
 /// Test crash recovery during early phase (split should be abandoned)
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_recovery_early_phase_abandons_split() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;
@@ -1128,7 +1126,7 @@ async fn crash_recovery_early_phase_abandons_split() {
 /// shard map, the split never completed and is safely abandoned.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_recovery_cloning_phase_abandons_split() {
-    let _guard = acquire_test_mutex();
+    let _guard = acquire_test_mutex().await;
 
     let prefix = unique_prefix();
     let num_shards: u32 = 1;

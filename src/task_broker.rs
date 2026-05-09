@@ -235,24 +235,24 @@ impl TaskBroker {
             }
         }
 
-        if total_read > 0 {
-            if let Some(ref m) = self.metrics {
-                m.record_broker_scan_tasks(
-                    &self.shard_name,
-                    &self.task_group,
-                    inserted as u64,
-                    skipped_future,
-                    skipped_inflight,
-                    skipped_tombstone,
-                    skipped_already_buffered,
-                    skipped_defunct,
-                );
-                m.set_broker_tombstone_count(
-                    &self.shard_name,
-                    &self.task_group,
-                    self.ack_tombstones.lock().unwrap().len() as u64,
-                );
-            }
+        if total_read > 0
+            && let Some(ref m) = self.metrics
+        {
+            m.record_broker_scan_tasks(
+                &self.shard_name,
+                &self.task_group,
+                inserted as u64,
+                skipped_future,
+                skipped_inflight,
+                skipped_tombstone,
+                skipped_already_buffered,
+                skipped_defunct,
+            );
+            m.set_broker_tombstone_count(
+                &self.shard_name,
+                &self.task_group,
+                self.ack_tombstones.lock().unwrap().len() as u64,
+            );
         }
 
         // Delete defunct tasks from the database

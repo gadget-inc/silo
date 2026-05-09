@@ -748,7 +748,8 @@ impl Silo for SiloService {
             ),
         };
 
-        if let Some(cached) = self.cluster_info_cache.lock().await.clone() {
+        let cached = self.cluster_info_cache.lock().await.clone();
+        if let Some(cached) = cached {
             warn!(
                 reason = %fallback_reason,
                 "GetClusterInfo serving cached response — coordination layer unhealthy"

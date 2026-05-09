@@ -1,6 +1,19 @@
 [workspace]
 members = [".", "silo-macros", "silo-autoscaler", "silo-compactor", "siloctl"]
 
+[workspace.lints.clippy]
+# Concurrency-focused lints opted in beyond the default set.
+# significant_drop_in_scrutinee: guard held across whole match arm.
+# await_holding_invalid_type: configurable via clippy.toml to ban
+#   specific types from being held across `.await` points.
+# significant_drop_tightening (nursery) is intentionally NOT enabled —
+# it produced ~300 cosmetic findings against this codebase.
+significant_drop_in_scrutinee = "warn"
+await_holding_invalid_type = "warn"
+
+[lints]
+workspace = true
+
 [package]
 authors = ["Harry Brundage <harry@gadget.dev>"]
 edition = "2024"
