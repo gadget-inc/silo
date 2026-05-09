@@ -66,6 +66,10 @@
             pkgs.jq
             # grpcurl for testing gRPC endpoints
             pkgs.grpcurl
+            # tokio-console CLI for inspecting the silo task runtime over the
+            # console-subscriber gRPC port (6399). Run as e.g.
+            #   tokio-console http://silo-0.silo.silo-staging.svc:6399
+            pkgs.tokio-console
             # Archive tools
             pkgs.gnutar
             pkgs.gzip
