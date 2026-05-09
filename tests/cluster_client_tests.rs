@@ -349,7 +349,7 @@ async fn cluster_client_json_serialization_preserves_data() {
             test_helpers::msgpack_payload(&serde_json::json!({
                 "string": "hello",
                 "number": 42,
-                "float": 3.14,
+                "float": 3.11,
                 "bool": true,
                 "null": null,
                 "array": [1, 2, 3],

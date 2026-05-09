@@ -5,8 +5,6 @@
 
 mod grpc_integration_helpers;
 
-use std::sync::Mutex;
-
 use grpc_integration_helpers::{
     create_test_factory, setup_multi_shard_server, setup_test_server, shutdown_server,
 };
@@ -14,9 +12,11 @@ use silo::pb::silo_client::SiloClient;
 use silo::pb::*;
 use silo::settings::AppConfig;
 use siloctl::{self, BytesOutputFormat, GlobalOptions};
+use tokio::sync::Mutex;
 
 // Global mutex to serialize profiler tests - both profilers use process-global state.
-static PROFILE_TEST_MUTEX: Mutex<()> = Mutex::new(());
+// Async-aware so the guard can be held across `.await` points.
+static PROFILE_TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
 fn opts_for_addr(addr: &std::net::SocketAddr) -> GlobalOptions {
     GlobalOptions {
@@ -749,7 +749,7 @@ async fn siloctl_connection_error() -> anyhow::Result<()> {
 #[silo::test(flavor = "multi_thread")]
 async fn siloctl_profile() -> anyhow::Result<()> {
     // Only one CPU profiler can run at a time system-wide
-    let _profile_lock = PROFILE_TEST_MUTEX.lock().unwrap();
+    let _profile_lock = PROFILE_TEST_MUTEX.lock().await;
 
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(60000), async {
         let (factory, _tmp) = create_test_factory().await?;
@@ -796,7 +796,7 @@ async fn siloctl_profile() -> anyhow::Result<()> {
 #[silo::test(flavor = "multi_thread")]
 async fn siloctl_profile_json_output() -> anyhow::Result<()> {
     // Only one CPU profiler can run at a time system-wide
-    let _profile_lock = PROFILE_TEST_MUTEX.lock().unwrap();
+    let _profile_lock = PROFILE_TEST_MUTEX.lock().await;
 
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(60000), async {
         let (factory, _tmp) = create_test_factory().await?;
@@ -851,7 +851,7 @@ async fn siloctl_profile_json_output() -> anyhow::Result<()> {
 
 #[silo::test(flavor = "multi_thread")]
 async fn siloctl_heap_profile() -> anyhow::Result<()> {
-    let _profile_lock = PROFILE_TEST_MUTEX.lock().unwrap();
+    let _profile_lock = PROFILE_TEST_MUTEX.lock().await;
 
     let _guard = tokio::time::timeout(std::time::Duration::from_millis(60000), async {
         let (factory, _tmp) = create_test_factory().await?;

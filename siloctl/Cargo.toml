@@ -25,3 +25,6 @@ flate2 = "1"
 anyhow = "1"
 hex = "0.4"
 base64 = "0.22"
+
+[lints]
+workspace = true

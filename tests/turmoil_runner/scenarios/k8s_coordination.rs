@@ -917,18 +917,18 @@ pub fn run() {
                 // to allow the new node to start up cleanly
                 controller_k8s_state.set_failure_rate(0.0).await;
 
-                // Activate the node
-                {
+                // Activate the node. Compute the send result inside the lock
+                // scope and release the guard before the `.await` below.
+                let send_result = {
                     let senders = controller_node_senders.lock().unwrap();
-                    if let Err(e) = senders[next_node_to_activate as usize].send(NodeState::Active)
-                    {
-                        tracing::error!(error = %e, "failed to activate node");
-                        drop(senders);
-                        controller_k8s_state
-                            .set_failure_rate(k8s_failure_rate)
-                            .await;
-                        continue;
-                    }
+                    senders[next_node_to_activate as usize].send(NodeState::Active)
+                };
+                if let Err(e) = send_result {
+                    tracing::error!(error = %e, "failed to activate node");
+                    controller_k8s_state
+                        .set_failure_rate(k8s_failure_rate)
+                        .await;
+                    continue;
                 }
 
                 // Update active nodes list for workers

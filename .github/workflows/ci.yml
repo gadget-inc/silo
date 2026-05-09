@@ -21,6 +21,25 @@ jobs:
       - name: Validate SILO sigils synchronized
         run: node scripts/validate-silo-sigils.js
 
+  clippy:
+    name: Rust clippy
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-test-env
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      # Production code (lib + bins): warnings fail CI.
+      - name: Run clippy (lib + bins, deny warnings)
+        run: cargo clippy --workspace --lib --bins --all-features -- -D warnings
+      # Tests: warnings are reported but only deny-by-default lints fail CI.
+      # Keeps cosmetic test issues out of the merge gate while still surfacing
+      # correctness problems (await_holding_lock, approx_constant, etc.).
+      - name: Run clippy (tests, warn only)
+        run: cargo clippy --workspace --tests --all-features
+
   test:
     name: Rust tests
     runs-on: blacksmith-8vcpu-ubuntu-2404

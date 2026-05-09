@@ -143,7 +143,8 @@ impl MockK8sState {
 
     /// Apply operation latency if configured
     async fn apply_latency(&self) {
-        if let Some(latency) = *self.operation_latency.lock().await {
+        let latency = *self.operation_latency.lock().await;
+        if let Some(latency) = latency {
             tokio::time::sleep(latency).await;
         }
     }
