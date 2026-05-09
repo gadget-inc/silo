@@ -120,6 +120,10 @@ pub struct Metrics {
     /// SlateDB per-shard counters and gauges. Shared with silo-compactor via
     /// the `metric_prefix` constructor argument.
     pub slatedb: SlatedbShardMetrics,
+
+    /// Tokio runtime metrics (worker busy time, queue depths, mean poll time)
+    /// driven by a periodic scraper spawned in `main.rs`.
+    pub tokio_runtime: crate::tokio_runtime_metrics::TokioRuntimeMetrics,
 }
 
 /// SlateDB per-shard metric instruments plus the previous-value map needed
@@ -1187,6 +1191,7 @@ pub fn init() -> anyhow::Result<Metrics> {
     );
 
     let slatedb = SlatedbShardMetrics::register(&registry, "silo_")?;
+    let tokio_runtime = crate::tokio_runtime_metrics::TokioRuntimeMetrics::register(&registry)?;
 
     Ok(Metrics {
         registry: Arc::new(registry),
@@ -1221,6 +1226,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         slatedb_manifest_compacted_count,
         slatedb_manifest_checkpoints_count,
         slatedb,
+        tokio_runtime,
     })
 }
 
