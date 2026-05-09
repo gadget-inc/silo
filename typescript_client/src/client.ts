@@ -2576,8 +2576,8 @@ export class SiloGRPCClient {
         return;
       }
 
-      // Reset on each unique server sequentially to avoid SlateDB conflicts
-      // when nodes share the same underlying object storage
+      // Each server only resets its own locally-owned shards, so we must call
+      // every node in the cluster to cover the full shard map.
       for (const addr of servers) {
         const conn = this._getOrCreateConnection(addr);
         const call = conn.client.resetShards({}, this._rpcOptions());
