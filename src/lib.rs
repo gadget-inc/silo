@@ -27,6 +27,7 @@ pub mod shard_range;
 pub mod storage;
 pub mod task;
 pub mod task_broker;
+pub mod tokio_runtime_metrics;
 pub mod trace;
 #[cfg(feature = "dst")]
 pub mod turmoil_object_store;

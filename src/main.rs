@@ -196,6 +196,18 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Periodic tokio runtime metrics scrape: surfaces per-worker busy time,
+    // queue depths, and mean poll time so we can spot starvation.
+    let tokio_metrics_handle = metrics.as_ref().map(|m| {
+        let runtime_metrics = m.tokio_runtime.clone();
+        let shutdown = shutdown_tx.subscribe();
+        tokio::spawn(silo::tokio_runtime_metrics::run_scraper(
+            runtime_metrics,
+            Duration::from_secs(1),
+            shutdown,
+        ))
+    });
+
     // Log server startup with all enabled endpoints
     let webui_addr_str = if cfg.webui.enabled {
         Some(cfg.webui.addr.as_str())
@@ -262,6 +274,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = handle.await;
     }
     if let Some(handle) = metrics_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = tokio_metrics_handle {
         let _ = handle.await;
     }
 
