@@ -588,7 +588,8 @@ pub async fn clone_golden_shard(
     let admin =
         slatedb::admin::Admin::builder(clone_dir_name.as_str(), Arc::clone(&root_store)).build();
     admin
-        .create_clone(golden_dir_name.as_str(), Some(metadata.checkpoint_id))
+        .create_clone_builder(golden_dir_name.as_str(), Some(metadata.checkpoint_id))
+        .build()
         .await
         .expect("create clone");
 

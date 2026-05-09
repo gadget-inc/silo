@@ -273,22 +273,22 @@ impl Metrics {
         status: &slatedb::DbStatus,
         manifest_changed: bool,
     ) {
-        let manifest = &status.current_manifest.manifest;
+        let manifest = &status.current_manifest;
         self.slatedb_durable_seq
             .with_label_values(&[shard])
             .set(status.durable_seq as f64);
         self.slatedb_manifest_last_l0_seq
             .with_label_values(&[shard])
-            .set(manifest.last_l0_seq as f64);
+            .set(manifest.last_l0_seq() as f64);
         self.slatedb_manifest_l0_count
             .with_label_values(&[shard])
-            .set(manifest.l0.len() as f64);
+            .set(manifest.l0().len() as f64);
         self.slatedb_manifest_compacted_count
             .with_label_values(&[shard])
-            .set(manifest.compacted.len() as f64);
+            .set(manifest.compacted().len() as f64);
         self.slatedb_manifest_checkpoints_count
             .with_label_values(&[shard])
-            .set(manifest.checkpoints.len() as f64);
+            .set(manifest.checkpoints().len() as f64);
         if manifest_changed {
             self.slatedb_manifest_revisions
                 .with_label_values(&[shard])

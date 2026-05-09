@@ -641,7 +641,8 @@ impl ShardFactory {
         let left_admin = left_admin_builder.build();
 
         left_admin
-            .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
+            .create_clone_builder(parent_db_path.as_str(), Some(checkpoint.id))
+            .build()
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(
@@ -661,7 +662,8 @@ impl ShardFactory {
         let right_admin = right_admin_builder.build();
 
         right_admin
-            .create_clone(parent_db_path.as_str(), Some(checkpoint.id))
+            .create_clone_builder(parent_db_path.as_str(), Some(checkpoint.id))
+            .build()
             .await
             .map_err(|e| {
                 ShardFactoryError::CloneError(format!(

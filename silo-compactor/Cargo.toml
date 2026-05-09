@@ -9,8 +9,8 @@ name = "silo-compactor"
 path = "src/main.rs"
 
 [dependencies]
-slatedb = { version = "0.12.1", features = ["compaction_filters"] }
-slatedb-common = "0.12.1"
+slatedb = { version = "0.12", features = ["compaction_filters"] }
+slatedb-common = "0.12"
 object_store = { version = "0.12", features = ["gcp"] }
 prometheus = "0.13"
 
