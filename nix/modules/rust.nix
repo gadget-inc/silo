@@ -62,6 +62,11 @@
         strictDeps = true;
         nativeBuildInputs = [ pkgs.protobuf pkgs.flatbuffers ];
         CARGO_PROFILE = "dev";
+        # Enable the embedded console-subscriber server so the dev image's
+        # tokio-console CLI can attach to a running silo. Requires
+        # `--cfg tokio_unstable` to compile against tokio's unstable APIs.
+        cargoExtraArgs = "--features tokio-console";
+        RUSTFLAGS = "--cfg tokio_unstable";
         # Disable fortify hardening so jemalloc's configure script can build
         # its strerror_r feature test. Nix's default _FORTIFY_SOURCE=2 + cargo's
         # debug -O0 + jemalloc's -Werror combine into a hard error in glibc's
