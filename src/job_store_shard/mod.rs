@@ -98,6 +98,10 @@ pub struct OpenShardOptions {
     /// Populated from `DatabaseConfig::hydrate_all_at_startup` /
     /// `DatabaseTemplate::hydrate_all_at_startup`; tests set it explicitly.
     pub hydrate_all_at_startup: bool,
+    /// When set, jobs reaching a terminal status (Succeeded/Failed/Cancelled)
+    /// have their associated KV records re-put with a SlateDB row TTL of this
+    /// many milliseconds. `None` disables the feature.
+    pub terminal_job_expire_ms: Option<u64>,
 }
 
 fn expand_slatedb_settings_for_shard(
@@ -162,6 +166,9 @@ pub struct JobStoreShard {
     range: ShardRange,
     /// Metrics recorder for SlateDB, passed to DbBuilder and used for stats collection.
     slatedb_metrics_recorder: Arc<DefaultMetricsRecorder>,
+    /// When set, terminal jobs have their associated records re-put with a
+    /// SlateDB row TTL of this many milliseconds. `None` disables the feature.
+    pub(crate) terminal_job_expire_ms: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -337,6 +344,7 @@ impl JobStoreShard {
                 ),
                 enable_counter_reconciliation: cfg.enable_counter_reconciliation,
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
+                terminal_job_expire_ms: cfg.terminal_job_expire_ms,
             },
             range,
         )
@@ -375,6 +383,7 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
             enable_counter_reconciliation,
             hydrate_all_at_startup,
+            terminal_job_expire_ms,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -472,6 +481,7 @@ impl JobStoreShard {
             db_path: db_path.to_string(),
             range: range.clone(),
             slatedb_metrics_recorder,
+            terminal_job_expire_ms,
         });
 
         // Periodically reconcile pending concurrency requests to self-heal from

@@ -689,6 +689,23 @@ impl JobStoreShard {
         job_id: &str,
         new_status: JobStatus,
     ) -> Result<(), JobStoreShardError> {
+        self.set_job_status_with_index_opts(writer, tenant, job_id, new_status, None)
+            .await
+    }
+
+    /// Update job status with optional row TTL on the new status/index records.
+    ///
+    /// When `expire_ts` is `Some`, the new `JOB_STATUS` and `IDX_STATUS_TIME`
+    /// rows are written with a SlateDB TTL expiring at `expire_ts` (epoch ms).
+    /// Used by the terminal-job expiration path; pass `None` everywhere else.
+    pub(crate) async fn set_job_status_with_index_opts<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        new_status: JobStatus,
+        expire_ts: Option<i64>,
+    ) -> Result<(), JobStoreShardError> {
         // Delete old index entries if present
         if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
             let old = decode_job_status_owned(&old_raw)?;
@@ -702,7 +719,7 @@ impl JobStoreShard {
             )?;
         }
 
-        Self::write_job_status_with_index(writer, tenant, job_id, new_status)
+        Self::write_job_status_with_index_opts(writer, tenant, job_id, new_status, expire_ts)
     }
 
     /// Shared helper: write status value and index entry.
@@ -712,9 +729,25 @@ impl JobStoreShard {
         job_id: &str,
         new_status: JobStatus,
     ) -> Result<(), JobStoreShardError> {
+        Self::write_job_status_with_index_opts(writer, tenant, job_id, new_status, None)
+    }
+
+    /// Shared helper variant that accepts an optional `expire_ts` for the new
+    /// status and index rows.
+    pub(crate) fn write_job_status_with_index_opts<W: WriteBatcher>(
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        new_status: JobStatus,
+        expire_ts: Option<i64>,
+    ) -> Result<(), JobStoreShardError> {
         // Write new status value
         let job_status_value = encode_job_status(&new_status);
-        writer.put(job_status_key(tenant, job_id), &job_status_value)?;
+        let status_key = job_status_key(tenant, job_id);
+        match expire_ts {
+            Some(ts) => writer.put_with_expire(&status_key, &job_status_value, ts)?,
+            None => writer.put(&status_key, &job_status_value)?,
+        }
 
         // Insert new index entries
         // For Scheduled statuses, use next_attempt_starts_after_ms as the timestamp
@@ -722,9 +755,14 @@ impl JobStoreShard {
         let new_kind = new_status.kind;
         let ts = status_index_timestamp(&new_status);
         let timek = idx_status_time_key(tenant, new_kind.as_str(), ts, job_id);
-        writer.put(&timek, [])?;
+        match expire_ts {
+            Some(ets) => writer.put_with_expire(&timek, [], ets)?,
+            None => writer.put(&timek, [])?,
+        }
 
-        // Increment tenant status counter for the new status
+        // Increment tenant status counter for the new status. Counter merges
+        // are intentionally not given a TTL — they are shard-global and would
+        // disappear with a stale-row dropping, breaking accounting.
         writer.merge(
             tenant_status_counter_key(tenant, new_kind.as_str()),
             encode_counter(1),

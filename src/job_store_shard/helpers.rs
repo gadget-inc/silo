@@ -1,6 +1,7 @@
 //! Helper functions shared across job_store_shard submodules.
 use slatedb::WriteBatch;
 use slatedb::bytes::Bytes;
+use slatedb::config::{PutOptions, Ttl};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::encode_task;
@@ -26,6 +27,21 @@ pub(crate) trait WriteBatcher {
         key: K,
         value: V,
     ) -> Result<(), slatedb::Error>;
+
+    /// Put a key-value pair with a SlateDB row TTL set to `expire_ts`
+    /// (epoch milliseconds). Used by the terminal-job expiration path so the
+    /// row is dropped during compaction once it ages past `expire_ts`.
+    ///
+    /// The default impl ignores the TTL and falls back to `put`. Implementors
+    /// should override when the underlying writer supports per-row TTL.
+    fn put_with_expire<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+        _expire_ts: i64,
+    ) -> Result<(), slatedb::Error> {
+        self.put(key, value)
+    }
 
     /// Delete a key.
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error>;
@@ -76,6 +92,22 @@ impl WriteBatcher for DbWriteBatcher<'_> {
         Ok(())
     }
 
+    fn put_with_expire<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+        expire_ts: i64,
+    ) -> Result<(), slatedb::Error> {
+        self.batch.put_with_options(
+            key,
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAt(expire_ts),
+            },
+        );
+        Ok(())
+    }
+
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error> {
         self.batch.delete(key);
         Ok(())
@@ -109,6 +141,21 @@ impl WriteBatcher for TxnWriter<'_> {
         value: V,
     ) -> Result<(), slatedb::Error> {
         self.0.put(key, value)
+    }
+
+    fn put_with_expire<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+        expire_ts: i64,
+    ) -> Result<(), slatedb::Error> {
+        self.0.put_with_options(
+            key,
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAt(expire_ts),
+            },
+        )
     }
 
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error> {
