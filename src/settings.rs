@@ -232,8 +232,15 @@ pub struct DatabaseTemplate {
     /// have all of their associated KV records re-put with a SlateDB row TTL
     /// expiring this many milliseconds in the future. `None` (the default)
     /// disables the behaviour. A typical value is `SEVEN_DAYS_MS`.
+    ///
     /// This adds work to the job-termination hot path; see
     /// `benches/job_termination.rs` for the A/B benchmark.
+    ///
+    /// **Counter consistency:** when this is enabled, compaction will silently
+    /// drop terminal `JOB_INFO`/`JOB_STATUS` rows, which the `COUNTER_*` rows
+    /// do not see — counters can drift high over time. Pair this with
+    /// `enable_counter_reconciliation = true` to periodically rederive counter
+    /// values from the surviving job rows.
     #[serde(default)]
     pub terminal_job_expire_ms: Option<u64>,
     /// Optional SlateDB-specific settings for tuning database performance.

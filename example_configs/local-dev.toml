@@ -29,6 +29,17 @@ path = "/var/lib/silo/%shard%"
 # Optional: periodic self-healing scan for pending concurrency requests (default: 5000)
 # concurrency_reconcile_interval_ms = 5000
 
+# Optional: terminal-job expiration. When set, jobs reaching a terminal status
+# (Succeeded/Failed/Cancelled) have their associated KV records (JOB_INFO,
+# JOB_STATUS, IDX_STATUS_TIME, IDX_METADATA, ATTEMPT, JOB_CANCELLED) re-put
+# with a SlateDB row TTL of this many milliseconds. The rows are dropped via
+# compaction once they age past the TTL. Default: feature disabled.
+# Counter accounting can drift slightly if shards close before terminal rows
+# are dropped — enable `enable_counter_reconciliation` to self-heal.
+# 7 days = 604_800_000 ms.
+# terminal_job_expire_ms = 604800000
+# enable_counter_reconciliation = true
+
 # Garbage collection — disabled by default in SlateDB!
 # Without this, old WAL files, SSTs, and manifests accumulate forever.
 [database.slatedb.garbage_collector_options.manifest_options]
