@@ -192,6 +192,7 @@ impl ShardFactory {
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
                         enable_counter_reconciliation: template.enable_counter_reconciliation,
+                        terminal_job_expire_ms: template.terminal_job_expire_ms,
                     },
                     range.clone(),
                 )

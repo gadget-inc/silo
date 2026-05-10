@@ -193,6 +193,10 @@ fn default_enable_counter_reconciliation() -> bool {
     false
 }
 
+/// 7 days in milliseconds. Convenient default for `terminal_job_expire_ms`
+/// when operators want to enable the feature without picking a value.
+pub const SEVEN_DAYS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -224,6 +228,14 @@ pub struct DatabaseTemplate {
     /// are unaffected. Defaults to false (reconciliation disabled).
     #[serde(default = "default_enable_counter_reconciliation")]
     pub enable_counter_reconciliation: bool,
+    /// When set, jobs that reach a terminal status (Succeeded/Failed/Cancelled)
+    /// have all of their associated KV records re-put with a SlateDB row TTL
+    /// expiring this many milliseconds in the future. `None` (the default)
+    /// disables the behaviour. A typical value is `SEVEN_DAYS_MS`.
+    /// This adds work to the job-termination hot path; see
+    /// `benches/job_termination.rs` for the A/B benchmark.
+    #[serde(default)]
+    pub terminal_job_expire_ms: Option<u64>,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -247,6 +259,7 @@ impl Default for DatabaseTemplate {
             apply_wal_on_close: default_apply_wal_on_close(),
             concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
             enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            terminal_job_expire_ms: None,
             slatedb: None,
             memory_cache: None,
         }
@@ -500,6 +513,10 @@ pub struct DatabaseConfig {
     /// See `DatabaseTemplate::enable_counter_reconciliation` for details.
     #[serde(default = "default_enable_counter_reconciliation")]
     pub enable_counter_reconciliation: bool,
+    /// When set, terminal jobs have their associated records re-put with a
+    /// SlateDB row TTL. See `DatabaseTemplate::terminal_job_expire_ms`.
+    #[serde(default)]
+    pub terminal_job_expire_ms: Option<u64>,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -523,6 +540,7 @@ impl Default for DatabaseConfig {
             wal: None,
             apply_wal_on_close: default_apply_wal_on_close(),
             enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            terminal_job_expire_ms: None,
             slatedb: None,
             memory_cache: None,
         }
