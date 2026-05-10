@@ -31,8 +31,8 @@ use std::task::{Context, Poll};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
-    TextEncoder, core::Collector,
+    CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+    core::Collector,
 };
 use slatedb_common::metrics::{DefaultMetricsRecorder, LATENCY_BOUNDARIES, MetricValue};
 use tokio::sync::broadcast;
@@ -67,6 +67,27 @@ const READY_TO_START_LATENCY_MS_BUCKETS: &[f64] = &[
 const OS_REQUEST_COUNT: &str = "slatedb.object_store.request_count";
 const OS_ERROR_COUNT: &str = "slatedb.object_store.error_count";
 const OS_REQUEST_DURATION_SECONDS: &str = "slatedb.object_store.request_duration_seconds";
+
+/// Code path that produced a concurrency ticket grant. Becomes the `path`
+/// label on `silo_concurrency_tickets_granted_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantPath {
+    /// Synchronous enqueue path where `try_reserve` finds capacity and a
+    /// holder is created right away (no request queue round-trip).
+    Immediate,
+    /// Async grant scanner or dequeue ticket-request processing path that
+    /// drains queued ticket requests as capacity becomes available.
+    Scanned,
+}
+
+impl GrantPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrantPath::Immediate => "immediate",
+            GrantPath::Scanned => "scanned",
+        }
+    }
+}
 
 /// Silo metrics handle containing all metric instruments.
 #[derive(Clone)]
@@ -107,7 +128,7 @@ pub struct Metrics {
     lease_reaper_errors_total: CounterVec,
 
     // Concurrency metrics
-    concurrency_tickets_granted: Counter,
+    concurrency_tickets_granted: CounterVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -394,9 +415,14 @@ impl Metrics {
             .inc();
     }
 
-    /// Record a concurrency ticket being granted.
-    pub fn record_concurrency_ticket_granted(&self) {
-        self.concurrency_tickets_granted.inc();
+    /// Record `n` concurrency tickets being granted via `path`.
+    pub fn record_concurrency_tickets_granted(&self, path: GrantPath, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.concurrency_tickets_granted
+            .with_label_values(&[path.as_str()])
+            .inc_by(n as f64);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1121,9 +1147,12 @@ pub fn init() -> anyhow::Result<Metrics> {
     // Concurrency metrics
     let concurrency_tickets_granted = register(
         &registry,
-        Counter::new(
-            "silo_concurrency_tickets_granted_total",
-            "Total number of concurrency tickets granted",
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_tickets_granted_total",
+                "Total number of concurrency tickets granted, labelled by grant path",
+            ),
+            &["path"],
         )?,
     );
 

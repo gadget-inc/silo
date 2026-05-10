@@ -1769,7 +1769,10 @@ async fn grant_scanner_records_concurrency_ticket_granted_metric() {
         holder_tasks.push(tasks[0].attempt().task_id().to_string());
     }
 
-    let baseline = read_concurrency_tickets_granted(&metrics);
+    let baseline_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
+    let baseline_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
 
     // Enqueue 3 more jobs that will queue as concurrency requests (queue is full).
     for i in 0..3 {
@@ -1801,18 +1804,110 @@ async fn grant_scanner_records_concurrency_ticket_granted_metric() {
     let granted = shard.process_concurrency_grants(tenant, queue, 2).await;
     assert_eq!(granted.len(), 2, "should grant 2 of the 3 waiters");
 
-    let after = read_concurrency_tickets_granted(&metrics);
+    let after_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
+    let after_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
     assert_eq!(
-        after - baseline,
+        after_scanned - baseline_scanned,
         2.0,
-        "process_grants must increment the counter once per granted ticket"
+        "process_grants must increment the scanned-path counter once per granted ticket"
+    );
+    assert_eq!(
+        after_immediate - baseline_immediate,
+        0.0,
+        "process_grants must not touch the immediate-path counter"
+    );
+}
+
+/// Tests that the immediate-grant enqueue path (where `try_reserve` finds capacity
+/// and `handle_enqueue` skips the request queue) increments
+/// `silo_concurrency_tickets_granted_total{path="immediate"}` once per granted
+/// enqueue, and does not bleed into the `path="scanned"` series.
+#[silo::test]
+async fn immediate_enqueue_records_concurrency_ticket_granted_metric() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let queue = "immediate-metric-q";
+    let tenant = "immediate-metric-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 3,
+    });
+
+    let baseline_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
+    let baseline_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
+
+    // 3 enqueues into a queue with capacity=3 should all hit the immediate-grant
+    // path (try_reserve succeeds for each).
+    for i in 0..3 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("immediate-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+
+    let after_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
+    let after_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
+
+    assert_eq!(
+        after_immediate - baseline_immediate,
+        3.0,
+        "immediate-grant enqueue path must increment the immediate-path counter once per grant"
+    );
+    assert_eq!(
+        after_scanned - baseline_scanned,
+        0.0,
+        "immediate-grant enqueue path must not touch the scanned-path counter"
+    );
+
+    // A 4th enqueue exceeds capacity and goes through the request queue, so the
+    // immediate-path counter should not advance.
+    shard
+        .enqueue(
+            tenant,
+            Some("waiter".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+
+    let final_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
+    assert_eq!(
+        final_immediate - after_immediate,
+        0.0,
+        "an at-capacity enqueue must not increment the immediate-path counter"
     );
 }
 
 /// Read the current value of the `silo_concurrency_tickets_granted_total` counter
-/// out of the Prometheus registry. The counter is unlabelled, so we just sum the
-/// single sample.
-fn read_concurrency_tickets_granted(metrics: &silo::metrics::Metrics) -> f64 {
+/// for a specific `path` label value, or summed across all values when `path`
+/// is `None`.
+fn read_concurrency_tickets_granted_for(
+    metrics: &silo::metrics::Metrics,
+    path: Option<silo::metrics::GrantPath>,
+) -> f64 {
     metrics
         .registry()
         .gather()
@@ -1821,6 +1916,13 @@ fn read_concurrency_tickets_granted(metrics: &silo::metrics::Metrics) -> f64 {
         .map(|f| {
             f.get_metric()
                 .iter()
+                .filter(|m| match path {
+                    None => true,
+                    Some(want) => m
+                        .get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "path" && l.get_value() == want.as_str()),
+                })
                 .map(|m| m.get_counter().get_value())
                 .sum()
         })
