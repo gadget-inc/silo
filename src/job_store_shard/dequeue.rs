@@ -452,7 +452,7 @@ impl JobStoreShard {
 
                 // Record concurrency ticket metric and ready-to-start latency
                 if let Some(ref m) = self.metrics {
-                    m.record_concurrency_ticket_granted();
+                    m.record_concurrency_ticket_granted("scanned_grant");
                     if let Some(parsed) = parse_task_key(task_key) {
                         let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
                         m.record_ready_to_start_latency_ms(self.name(), req_task_group, latency_ms);

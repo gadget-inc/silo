@@ -31,8 +31,8 @@ use std::task::{Context, Poll};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
-    TextEncoder, core::Collector,
+    CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+    core::Collector,
 };
 use slatedb_common::metrics::{DefaultMetricsRecorder, LATENCY_BOUNDARIES, MetricValue};
 use tokio::sync::broadcast;
@@ -107,7 +107,7 @@ pub struct Metrics {
     lease_reaper_errors_total: CounterVec,
 
     // Concurrency metrics
-    concurrency_tickets_granted: Counter,
+    concurrency_tickets_granted: CounterVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -395,8 +395,15 @@ impl Metrics {
     }
 
     /// Record a concurrency ticket being granted.
-    pub fn record_concurrency_ticket_granted(&self) {
-        self.concurrency_tickets_granted.inc();
+    ///
+    /// `granted` labels the code path that produced the grant: `immediate_grant`
+    /// for the synchronous enqueue path that observes capacity via `try_reserve`,
+    /// and `scanned_grant` for the async grant scanner / dequeue ticket-request
+    /// processing path that drains queued requests.
+    pub fn record_concurrency_ticket_granted(&self, granted: &str) {
+        self.concurrency_tickets_granted
+            .with_label_values(&[granted])
+            .inc();
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1121,9 +1128,12 @@ pub fn init() -> anyhow::Result<Metrics> {
     // Concurrency metrics
     let concurrency_tickets_granted = register(
         &registry,
-        Counter::new(
-            "silo_concurrency_tickets_granted_total",
-            "Total number of concurrency tickets granted",
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_tickets_granted_total",
+                "Total number of concurrency tickets granted, labelled by grant path",
+            ),
+            &["granted"],
         )?,
     );
 

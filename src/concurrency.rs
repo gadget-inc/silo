@@ -531,6 +531,9 @@ impl ConcurrencyManager {
                 relative_attempt_number,
                 task_group,
             )?;
+            if let Some(ref m) = self.metrics {
+                m.record_concurrency_ticket_granted("immediate_grant");
+            }
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
                 task_id: task_id.to_string(),
                 queue: queue.clone(),
@@ -1130,7 +1133,7 @@ impl ConcurrencyManager {
 
             if let Some(ref m) = self.metrics {
                 for _ in 0..grants.len() {
-                    m.record_concurrency_ticket_granted();
+                    m.record_concurrency_ticket_granted("scanned_grant");
                 }
             }
 
