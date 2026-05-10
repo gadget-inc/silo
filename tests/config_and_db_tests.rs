@@ -596,6 +596,33 @@ enable_counter_reconciliation = true
     assert!(cfg.database.enable_counter_reconciliation);
 }
 
+#[silo::test]
+fn parse_toml_terminal_job_expire_ms_defaults_off() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert!(
+        cfg.database.terminal_job_expire_ms.is_none(),
+        "terminal_job_expire_ms should default to None (feature off)"
+    );
+}
+
+#[silo::test]
+fn parse_toml_terminal_job_expire_ms_opt_in() {
+    // 7 days in milliseconds.
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+terminal_job_expire_ms = 604800000
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert_eq!(cfg.database.terminal_job_expire_ms, Some(604_800_000));
+}
+
 /// Guards against the manual `Default` impl on `DatabaseTemplate` drifting away
 /// from the serde defaults. If a future field is added with a `#[serde(default)]`
 /// but is not mirrored in the `Default` impl (or vice versa), this fails.
@@ -621,6 +648,10 @@ path = "/tmp/silo-%shard%"
     assert_eq!(
         from_default.enable_counter_reconciliation,
         from_toml.database.enable_counter_reconciliation
+    );
+    assert_eq!(
+        from_default.terminal_job_expire_ms,
+        from_toml.database.terminal_job_expire_ms
     );
     assert!(from_default.wal.is_none() && from_toml.database.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.database.slatedb.is_none());
@@ -649,6 +680,10 @@ path = "/tmp/silo-shard"
     assert_eq!(
         from_default.enable_counter_reconciliation,
         from_toml.enable_counter_reconciliation
+    );
+    assert_eq!(
+        from_default.terminal_job_expire_ms,
+        from_toml.terminal_job_expire_ms
     );
     assert!(from_default.wal.is_none() && from_toml.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.slatedb.is_none());

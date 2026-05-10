@@ -82,6 +82,29 @@ pub async fn open_temp_shard_with_metrics() -> (
     (tmp, shard, metrics)
 }
 
+/// Open a temp shard with `terminal_job_expire_ms` set, so that terminal-job
+/// records are written with a SlateDB row TTL. The TTL is given in
+/// milliseconds — pass a very small value (e.g. 100ms) to exercise expiration
+/// in tests.
+pub async fn open_temp_shard_with_terminal_expire_ms(
+    terminal_job_expire_ms: u64,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        terminal_job_expire_ms: Some(terminal_job_expire_ms),
+        ..Default::default()
+    };
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
+        .await
+        .expect("open shard");
+    (tmp, shard)
+}
+
 /// Open a temp shard with a custom periodic concurrency reconciliation interval.
 pub async fn open_temp_shard_with_reconcile_interval_ms(
     interval_ms: u64,

@@ -212,8 +212,16 @@ fact wellFormed {
     all t: Time | one e: AttemptExists | e.time = t
     all t: Time | one e: JobExists | e.time = t
     
-    -- Once a job exists, it always exists (jobs are not deleted in normal operation)
-    all t: Time - last, j: Job | j in jobExistsAt[t] implies j in jobExistsAt[t.next]
+    -- Non-terminal jobs are never dropped from existence: only terminal
+    -- (Succeeded/Failed) jobs can leave `jobExistsAt`, and only via the
+    -- `expireTerminalJob` transition (gated by the
+    -- `terminal_job_expire_ms` setting in the Rust implementation, which
+    -- attaches a SlateDB row TTL on the JOB_INFO/IDX/ATTEMPT records
+    -- written at terminal-status time so they age out via compaction).
+    -- See: src/job_store_shard/lease.rs::expire_terminal_job_records.
+    all t: Time - last, j: Job |
+        (j in jobExistsAt[t] and not isTerminal[statusAt[j, t]]) implies
+            j in jobExistsAt[t.next]
     
     -- Leases must have expiry at or after their recorded time
     -- When a lease is first created (dequeue/heartbeat), expiry > ltime
@@ -1360,6 +1368,79 @@ pred reapExpiredLeaseReleaseTicket[tid: TaskId, q: Queue, t: Time, tnext: Time] 
 
 -- Transition: STUTTER
 -- Necessary for alloy to make arbitrary time steps forward without changing any state
+-- Transition: EXPIRE_TERMINAL_JOB - Drop a terminal job's records.
+--
+-- Models the optional TTL'd cleanup of terminal jobs. When the
+-- `terminal_job_expire_ms` setting is configured (None = disabled), the
+-- implementation re-puts JOB_INFO, JOB_STATUS, IDX_STATUS_TIME,
+-- IDX_METADATA, ATTEMPT, and JOB_CANCELLED rows with a SlateDB row TTL at
+-- the moment a job reaches terminal status. After enough wall-clock time
+-- has passed, those rows are dropped during compaction and the job is no
+-- longer queryable. In Alloy we collapse "TTL set + compaction drops it"
+-- into a single nondeterministic transition that can fire any time after
+-- the job has reached terminal status.
+--
+-- Pre:
+--   * Job exists at t
+--   * Status is terminal (Succeeded or Failed). Cancelled-but-non-terminal
+--     jobs are not eligible (in Rust, the TTL is set when the worker
+--     reports a terminal outcome, not when cancellation is recorded).
+--   * No active state references the job. The existing assertions
+--     `noQueuedTasksForTerminal`, `noLeasesForTerminal`, and
+--     `noHoldersForTerminal` already require this for terminal jobs, so
+--     these are conservative redundant guards.
+--
+-- Post:
+--   * Job removed from existence
+--   * All attempts for the job removed from existence
+--   * Any cancellation record for the job is dropped (mirrors Rust's
+--     re-put of JOB_CANCELLED with TTL)
+--
+-- See: src/job_store_shard/lease.rs::expire_terminal_job_records,
+--      src/settings.rs::terminal_job_expire_ms.
+pred expireTerminalJob[j: Job, t: Time, tnext: Time] {
+    -- [SILO-EXPIRE-1] Pre: job exists and is terminal
+    j in jobExistsAt[t]
+    isTerminal[statusAt[j, t]]
+
+    -- [SILO-EXPIRE-2] Pre: no active state for this job
+    no tid: TaskId | dbQueuedAt[tid, t] = j
+    no tid: TaskId | bufferedAt[tid, t] = j
+    no tid: TaskId | leaseJobAt[tid, t] = j
+    no tid: TaskId | dbCheckRateLimitAt[tid, t] = j
+    no tid: TaskId | bufferedCheckRateLimitAt[tid, t] = j
+
+    -- [SILO-EXPIRE-3] Post: job no longer exists
+    j not in jobExistsAt[tnext]
+
+    -- [SILO-EXPIRE-4] Post: attempts for this job no longer exist
+    all a: attemptExistsAt[t] | attemptJob[a] = j implies a not in attemptExistsAt[tnext]
+    -- Frame: attempts for other jobs unchanged
+    all a: attemptExistsAt[t] | attemptJob[a] != j implies a in attemptExistsAt[tnext]
+    attemptExistsAt[tnext] in attemptExistsAt[t]
+    all a: attemptExistsAt[tnext] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+
+    -- [SILO-EXPIRE-5] Post: cancellation record for j is dropped
+    not isCancelledAt[j, tnext]
+
+    -- Frame: other jobs' existence and status unchanged
+    all j2: Job | j2 != j implies (j2 in jobExistsAt[tnext] iff j2 in jobExistsAt[t])
+    all j2: Job | (j2 in jobExistsAt[t] and j2 != j) implies statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | j2 != j implies (isCancelledAt[j2, tnext] iff isCancelledAt[j2, t])
+
+    -- Frame: tasks/buffer/leases unchanged (terminal job had none)
+    all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+
+    -- Frame: concurrency state unchanged (terminal jobs hold no requests/holders)
+    concurrencyUnchanged[t, tnext]
+}
+
 pred stutter[t: Time, tnext: Time] {
     -- All existing jobs unchanged (status and cancellation)
     all j: Job | j in jobExistsAt[t] implies statusAt[j, tnext] = statusAt[j, t]
@@ -1941,6 +2022,8 @@ pred step[t: Time, tnext: Time] {
     or (brokerScanCheckRateLimit[t, tnext])
     or (some tid: TaskId | dequeueDropRunAttempt[tid, t, tnext])
     or (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
+    -- Terminal-job expiration (gated by terminal_job_expire_ms in Rust)
+    or (some j: Job | expireTerminalJob[j, t, tnext])
     -- Stutter
     or stutter[t, tnext]
 }
@@ -2007,11 +2090,15 @@ assert runningJobHasRunningAttempt {
         (one a: attemptExistsAt[t] | attemptJob[a] = j and attemptStatusAt[a, t] = AttemptRunning)
 }
 
-/** A completed attempt is never running again */
+/** A completed attempt is never running again (while the attempt still exists).
+ *  Terminal-job expiration may drop the attempt from existence entirely; in
+ *  that case there is nothing to be "running again" so the property
+ *  trivially holds. We guard explicitly so the equality has both sides
+ *  defined. */
 assert attemptTerminalIsForever {
-    all t: Time - last, a: attemptExistsAt[t] | 
-        isTerminalAttempt[attemptStatusAt[a, t]] implies 
-        attemptStatusAt[a, t.next] = attemptStatusAt[a, t]
+    all t: Time - last, a: attemptExistsAt[t] |
+        (isTerminalAttempt[attemptStatusAt[a, t]] and a in attemptExistsAt[t.next]) implies
+            attemptStatusAt[a, t.next] = attemptStatusAt[a, t]
 }
 
 /**
@@ -2020,7 +2107,12 @@ assert attemptTerminalIsForever {
  * Status is just: Scheduled, Running, Succeeded, Failed
  */
 assert validTransitions {
-    all t: Time - last, j: Job | j in jobExistsAt[t] implies {
+    -- Status transitions are only constrained while the job continues to exist.
+    -- Terminal-job expiration (`expireTerminalJob`) drops the job from
+    -- `jobExistsAt`, after which `statusAt[j, t.next]` is empty — that's a
+    -- legal terminal sink, not a transition rule violation.
+    all t: Time - last, j: Job |
+        (j in jobExistsAt[t] and j in jobExistsAt[t.next]) implies {
         -- Scheduled can go to Running (dequeue), stay Scheduled (stutter/reimport),
         -- or go to Succeeded/Failed (reimport with terminal attempts)
         statusAt[j, t] = Scheduled implies statusAt[j, t.next] in (Scheduled + Running + Succeeded + Failed)
@@ -2065,18 +2157,24 @@ assert noLeasesForTerminal {
  * Succeeded jobs cannot be restarted or have their cancellation cleared.
  */
 assert cancellationClearedRequiresRestartable {
-    all j: Job, t: Time - last | 
-        (isCancelledAt[j, t] and not isCancelledAt[j, t.next]) implies 
+    -- Only relevant while the job continues to exist. If the job is dropped
+    -- by `expireTerminalJob` between t and t.next, its cancellation record
+    -- goes with it — that's the TTL'ing of JOB_CANCELLED, not a restart.
+    all j: Job, t: Time - last |
+        (isCancelledAt[j, t] and not isCancelledAt[j, t.next]
+         and j in jobExistsAt[t.next]) implies
             statusAt[j, t] != Succeeded
 }
 
 /**
- * When cancellation is cleared, the job becomes Scheduled with a new task.
- * This verifies the restart postconditions.
+ * When cancellation is cleared by a restart, the job becomes Scheduled with
+ * a new task. This verifies the restart postconditions. Cancellation cleared
+ * because the job was expired (and so no longer exists at t.next) is excluded.
  */
 assert restartedJobIsScheduledWithTask {
-    all j: Job, t: Time - last | 
-        (isCancelledAt[j, t] and not isCancelledAt[j, t.next]) implies {
+    all j: Job, t: Time - last |
+        (isCancelledAt[j, t] and not isCancelledAt[j, t.next]
+         and j in jobExistsAt[t.next]) implies {
             statusAt[j, t.next] = Scheduled
             some tid: TaskId | dbQueuedAt[tid, t.next] = j
         }

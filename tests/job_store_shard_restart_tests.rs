@@ -423,6 +423,146 @@ async fn restart_nonexistent_job_returns_not_found() {
     });
 }
 
+/// When `terminal_job_expire_ms` is set, the records written by the terminal
+/// outcome path carry a SlateDB row TTL with `expire_ts ≈ now + ttl_ms`.
+/// SlateDB applies the TTL at compaction time, so this test verifies the
+/// per-row metadata directly rather than waiting for compaction to drop the
+/// row.
+///
+/// This is the safety hook for the spec's `expireTerminalJob` transition:
+/// once compaction passes the TTL, the rows disappear from the shard's view
+/// and `restartFailedJob`'s `j in jobExistsAt[t]` precondition stops holding.
+#[silo::test]
+async fn terminal_records_are_tagged_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::{job_info_key, job_status_key};
+        let ttl_ms: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(ttl_ms).await;
+
+        let before_ms = now_ms();
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Drive the job to Failed (no retry policy → first error is permanent).
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: b"boom".to_vec(),
+                },
+            )
+            .await
+            .expect("report failure");
+        let after_ms = now_ms();
+
+        // JOB_STATUS and JOB_INFO must both carry an `expire_ts` set to roughly
+        // `now + ttl_ms`. Allow a generous window around the wall-clock bounds
+        // (clocks can skew under load and the implementation samples `now_ms`
+        // once per termination call).
+        let raw_db = shard.db();
+        for key in [job_status_key("-", &job_id), job_info_key("-", &job_id)] {
+            let kv = raw_db
+                .get_key_value(&key)
+                .await
+                .expect("get_key_value")
+                .expect("row present");
+            let expire_ts = kv
+                .expire_ts
+                .expect("terminal record should carry expire_ts");
+            let lower = before_ms + ttl_ms as i64 - 5_000;
+            let upper = after_ms + ttl_ms as i64 + 5_000;
+            assert!(
+                expire_ts >= lower && expire_ts <= upper,
+                "expire_ts {expire_ts} outside expected window [{lower}, {upper}] for key {key:?}"
+            );
+        }
+    });
+}
+
+/// Even with TTL configured, a Failed job is restartable **before** the TTL
+/// elapses. Guards against accidentally writing the TTL with `expire_ts` in
+/// the past, or applying the row TTL on the wrong write path.
+#[silo::test]
+async fn ttl_unexpired_failed_job_is_still_restartable() {
+    with_timeout!(30000, {
+        // Long enough that the records can't expire during the test.
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: b"boom".to_vec(),
+                },
+            )
+            .await
+            .expect("report failure");
+
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(status.kind, JobStatusKind::Failed);
+
+        // Restart well before the TTL — should succeed.
+        shard
+            .restart_job("-", &job_id)
+            .await
+            .expect("restart of not-yet-expired job should succeed");
+
+        let status_after = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(status_after.kind, JobStatusKind::Scheduled);
+    });
+}
+
 /// Restart a job with retry policy that failed after exhausting retries
 
 #[silo::test]
