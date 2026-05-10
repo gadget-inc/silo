@@ -532,7 +532,7 @@ impl ConcurrencyManager {
                 task_group,
             )?;
             if let Some(ref m) = self.metrics {
-                m.record_concurrency_ticket_granted("immediate_grant");
+                m.record_concurrency_tickets_granted(crate::metrics::GrantPath::Immediate, 1);
             }
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
                 task_id: task_id.to_string(),
@@ -1132,9 +1132,10 @@ impl ConcurrencyManager {
             }
 
             if let Some(ref m) = self.metrics {
-                for _ in 0..grants.len() {
-                    m.record_concurrency_ticket_granted("scanned_grant");
-                }
+                m.record_concurrency_tickets_granted(
+                    crate::metrics::GrantPath::Scanned,
+                    grants.len() as u64,
+                );
             }
 
             total_granted += grants.len();

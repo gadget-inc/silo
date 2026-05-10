@@ -1769,9 +1769,10 @@ async fn grant_scanner_records_concurrency_ticket_granted_metric() {
         holder_tasks.push(tasks[0].attempt().task_id().to_string());
     }
 
-    let baseline_scanned = read_concurrency_tickets_granted_for(&metrics, Some("scanned_grant"));
+    let baseline_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
     let baseline_immediate =
-        read_concurrency_tickets_granted_for(&metrics, Some("immediate_grant"));
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
 
     // Enqueue 3 more jobs that will queue as concurrency requests (queue is full).
     for i in 0..3 {
@@ -1803,24 +1804,26 @@ async fn grant_scanner_records_concurrency_ticket_granted_metric() {
     let granted = shard.process_concurrency_grants(tenant, queue, 2).await;
     assert_eq!(granted.len(), 2, "should grant 2 of the 3 waiters");
 
-    let after_scanned = read_concurrency_tickets_granted_for(&metrics, Some("scanned_grant"));
-    let after_immediate = read_concurrency_tickets_granted_for(&metrics, Some("immediate_grant"));
+    let after_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
+    let after_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
     assert_eq!(
         after_scanned - baseline_scanned,
         2.0,
-        "process_grants must increment the scanned_grant counter once per granted ticket"
+        "process_grants must increment the scanned-path counter once per granted ticket"
     );
     assert_eq!(
         after_immediate - baseline_immediate,
         0.0,
-        "process_grants must not touch the immediate_grant counter"
+        "process_grants must not touch the immediate-path counter"
     );
 }
 
 /// Tests that the immediate-grant enqueue path (where `try_reserve` finds capacity
 /// and `handle_enqueue` skips the request queue) increments
-/// `silo_concurrency_tickets_granted_total{granted="immediate_grant"}` once per
-/// granted enqueue, and does not bleed into the `scanned_grant` counter.
+/// `silo_concurrency_tickets_granted_total{path="immediate"}` once per granted
+/// enqueue, and does not bleed into the `path="scanned"` series.
 #[silo::test]
 async fn immediate_enqueue_records_concurrency_ticket_granted_metric() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
@@ -1833,8 +1836,9 @@ async fn immediate_enqueue_records_concurrency_ticket_granted_metric() {
     });
 
     let baseline_immediate =
-        read_concurrency_tickets_granted_for(&metrics, Some("immediate_grant"));
-    let baseline_scanned = read_concurrency_tickets_granted_for(&metrics, Some("scanned_grant"));
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
+    let baseline_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
 
     // 3 enqueues into a queue with capacity=3 should all hit the immediate-grant
     // path (try_reserve succeeds for each).
@@ -1855,22 +1859,24 @@ async fn immediate_enqueue_records_concurrency_ticket_granted_metric() {
             .unwrap();
     }
 
-    let after_immediate = read_concurrency_tickets_granted_for(&metrics, Some("immediate_grant"));
-    let after_scanned = read_concurrency_tickets_granted_for(&metrics, Some("scanned_grant"));
+    let after_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
+    let after_scanned =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Scanned));
 
     assert_eq!(
         after_immediate - baseline_immediate,
         3.0,
-        "immediate-grant enqueue path must increment the immediate_grant counter once per grant"
+        "immediate-grant enqueue path must increment the immediate-path counter once per grant"
     );
     assert_eq!(
         after_scanned - baseline_scanned,
         0.0,
-        "immediate-grant enqueue path must not touch the scanned_grant counter"
+        "immediate-grant enqueue path must not touch the scanned-path counter"
     );
 
     // A 4th enqueue exceeds capacity and goes through the request queue, so the
-    // immediate_grant counter should not advance.
+    // immediate-path counter should not advance.
     shard
         .enqueue(
             tenant,
@@ -1886,20 +1892,21 @@ async fn immediate_enqueue_records_concurrency_ticket_granted_metric() {
         .await
         .unwrap();
 
-    let final_immediate = read_concurrency_tickets_granted_for(&metrics, Some("immediate_grant"));
+    let final_immediate =
+        read_concurrency_tickets_granted_for(&metrics, Some(silo::metrics::GrantPath::Immediate));
     assert_eq!(
         final_immediate - after_immediate,
         0.0,
-        "an at-capacity enqueue must not increment the immediate_grant counter"
+        "an at-capacity enqueue must not increment the immediate-path counter"
     );
 }
 
 /// Read the current value of the `silo_concurrency_tickets_granted_total` counter
-/// for a specific `granted` label value, or summed across all values when `granted`
+/// for a specific `path` label value, or summed across all values when `path`
 /// is `None`.
 fn read_concurrency_tickets_granted_for(
     metrics: &silo::metrics::Metrics,
-    granted: Option<&str>,
+    path: Option<silo::metrics::GrantPath>,
 ) -> f64 {
     metrics
         .registry()
@@ -1909,12 +1916,12 @@ fn read_concurrency_tickets_granted_for(
         .map(|f| {
             f.get_metric()
                 .iter()
-                .filter(|m| match granted {
+                .filter(|m| match path {
                     None => true,
                     Some(want) => m
                         .get_label()
                         .iter()
-                        .any(|l| l.get_name() == "granted" && l.get_value() == want),
+                        .any(|l| l.get_name() == "path" && l.get_value() == want.as_str()),
                 })
                 .map(|m| m.get_counter().get_value())
                 .sum()

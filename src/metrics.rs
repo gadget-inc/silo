@@ -68,6 +68,27 @@ const OS_REQUEST_COUNT: &str = "slatedb.object_store.request_count";
 const OS_ERROR_COUNT: &str = "slatedb.object_store.error_count";
 const OS_REQUEST_DURATION_SECONDS: &str = "slatedb.object_store.request_duration_seconds";
 
+/// Code path that produced a concurrency ticket grant. Becomes the `path`
+/// label on `silo_concurrency_tickets_granted_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantPath {
+    /// Synchronous enqueue path where `try_reserve` finds capacity and a
+    /// holder is created right away (no request queue round-trip).
+    Immediate,
+    /// Async grant scanner or dequeue ticket-request processing path that
+    /// drains queued ticket requests as capacity becomes available.
+    Scanned,
+}
+
+impl GrantPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GrantPath::Immediate => "immediate",
+            GrantPath::Scanned => "scanned",
+        }
+    }
+}
+
 /// Silo metrics handle containing all metric instruments.
 #[derive(Clone)]
 pub struct Metrics {
@@ -394,16 +415,14 @@ impl Metrics {
             .inc();
     }
 
-    /// Record a concurrency ticket being granted.
-    ///
-    /// `granted` labels the code path that produced the grant: `immediate_grant`
-    /// for the synchronous enqueue path that observes capacity via `try_reserve`,
-    /// and `scanned_grant` for the async grant scanner / dequeue ticket-request
-    /// processing path that drains queued requests.
-    pub fn record_concurrency_ticket_granted(&self, granted: &str) {
+    /// Record `n` concurrency tickets being granted via `path`.
+    pub fn record_concurrency_tickets_granted(&self, path: GrantPath, n: u64) {
+        if n == 0 {
+            return;
+        }
         self.concurrency_tickets_granted
-            .with_label_values(&[granted])
-            .inc();
+            .with_label_values(&[path.as_str()])
+            .inc_by(n as f64);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1133,7 +1152,7 @@ pub fn init() -> anyhow::Result<Metrics> {
                 "silo_concurrency_tickets_granted_total",
                 "Total number of concurrency tickets granted, labelled by grant path",
             ),
-            &["granted"],
+            &["path"],
         )?,
     );
 
