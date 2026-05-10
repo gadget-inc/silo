@@ -437,8 +437,17 @@ impl JobStoreShard {
         job_id: &str,
         expire_ts: i64,
     ) -> Result<(), JobStoreShardError> {
-        // 1. Re-put JOB_INFO with TTL, and harvest the metadata pairs from it
-        //    so we know which IDX_METADATA rows to TTL.
+        // [SILO-EXPIRE-1] Pre: caller has ensured the job has reached a terminal
+        // status (Succeeded/Failed/Cancelled) and the in-batch JOB_STATUS write
+        // is already tagged with `expire_ts` via set_job_status_with_index_opts.
+        //
+        // [SILO-EXPIRE-2] Pre: no active state references the job — terminal
+        // jobs have no DB queue tasks, buffered tasks, leases, or holders
+        // (enforced by the existing termination flow + assertions
+        // noQueuedTasksForTerminal / noLeasesForTerminal / noHoldersForTerminal).
+        //
+        // [SILO-EXPIRE-3] Post: re-put JOB_INFO with the row TTL so it ages
+        // out of the store alongside the JOB_STATUS row.
         let info_key = job_info_key(tenant, job_id);
         let metadata_pairs = if let Some(info_raw) = self.db.get(&info_key).await? {
             let view = JobView::new(info_raw.clone())?;
@@ -449,13 +458,18 @@ impl JobStoreShard {
             Vec::new()
         };
 
-        // 2. IDX_METADATA: one row per (key, value) pair, value is empty bytes.
+        // [SILO-EXPIRE-3] Post: IDX_METADATA rows for the job's metadata pairs
+        // are also re-put with the row TTL. The value is empty bytes (these
+        // rows are presence-only).
         for (mk, mv) in &metadata_pairs {
             let mkey = idx_metadata_key(tenant, mk, mv, job_id);
             writer.put_with_expire(&mkey, [], expire_ts)?;
         }
 
-        // 3. ATTEMPT rows: scan and re-put each with TTL.
+        // [SILO-EXPIRE-4] Post: every ATTEMPT row for the job is re-put with
+        // the row TTL. We do this in addition to TTLing the new in-batch
+        // attempt because earlier attempts (from retries before this terminal
+        // outcome) were written without a TTL and need to be tagged now.
         let attempt_start = attempt_prefix(tenant, job_id);
         let attempt_end = end_bound(&attempt_start);
         let mut iter = self
@@ -466,7 +480,8 @@ impl JobStoreShard {
             writer.put_with_expire(&kv.key, &kv.value, expire_ts)?;
         }
 
-        // 4. JOB_CANCELLED (only present for cancelled jobs) — re-put if it exists.
+        // [SILO-EXPIRE-5] Post: if the job has a JOB_CANCELLED record, re-put
+        // it with the row TTL so it disappears alongside the rest of the job.
         let cancelled_key = job_cancelled_key(tenant, job_id);
         if let Some(cancelled_raw) = self.db.get(&cancelled_key).await? {
             writer.put_with_expire(&cancelled_key, cancelled_raw, expire_ts)?;
