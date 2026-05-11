@@ -299,6 +299,33 @@ impl JobStoreShard {
             }
         }
 
+        // Re-put all of the job's *prior* associated records (JOB_INFO,
+        // IDX_METADATA, earlier ATTEMPT rows, JOB_CANCELLED) with the TTL.
+        //
+        // Ordering note: this MUST happen before we write the new ATTEMPT row
+        // for the current attempt. The helper scans `attempt_prefix` from
+        // `self.db` (which reflects committed state, pre-batch) — so the row
+        // for the current attempt comes back with its old Running status, and
+        // would clobber a freshly-batched terminal put on the same key
+        // because WriteBatch is last-write-wins per key (see
+        // slatedb::WriteBatch::put_with_options removing prior ops for the
+        // key). Writing the new attempt afterwards lets it win.
+        //
+        // Concurrency note: another writer cannot mutate this job's
+        // attempt rows in parallel — the lease for the running attempt was
+        // just deleted earlier in this batch, no other attempt for this
+        // job_id can be Running, and the job's terminal status will block
+        // dequeue / restart / reimport, so the scan sees a stable view.
+        if reached_terminal && let Some(ts) = terminal_expire_ts {
+            self.expire_terminal_job_records(
+                &mut DbWriteBatcher::new(&self.db, &mut batch),
+                &tenant,
+                &job_id,
+                ts,
+            )
+            .await?;
+        }
+
         // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status.
         // Apply TTL to terminal-job attempts so they expire alongside the rest of
         // the job's records. The retry-scheduling branch leaves the attempt
@@ -316,17 +343,6 @@ impl JobStoreShard {
                 );
             }
             _ => batch.put(&attempt_key, &attempt_val),
-        }
-
-        // Re-put all of the job's other associated records with the same TTL.
-        if reached_terminal && let Some(ts) = terminal_expire_ts {
-            self.expire_terminal_job_records(
-                &mut DbWriteBatcher::new(&self.db, &mut batch),
-                &tenant,
-                &job_id,
-                ts,
-            )
-            .await?;
         }
 
         // [SILO-REL-1][SILO-RETRY-REL] Delete concurrency holders in the batch.
@@ -420,14 +436,13 @@ impl JobStoreShard {
     /// `JOB_STATUS` and `IDX_STATUS_TIME` are written with TTL by the caller via
     /// `set_job_status_with_index_opts`, so they are intentionally not handled here.
     ///
-    /// The attempt scan reads from `self.db` directly because in-batch reads
-    /// are not supported by `WriteBatcher::get`. The expectation is that any
-    /// previously-written attempts in the same batch as this call (i.e. the
-    /// attempt for the outcome being reported) are already represented on disk
-    /// or already in the batch — the scan covers persisted ones; the in-batch
-    /// new attempt is given a TTL by passing `expire_ts` separately when it is
-    /// put. (We re-put it here too to keep this helper self-contained for
-    /// callers that don't want to special-case the new attempt write.)
+    /// The attempt scan reads from `self.db` directly (committed state,
+    /// pre-batch). For the current attempt this returns its old Running
+    /// value, so the caller MUST put the new terminal ATTEMPT row **after**
+    /// invoking this helper. `WriteBatch` is last-write-wins per key, and
+    /// putting the new row earlier would be silently clobbered when the
+    /// helper re-puts the old Running value with TTL. See the call site in
+    /// `report_attempt_outcome`.
     pub(crate) async fn expire_terminal_job_records(
         &self,
         writer: &mut DbWriteBatcher<'_>,

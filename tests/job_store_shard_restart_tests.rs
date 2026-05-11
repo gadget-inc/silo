@@ -499,6 +499,68 @@ async fn terminal_records_are_tagged_with_expire_ts() {
     });
 }
 
+/// Regression: when terminal_job_expire_ms is set, the ATTEMPT row for the
+/// job's current attempt must reflect the **terminal** outcome status (e.g.
+/// Succeeded), not the prior Running status that was on disk before
+/// `report_attempt_outcome` ran. An earlier implementation re-scanned
+/// ATTEMPT rows after writing the new terminal attempt and clobbered the
+/// new value with the old Running value because WriteBatch is last-write-wins
+/// per key. This test reads the ATTEMPT row directly and asserts both the
+/// terminal status and the TTL are present.
+#[silo::test]
+async fn terminal_attempt_row_keeps_terminal_status_under_ttl() {
+    with_timeout!(20000, {
+        use silo::job_attempt::{AttemptStatus, JobAttemptView};
+        use silo::keys::attempt_key;
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: Vec::new() })
+            .await
+            .expect("report success");
+
+        // The committed attempt row for attempt 1 must be Succeeded with a TTL.
+        let kv = shard
+            .db()
+            .get_key_value(&attempt_key("-", &job_id, 1))
+            .await
+            .expect("get_key_value")
+            .expect("attempt row present");
+        assert!(
+            kv.expire_ts.is_some(),
+            "terminal attempt row should carry expire_ts"
+        );
+        let view = JobAttemptView::new(kv.value).expect("decode attempt");
+        match view.state() {
+            AttemptStatus::Succeeded { .. } => {}
+            other => panic!("expected AttemptStatus::Succeeded, got {:?}", other),
+        }
+    });
+}
+
 /// Even with TTL configured, a Failed job is restartable **before** the TTL
 /// elapses. Guards against accidentally writing the TTL with `expire_ts` in
 /// the past, or applying the row TTL on the wrong write path.
