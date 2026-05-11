@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tracing::info_span;
+use tracing::{Instrument, info_span};
 
 use crate::instrumented_db::InstrumentedDb;
 
@@ -371,7 +371,7 @@ impl JobStoreShard {
         }
 
         let shard_span = info_span!("shard", shard = %name);
-        let db = db_builder.build().await?;
+        let db = db_builder.build().instrument(shard_span.clone()).await?;
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
         let concurrency = Arc::new(ConcurrencyManager::new(metrics.clone()));
 
