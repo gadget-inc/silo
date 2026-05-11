@@ -415,13 +415,13 @@ impl Metrics {
             .inc();
     }
 
-    /// Record `n` concurrency tickets being granted via `path`.
-    pub fn record_concurrency_tickets_granted(&self, path: GrantPath, n: u64) {
+    /// Record `n` concurrency tickets being granted via `path` on `shard`.
+    pub fn record_concurrency_tickets_granted(&self, shard: &str, path: GrantPath, n: u64) {
         if n == 0 {
             return;
         }
         self.concurrency_tickets_granted
-            .with_label_values(&[path.as_str()])
+            .with_label_values(&[shard, path.as_str()])
             .inc_by(n as f64);
     }
 
@@ -1150,9 +1150,9 @@ pub fn init() -> anyhow::Result<Metrics> {
         CounterVec::new(
             Opts::new(
                 "silo_concurrency_tickets_granted_total",
-                "Total number of concurrency tickets granted, labelled by grant path",
+                "Total number of concurrency tickets granted, labelled by shard and grant path",
             ),
-            &["path"],
+            &["shard", "path"],
         )?,
     );
 
