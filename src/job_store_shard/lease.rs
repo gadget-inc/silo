@@ -120,9 +120,16 @@ impl JobStoreShard {
         // Compute the row-TTL deadline for terminal records once, up front. We
         // only know whether the outcome is terminal after matching on it below,
         // but the value itself is outcome-independent so we resolve it here.
-        let terminal_expire_ts: Option<i64> = self
-            .terminal_job_expire_ms
-            .map(|ms| now_ms.saturating_add(ms as i64));
+        //
+        // `terminal_job_expire_ms: u64` is operator-supplied and realistic
+        // values are days/weeks (< 2^41). Saturate at `i64::MAX` to keep the
+        // u64→i64 cast meaningful even if someone passes an absurd value
+        // (would otherwise wrap to a negative `expire_ts`, which SlateDB
+        // interprets as already-expired).
+        let terminal_expire_ts: Option<i64> = self.terminal_job_expire_ms.map(|ms| {
+            let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
+            now_ms.saturating_add(ms_i64)
+        });
         let attempt_status = match &outcome {
             AttemptOutcome::Success { result } => AttemptStatus::Succeeded {
                 finished_at_ms: now_ms,
