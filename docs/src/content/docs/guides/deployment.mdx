@@ -80,14 +80,14 @@ backend = "gcs"
 path = "gs://my-bucket/silo/%shard%"
 
 [database.slatedb.object_store_cache_options]
-root_folder = "/var/silo-cache"
+root_folder = "/var/silo-cache/%shard%"
 max_cache_size_bytes = 17179869184  # 16 GB
 cache_puts = true
 ```
 
 The cache is enabled when `root_folder` is set. Key options:
 
-- **`root_folder`**: Path to the local directory where cached data is stored. Must be set to enable the cache.
+- **`root_folder`**: Path to the local directory where cached data is stored. Must be set to enable the cache. Supports the same `%shard%` and `{shard}` placeholders as `[database].path`.
 - **`max_cache_size_bytes`**: Maximum total size of the cache on disk. When exceeded, older entries are evicted.
 - **`cache_puts`**: When `true`, data written to object storage is also written to the local cache, warming it for subsequent reads.
 

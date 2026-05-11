@@ -91,6 +91,35 @@ pub struct OpenShardOptions {
     pub enable_counter_reconciliation: bool,
 }
 
+fn expand_slatedb_settings_for_shard(
+    mut settings: slatedb::config::Settings,
+    shard_name: &str,
+) -> slatedb::config::Settings {
+    expand_shard_placeholder_in_path(
+        &mut settings.object_store_cache_options.root_folder,
+        shard_name,
+    );
+    settings
+}
+
+fn expand_shard_placeholder_in_path(path: &mut Option<std::path::PathBuf>, shard_name: &str) {
+    let Some(path) = path.as_mut() else {
+        return;
+    };
+    let Some(path_str) = path.to_str() else {
+        return;
+    };
+    if !path_str.contains("%shard%") && !path_str.contains("{shard}") {
+        return;
+    }
+
+    *path = std::path::PathBuf::from(
+        path_str
+            .replace("%shard%", shard_name)
+            .replace("{shard}", shard_name),
+    );
+}
+
 /// Result of a dequeue operation - contains both job tasks and floating limit refresh tasks
 #[derive(Debug, Default)]
 pub struct DequeueResult {
@@ -339,7 +368,8 @@ impl JobStoreShard {
         // Note: The merge_operator field in settings is ignored because we already
         // set it above via with_merge_operator() for counter support
         if let Some(settings) = slatedb_settings {
-            db_builder = db_builder.with_settings(settings);
+            db_builder =
+                db_builder.with_settings(expand_slatedb_settings_for_shard(settings, &name));
         }
 
         // Apply custom in-memory cache sizes if specified
@@ -1024,5 +1054,64 @@ impl JobStoreShard {
         self.db.write(batch).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_slatedb_settings_for_shard;
+
+    #[test]
+    fn expands_shard_placeholder_in_slatedb_cache_root_folder() {
+        let settings = slatedb::config::Settings {
+            object_store_cache_options: slatedb::config::ObjectStoreCacheOptions {
+                root_folder: Some("/var/silo-cache/%shard%".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let settings = expand_slatedb_settings_for_shard(settings, "shard-123");
+
+        assert_eq!(
+            settings.object_store_cache_options.root_folder.as_deref(),
+            Some(std::path::Path::new("/var/silo-cache/shard-123"))
+        );
+    }
+
+    #[test]
+    fn expands_braced_shard_placeholder_in_slatedb_cache_root_folder() {
+        let settings = slatedb::config::Settings {
+            object_store_cache_options: slatedb::config::ObjectStoreCacheOptions {
+                root_folder: Some("/var/silo-cache/{shard}".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let settings = expand_slatedb_settings_for_shard(settings, "shard-123");
+
+        assert_eq!(
+            settings.object_store_cache_options.root_folder.as_deref(),
+            Some(std::path::Path::new("/var/silo-cache/shard-123"))
+        );
+    }
+
+    #[test]
+    fn leaves_slatedb_cache_root_folder_without_placeholder_unchanged() {
+        let settings = slatedb::config::Settings {
+            object_store_cache_options: slatedb::config::ObjectStoreCacheOptions {
+                root_folder: Some("/var/silo-cache".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let settings = expand_slatedb_settings_for_shard(settings, "shard-123");
+
+        assert_eq!(
+            settings.object_store_cache_options.root_folder.as_deref(),
+            Some(std::path::Path::new("/var/silo-cache"))
+        );
     }
 }
