@@ -41,10 +41,6 @@ impl InstrumentedDb {
         &self.inner
     }
 
-    pub fn span(&self) -> &Span {
-        &self.span
-    }
-
     pub async fn write(&self, batch: WriteBatch) -> Result<WriteHandle, slatedb::Error> {
         self.inner.write(batch).instrument(self.span.clone()).await
     }
@@ -177,10 +173,6 @@ pub struct InstrumentedDbTransaction {
 }
 
 impl InstrumentedDbTransaction {
-    pub fn span(&self) -> &Span {
-        &self.span
-    }
-
     pub async fn get<K: AsRef<[u8]> + Send>(
         &self,
         key: K,
