@@ -44,7 +44,10 @@
         # Enable frame pointers for profiling support - pprof uses frame-pointer
         # based unwinding, which requires the compiler to actually preserve them
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";  # Better inlining visibility
-        RUSTFLAGS = "--cfg tokio_unstable --cfg tokio_taskdump -C force-frame-pointers=yes";
+        # tokio_taskdump only compiles on Linux (x86_64/aarch64); gate it so
+        # macOS/aarch64-darwin consumers of this flake (e.g. siloctl in gadget's
+        # development flake) can build.
+        RUSTFLAGS = "--cfg tokio_unstable ${lib.optionalString pkgs.stdenv.isLinux "--cfg tokio_taskdump "}-C force-frame-pointers=yes";
       };
       
       # Build dependencies separately for caching
