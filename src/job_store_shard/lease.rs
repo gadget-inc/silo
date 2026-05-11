@@ -450,9 +450,9 @@ impl JobStoreShard {
     /// putting the new row earlier would be silently clobbered when the
     /// helper re-puts the old Running value with TTL. See the call site in
     /// `report_attempt_outcome`.
-    pub(crate) async fn expire_terminal_job_records(
+    pub(crate) async fn expire_terminal_job_records<W: WriteBatcher>(
         &self,
-        writer: &mut DbWriteBatcher<'_>,
+        writer: &mut W,
         tenant: &str,
         job_id: &str,
         expire_ts: i64,

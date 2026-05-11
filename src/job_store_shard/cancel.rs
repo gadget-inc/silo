@@ -77,15 +77,51 @@ impl JobStoreShard {
             ));
         }
 
-        // [SILO-CXL-2] Post: Mark job as cancelled (write cancellation record)
+        // Track whether we're transitioning a scheduled job to terminal state
+        let was_scheduled = status.kind == JobStatusKind::Scheduled;
+
+        // Compute the row-TTL deadline for terminal records once, up front. Only
+        // applied when this cancellation transitions the job to a terminal status
+        // (i.e. it was previously Scheduled) so the records age out of slatedb
+        // alongside the other terminal-job paths in `report_attempt_outcome`.
+        //
+        // `terminal_job_expire_ms: u64` is operator-supplied and realistic values
+        // are days/weeks (< 2^41). Saturate at `i64::MAX` to keep the u64→i64
+        // cast meaningful even if someone passes an absurd value (would otherwise
+        // wrap to a negative `expire_ts`, which SlateDB interprets as
+        // already-expired).
+        let terminal_expire_ts: Option<i64> = if was_scheduled {
+            self.terminal_job_expire_ms.map(|ms| {
+                let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
+                now_ms.saturating_add(ms_i64)
+            })
+        } else {
+            None
+        };
+
+        // [SILO-CXL-2] Post: Mark job as cancelled (write cancellation record).
+        // If this cancellation transitions the job to terminal, tag the new
+        // JOB_CANCELLED row with the row TTL directly. `expire_terminal_job_records`
+        // re-puts an existing JOB_CANCELLED row with TTL by reading from
+        // committed state via `self.db.get`, but the row we just wrote lives in
+        // the open transaction, so the helper wouldn't see it.
         let cancellation = JobCancellation {
             cancelled_at_ms: now_ms,
         };
         let cancellation_value = encode_job_cancellation(&cancellation);
-        txn.put(&cancelled_key, &cancellation_value)?;
-
-        // Track whether we're transitioning a scheduled job to terminal state
-        let was_scheduled = status.kind == JobStatusKind::Scheduled;
+        match terminal_expire_ts {
+            Some(ts) => {
+                use slatedb::config::{PutOptions, Ttl};
+                txn.put_with_options(
+                    &cancelled_key,
+                    &cancellation_value,
+                    &PutOptions {
+                        ttl: Ttl::ExpireAt(ts),
+                    },
+                )?;
+            }
+            None => txn.put(&cancelled_key, &cancellation_value)?,
+        }
 
         // Track concurrency state for post-commit cleanup
         let mut held_queues_to_release: Vec<String> = Vec::new();
@@ -102,8 +138,14 @@ impl JobStoreShard {
                 status.next_attempt_starts_after_ms,
                 status.current_attempt,
             );
-            self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, cancelled_status)
-                .await?;
+            self.set_job_status_with_index_opts(
+                &mut TxnWriter(&txn),
+                tenant,
+                id,
+                cancelled_status,
+                terminal_expire_ts,
+            )
+            .await?;
 
             // Read job info to get task_group, priority, and limits for task key reconstruction
             let job_key = job_info_key(tenant, id);
@@ -183,6 +225,22 @@ impl JobStoreShard {
         // Include counter in the transaction (unmark_write excludes it from conflict detection)
         if was_scheduled {
             self.increment_completed_jobs_counter(&mut TxnWriter(&txn))?;
+        }
+
+        // Re-put the job's prior associated records (JOB_INFO, IDX_METADATA,
+        // any pre-existing ATTEMPT rows) with the row TTL so they age out of
+        // slatedb alongside JOB_STATUS / JOB_CANCELLED. JOB_STATUS was tagged
+        // above via set_job_status_with_index_opts, and JOB_CANCELLED was
+        // tagged at its put site, so the helper only needs to handle the
+        // remaining records.
+        //
+        // The helper reads existing values via `self.db.get` (committed
+        // state). For JOB_INFO and any prior ATTEMPT rows that is correct
+        // (those were written by earlier transactions). It re-puts via the
+        // TxnWriter, which goes through the open transaction.
+        if let Some(ts) = terminal_expire_ts {
+            self.expire_terminal_job_records(&mut TxnWriter(&txn), tenant, id, ts)
+                .await?;
         }
 
         // Commit the transaction - this will detect conflicts with concurrent modifications
