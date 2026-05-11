@@ -30,7 +30,6 @@ use helpers::DbWriteBatcher;
 use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
-use slatedb::Db;
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::Arc;
 #[cfg(feature = "server")]
@@ -38,7 +37,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tracing::info_span;
+use tracing::{Instrument, info_span};
 
 use crate::instrumented_db::InstrumentedDb;
 
@@ -372,7 +371,7 @@ impl JobStoreShard {
         }
 
         let shard_span = info_span!("shard", shard = %name);
-        let db = db_builder.build().await?;
+        let db = db_builder.build().instrument(shard_span.clone()).await?;
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
         let concurrency = Arc::new(ConcurrencyManager::new(metrics.clone()));
 
@@ -542,7 +541,7 @@ impl JobStoreShard {
         };
         let shard_name = self.name.clone();
         let cancellation = self.cancellation.clone();
-        let mut rx = self.db.subscribe();
+        let mut rx = self.db.inner().subscribe();
 
         tokio::spawn(async move {
             // Emit initial values so gauges aren't empty until the first
@@ -697,7 +696,7 @@ impl JobStoreShard {
         });
     }
 
-    pub fn db(&self) -> &Db {
+    pub fn db(&self) -> &InstrumentedDb {
         &self.db
     }
 
@@ -936,12 +935,10 @@ impl JobStoreShard {
         tenant: &str,
         job_id: &str,
     ) -> Result<Vec<JobAttemptView>, JobStoreShardError> {
-        use slatedb::DbIterator;
-
         let start = crate::keys::attempt_prefix(tenant, job_id);
         let end = crate::keys::end_bound(&start);
 
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
         let mut attempts = Vec::new();
 
         while let Some(kv) = iter.next().await? {

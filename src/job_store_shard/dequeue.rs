@@ -1,7 +1,7 @@
 //! Task dequeue and processing operations.
 
+use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
-use slatedb::{DbIterator, WriteBatch};
 
 use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_lease};
 use crate::concurrency::RequestTicketTaskOutcome;
@@ -387,7 +387,7 @@ impl JobStoreShard {
         let outcome = self
             .concurrency
             .process_ticket_request_task(
-                &self.db,
+                self.db.as_ref(),
                 shard_range,
                 &mut state.batch,
                 task_key,
@@ -822,7 +822,7 @@ impl JobStoreShard {
         // Scan tasks under tasks/{task_group}/ using binary storekey encoding
         let start = crate::keys::task_group_prefix(task_group);
         let end = crate::keys::end_bound(&start);
-        let mut iter: DbIterator = self
+        let mut iter = self
             .db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await?;

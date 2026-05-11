@@ -226,7 +226,6 @@ impl JobStoreShard {
         use crate::keys::{
             end_bound, parse_tenant_status_counter_key, tenant_status_counter_prefix,
         };
-        use slatedb::DbIterator;
 
         let (start, end) = tenant_range
             .as_ref()
@@ -243,7 +242,7 @@ impl JobStoreShard {
 
         let range = self.get_range();
 
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
         let mut results = Vec::new();
 
         while let Some(kv) = iter.next().await? {

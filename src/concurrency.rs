@@ -42,8 +42,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 
+use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
-use slatedb::{Db, DbIterator, WriteBatch};
 
 use crate::instrumented_db::InstrumentedDb;
 
@@ -156,7 +156,7 @@ impl ConcurrencyCounts {
     /// Uses the per-queue prefix for efficient scanning of only the relevant holders. The `range` parameter filters holders to only load those for tenants within the shard's range. This is critical after shard splits - both child shards clone the same holder records, and without filtering, both would think they own the same concurrency tickets, leading to limit violations.
     pub async fn hydrate_queue(
         &self,
-        db: &Db,
+        db: &InstrumentedDb,
         range: &ShardRange,
         tenant: &str,
         queue: &str,
@@ -166,7 +166,7 @@ impl ConcurrencyCounts {
         // Scan holders for this specific tenant/queue using the queue prefix
         let start = concurrency_holders_queue_prefix(tenant, queue);
         let end = end_bound(&start);
-        let mut iter: DbIterator = db
+        let mut iter = db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await?;
 
@@ -218,7 +218,7 @@ impl ConcurrencyCounts {
     /// Fast path: if already hydrated, return immediately.
     pub async fn ensure_hydrated(
         &self,
-        db: &Db,
+        db: &InstrumentedDb,
         range: &ShardRange,
         tenant: &str,
         queue: &str,
@@ -246,7 +246,7 @@ impl ConcurrencyCounts {
     #[allow(clippy::too_many_arguments)]
     pub async fn try_reserve(
         &self,
-        db: &Db,
+        db: &InstrumentedDb,
         range: &ShardRange,
         tenant: &str,
         queue: &str,
@@ -445,7 +445,7 @@ impl ConcurrencyManager {
     }
 
     async fn resolve_queue_capacity(
-        db: &Db,
+        db: &InstrumentedDb,
         tenant: &str,
         queue: &str,
         view: &JobView,
@@ -482,7 +482,7 @@ impl ConcurrencyManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_enqueue<W: WriteBatcher>(
         &self,
-        db: &Db,
+        db: &InstrumentedDb,
         range: &ShardRange,
         writer: &mut W,
         tenant: &str,
@@ -595,7 +595,7 @@ impl ConcurrencyManager {
     #[allow(clippy::too_many_arguments)]
     pub async fn process_ticket_request_task(
         &self,
-        db: &Db,
+        db: &InstrumentedDb,
         range: &ShardRange,
         batch: &mut WriteBatch,
         task_key: &[u8],

@@ -35,3 +35,4 @@ AGENTS.md
 tests/turmoil/AGENTS.md
 # end lnai-generated
 profiles/
+.claude/scheduled_tasks.lock

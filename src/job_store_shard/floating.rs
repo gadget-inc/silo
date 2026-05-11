@@ -1,6 +1,6 @@
 //! Floating concurrency limit operations.
 
-use slatedb::{DbIterator, WriteBatch};
+use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::codec::{
@@ -44,7 +44,7 @@ impl JobStoreShard {
     ) -> Result<bool, JobStoreShardError> {
         let start = concurrency_request_prefix(tenant, queue_key);
         let end = end_bound(&start);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
         Ok(iter.next().await?.is_some())
     }
 

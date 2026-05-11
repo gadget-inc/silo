@@ -335,7 +335,7 @@ impl JobStoreShard {
         &self,
         tenant: &str,
         params: &ImportJobParams,
-        txn: slatedb::DbTransaction,
+        txn: crate::instrumented_db::InstrumentedDbTransaction,
         existing_job: JobView,
         now_ms: i64,
     ) -> Result<JobStatusKind, JobStoreShardError> {

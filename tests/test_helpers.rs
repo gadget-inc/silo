@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
 use silo::gubernator::{MockGubernatorClient, RateLimitClient};
+use silo::instrumented_db::InstrumentedDb;
 use silo::job_store_shard::{JobStoreShard, OpenShardOptions};
 use silo::settings::{Backend, DatabaseConfig};
 use silo::shard_range::ShardRange;
 use silo::storage::resolve_object_store;
-use slatedb::{Db, DbIterator};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -207,47 +207,50 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-pub async fn first_kv_with_prefix(db: &Db, prefix: &str) -> Option<(String, bytes::Bytes)> {
+pub async fn first_kv_with_prefix(
+    db: &InstrumentedDb,
+    prefix: &str,
+) -> Option<(String, bytes::Bytes)> {
     let start: Vec<u8> = prefix.as_bytes().to_vec();
     let mut end: Vec<u8> = prefix.to_string().into_bytes();
     end.push(0xFF);
-    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..=end).await.ok()?;
+    let mut iter = db.scan::<Vec<u8>, _>(start..=end).await.ok()?;
     let first = iter.next().await.ok()?;
     first.map(|kv| (String::from_utf8_lossy(&kv.key).to_string(), kv.value))
 }
 
 /// Get first key/value with a binary prefix (for storekey-encoded keys).
 pub async fn first_kv_with_binary_prefix(
-    db: &Db,
+    db: &InstrumentedDb,
     prefix: &[u8],
 ) -> Option<(Vec<u8>, bytes::Bytes)> {
     let start = prefix.to_vec();
     let end = silo::keys::end_bound(&start);
-    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await.ok()?;
+    let mut iter = db.scan::<Vec<u8>, _>(start..end).await.ok()?;
     let first = iter.next().await.ok()?;
     first.map(|kv| (kv.key.to_vec(), kv.value))
 }
 
 /// Get first task key/value (0x05 prefix).
-pub async fn first_task_kv(db: &Db) -> Option<(Vec<u8>, bytes::Bytes)> {
+pub async fn first_task_kv(db: &InstrumentedDb) -> Option<(Vec<u8>, bytes::Bytes)> {
     first_kv_with_binary_prefix(db, &silo::keys::tasks_prefix()).await
 }
 
 /// Get first lease key/value (0x06 prefix).
-pub async fn first_lease_kv(db: &Db) -> Option<(Vec<u8>, bytes::Bytes)> {
+pub async fn first_lease_kv(db: &InstrumentedDb) -> Option<(Vec<u8>, bytes::Bytes)> {
     first_kv_with_binary_prefix(db, &silo::keys::leases_prefix()).await
 }
 
 /// Get first concurrency request key/value (0x08 prefix).
-pub async fn first_concurrency_request_kv(db: &Db) -> Option<(Vec<u8>, bytes::Bytes)> {
+pub async fn first_concurrency_request_kv(db: &InstrumentedDb) -> Option<(Vec<u8>, bytes::Bytes)> {
     first_kv_with_binary_prefix(db, &silo::keys::concurrency_requests_prefix()).await
 }
 
-pub async fn count_tasks_before(db: &Db, cutoff_ms: i64) -> usize {
+pub async fn count_tasks_before(db: &InstrumentedDb, cutoff_ms: i64) -> usize {
     let start: Vec<u8> = b"tasks/".to_vec();
     let mut end: Vec<u8> = b"tasks/".to_vec();
     end.push(0xFF);
-    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..=end).await.unwrap();
+    let mut iter = db.scan::<Vec<u8>, _>(start..=end).await.unwrap();
     let mut count = 0usize;
     loop {
         let maybe = iter.next().await.unwrap();
@@ -262,11 +265,11 @@ pub async fn count_tasks_before(db: &Db, cutoff_ms: i64) -> usize {
     count
 }
 
-pub async fn count_with_prefix(db: &Db, prefix: &str) -> usize {
+pub async fn count_with_prefix(db: &InstrumentedDb, prefix: &str) -> usize {
     let start: Vec<u8> = prefix.as_bytes().to_vec();
     let mut end: Vec<u8> = prefix.to_string().into_bytes();
     end.push(0xFF);
-    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..=end).await.unwrap();
+    let mut iter = db.scan::<Vec<u8>, _>(start..=end).await.unwrap();
     let mut count = 0usize;
     loop {
         let maybe = iter.next().await.unwrap();
@@ -279,10 +282,10 @@ pub async fn count_with_prefix(db: &Db, prefix: &str) -> usize {
 }
 
 /// Count keys with a binary prefix (for use with storekey-encoded keys).
-pub async fn count_with_binary_prefix(db: &Db, prefix: &[u8]) -> usize {
+pub async fn count_with_binary_prefix(db: &InstrumentedDb, prefix: &[u8]) -> usize {
     let start = prefix.to_vec();
     let end = silo::keys::end_bound(&start);
-    let mut iter: DbIterator = db.scan::<Vec<u8>, _>(start..end).await.unwrap();
+    let mut iter = db.scan::<Vec<u8>, _>(start..end).await.unwrap();
     let mut count = 0usize;
     loop {
         let maybe = iter.next().await.unwrap();
@@ -295,47 +298,47 @@ pub async fn count_with_binary_prefix(db: &Db, prefix: &[u8]) -> usize {
 }
 
 /// Count job info keys (0x01 prefix).
-pub async fn count_job_info_keys(db: &Db) -> usize {
+pub async fn count_job_info_keys(db: &InstrumentedDb) -> usize {
     count_with_binary_prefix(db, &silo::keys::jobs_prefix()).await
 }
 
 /// Count job info keys for a specific tenant.
-pub async fn count_job_info_keys_for_tenant(db: &Db, tenant: &str) -> usize {
+pub async fn count_job_info_keys_for_tenant(db: &InstrumentedDb, tenant: &str) -> usize {
     count_with_binary_prefix(db, &silo::keys::job_info_prefix(tenant)).await
 }
 
 /// Count job status keys (0x02 prefix).
-pub async fn count_job_status_keys(db: &Db) -> usize {
+pub async fn count_job_status_keys(db: &InstrumentedDb) -> usize {
     count_with_binary_prefix(db, &[0x02]).await
 }
 
 /// Count status/time index keys (0x03 prefix).
-pub async fn count_status_time_index_keys(db: &Db) -> usize {
+pub async fn count_status_time_index_keys(db: &InstrumentedDb) -> usize {
     count_with_binary_prefix(db, &[0x03]).await
 }
 
 /// Count task keys (0x05 prefix).
-pub async fn count_task_keys(db: &Db) -> usize {
+pub async fn count_task_keys(db: &InstrumentedDb) -> usize {
     count_with_binary_prefix(db, &silo::keys::tasks_prefix()).await
 }
 
 /// Count lease keys (0x06 prefix).
-pub async fn count_lease_keys(db: &Db) -> usize {
+pub async fn count_lease_keys(db: &InstrumentedDb) -> usize {
     count_with_binary_prefix(db, &silo::keys::leases_prefix()).await
 }
 
 /// Count concurrency request keys (0x08 prefix).
-pub async fn count_concurrency_requests(db: &Db) -> usize {
+pub async fn count_concurrency_requests(db: &InstrumentedDb) -> usize {
     count_with_binary_prefix(db, &silo::keys::concurrency_requests_prefix()).await
 }
 
 /// Count concurrency holder keys (0x09 prefix).
-pub async fn count_concurrency_holders(db: &Db) -> usize {
+pub async fn count_concurrency_holders(db: &InstrumentedDb) -> usize {
     count_with_binary_prefix(db, &silo::keys::concurrency_holders_prefix()).await
 }
 
 /// Count concurrency holder keys for a specific tenant.
-pub async fn count_concurrency_holders_for_tenant(db: &Db, tenant: &str) -> usize {
+pub async fn count_concurrency_holders_for_tenant(db: &InstrumentedDb, tenant: &str) -> usize {
     count_with_binary_prefix(db, &silo::keys::concurrency_holders_tenant_prefix(tenant)).await
 }
 

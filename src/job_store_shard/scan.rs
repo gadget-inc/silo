@@ -2,8 +2,7 @@
 
 use std::ops::ControlFlow;
 
-use slatedb::Db;
-
+use crate::instrumented_db::InstrumentedDb;
 use crate::job::JobStatusKind;
 use crate::job::{JobStatus, JobView};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
@@ -22,7 +21,7 @@ use crate::keys::{
 /// - `ControlFlow::Continue(None)` to skip the entry
 /// - `ControlFlow::Break(())` to stop iteration early
 async fn scan_collect<T>(
-    db: &Db,
+    db: &InstrumentedDb,
     start: Vec<u8>,
     end: Vec<u8>,
     limit: Option<usize>,
