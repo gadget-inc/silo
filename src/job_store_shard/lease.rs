@@ -450,6 +450,22 @@ impl JobStoreShard {
     /// putting the new row earlier would be silently clobbered when the
     /// helper re-puts the old Running value with TTL. See the call site in
     /// `report_attempt_outcome`.
+    ///
+    /// Transaction-race caveat (cancel.rs call site): the helper's reads
+    /// (`self.db.get` for `JOB_INFO` / `JOB_CANCELLED`, `self.db.scan` for
+    /// attempts) bypass the open transaction's optimistic concurrency
+    /// tracker. A concurrent writer that mutates one of these keys
+    /// between the helper's read and the caller's commit would NOT be
+    /// detected as a conflict by `SerializableSnapshot`, and the
+    /// helper's re-put would silently clobber the concurrent write with
+    /// stale bytes (plus a TTL). Today this is safe because every
+    /// JOB_INFO mutator (e.g. `reimport_job`) also writes `JOB_STATUS`
+    /// in the same txn, and the cancel txn reads `JOB_STATUS` early —
+    /// so any JOB_INFO race is closed transitively via the status-key
+    /// read conflict. Callers that introduce new JOB_INFO / ATTEMPT /
+    /// JOB_CANCELLED mutators MUST gate them on a `JOB_STATUS` read in
+    /// the same txn, or this helper needs to be reworked to read
+    /// through the transaction.
     pub(crate) async fn expire_terminal_job_records<W: WriteBatcher>(
         &self,
         writer: &mut W,
