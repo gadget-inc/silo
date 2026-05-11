@@ -3,6 +3,7 @@
 use slatedb::IsolationLevel;
 
 use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
+use crate::dst_events::{self, DstEvent};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{
@@ -243,8 +244,36 @@ impl JobStoreShard {
                 .await?;
         }
 
+        // Two-phase DST events: emit before commit for correct causal
+        // ordering, confirm if the commit succeeds, cancel if it fails.
+        // We only emit JobStatusChanged for the Scheduled→Cancelled
+        // transition — the cancel path is what makes the job terminal in
+        // Rust on that branch. For Running cancellations the status stays
+        // Running until the worker acks via `report_attempt_outcome`,
+        // which emits its own JobStatusChanged{new_status:"Cancelled"} —
+        // emitting one here too would double-count the terminal event.
+        let write_op = dst_events::next_write_op();
+        if was_scheduled {
+            dst_events::emit_pending(
+                DstEvent::JobStatusChanged {
+                    tenant: tenant.to_string(),
+                    job_id: id.to_string(),
+                    new_status: "Cancelled".to_string(),
+                },
+                write_op,
+            );
+        }
+
         // Commit the transaction - this will detect conflicts with concurrent modifications
-        txn.commit().await?;
+        if let Err(e) = txn.commit().await {
+            if was_scheduled {
+                dst_events::cancel_write(write_op);
+            }
+            return Err(e.into());
+        }
+        if was_scheduled {
+            dst_events::confirm_write(write_op);
+        }
 
         // ---- Post-commit: update in-memory state ----
 

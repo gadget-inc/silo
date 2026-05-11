@@ -212,15 +212,25 @@ fact wellFormed {
     all t: Time | one e: AttemptExists | e.time = t
     all t: Time | one e: JobExists | e.time = t
     
-    -- Non-terminal jobs are never dropped from existence: only terminal
-    -- (Succeeded/Failed) jobs can leave `jobExistsAt`, and only via the
-    -- `expireTerminalJob` transition (gated by the
-    -- `terminal_job_expire_ms` setting in the Rust implementation, which
-    -- attaches a SlateDB row TTL on the JOB_INFO/IDX/ATTEMPT records
-    -- written at terminal-status time so they age out via compaction).
-    -- See: src/job_store_shard/lease.rs::expire_terminal_job_records.
+    -- Non-terminal, non-cancelled jobs are never dropped from existence.
+    -- Jobs can leave `jobExistsAt` only via the `expireTerminalJob`
+    -- transition (gated by the `terminal_job_expire_ms` setting in the
+    -- Rust implementation, which attaches a SlateDB row TTL on the
+    -- JOB_INFO/IDX/ATTEMPT records so they age out via compaction).
+    -- Eligible Rust call sites:
+    --   * lease.rs::expire_terminal_job_records, invoked when an attempt
+    --     outcome (Success/Failure-no-retry/Cancelled) transitions the job
+    --     to a terminal Rust status (Succeeded/Failed/Cancelled).
+    --   * cancel.rs::cancel_job_inner, invoked when the cancel RPC
+    --     transitions a Scheduled job directly to terminal. Modeled here
+    --     as `expireTerminalJob` firing for `isCancelledAt[j, t]` regardless
+    --     of `statusAt[j, t]` — the spec's `cancelJob` leaves the prior
+    --     status (e.g. Scheduled) in place, so cancellation, not status,
+    --     is what makes the records eligible for TTL on this path.
     all t: Time - last, j: Job |
-        (j in jobExistsAt[t] and not isTerminal[statusAt[j, t]]) implies
+        (j in jobExistsAt[t]
+         and not isTerminal[statusAt[j, t]]
+         and not isCancelledAt[j, t]) implies
             j in jobExistsAt[t.next]
     
     -- Leases must have expiry at or after their recorded time
@@ -1382,13 +1392,20 @@ pred reapExpiredLeaseReleaseTicket[tid: TaskId, q: Queue, t: Time, tnext: Time] 
 --
 -- Pre:
 --   * Job exists at t
---   * Status is terminal (Succeeded or Failed). Cancelled-but-non-terminal
---     jobs are not eligible (in Rust, the TTL is set when the worker
---     reports a terminal outcome, not when cancellation is recorded).
+--   * Either:
+--       (a) Status is terminal (Succeeded or Failed) — covers the
+--           `lease.rs` worker-ack Success / permanent-Failure paths, OR
+--       (b) Job is cancelled — covers the `cancel.rs` Scheduled→Cancelled
+--           transition where the cancel RPC itself is what makes the job
+--           terminal in Rust. The spec leaves the prior status (e.g.
+--           Scheduled) in place after `cancelJob`, so the cancellation
+--           flag is the eligibility predicate on this path.
 --   * No active state references the job. The existing assertions
 --     `noQueuedTasksForTerminal`, `noLeasesForTerminal`, and
---     `noHoldersForTerminal` already require this for terminal jobs, so
---     these are conservative redundant guards.
+--     `noHoldersForTerminal` already require this for terminal jobs, and
+--     `cancelJob` eagerly clears DB queue tasks / holders / requests for
+--     a cancelled Scheduled job, so these checks are conservative
+--     redundant guards.
 --
 -- Post:
 --   * Job removed from existence
@@ -1396,12 +1413,36 @@ pred reapExpiredLeaseReleaseTicket[tid: TaskId, q: Queue, t: Time, tnext: Time] 
 --   * Any cancellation record for the job is dropped (mirrors Rust's
 --     re-put of JOB_CANCELLED with TTL)
 --
+-- Spec / implementation gap, under-modeled (intentional):
+--   Rust's third TTL-eligible path is `report_attempt_outcome(Cancelled)`
+--   — the worker acknowledging a previously-requested cancellation. That
+--   transition sets `JobStatusKind::Cancelled` (a real terminal status in
+--   Rust) and runs the same `expire_terminal_job_records` helper. The
+--   spec deliberately does NOT model `Cancelled` as a `JobStatus` value
+--   (see the comment on the `JobStatus` sig: "Doesn't include Cancelled,
+--   we track cancellation separately for performance reasons") and has
+--   no `completeCancelled` transition predicate. The spec covers this
+--   path indirectly: the prior `cancelJob` step set `isCancelledAt`, so
+--   clause (b) of this precondition lets `expireTerminalJob` fire for
+--   the post-ack state — but the worker-ack transition itself, and the
+--   fact that Rust uses `Cancelled` as a status, isn't checked by Alloy.
+--   If anyone tightens the spec to model `Cancelled` as a status (or
+--   adds a `completeCancelled` predicate), revisit this precondition.
+--
 -- See: src/job_store_shard/lease.rs::expire_terminal_job_records,
+--      src/job_store_shard/cancel.rs::cancel_job_inner,
 --      src/settings.rs::terminal_job_expire_ms.
 pred expireTerminalJob[j: Job, t: Time, tnext: Time] {
-    -- [SILO-EXPIRE-1] Pre: job exists and is terminal
+    -- [SILO-EXPIRE-1] Pre: job exists and is either terminal or cancelled.
+    -- Cancelled-Running is allowed here at the spec level — the spec doesn't
+    -- distinguish it from cancelled-Scheduled — but the Rust cancel path
+    -- only triggers the TTL when the cancellation transitions a Scheduled
+    -- job to terminal; a cancelled-Running job waits on the worker ack
+    -- before its records get the TTL. The [SILO-EXPIRE-2] no-active-state
+    -- preconditions below provide the practical guard against firing while
+    -- a lease is still outstanding.
     j in jobExistsAt[t]
-    isTerminal[statusAt[j, t]]
+    (isTerminal[statusAt[j, t]] or isCancelledAt[j, t])
 
     -- [SILO-EXPIRE-2] Pre: no active state for this job
     no tid: TaskId | dbQueuedAt[tid, t] = j
