@@ -830,7 +830,6 @@ async fn retry_branch_attempt_row_has_no_expire_ts() {
 async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
     use silo::settings::{Backend, DatabaseConfig};
     use silo::shard_range::ShardRange;
-    use std::sync::Arc;
     use std::time::Duration;
 
     with_timeout!(60000, {
@@ -893,10 +892,9 @@ async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
         // Force the rows from memtable to L0 so compaction can see them.
         // With l0_max_ssts=1 the compactor needs >1 L0 SST to fire, so churn
         // a few more flushes by enqueuing+cancelling unrelated jobs.
-        let _ = Arc::clone(&shard);
         shard.db().flush().await.expect("flush");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        for i in 0..6 {
+        for i in 0..12 {
             let payload = test_helpers::msgpack_payload(&serde_json::json!({"churn": i}));
             let jid = shard
                 .enqueue(
@@ -917,16 +915,22 @@ async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
             shard.db().flush().await.expect("flush");
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
-        // Final sleep to let TTL elapse + compaction catch up.
-        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // After TTL+compaction: JOB_STATUS is gone (the row was dropped) but
-        // the COUNTER_TENANT_STATUS merge for Succeeded was written without
-        // a TTL, so it still says +1.
-        let live_status = shard
-            .get_job_status("-", &job_id)
-            .await
-            .expect("get_job_status");
+        // Poll for up to ~10s for the row to actually drop. Compaction is
+        // non-deterministic, but with the aggressive churn above it should
+        // fire well within the budget. Reading early lets the test finish
+        // fast on healthy machines while still tolerating slow CI.
+        let mut live_status = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            live_status = shard
+                .get_job_status("-", &job_id)
+                .await
+                .expect("get_job_status");
+            if live_status.is_none() {
+                break;
+            }
+        }
 
         // Read the tenant-status (Succeeded) counter pre-reconcile.
         let pre = shard.scan_tenant_status_counters(None).await.expect("scan");
@@ -941,9 +945,18 @@ async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
             pre_succeeded
         );
 
-        // If the row hasn't actually been dropped yet by compaction (this can
-        // happen on slow CI), skip the drift assertion — we still want to
-        // exercise the reconciler.
+        // Drift-and-reconcile is gated on compaction actually dropping the
+        // row within the test budget. We can't deterministically force
+        // slatedb compaction from a test, so this is soft-skipped (with a
+        // loud warning) when the row is still present — the structural
+        // tests above cover the wiring; this test is the only end-to-end
+        // smoke for the reconciler path under TTL.
+        //
+        // Don't convert the skip to a hard assertion: prior attempts to do
+        // so flaked because compaction is async and L0→L1 promotion
+        // depends on slatedb internals the test can't drive. If you want
+        // hard coverage of the reconciler, add a unit test that injects a
+        // stale counter directly rather than waiting on compaction.
         let drifted = live_status.is_none() && pre_succeeded == 1;
         if drifted {
             let summary = shard.reconcile_counters(&ShardRange::full()).await;
@@ -965,8 +978,15 @@ async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
             );
         } else {
             eprintln!(
-                "compaction did not drop the row within the test budget; \
-                 skipping drift assertion (structural tests still cover the wiring)"
+                "\n  !! SKIPPED reconciler drift assertion: compaction did not drop the\n  \
+                 !! terminal JOB_STATUS row within the test budget\n  \
+                 !! (live_status_present={}, pre_succeeded_counter={}).\n  \
+                 !! The structural TTL tests still cover record tagging; this test\n  \
+                 !! exists only as an end-to-end smoke and is a no-op when slatedb\n  \
+                 !! compaction is too slow. Investigate slatedb settings if this\n  \
+                 !! happens routinely.\n",
+                live_status.is_some(),
+                pre_succeeded
             );
         }
     });
