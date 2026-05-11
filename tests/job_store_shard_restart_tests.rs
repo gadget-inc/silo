@@ -1360,3 +1360,369 @@ async fn multiple_restarts_of_same_job() {
         assert_eq!(final_status.kind, JobStatusKind::Succeeded);
     });
 }
+
+/// When `cancel_job` transitions a Scheduled job straight to terminal
+/// (Cancelled), the records written inside the cancel transaction must carry
+/// a SlateDB row TTL — the same invariant `terminal_records_are_tagged_with_expire_ts`
+/// asserts for `report_attempt_outcome`. Without TTL on this path the
+/// cancellation-driven terminal records would stick around indefinitely while
+/// success/failure-driven ones would not.
+#[silo::test]
+async fn cancel_scheduled_job_tags_records_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::{job_cancelled_key, job_info_key, job_status_key};
+
+        let ttl_ms: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(ttl_ms).await;
+
+        let before_ms = now_ms();
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+        let after_ms = now_ms();
+
+        // JOB_STATUS, JOB_INFO, and JOB_CANCELLED must all carry an `expire_ts`
+        // set to roughly `now + ttl_ms`. Allow a generous window around the
+        // wall-clock bounds (the implementation samples `now_ms` once per
+        // cancellation call).
+        let raw_db = shard.db();
+        for key in [
+            job_status_key("-", &job_id),
+            job_info_key("-", &job_id),
+            job_cancelled_key("-", &job_id),
+        ] {
+            let kv = raw_db
+                .get_key_value(&key)
+                .await
+                .expect("get_key_value")
+                .expect("row present");
+            let expire_ts = kv
+                .expire_ts
+                .expect("cancellation-terminal record should carry expire_ts");
+            let lower = before_ms + ttl_ms as i64 - 5_000;
+            let upper = after_ms + ttl_ms as i64 + 5_000;
+            assert!(
+                expire_ts >= lower && expire_ts <= upper,
+                "expire_ts {expire_ts} outside expected window [{lower}, {upper}] for key {key:?}"
+            );
+        }
+    });
+}
+
+/// The new IDX_STATUS_TIME row written for the Cancelled status by
+/// `set_job_status_with_index_opts` must carry the row TTL when the cancel
+/// path transitions a Scheduled job to terminal.
+#[silo::test]
+async fn cancel_scheduled_job_tags_idx_status_time_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::job::JobStatusKind;
+        use silo::keys::{idx_status_time_key, status_index_timestamp};
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(status.kind, JobStatusKind::Cancelled);
+        let ts = status_index_timestamp(&status);
+        let kv = shard
+            .db()
+            .get_key_value(&idx_status_time_key(
+                "-",
+                JobStatusKind::Cancelled.as_str(),
+                ts,
+                &job_id,
+            ))
+            .await
+            .expect("get_key_value")
+            .expect("IDX_STATUS_TIME row present");
+        assert!(
+            kv.expire_ts.is_some(),
+            "IDX_STATUS_TIME row for terminal Cancelled status must carry expire_ts"
+        );
+    });
+}
+
+/// IDX_METADATA rows must also be re-put with the row TTL on the cancel
+/// path. Mirrors `terminal_idx_metadata_rows_are_tagged_with_expire_ts` for
+/// the cancel-driven terminal transition.
+#[silo::test]
+async fn cancel_scheduled_job_tags_idx_metadata_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::idx_metadata_key;
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+
+        let metadata = vec![
+            ("env".to_string(), "prod".to_string()),
+            ("region".to_string(), "us-east-1".to_string()),
+        ];
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                Some(metadata.clone()),
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        for (k, v) in &metadata {
+            let kv = shard
+                .db()
+                .get_key_value(&idx_metadata_key("-", k, v, &job_id))
+                .await
+                .expect("get_key_value")
+                .unwrap_or_else(|| panic!("IDX_METADATA row missing for {k}={v}"));
+            assert!(
+                kv.expire_ts.is_some(),
+                "IDX_METADATA row for {k}={v} must carry expire_ts after cancel"
+            );
+        }
+    });
+}
+
+/// A prior ATTEMPT row written by a retry-scheduling outcome was left
+/// without a TTL on purpose (job wasn't yet terminal). When the job is
+/// later cancelled via the cancel RPC, the cancel path must re-put that
+/// attempt row with the row TTL — that's what
+/// `expire_terminal_job_records` does, and we want to pin it down for the
+/// cancel call site.
+#[silo::test]
+async fn cancel_scheduled_job_tags_prior_attempt_rows_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::attempt_key;
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+
+        let retry_policy = RetryPolicy {
+            retry_count: 3,
+            initial_interval_ms: 1_000,
+            max_interval_ms: 60_000,
+            randomize_interval: false,
+            backoff_factor: 2.0,
+        };
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                Some(retry_policy),
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Run-and-fail attempt 1 → retry-scheduling branch (job back to
+        // Scheduled, attempt 1 row has NO TTL).
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: b"boom".to_vec(),
+                },
+            )
+            .await
+            .expect("report failure");
+
+        // Sanity: attempt 1 row currently has no TTL.
+        let attempt_kv = shard
+            .db()
+            .get_key_value(&attempt_key("-", &job_id, 1))
+            .await
+            .expect("get_key_value")
+            .expect("attempt row present");
+        assert!(
+            attempt_kv.expire_ts.is_none(),
+            "pre-cancel attempt row should not yet carry expire_ts"
+        );
+
+        // Cancel — the job is back to Scheduled, so cancel transitions it
+        // straight to terminal Cancelled and the prior attempt row must
+        // pick up the TTL.
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        let attempt_kv_after = shard
+            .db()
+            .get_key_value(&attempt_key("-", &job_id, 1))
+            .await
+            .expect("get_key_value")
+            .expect("attempt row still present");
+        assert!(
+            attempt_kv_after.expire_ts.is_some(),
+            "prior attempt row must carry expire_ts after terminal cancel"
+        );
+    });
+}
+
+/// Running-job cancellation does NOT immediately tag records with the row
+/// TTL. The job is still Running until the worker acknowledges via
+/// `report_attempt_outcome(Cancelled)` — only then is it terminal. Tagging
+/// records on the cancel call would mean records expire before the worker
+/// even hears about the cancellation. The worker-ack path
+/// (`cancelled_terminal_job_cancellation_row_is_tagged_with_expire_ts`)
+/// covers TTL for that case.
+#[silo::test]
+async fn cancel_running_job_does_not_tag_records_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::{job_cancelled_key, job_info_key, job_status_key};
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Dequeue first so the job is Running.
+        let _ = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("status")
+            .expect("exists");
+        assert_eq!(
+            status.kind,
+            JobStatusKind::Running,
+            "status should still be Running until worker acknowledges"
+        );
+
+        let raw_db = shard.db();
+        for key in [
+            job_status_key("-", &job_id),
+            job_info_key("-", &job_id),
+            job_cancelled_key("-", &job_id),
+        ] {
+            let kv = raw_db
+                .get_key_value(&key)
+                .await
+                .expect("get_key_value")
+                .expect("row present");
+            assert!(
+                kv.expire_ts.is_none(),
+                "running-cancel must not pre-tag record with expire_ts: key={key:?}"
+            );
+        }
+    });
+}
+
+/// Sanity: when `terminal_job_expire_ms` is *not* configured, cancellation
+/// of a Scheduled job must NOT tag any record with `expire_ts`. Guards
+/// against an accidental hard-coded default that would enable the TTL
+/// feature for operators that haven't opted in.
+#[silo::test]
+async fn cancel_without_terminal_expire_config_writes_no_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::{job_cancelled_key, job_info_key, job_status_key};
+
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+
+        let raw_db = shard.db();
+        for key in [
+            job_status_key("-", &job_id),
+            job_info_key("-", &job_id),
+            job_cancelled_key("-", &job_id),
+        ] {
+            let kv = raw_db
+                .get_key_value(&key)
+                .await
+                .expect("get_key_value")
+                .expect("row present");
+            assert!(
+                kv.expire_ts.is_none(),
+                "cancel without TTL config must not tag record: key={key:?}"
+            );
+        }
+    });
+}
