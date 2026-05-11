@@ -373,7 +373,7 @@ impl JobStoreShard {
         let shard_span = info_span!("shard", shard = %name);
         let db = db_builder.build().instrument(shard_span.clone()).await?;
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
-        let concurrency = Arc::new(ConcurrencyManager::new(metrics.clone()));
+        let concurrency = Arc::new(ConcurrencyManager::new(name.clone(), metrics.clone()));
 
         // Note: concurrency counts are hydrated lazily on first access to each queue.
         // This avoids blocking shard startup while scanning potentially large holder sets.

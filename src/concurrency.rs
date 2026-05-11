@@ -380,6 +380,9 @@ pub struct CachedQueueLimit {
 /// This eliminates the race condition where concurrent `release_and_grant_next` calls
 /// would both scan and grant the same pending request.
 pub struct ConcurrencyManager {
+    /// Name of the shard this manager belongs to. Used as the `shard` label
+    /// on per-shard metrics emitted from the grant paths.
+    shard: String,
     counts: ConcurrencyCounts,
     /// Pending grant counts per queue. Key: concurrency_counts_key(tenant, queue).
     /// Value: (tenant, queue, count). Lock held only briefly for increment/drain.
@@ -393,15 +396,10 @@ pub struct ConcurrencyManager {
     metrics: Option<Metrics>,
 }
 
-impl Default for ConcurrencyManager {
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
-
 impl ConcurrencyManager {
-    pub fn new(metrics: Option<Metrics>) -> Self {
+    pub fn new(shard: impl Into<String>, metrics: Option<Metrics>) -> Self {
         Self {
+            shard: shard.into(),
             counts: ConcurrencyCounts::new(),
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
@@ -532,7 +530,11 @@ impl ConcurrencyManager {
                 task_group,
             )?;
             if let Some(ref m) = self.metrics {
-                m.record_concurrency_tickets_granted(crate::metrics::GrantPath::Immediate, 1);
+                m.record_concurrency_tickets_granted(
+                    &self.shard,
+                    crate::metrics::GrantPath::Immediate,
+                    1,
+                );
             }
             Ok(Some(RequestTicketOutcome::GrantedImmediately {
                 task_id: task_id.to_string(),
@@ -1133,6 +1135,7 @@ impl ConcurrencyManager {
 
             if let Some(ref m) = self.metrics {
                 m.record_concurrency_tickets_granted(
+                    &self.shard,
                     crate::metrics::GrantPath::Scanned,
                     grants.len() as u64,
                 );

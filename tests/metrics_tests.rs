@@ -241,8 +241,8 @@ async fn test_metrics_all_recording_methods() {
     metrics.dec_task_leases_active("0", "default");
 
     // record_concurrency_tickets_granted
-    metrics.record_concurrency_tickets_granted(silo::metrics::GrantPath::Immediate, 1);
-    metrics.record_concurrency_tickets_granted(silo::metrics::GrantPath::Scanned, 2);
+    metrics.record_concurrency_tickets_granted("0", silo::metrics::GrantPath::Immediate, 1);
+    metrics.record_concurrency_tickets_granted("0", silo::metrics::GrantPath::Scanned, 2);
 
     // set_coordination_shards_open
     metrics.set_coordination_shards_open(5);
@@ -347,14 +347,16 @@ async fn test_metrics_all_recording_methods() {
         leases_line
     );
 
-    // Verify concurrency tickets granted, labelled by grant path
+    // Verify concurrency tickets granted, labelled by shard and grant path.
+    // Prometheus exposition renders labels in alphabetical order.
     assert!(
-        body_str.contains("silo_concurrency_tickets_granted_total{path=\"immediate\"} 1"),
+        body_str
+            .contains("silo_concurrency_tickets_granted_total{path=\"immediate\",shard=\"0\"} 1"),
         "immediate-path concurrency ticket should be 1, body: {}",
         body_str
     );
     assert!(
-        body_str.contains("silo_concurrency_tickets_granted_total{path=\"scanned\"} 2"),
+        body_str.contains("silo_concurrency_tickets_granted_total{path=\"scanned\",shard=\"0\"} 2"),
         "scanned-path concurrency tickets should be 2, body: {}",
         body_str
     );
