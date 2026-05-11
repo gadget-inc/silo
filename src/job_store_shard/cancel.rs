@@ -1,6 +1,6 @@
 //! Job cancellation operations.
 
-use slatedb::{DbIterator, IsolationLevel};
+use slatedb::IsolationLevel;
 
 use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
@@ -218,7 +218,7 @@ impl JobStoreShard {
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn delete_concurrency_requests_for_job(
         &self,
-        txn: &slatedb::DbTransaction,
+        txn: &crate::instrumented_db::InstrumentedDbTransaction,
         tenant: &str,
         job_id: &str,
         limits: &[Limit],
@@ -267,7 +267,7 @@ impl JobStoreShard {
     #[expect(clippy::too_many_arguments)]
     async fn delete_concurrency_requests_with_prefix(
         &self,
-        txn: &slatedb::DbTransaction,
+        txn: &crate::instrumented_db::InstrumentedDbTransaction,
         tenant: &str,
         job_id: &str,
         queue_key: &str,
@@ -284,7 +284,7 @@ impl JobStoreShard {
             attempt_number,
         );
         let end = end_bound(&prefix);
-        let mut iter: DbIterator = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
 
         let mut deleted_count: i64 = 0;
         while let Some(kv) = iter.next().await? {

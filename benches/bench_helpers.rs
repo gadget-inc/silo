@@ -284,6 +284,7 @@ async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShar
     };
     let checkpoint = shard
         .db()
+        .inner()
         .create_checkpoint(slatedb::config::CheckpointScope::All, &checkpoint_options)
         .await
         .expect("create checkpoint");

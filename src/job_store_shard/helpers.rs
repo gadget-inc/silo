@@ -1,9 +1,10 @@
 //! Helper functions shared across job_store_shard submodules.
+use slatedb::WriteBatch;
 use slatedb::bytes::Bytes;
-use slatedb::{Db, DbTransaction, WriteBatch};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::encode_task;
+use crate::instrumented_db::{InstrumentedDb, InstrumentedDbTransaction};
 use crate::job::JobStatus;
 use crate::job_store_shard::JobStoreShardError;
 use crate::keys::task_key;
@@ -55,12 +56,12 @@ pub(crate) trait WriteBatcher {
 ///
 /// This combines a database reference for reads with a write batch for writes, allowing batch-based code paths to use the same trait as transaction-based ones.
 pub(crate) struct DbWriteBatcher<'a> {
-    pub db: &'a Db,
+    pub db: &'a InstrumentedDb,
     pub batch: &'a mut WriteBatch,
 }
 
 impl<'a> DbWriteBatcher<'a> {
-    pub fn new(db: &'a Db, batch: &'a mut WriteBatch) -> Self {
+    pub fn new(db: &'a InstrumentedDb, batch: &'a mut WriteBatch) -> Self {
         Self { db, batch }
     }
 }
@@ -94,12 +95,12 @@ impl WriteBatcher for DbWriteBatcher<'_> {
     }
 }
 
-/// Wrapper around `&DbTransaction` that implements `WriteBatcher`.
+/// Wrapper around `&InstrumentedDbTransaction` that implements `WriteBatcher`.
 ///
-/// This wrapper is needed because `DbTransaction` methods take `&self` (interior mutability)
+/// This wrapper is needed because transaction methods take `&self` (interior mutability)
 /// while `WriteBatch` methods take `&mut self`. The wrapper allows us to have a uniform
 /// `&mut self` interface in the `WriteBatcher` trait.
-pub(crate) struct TxnWriter<'a>(pub &'a DbTransaction);
+pub(crate) struct TxnWriter<'a>(pub &'a InstrumentedDbTransaction);
 
 impl WriteBatcher for TxnWriter<'_> {
     fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(

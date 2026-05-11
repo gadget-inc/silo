@@ -6,7 +6,7 @@ use silo::job_attempt::{AttemptOutcome, AttemptStatus};
 use silo::keys::{concurrency_holder_key, concurrency_request_key};
 use silo::retry::RetryPolicy;
 use silo::task::{ConcurrencyAction, LeaseRecord, Task};
-use slatedb::{DbIterator, WriteBatch};
+use slatedb::WriteBatch;
 
 use test_helpers::*;
 
@@ -1807,7 +1807,7 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
     // Verify we have 2 holders in DB (the original ones)
     let start = silo::keys::concurrency_holders_queue_prefix("-", &queue);
     let end = silo::keys::end_bound(&start);
-    let mut iter: DbIterator = shard2
+    let mut iter = shard2
         .db()
         .scan::<Vec<u8>, _>(start..end)
         .await

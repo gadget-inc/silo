@@ -11,7 +11,6 @@ use silo::keys::{
 };
 use silo::query::ShardQueryEngine;
 use silo::retry::RetryPolicy;
-use slatedb::DbIterator;
 use test_helpers::*;
 
 // Helper to extract string column values from batches
@@ -94,7 +93,7 @@ async fn collect_index_entries(
 ) -> Vec<ParsedStatusTimeIndexKey> {
     let start = idx_status_time_prefix(tenant, status);
     let end = end_bound(&start);
-    let mut iter: DbIterator = shard.db().scan::<Vec<u8>, _>(start..end).await.unwrap();
+    let mut iter = shard.db().scan::<Vec<u8>, _>(start..end).await.unwrap();
     let mut out = Vec::new();
     loop {
         let maybe = iter.next().await.unwrap();
@@ -110,7 +109,7 @@ async fn collect_index_entries(
 async fn collect_all_index_entries(shard: &JobStoreShard) -> Vec<ParsedStatusTimeIndexKey> {
     let start = vec![0x03u8];
     let end = end_bound(&start);
-    let mut iter: DbIterator = shard.db().scan::<Vec<u8>, _>(start..end).await.unwrap();
+    let mut iter = shard.db().scan::<Vec<u8>, _>(start..end).await.unwrap();
     let mut out = Vec::new();
     loop {
         let maybe = iter.next().await.unwrap();

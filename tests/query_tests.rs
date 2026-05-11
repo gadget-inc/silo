@@ -2186,7 +2186,6 @@ async fn verify_metadata_prefix_explain_plan() {
 use silo::keys::{
     ParsedMetadataIndexKey, end_bound, idx_metadata_key_only_prefix, parse_metadata_index_key,
 };
-use slatedb::DbIterator;
 
 /// Collect all metadata index entries (0x04) for a given tenant and key.
 async fn collect_metadata_index_entries(
@@ -2196,7 +2195,7 @@ async fn collect_metadata_index_entries(
 ) -> Vec<ParsedMetadataIndexKey> {
     let start = idx_metadata_key_only_prefix(tenant, key);
     let end = end_bound(&start);
-    let mut iter: DbIterator = shard.db().scan::<Vec<u8>, _>(start..end).await.unwrap();
+    let mut iter = shard.db().scan::<Vec<u8>, _>(start..end).await.unwrap();
     let mut out = Vec::new();
     loop {
         let maybe = iter.next().await.unwrap();

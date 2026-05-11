@@ -1,7 +1,7 @@
 //! Lease management: heartbeat, outcome reporting, and expired lease reaping.
 
+use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
-use slatedb::{DbIterator, WriteBatch};
 use uuid::Uuid;
 
 use crate::codec::{
@@ -366,7 +366,7 @@ impl JobStoreShard {
         // Scan all lease keys using the binary prefix
         let start = crate::keys::leases_prefix();
         let end = crate::keys::end_bound(&start);
-        let mut iter: DbIterator = self
+        let mut iter = self
             .db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await?;
@@ -546,7 +546,7 @@ impl JobStoreShard {
     ) -> Result<usize, JobStoreShardError> {
         let start = concurrency_holders_tenant_prefix(tenant);
         let end = end_bound(&start);
-        let mut iter: DbIterator = self
+        let mut iter = self
             .db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await?;

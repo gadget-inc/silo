@@ -76,7 +76,10 @@ fn unique_prefix() -> String {
 /// the actual concurrency-holder prefix is 0x09). That made the simulator's
 /// holder/lease/request invariants vacuous. Always pass the binary prefix from
 /// `keys::*_prefix()`.
-async fn count_with_binary_prefix(db: &slatedb::Db, prefix: &[u8]) -> usize {
+async fn count_with_binary_prefix(
+    db: &silo::instrumented_db::InstrumentedDb,
+    prefix: &[u8],
+) -> usize {
     let start: Vec<u8> = prefix.to_vec();
     let end: Vec<u8> = keys::end_bound(prefix);
     let mut iter = db.scan::<Vec<u8>, _>(start..end).await.expect("scan");
