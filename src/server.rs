@@ -1509,27 +1509,43 @@ impl Silo for SiloService {
             ));
         }
 
-        // Use the coordinator's shard map as the source of truth for which shards
-        // should exist, not just what's currently in the factory. This catches cases
-        // where shards failed to open during startup (e.g., due to path configuration
-        // errors) but are still listed in the shard map.
+        // Only reset shards this node owns. In a multi-node cluster, resetting a
+        // shard owned by another node would wipe its object-store data and bump
+        // the manifest epoch, fencing the owner's `l0_manifest_writer` task and
+        // permanently closing its slatedb instance. The TS test client calls
+        // `resetShards` against every server, so each owner resets its own shards.
         let shard_map = self
             .coordinator
             .get_shard_map()
             .await
             .map_err(|e| Status::internal(format!("failed to get shard map: {}", e)))?;
+        let owned_ids: std::collections::HashSet<_> = self
+            .coordinator
+            .base()
+            .owned
+            .lock()
+            .await
+            .iter()
+            .copied()
+            .collect();
+        let local_shards: Vec<_> = shard_map
+            .shards()
+            .iter()
+            .filter(|info| owned_ids.contains(&info.id))
+            .cloned()
+            .collect();
 
         let mut reset_count = 0u32;
-        for shard_info in shard_map.shards() {
+        for shard_info in &local_shards {
             let shard_id = shard_info.id;
             let range = match self.factory.get(&shard_id) {
                 Some(shard) => shard.get_range(),
                 None => {
-                    // Shard is in the shard map but not in the factory - this means it
-                    // failed to open during startup. Try to open it now.
+                    // Shard is owned but not in the factory - this means it failed
+                    // to open during startup. Try to open it now.
                     tracing::warn!(
                         shard = %shard_id,
-                        "shard not found in factory during reset, attempting to open it"
+                        "owned shard not found in factory during reset, attempting to open it"
                     );
                     shard_info.range.clone()
                 }
@@ -1554,13 +1570,13 @@ impl Silo for SiloService {
         // which improves diagnostic logging in shard_with_redirect().
         {
             let mut owned = self.coordinator.base().owned.lock().await;
-            for shard_info in shard_map.shards() {
+            for shard_info in &local_shards {
                 owned.insert(shard_info.id);
             }
         }
 
-        // Verify all shards are accessible after reset
-        for shard_info in shard_map.shards() {
+        // Verify all locally-owned shards are accessible after reset
+        for shard_info in &local_shards {
             if self.factory.get(&shard_info.id).is_none() {
                 return Err(Status::internal(format!(
                     "shard {} not accessible after reset - this is a bug",
