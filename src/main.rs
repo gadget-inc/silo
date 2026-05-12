@@ -208,6 +208,19 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // Periodic jemalloc stats scrape: lets us distinguish purgeable retained
+    // pages from genuinely live allocations vs non-jemalloc mmaps.
+    #[cfg(unix)]
+    let _jemalloc_metrics_handle = metrics.as_ref().map(|m| {
+        let jm = m.jemalloc.clone();
+        let shutdown = shutdown_tx.subscribe();
+        tokio::spawn(silo::jemalloc_metrics::run_scraper(
+            jm,
+            Duration::from_secs(1),
+            shutdown,
+        ))
+    });
+
     // Log server startup with all enabled endpoints
     let webui_addr_str = if cfg.webui.enabled {
         Some(cfg.webui.addr.as_str())
