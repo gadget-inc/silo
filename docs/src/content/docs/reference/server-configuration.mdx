@@ -280,7 +280,7 @@ You can specify only the SlateDB options you want to customize—unspecified opt
 flush_interval = "1ms"
 
 [database.slatedb.object_store_cache_options]
-root_folder = "/var/silo-cache"
+root_folder = "/var/silo-cache/%shard%"
 cache_puts = true
 ```
 
