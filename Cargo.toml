@@ -167,6 +167,10 @@ required-features = ["server"]
 name = "task_scanner_profile"
 harness = false
 
+[[bench]]
+name = "concurrency_request_scan_compare"
+harness = false
+
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"
