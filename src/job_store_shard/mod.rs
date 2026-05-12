@@ -618,6 +618,33 @@ impl JobStoreShard {
         let reconcile_interval = self.concurrency_reconcile_interval;
 
         tokio::spawn(async move {
+            // Deterministic jitter based on shard name so that many shards
+            // opened simultaneously in one process don't all scan the
+            // CONCURRENCY_REQUESTS prefix at the same instant.
+            let interval_ms = reconcile_interval.as_millis() as u64;
+            let jitter_ms = if interval_ms > 0 {
+                let mut h: u64 = 1469598103934665603;
+                for b in shard_name.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(1099511628211);
+                }
+                h % interval_ms
+            } else {
+                0
+            };
+
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(Duration::from_millis(jitter_ms)) => {}
+                _ = cancellation.cancelled() => {
+                    tracing::debug!(
+                        shard = %shard_name,
+                        "stopping periodic concurrency reconciliation before first tick (shard closing)"
+                    );
+                    return;
+                }
+            }
+
             let mut interval = tokio::time::interval(reconcile_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
