@@ -1139,8 +1139,12 @@ impl Silo for SiloService {
             let now_ms = crate::job_store_shard::now_epoch_ms();
 
             if let Some(ref m) = self.metrics {
-                m.record_poll(&shard_str);
-                m.record_poll_duration(&shard_str, poll_start.elapsed().as_secs_f64());
+                m.record_poll(&shard_str, &r.task_group);
+                m.record_poll_duration(
+                    &shard_str,
+                    &r.task_group,
+                    poll_start.elapsed().as_secs_f64(),
+                );
             }
 
             for lt in result.tasks {
