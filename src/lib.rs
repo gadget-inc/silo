@@ -64,7 +64,7 @@ union MallocConfPtr {
 }
 
 #[cfg(unix)]
-const MALLOC_CONF_STR: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
+const MALLOC_CONF_STR: &[u8] = b"prof:true,prof_active:false\0";
 
 // This build keeps jemalloc's default `_rjem_` prefixing. If we switch to
 // `unprefixed_malloc_on_supported_platforms` later, this export should change
