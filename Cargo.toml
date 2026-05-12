@@ -67,7 +67,7 @@ tracing-opentelemetry = "0.27"
 opentelemetry = { version = "0.26" }
 opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.26", features = ["http-json", "trace"] }
-prometheus = "0.13"
+prometheus = { version = "0.13", features = ["process"] }
 usdt = "0.6.0"
 tempfile = "3"
 async-trait = "0.1"
@@ -89,8 +89,8 @@ rand = "0.9"
 datafusion-sql = { version = "50", optional = true }
 hostname = "0.4"
 pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
-tikv-jemallocator = { version = "0.6", features = ["profiling"] }
-tikv-jemalloc-ctl = { version = "0.6", features = ["profiling"] }
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["profiling", "stats"] }
 flate2 = "1"
 urlencoding = "2"
 storekey = { version = "0.11", features = ["storekey-derive"] }

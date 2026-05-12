@@ -12,6 +12,8 @@ pub mod grpc_trace;
 pub mod gubernator;
 pub mod heap_profile;
 pub mod instrumented_db;
+#[cfg(unix)]
+pub mod jemalloc_metrics;
 pub mod job;
 pub mod job_attempt;
 pub mod job_store_shard;

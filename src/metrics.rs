@@ -145,6 +145,10 @@ pub struct Metrics {
     /// Tokio runtime metrics (worker busy time, queue depths, mean poll time)
     /// driven by a periodic scraper spawned in `main.rs`.
     pub tokio_runtime: crate::tokio_runtime_metrics::TokioRuntimeMetrics,
+
+    /// Jemalloc allocator stats driven by a periodic scraper spawned in `main.rs`.
+    #[cfg(unix)]
+    pub jemalloc: crate::jemalloc_metrics::JemallocMetrics,
 }
 
 /// SlateDB per-shard metric instruments plus the previous-value map needed
@@ -897,6 +901,16 @@ fn register<C: Collector + Clone + 'static>(registry: &Registry, metric: C) -> C
 pub fn init() -> anyhow::Result<Metrics> {
     let registry = Registry::new();
 
+    // Process-level metrics (RSS, VSZ, FDs, CPU). Linux-only because the
+    // prometheus crate's ProcessCollector reads /proc.
+    #[cfg(target_os = "linux")]
+    {
+        let pc = prometheus::process_collector::ProcessCollector::for_self();
+        if let Err(e) = registry.register(Box::new(pc)) {
+            tracing::warn!(error = %e, "failed to register process collector");
+        }
+    }
+
     // Job metrics
     let jobs_enqueued = register(
         &registry,
@@ -1227,6 +1241,8 @@ pub fn init() -> anyhow::Result<Metrics> {
 
     let slatedb = SlatedbShardMetrics::register(&registry, "silo_")?;
     let tokio_runtime = crate::tokio_runtime_metrics::TokioRuntimeMetrics::register(&registry)?;
+    #[cfg(unix)]
+    let jemalloc = crate::jemalloc_metrics::JemallocMetrics::register(&registry)?;
 
     Ok(Metrics {
         registry: Arc::new(registry),
@@ -1262,6 +1278,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         slatedb_manifest_checkpoints_count,
         slatedb,
         tokio_runtime,
+        #[cfg(unix)]
+        jemalloc,
     })
 }
 
