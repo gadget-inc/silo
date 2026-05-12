@@ -358,15 +358,17 @@ impl Metrics {
             .set(count as f64);
     }
 
-    /// Record a poll (lease_tasks call) for a shard.
-    pub fn record_poll(&self, shard: &str) {
-        self.polls_total.with_label_values(&[shard]).inc();
+    /// Record a poll (lease_tasks call) for a shard/task_group.
+    pub fn record_poll(&self, shard: &str, task_group: &str) {
+        self.polls_total
+            .with_label_values(&[shard, task_group])
+            .inc();
     }
 
-    /// Record poll duration (time to service a lease_tasks call for a shard) in seconds.
-    pub fn record_poll_duration(&self, shard: &str, duration_secs: f64) {
+    /// Record poll duration (time to service a lease_tasks call for a shard/task_group) in seconds.
+    pub fn record_poll_duration(&self, shard: &str, task_group: &str, duration_secs: f64) {
         self.poll_duration
-            .with_label_values(&[shard])
+            .with_label_values(&[shard, task_group])
             .observe(duration_secs);
     }
 
@@ -1057,9 +1059,9 @@ pub fn init() -> anyhow::Result<Metrics> {
         CounterVec::new(
             Opts::new(
                 "silo_polls_total",
-                "Total number of lease_tasks polls received per shard",
+                "Total number of lease_tasks polls received per shard/task_group",
             ),
-            &["shard"],
+            &["shard", "task_group"],
         )?,
     );
 
@@ -1068,10 +1070,10 @@ pub fn init() -> anyhow::Result<Metrics> {
         HistogramVec::new(
             HistogramOpts::new(
                 "silo_poll_duration_seconds",
-                "Duration of lease_tasks poll per shard in seconds",
+                "Duration of lease_tasks poll per shard/task_group in seconds",
             )
             .buckets(LATENCY_BUCKETS.to_vec()),
-            &["shard"],
+            &["shard", "task_group"],
         )?,
     );
 
