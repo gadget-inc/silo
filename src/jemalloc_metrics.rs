@@ -8,8 +8,6 @@
 //! Jemalloc caches stats per "epoch" — `epoch::advance()` must be called
 //! before reading or the values are stale.
 
-#![cfg(unix)]
-
 use std::time::Duration;
 
 use prometheus::{Gauge, Registry, core::Collector};
