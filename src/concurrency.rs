@@ -850,7 +850,7 @@ impl ConcurrencyManager {
             let mut iter = match db
                 .scan_with_options::<Vec<u8>, _>(
                     next_start.clone()..end.clone(),
-                    &crate::scan_options(),
+                    &crate::cold_scan_options(),
                 )
                 .await
             {
