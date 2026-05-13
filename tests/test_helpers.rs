@@ -103,6 +103,9 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             metrics: None,
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
             enable_counter_reconciliation: false,
+            background_task_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                silo::settings::DEFAULT_BACKGROUND_TASK_CONCURRENCY,
+            )),
         },
         ShardRange::full(),
     )

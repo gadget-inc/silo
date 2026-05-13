@@ -613,6 +613,9 @@ pub async fn clone_golden_shard(
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
             ),
             enable_counter_reconciliation: false,
+            background_task_gate: Arc::new(tokio::sync::Semaphore::new(
+                silo::settings::DEFAULT_BACKGROUND_TASK_CONCURRENCY,
+            )),
         },
         ShardRange::full(),
     )

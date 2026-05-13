@@ -193,6 +193,17 @@ fn default_enable_counter_reconciliation() -> bool {
     false
 }
 
+/// Default cap on how many heavy background scan tasks can run
+/// concurrently across the process (per shard reconcile_pending_requests,
+/// per shard counter reconciliation, and the global lease reaper as it
+/// walks each shard). Sized so a single host hosting many shards can't
+/// fan out all of them onto SST iterators at the same moment and OOM.
+pub const DEFAULT_BACKGROUND_TASK_CONCURRENCY: usize = 4;
+
+fn default_background_task_concurrency() -> usize {
+    DEFAULT_BACKGROUND_TASK_CONCURRENCY
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -236,6 +247,13 @@ pub struct DatabaseTemplate {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// Maximum number of heavy background scan tasks that may run
+    /// concurrently across the entire process. Gates per-shard
+    /// `reconcile_pending_requests`, per-shard counter reconciliation,
+    /// and the global lease reaper's per-shard scans. Caps the number of
+    /// SST iterators that can be live at once across all shards.
+    #[serde(default = "default_background_task_concurrency")]
+    pub background_task_concurrency: usize,
 }
 
 impl Default for DatabaseTemplate {
@@ -249,6 +267,7 @@ impl Default for DatabaseTemplate {
             enable_counter_reconciliation: default_enable_counter_reconciliation(),
             slatedb: None,
             memory_cache: None,
+            background_task_concurrency: default_background_task_concurrency(),
         }
     }
 }
@@ -512,6 +531,10 @@ pub struct DatabaseConfig {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// Maximum number of heavy background scan tasks that may run
+    /// concurrently. See `DatabaseTemplate::background_task_concurrency`.
+    #[serde(default = "default_background_task_concurrency")]
+    pub background_task_concurrency: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -525,6 +548,7 @@ impl Default for DatabaseConfig {
             enable_counter_reconciliation: default_enable_counter_reconciliation(),
             slatedb: None,
             memory_cache: None,
+            background_task_concurrency: default_background_task_concurrency(),
         }
     }
 }

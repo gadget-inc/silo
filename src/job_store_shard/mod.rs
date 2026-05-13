@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 
@@ -89,6 +90,12 @@ pub struct OpenShardOptions {
     /// standalone compactor dropping terminal job rows; deployments that run
     /// the standalone compactor enable it. Defaults to off.
     pub enable_counter_reconciliation: bool,
+    /// Process-global cap on heavy background scan concurrency. Acquired
+    /// before reconcile_pending_requests, the counter reconciler, and the
+    /// lease reaper's per-shard scan, so the number of live SST iterators
+    /// across all shards is bounded. A single semaphore instance is shared
+    /// across all shards in the same factory.
+    pub background_task_gate: Arc<Semaphore>,
 }
 
 fn expand_slatedb_settings_for_shard(
@@ -142,6 +149,9 @@ pub struct JobStoreShard {
     pub(crate) metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     concurrency_reconcile_interval: Duration,
+    /// Process-global cap on heavy background scan concurrency. See
+    /// [`OpenShardOptions::background_task_gate`].
+    pub(crate) background_task_gate: Arc<Semaphore>,
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
@@ -300,6 +310,8 @@ impl JobStoreShard {
         // Use SlateDB settings if configured
         let slatedb_settings = cfg.slatedb.clone();
 
+        let background_task_gate = Arc::new(Semaphore::new(cfg.background_task_concurrency.max(1)));
+
         Self::open_with_resolved_store(
             cfg.name.clone(),
             &resolved.canonical_path,
@@ -315,6 +327,7 @@ impl JobStoreShard {
                     crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
                 ),
                 enable_counter_reconciliation: cfg.enable_counter_reconciliation,
+                background_task_gate,
             },
             range,
         )
@@ -352,6 +365,7 @@ impl JobStoreShard {
             metrics,
             concurrency_reconcile_interval,
             enable_counter_reconciliation,
+            background_task_gate,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -417,7 +431,12 @@ impl JobStoreShard {
 
         // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready.
         // It takes the instrumented db so its writes are tagged with the shard span too.
-        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
+        concurrency.start_grant_scanner(
+            Arc::clone(&db),
+            Arc::clone(&brokers),
+            range.clone(),
+            Arc::clone(&background_task_gate),
+        );
 
         let shard = Arc::new(Self {
             name,
@@ -430,6 +449,7 @@ impl JobStoreShard {
             wal_close_config,
             metrics,
             concurrency_reconcile_interval,
+            background_task_gate,
             cancellation: CancellationToken::new(),
             store,
             db_path: db_path.to_string(),
@@ -652,6 +672,12 @@ impl JobStoreShard {
                 tokio::select! {
                     biased;
                     _ = interval.tick() => {
+                        // Cap how many shards can be running this scan
+                        // concurrently across the whole process.
+                        let Ok(_permit) = shard.background_task_gate.acquire().await else {
+                            // Semaphore closed — process shutting down.
+                            break;
+                        };
                         shard
                             .concurrency
                             .reconcile_pending_requests(shard.db.as_ref(), &range)
@@ -723,6 +749,14 @@ impl JobStoreShard {
                 tokio::select! {
                     biased;
                     _ = interval.tick() => {
+                        // Cap how many shards can be running this scan
+                        // concurrently across the whole process. This task's
+                        // scan is the heaviest in silo (full JOB_INFO +
+                        // JOB_STATUS sweep), so the gate matters most here.
+                        let Ok(_permit) = shard.background_task_gate.acquire().await else {
+                            // Semaphore closed — process shutting down.
+                            break;
+                        };
                         let summary = shard.reconcile_counters(&range).await;
                         if summary.failed > 0 {
                             tracing::warn!(

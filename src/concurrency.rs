@@ -766,12 +766,23 @@ impl ConcurrencyManager {
         db: Arc<InstrumentedDb>,
         brokers: Arc<TaskBrokerRegistry>,
         range: ShardRange,
+        background_task_gate: Arc<tokio::sync::Semaphore>,
     ) {
         self.grant_running.store(true, Ordering::SeqCst);
         let mgr = Arc::clone(self);
         tokio::spawn(async move {
-            // Startup: scan for existing pending requests
-            mgr.reconcile_pending_requests(&db, &range).await;
+            // Startup: scan for existing pending requests. Acquire a permit
+            // from the process-wide gate first so a node hosting many shards
+            // doesn't fan out N startup scans at once.
+            match background_task_gate.acquire().await {
+                Ok(_permit) => {
+                    mgr.reconcile_pending_requests(&db, &range).await;
+                }
+                Err(_) => {
+                    // Semaphore closed before startup reconcile ran.
+                    return;
+                }
+            }
 
             loop {
                 mgr.grant_notify.notified().await;
@@ -834,16 +845,12 @@ impl ConcurrencyManager {
         // shard with millions of pending requests pulls the entire prefix's
         // worth of SST blocks into the iterator's heap residency before the
         // sweep finishes.
-        //
-        // The reconcile scan is also a cold sweep, so reopening pays only the
-        // SST index decode cost; data blocks aren't cached either way (see
-        // `cold_scan_options`).
         let mut next_start: Vec<u8> = prefix;
         'outer: loop {
             let mut iter = match db
                 .scan_with_options::<Vec<u8>, _>(
                     next_start.clone()..end.clone(),
-                    &crate::cold_scan_options(),
+                    &crate::scan_options(),
                 )
                 .await
             {

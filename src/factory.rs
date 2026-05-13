@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::gubernator::RateLimitClient;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, OpenShardOptions};
@@ -59,6 +59,10 @@ pub struct ShardFactory {
     rate_limiter: Arc<dyn RateLimitClient>,
     metrics: Option<Metrics>,
     close_timeout: Duration,
+    /// Process-global cap on heavy background scan concurrency. Shared with
+    /// every shard opened by this factory and with the lease reaper loop that
+    /// iterates shards. See `DatabaseTemplate::background_task_concurrency`.
+    background_task_gate: Arc<Semaphore>,
 }
 
 impl ShardFactory {
@@ -67,12 +71,15 @@ impl ShardFactory {
         rate_limiter: Arc<dyn RateLimitClient>,
         metrics: Option<Metrics>,
     ) -> Self {
+        let background_task_gate =
+            Arc::new(Semaphore::new(template.background_task_concurrency.max(1)));
         Self {
             instances: DashMap::new(),
             template,
             rate_limiter,
             metrics,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            background_task_gate,
         }
     }
 
@@ -84,17 +91,26 @@ impl ShardFactory {
     pub fn new_noop() -> Self {
         use crate::gubernator::NullGubernatorClient;
 
+        let template = DatabaseTemplate {
+            path: "/noop".to_string(),
+            apply_wal_on_close: false,
+            ..Default::default()
+        };
+        let background_task_gate =
+            Arc::new(Semaphore::new(template.background_task_concurrency.max(1)));
         Self {
             instances: DashMap::new(),
-            template: DatabaseTemplate {
-                path: "/noop".to_string(),
-                apply_wal_on_close: false,
-                ..Default::default()
-            },
+            template,
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            background_task_gate,
         }
+    }
+
+    /// Process-global semaphore that caps concurrent heavy background scans.
+    pub fn background_task_gate(&self) -> &Arc<Semaphore> {
+        &self.background_task_gate
     }
 
     /// Set the timeout for shard close operations.
@@ -146,6 +162,7 @@ impl ShardFactory {
         let template = &self.template;
         let rate_limiter = Arc::clone(&self.rate_limiter);
         let metrics = self.metrics.clone();
+        let background_task_gate = Arc::clone(&self.background_task_gate);
 
         entry
             .get_or_try_init(|| async {
@@ -192,6 +209,7 @@ impl ShardFactory {
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
                         enable_counter_reconciliation: template.enable_counter_reconciliation,
+                        background_task_gate: Arc::clone(&background_task_gate),
                     },
                     range.clone(),
                 )

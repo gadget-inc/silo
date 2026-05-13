@@ -2110,8 +2110,16 @@ where
                         m.set_coordination_shards_open(instances.len() as u64);
                     }
 
-                    // Use default tenant "-" for system-level reaping
+                    // Use default tenant "-" for system-level reaping. Acquire
+                    // a permit from the process-global gate before each shard's
+                    // reap so the reaper can't fan out N concurrent lease-prefix
+                    // scans (or run alongside N reconcile/counter passes).
+                    let gate = reaper_factory.background_task_gate();
                     for (shard_id, shard) in instances.iter() {
+                        let Ok(_permit) = gate.acquire().await else {
+                            // Semaphore closed — process shutting down.
+                            break;
+                        };
                         let reap_start = std::time::Instant::now();
                         let result = shard.reap_expired_leases("-").await;
                         let shard_label = shard_id.to_string();
