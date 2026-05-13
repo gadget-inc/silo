@@ -68,6 +68,64 @@ use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 use crate::task_broker::TaskBrokerRegistry;
 
+/// Probe for capturing jemalloc allocated/resident deltas across a code region.
+///
+/// `start()` records the current allocated/resident counters (after advancing
+/// the jemalloc stats epoch), and `finish()` re-reads them and returns the
+/// signed deltas. On non-unix or when jemalloc isn't built in, both values
+/// come back as zero.
+///
+/// Note: jemalloc's `stats.*` counters are process-global, so concurrent work
+/// on other tasks bleeds into the delta. The delta is still useful as a
+/// directional signal when this scan dominates the shard's work during its
+/// run, and the histogram aggregates across many samples.
+struct ReconcileMemProbe {
+    #[cfg(unix)]
+    allocated_before: i64,
+    #[cfg(unix)]
+    resident_before: i64,
+}
+
+impl ReconcileMemProbe {
+    fn start() -> Self {
+        #[cfg(unix)]
+        {
+            // Advance the jemalloc stats epoch so the subsequent reads return
+            // current values rather than the cached snapshot from the last
+            // advance. If the call fails, we still capture whatever the cache
+            // holds — the delta is a relative measure.
+            let _ = tikv_jemalloc_ctl::epoch::advance();
+            let allocated_before = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as i64;
+            let resident_before = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as i64;
+            Self {
+                allocated_before,
+                resident_before,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    fn finish(self) -> (i64, i64) {
+        #[cfg(unix)]
+        {
+            let _ = tikv_jemalloc_ctl::epoch::advance();
+            let allocated_after = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as i64;
+            let resident_after = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as i64;
+            (
+                allocated_after - self.allocated_before,
+                resident_after - self.resident_before,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            (0, 0)
+        }
+    }
+}
+
 /// Error type for concurrency operations that can fail due to storage or encoding errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConcurrencyError {
@@ -721,10 +779,16 @@ impl ConcurrencyManager {
     /// This is used at grant-scanner startup and by the shard's periodic
     /// reconciliation task to self-heal from missed notifications.
     pub async fn reconcile_pending_requests(&self, db: &InstrumentedDb, range: &ShardRange) {
+        let probe = ReconcileMemProbe::start();
+        let t0 = std::time::Instant::now();
+
         let start = concurrency_requests_prefix();
         let end = end_bound(&start);
+        // Reconciliation is a one-shot cold sweep over the full shard prefix on
+        // a slow cadence; pinning the touched SST blocks into the cache (which
+        // [`crate::scan_options`] does) inflates RSS without any hit-rate gain.
         let mut iter = match db
-            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::cold_scan_options())
             .await
         {
             Ok(i) => i,
@@ -739,6 +803,7 @@ impl ConcurrencyManager {
 
         // Count pending requests per (tenant, queue)
         let mut queue_counts: BTreeMap<Vec<u8>, (String, String, u32)> = BTreeMap::new();
+        let mut keys_scanned: u64 = 0;
         loop {
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
@@ -751,6 +816,7 @@ impl ConcurrencyManager {
                     break;
                 }
             };
+            keys_scanned += 1;
 
             let Some(parsed) = parse_concurrency_request_key(&kv.key) else {
                 continue;
@@ -768,9 +834,23 @@ impl ConcurrencyManager {
             entry.2 += 1;
         }
 
+        let queues_found = queue_counts.len() as u64;
+
         // Trigger grants for each queue with pending requests
         for (_key, (tenant, queue, count)) in queue_counts {
             self.request_grant_count(&tenant, &queue, count);
+        }
+
+        if let Some(ref m) = self.metrics {
+            let (allocated_delta, resident_delta) = probe.finish();
+            m.record_concurrency_reconcile(
+                &self.shard,
+                t0.elapsed().as_secs_f64(),
+                keys_scanned,
+                queues_found,
+                allocated_delta,
+                resident_delta,
+            );
         }
     }
 

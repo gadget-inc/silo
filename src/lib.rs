@@ -90,3 +90,12 @@ pub static rjem_malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
 pub fn scan_options() -> slatedb::config::ScanOptions {
     slatedb::config::ScanOptions::default().with_cache_blocks(true)
 }
+
+/// Scan options for one-shot cold sweeps (e.g. periodic reconciliation).
+///
+/// Unlike [`scan_options`], these scans walk a large shard-wide prefix on a
+/// slow cadence and never revisit the same blocks soon after. Pinning the
+/// touched SST blocks into the cache bloats RSS for no hit-rate benefit.
+pub fn cold_scan_options() -> slatedb::config::ScanOptions {
+    slatedb::config::ScanOptions::default().with_cache_blocks(false)
+}

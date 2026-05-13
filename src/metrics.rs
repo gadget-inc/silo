@@ -55,6 +55,34 @@ const WAIT_TIME_BUCKETS: &[f64] = &[
     0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0,
 ];
 
+/// Histogram buckets for "items counted" in a reconcile sweep (keys scanned,
+/// queues with pending requests). Exponential, covers up to ~10M.
+const RECONCILE_ITEMS_BUCKETS: &[f64] = &[
+    1.0,
+    10.0,
+    100.0,
+    1_000.0,
+    10_000.0,
+    100_000.0,
+    1_000_000.0,
+    10_000_000.0,
+];
+
+/// Histogram buckets for memory-delta observations in bytes (jemalloc
+/// allocated/resident bytes before vs after a reconcile sweep). Exponential
+/// from 1KiB up to 4GiB.
+const RECONCILE_BYTES_BUCKETS: &[f64] = &[
+    1_024.0,
+    16_384.0,
+    262_144.0,
+    1_048_576.0,     // 1 MiB
+    16_777_216.0,    // 16 MiB
+    134_217_728.0,   // 128 MiB
+    536_870_912.0,   // 512 MiB
+    2_147_483_648.0, // 2 GiB
+    4_294_967_296.0, // 4 GiB
+];
+
 /// Histogram buckets for ready-to-start latency (in milliseconds)
 const READY_TO_START_LATENCY_MS_BUCKETS: &[f64] = &[
     1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 30000.0, 60000.0, 300000.0, 600000.0,
@@ -129,6 +157,12 @@ pub struct Metrics {
 
     // Concurrency metrics
     concurrency_tickets_granted: CounterVec,
+    concurrency_reconcile_duration: HistogramVec,
+    concurrency_reconcile_keys_scanned: HistogramVec,
+    concurrency_reconcile_queues_found: HistogramVec,
+    concurrency_reconcile_allocated_delta_bytes: HistogramVec,
+    concurrency_reconcile_resident_delta_bytes: HistogramVec,
+    concurrency_reconcile_total: CounterVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -429,6 +463,44 @@ impl Metrics {
         self.concurrency_tickets_granted
             .with_label_values(&[shard, path.as_str()])
             .inc_by(n as f64);
+    }
+
+    /// Record one pass of `ConcurrencyManager::reconcile_pending_requests`.
+    ///
+    /// `allocated_delta` and `resident_delta` are jemalloc deltas (after - before)
+    /// captured around the scan. They are process-global, so concurrent work on
+    /// other shards bleeds in — but a sustained spike here when reconcile is the
+    /// dominant work isolates whether this scan is the OOM source.
+    pub fn record_concurrency_reconcile(
+        &self,
+        shard: &str,
+        duration_secs: f64,
+        keys_scanned: u64,
+        queues_found: u64,
+        allocated_delta_bytes: i64,
+        resident_delta_bytes: i64,
+    ) {
+        self.concurrency_reconcile_total
+            .with_label_values(&[shard])
+            .inc();
+        self.concurrency_reconcile_duration
+            .with_label_values(&[shard])
+            .observe(duration_secs);
+        self.concurrency_reconcile_keys_scanned
+            .with_label_values(&[shard])
+            .observe(keys_scanned as f64);
+        self.concurrency_reconcile_queues_found
+            .with_label_values(&[shard])
+            .observe(queues_found as f64);
+        // Clamp negative deltas to zero: histograms only meaningfully capture
+        // growth, and negatives mean other code freed more than reconcile
+        // allocated during the window (still useful as the bottom bucket).
+        self.concurrency_reconcile_allocated_delta_bytes
+            .with_label_values(&[shard])
+            .observe(allocated_delta_bytes.max(0) as f64);
+        self.concurrency_reconcile_resident_delta_bytes
+            .with_label_values(&[shard])
+            .observe(resident_delta_bytes.max(0) as f64);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1172,6 +1244,77 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_reconcile_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_reconcile_total",
+                "Total number of reconcile_pending_requests sweeps per shard",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconcile_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_reconcile_duration_seconds",
+                "Wall time of reconcile_pending_requests sweeps per shard",
+            )
+            .buckets(SCAN_DURATION_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconcile_keys_scanned = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_reconcile_keys_scanned",
+                "Number of CONCURRENCY_REQUESTS keys read during a reconcile sweep",
+            )
+            .buckets(RECONCILE_ITEMS_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconcile_queues_found = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_reconcile_queues_found",
+                "Number of distinct (tenant, queue) pairs with pending requests in a reconcile sweep",
+            )
+            .buckets(RECONCILE_ITEMS_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconcile_allocated_delta_bytes = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_reconcile_allocated_delta_bytes",
+                "Process-global jemalloc stats.allocated delta (after - before) across a reconcile sweep",
+            )
+            .buckets(RECONCILE_BYTES_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconcile_resident_delta_bytes = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_reconcile_resident_delta_bytes",
+                "Process-global jemalloc stats.resident delta (after - before) across a reconcile sweep",
+            )
+            .buckets(RECONCILE_BYTES_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
     // SlateDB watcher metrics (driven by Db::subscribe)
     let slatedb_durable_seq = register(
         &registry,
@@ -1270,6 +1413,12 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
         concurrency_tickets_granted,
+        concurrency_reconcile_duration,
+        concurrency_reconcile_keys_scanned,
+        concurrency_reconcile_queues_found,
+        concurrency_reconcile_allocated_delta_bytes,
+        concurrency_reconcile_resident_delta_bytes,
+        concurrency_reconcile_total,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
         slatedb_manifest_last_l0_seq,
