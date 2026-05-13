@@ -27,6 +27,19 @@ backend = "fs"
 # NOTE: %shard% must be at a directory boundary (after /) for split/clone to work correctly
 path = "./tmp/silo-data/%shard%"
 
+terminal_job_expire_ms = 100
+enable_counter_reconciliation = true
+
+[database.slatedb]
+# flush memtable to ssts frequently for low latency writes
+flush_interval = "1ms"
+
+# roll active memtable into a new l0 sst every 64mb. smaller individual
+# flushes complete faster, which matters during shard.close() — db.close()
+# has to drain every queued unflushed byte to object storage before it
+# returns.
+l0_sst_size_bytes = 524288 # 512 kib
+
 # Garbage collection — disabled by default in SlateDB!
 [database.slatedb.garbage_collector_options.manifest_options]
 interval = "300s"
