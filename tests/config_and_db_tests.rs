@@ -553,7 +553,7 @@ path = "/tmp/silo-%shard%"
     // slatedb should be None when not specified
     assert!(cfg.database.slatedb.is_none());
     assert_eq!(
-        cfg.database.concurrency_reconcile_interval_ms, 5000,
+        cfg.database.concurrency_reconcile_interval_ms, 10_000,
         "missing concurrency_reconcile_interval_ms should use default"
     );
 }
