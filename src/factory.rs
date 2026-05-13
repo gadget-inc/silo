@@ -66,6 +66,13 @@ pub struct ShardFactory {
 }
 
 impl ShardFactory {
+    /// Build a factory from a validated template.
+    ///
+    /// Callers are expected to have run `DatabaseTemplate::validate()` already
+    /// (e.g. via `AppConfig::load`), which rejects
+    /// `background_task_concurrency == 0`. The `.max(1)` below is defense-in-
+    /// depth: if a caller bypasses validation, the gate falls back to one
+    /// permit instead of deadlocking on `acquire`.
     pub fn new(
         template: DatabaseTemplate,
         rate_limiter: Arc<dyn RateLimitClient>,

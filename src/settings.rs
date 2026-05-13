@@ -272,6 +272,25 @@ impl Default for DatabaseTemplate {
     }
 }
 
+impl DatabaseTemplate {
+    /// Validate fields that have no sensible "zero" interpretation.
+    ///
+    /// `background_task_concurrency = 0` would create a `Semaphore` with no
+    /// permits, deadlocking every gated background task. Reject at parse
+    /// time so the failure is loud instead of silent. The constructors
+    /// downstream still floor at 1 as defense-in-depth, but no production
+    /// configuration should rely on that.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.background_task_concurrency == 0 {
+            return Err(
+                "database.background_task_concurrency must be >= 1 (got 0); use a positive value to cap heavy background scan parallelism"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for SlateDB's in-memory caches.
 ///
 /// SlateDB maintains two separate in-memory caches:
@@ -553,6 +572,19 @@ impl Default for DatabaseConfig {
     }
 }
 
+impl DatabaseConfig {
+    /// See [`DatabaseTemplate::validate`] for the rationale.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.background_task_concurrency == 0 {
+            return Err(
+                "database.background_task_concurrency must be >= 1 (got 0); use a positive value to cap heavy background scan parallelism"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
@@ -682,6 +714,9 @@ impl AppConfig {
                 // This allows using ${VAR} or ${VAR:-default} syntax in config values.
                 let expanded = expand_env_vars(&data);
                 let cfg: Self = toml::from_str(&expanded)?;
+                cfg.database
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
                 Ok(cfg)
             }
             None => Ok(default),

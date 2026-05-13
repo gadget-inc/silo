@@ -597,6 +597,28 @@ enable_counter_reconciliation = true
     assert!(cfg.database.enable_counter_reconciliation);
 }
 
+#[silo::test]
+fn app_config_load_rejects_zero_background_task_concurrency() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    std::fs::write(
+        tmp.path(),
+        r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+background_task_concurrency = 0
+"#,
+    )
+    .expect("write");
+
+    let err = silo::settings::AppConfig::load(Some(tmp.path())).expect_err("expected rejection");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("background_task_concurrency"),
+        "error should mention the field; got: {msg}"
+    );
+}
+
 /// Guards against the manual `Default` impl on `DatabaseTemplate` drifting away
 /// from the serde defaults. If a future field is added with a `#[serde(default)]`
 /// but is not mirrored in the `Default` impl (or vice versa), this fails.

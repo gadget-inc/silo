@@ -287,6 +287,8 @@ impl JobStoreShard {
         metrics: Option<Metrics>,
         range: ShardRange,
     ) -> Result<Arc<Self>, JobStoreShardError> {
+        cfg.validate()
+            .map_err(JobStoreShardError::InvalidArgument)?;
         let resolved = resolve_object_store(&cfg.backend, &cfg.path)?;
 
         // Configure separate WAL object store if specified, and track for cleanup on close
