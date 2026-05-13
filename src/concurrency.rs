@@ -724,7 +724,7 @@ impl ConcurrencyManager {
         let start = concurrency_requests_prefix();
         let end = end_bound(&start);
         let mut iter = match db
-            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options_uncached())
             .await
         {
             Ok(i) => i,

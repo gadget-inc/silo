@@ -90,3 +90,11 @@ pub static rjem_malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
 pub fn scan_options() -> slatedb::config::ScanOptions {
     slatedb::config::ScanOptions::default().with_cache_blocks(true)
 }
+
+/// Variant of [`scan_options`] for full-prefix / one-shot scans where the
+/// scanned data is unlikely to be re-read soon. Disables block caching to
+/// avoid evicting hot blocks used by short-range scans on the steady-state
+/// path.
+pub fn scan_options_uncached() -> slatedb::config::ScanOptions {
+    scan_options().with_cache_blocks(false)
+}
