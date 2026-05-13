@@ -163,6 +163,11 @@ pub struct Metrics {
     concurrency_reconcile_peak_allocated_bytes: HistogramVec,
     concurrency_reconcile_peak_resident_bytes: HistogramVec,
     concurrency_reconcile_total: CounterVec,
+    concurrency_process_grants_total: CounterVec,
+    concurrency_process_grants_passes_total: CounterVec,
+    concurrency_process_grants_stale_total: CounterVec,
+    concurrency_process_grants_duration: HistogramVec,
+    concurrency_process_grants_keys_scanned: HistogramVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -503,6 +508,39 @@ impl Metrics {
         self.concurrency_reconcile_peak_resident_bytes
             .with_label_values(&[shard])
             .observe(peak_resident_bytes.max(0) as f64);
+    }
+
+    /// Record one invocation of `ConcurrencyManager::process_grants`.
+    ///
+    /// `passes` is the number of scan→validate→commit passes the call ran
+    /// (the outer `while total_granted < count` loop). `keys_scanned` is the
+    /// total number of CONCURRENCY_REQUESTS rows pulled from the iterator
+    /// across all passes; `stale_deleted` counts request rows deleted for
+    /// being malformed, of an unknown variant, or pointing at a job whose
+    /// status has moved past the request's attempt.
+    pub fn record_concurrency_process_grants(
+        &self,
+        shard: &str,
+        duration_secs: f64,
+        passes: u64,
+        keys_scanned: u64,
+        stale_deleted: u64,
+    ) {
+        self.concurrency_process_grants_total
+            .with_label_values(&[shard])
+            .inc();
+        self.concurrency_process_grants_passes_total
+            .with_label_values(&[shard])
+            .inc_by(passes as f64);
+        self.concurrency_process_grants_stale_total
+            .with_label_values(&[shard])
+            .inc_by(stale_deleted as f64);
+        self.concurrency_process_grants_duration
+            .with_label_values(&[shard])
+            .observe(duration_secs);
+        self.concurrency_process_grants_keys_scanned
+            .with_label_values(&[shard])
+            .observe(keys_scanned as f64);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1317,6 +1355,63 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_process_grants_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_process_grants_total",
+                "Total number of process_grants invocations per shard (each invocation drains pending requests for a single (tenant, queue))",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_process_grants_passes_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_process_grants_passes_total",
+                "Total number of scan->validate->commit passes across all process_grants invocations per shard",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_process_grants_stale_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_process_grants_stale_total",
+                "Total number of request rows deleted by process_grants for being malformed, of unknown variant, or for a non-current job attempt",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_process_grants_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_process_grants_duration_seconds",
+                "Wall time of process_grants invocations per shard",
+            )
+            .buckets(SCAN_DURATION_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_process_grants_keys_scanned = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_process_grants_keys_scanned",
+                "Number of CONCURRENCY_REQUESTS keys read by a single process_grants invocation across all passes",
+            )
+            .buckets(RECONCILE_ITEMS_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
     // SlateDB watcher metrics (driven by Db::subscribe)
     let slatedb_durable_seq = register(
         &registry,
@@ -1421,6 +1516,11 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_reconcile_peak_allocated_bytes,
         concurrency_reconcile_peak_resident_bytes,
         concurrency_reconcile_total,
+        concurrency_process_grants_total,
+        concurrency_process_grants_passes_total,
+        concurrency_process_grants_stale_total,
+        concurrency_process_grants_duration,
+        concurrency_process_grants_keys_scanned,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
         slatedb_manifest_last_l0_seq,

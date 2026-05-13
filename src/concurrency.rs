@@ -962,6 +962,11 @@ impl ConcurrencyManager {
         queue: &str,
         count: u32,
     ) -> Vec<String> {
+        let t0 = std::time::Instant::now();
+        let mut passes: u64 = 0;
+        let mut keys_scanned: u64 = 0;
+        let mut stale_deleted_total: u64 = 0;
+
         if let Err(e) = self.counts.ensure_hydrated(db, range, tenant, queue).await {
             tracing::warn!(
                 error = %e,
@@ -969,6 +974,15 @@ impl ConcurrencyManager {
                 queue = %queue,
                 "grant scanner: failed to hydrate queue"
             );
+            if let Some(ref m) = self.metrics {
+                m.record_concurrency_process_grants(
+                    &self.shard,
+                    t0.elapsed().as_secs_f64(),
+                    passes,
+                    keys_scanned,
+                    stale_deleted_total,
+                );
+            }
             return Vec::new();
         }
 
@@ -984,6 +998,15 @@ impl ConcurrencyManager {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(error = %e, "grant scanner: failed to scan requests");
+                if let Some(ref m) = self.metrics {
+                    m.record_concurrency_process_grants(
+                        &self.shard,
+                        t0.elapsed().as_secs_f64(),
+                        passes,
+                        keys_scanned,
+                        stale_deleted_total,
+                    );
+                }
                 return Vec::new();
             }
         };
@@ -1014,6 +1037,7 @@ impl ConcurrencyManager {
         // so a large accumulated `count` is drained over multiple bounded passes
         // rather than one unbounded one.
         while total_granted < count as usize && !iter_exhausted && !capacity_exhausted {
+            passes += 1;
             let needed = (count as usize - total_granted).min(MAX_GRANTS_PER_PASS);
 
             let mut batch = WriteBatch::new();
@@ -1035,6 +1059,7 @@ impl ConcurrencyManager {
                         break;
                     }
                 };
+                keys_scanned += 1;
 
                 let parsed_req = parse_concurrency_request_key(&kv.key);
 
@@ -1292,8 +1317,21 @@ impl ConcurrencyManager {
                     prior_grants = total_granted,
                     "grant scanner: batch write failed, rolled back this pass's reservations"
                 );
+                if let Some(ref m) = self.metrics {
+                    m.record_concurrency_process_grants(
+                        &self.shard,
+                        t0.elapsed().as_secs_f64(),
+                        passes,
+                        keys_scanned,
+                        stale_deleted_total,
+                    );
+                }
                 return all_granted_groups;
             }
+            // Only count stale deletions after the batch successfully commits;
+            // a failed commit leaves the stale rows in the DB so we'll see them
+            // again next pass.
+            stale_deleted_total += stale_and_corrupt_count as u64;
 
             for (request_id, task_group) in &grants {
                 tracing::debug!(
@@ -1314,6 +1352,16 @@ impl ConcurrencyManager {
 
             total_granted += grants.len();
             all_granted_groups.extend(grants.into_iter().map(|(_, tg)| tg));
+        }
+
+        if let Some(ref m) = self.metrics {
+            m.record_concurrency_process_grants(
+                &self.shard,
+                t0.elapsed().as_secs_f64(),
+                passes,
+                keys_scanned,
+                stale_deleted_total,
+            );
         }
 
         all_granted_groups
