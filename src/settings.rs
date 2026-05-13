@@ -176,7 +176,7 @@ fn default_apply_wal_on_close() -> bool {
     true
 }
 
-pub const DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS: u64 = 5000;
+pub const DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS: u64 = 10_000;
 
 fn default_concurrency_reconcile_interval_ms() -> u64 {
     DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS

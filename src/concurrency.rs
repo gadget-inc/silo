@@ -164,6 +164,14 @@ const STATUS_LOOKUP_CONCURRENCY: usize = 64;
 /// the requested count.
 const MAX_GRANTS_PER_PASS: usize = 256;
 
+/// Number of keys `reconcile_pending_requests` scans through one open
+/// iterator before dropping it and reopening at the next key. Caps the
+/// SST iterator's live heap residency (decoded index entries plus the
+/// buffered data block) so a shard with a very large `CONCURRENCY_REQUESTS`
+/// prefix doesn't accumulate iterator state proportional to the full
+/// prefix size before the sweep finishes.
+const RECONCILE_REOPEN_AFTER: u32 = 4_096;
+
 /// Result of attempting to enqueue a job with concurrency limits
 #[derive(Debug)]
 pub enum RequestTicketOutcome {
@@ -782,56 +790,89 @@ impl ConcurrencyManager {
         let probe = ReconcileMemProbe::start();
         let t0 = std::time::Instant::now();
 
-        let start = concurrency_requests_prefix();
-        let end = end_bound(&start);
-        // Reconciliation is a one-shot cold sweep over the full shard prefix on
-        // a slow cadence; pinning the touched SST blocks into the cache (which
-        // [`crate::scan_options`] does) inflates RSS without any hit-rate gain.
-        let mut iter = match db
-            .scan_with_options::<Vec<u8>, _>(start..end, &crate::cold_scan_options())
-            .await
-        {
-            Ok(i) => i,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "grant scanner: failed to scan requests during reconciliation"
-                );
-                return;
-            }
-        };
+        let prefix = concurrency_requests_prefix();
+        let end = end_bound(&prefix);
 
         // Count pending requests per (tenant, queue)
         let mut queue_counts: BTreeMap<Vec<u8>, (String, String, u32)> = BTreeMap::new();
         let mut keys_scanned: u64 = 0;
-        loop {
-            let kv = match iter.next().await {
-                Ok(Some(kv)) => kv,
-                Ok(None) => break,
+
+        // Drop+reopen pacing: every `RECONCILE_REOPEN_AFTER` keys we drop the
+        // iterator and reopen it just past the last key. This bounds the live
+        // SST iterator state (decoded index entries + buffered data blocks)
+        // across the full sweep — the failure mode without this is that a
+        // shard with millions of pending requests pulls the entire prefix's
+        // worth of SST blocks into the iterator's heap residency before the
+        // sweep finishes.
+        //
+        // The reconcile scan is also a cold sweep, so reopening pays only the
+        // SST index decode cost; data blocks aren't cached either way (see
+        // `cold_scan_options`).
+        let mut next_start: Vec<u8> = prefix;
+        'outer: loop {
+            let mut iter = match db
+                .scan_with_options::<Vec<u8>, _>(
+                    next_start.clone()..end.clone(),
+                    &crate::cold_scan_options(),
+                )
+                .await
+            {
+                Ok(i) => i,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "grant scanner: reconciliation scan iteration error"
+                        "grant scanner: failed to scan requests during reconciliation"
                     );
-                    break;
+                    return;
                 }
             };
-            keys_scanned += 1;
 
-            let Some(parsed) = parse_concurrency_request_key(&kv.key) else {
-                continue;
-            };
+            let mut keys_this_pass: u32 = 0;
+            // Loop until the iterator is exhausted (break 'outer) or we hit
+            // the per-pass cap (continue 'outer to reopen at the next key).
+            loop {
+                let kv = match iter.next().await {
+                    Ok(Some(kv)) => kv,
+                    Ok(None) => break 'outer,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "grant scanner: reconciliation scan iteration error"
+                        );
+                        break 'outer;
+                    }
+                };
+                keys_scanned += 1;
+                keys_this_pass += 1;
 
-            // Only process requests for tenants in our range
-            if !range.contains_tenant(&parsed.tenant) {
-                continue;
+                if let Some(parsed) = parse_concurrency_request_key(&kv.key) {
+                    // Only process requests for tenants in our range
+                    if range.contains_tenant(&parsed.tenant) {
+                        let key = concurrency_counts_key(&parsed.tenant, &parsed.queue);
+                        let entry = queue_counts
+                            .entry(key)
+                            .or_insert_with(|| (parsed.tenant.clone(), parsed.queue.clone(), 0));
+                        entry.2 += 1;
+                    }
+                }
+
+                if keys_this_pass >= RECONCILE_REOPEN_AFTER {
+                    // Advance past this key. Appending a zero byte yields the
+                    // lexicographically next key, which is the smallest key
+                    // the next half-open scan must include. Drop the iterator
+                    // first so the buffered SST blocks and index entries it
+                    // holds are released before the next pass opens fresh
+                    // ones. Yield to the runtime to avoid starving other
+                    // shard tasks if the entire pass ran without awaiting on
+                    // I/O (block cache hits, in-memtable reads).
+                    let mut next = kv.key.to_vec();
+                    next.push(0);
+                    drop(iter);
+                    next_start = next;
+                    tokio::task::yield_now().await;
+                    continue 'outer;
+                }
             }
-
-            let key = concurrency_counts_key(&parsed.tenant, &parsed.queue);
-            let entry = queue_counts
-                .entry(key)
-                .or_insert_with(|| (parsed.tenant.clone(), parsed.queue.clone(), 0));
-            entry.2 += 1;
         }
 
         let queues_found = queue_counts.len() as u64;
