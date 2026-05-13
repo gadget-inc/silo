@@ -166,7 +166,7 @@ impl JobStoreShard {
         txn.delete(&old_task_key)?;
 
         // Generate new task_id and create RunAttempt task
-        let new_task_id = Uuid::new_v4().to_string();
+        let new_task_id = Uuid::now_v7().to_string();
         let run_task = Task::RunAttempt {
             id: new_task_id.clone(),
             tenant: tenant.to_string(),
@@ -215,7 +215,7 @@ impl JobStoreShard {
         // Commit the transaction with durable writes
         txn.commit_with_options(&WriteOptions {
             await_durable: true,
-        })
+        ..Default::default()})
         .await?;
 
         // Post-commit: evict old task key from broker buffer and wake broker

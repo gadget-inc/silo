@@ -24,6 +24,7 @@ pub mod pb_convert;
 pub mod query;
 pub mod retry;
 pub mod routing_client;
+pub mod segment;
 pub mod settings;
 pub mod shard_range;
 pub mod storage;

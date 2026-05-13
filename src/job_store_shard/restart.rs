@@ -151,7 +151,7 @@ impl JobStoreShard {
             .await?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
-        let new_task_id = Uuid::new_v4().to_string();
+        let new_task_id = Uuid::now_v7().to_string();
         let task_group = job_view.task_group().to_string();
         let new_task = Task::RunAttempt {
             id: new_task_id,

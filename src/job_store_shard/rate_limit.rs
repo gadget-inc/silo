@@ -27,7 +27,7 @@ impl JobStoreShard {
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let retry_task = Task::CheckRateLimit {
-            task_id: Uuid::new_v4().to_string(),
+            task_id: Uuid::now_v7().to_string(),
             tenant: tenant.to_string(),
             job_id: job_id.to_string(),
             attempt_number,

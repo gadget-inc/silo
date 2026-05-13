@@ -70,7 +70,7 @@ fn record_grant_outcome(
             grants.push((queue_key.to_string(), current_task_id.clone()));
             current_held_queues.push(queue_key.to_string());
             *current_index += 1;
-            *current_task_id = Uuid::new_v4().to_string();
+            *current_task_id = Uuid::now_v7().to_string();
             GrantResult::Granted
         }
         Some(_) => {
@@ -116,7 +116,7 @@ impl JobStoreShard {
             )
             .await
         } else {
-            let job_id = Uuid::new_v4().to_string();
+            let job_id = Uuid::now_v7().to_string();
             self.enqueue_batch(
                 tenant,
                 &job_id,
@@ -184,7 +184,7 @@ impl JobStoreShard {
                 batch,
                 &WriteOptions {
                     await_durable: true,
-                },
+                ..Default::default()},
             )
             .await
         {
@@ -287,7 +287,7 @@ impl JobStoreShard {
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
-            })
+            ..Default::default()})
             .await
         {
             dst_events::cancel_write(write_op);
@@ -330,7 +330,7 @@ impl JobStoreShard {
         };
         let job_value = encode_job_info(&job);
 
-        let first_task_id = Uuid::new_v4().to_string();
+        let first_task_id = Uuid::now_v7().to_string();
         let effective_start_at_ms = if start_at_ms <= 0 {
             now_ms
         } else {

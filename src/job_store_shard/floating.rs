@@ -116,7 +116,7 @@ impl JobStoreShard {
         }
 
         // Schedule a refresh task
-        let task_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::now_v7().to_string();
         let refresh_task = Task::RefreshFloatingLimit {
             task_id: task_id.clone(),
             tenant: tenant.to_string(),
@@ -292,7 +292,7 @@ impl JobStoreShard {
         batch.put(&state_key, &state_value);
         if has_waiters {
             // Schedule a new refresh task
-            let new_task_id = Uuid::new_v4().to_string();
+            let new_task_id = Uuid::now_v7().to_string();
             let refresh_task = Task::RefreshFloatingLimit {
                 task_id: new_task_id.clone(),
                 tenant: tenant.clone(),

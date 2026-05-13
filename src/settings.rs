@@ -255,6 +255,15 @@ pub struct DatabaseTemplate {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// Enable segment-oriented compaction (slatedb RFC-0024) and pick the
+    /// segment-bucket granularity. `None` disables segmenting; `Some(Date)`
+    /// buckets keys by the UTC date embedded in their UUIDv7 id; `Some(Minute)`
+    /// buckets by minute-of-hour (intended for short-lived test shards). The
+    /// strategy is recorded in the manifest at db-creation time and cannot be
+    /// changed for an existing shard — slatedb refuses to reopen with a
+    /// different extractor name.
+    #[serde(default)]
+    pub compaction_segment: Option<crate::segment::SegmentStrategy>,
 }
 
 impl Default for DatabaseTemplate {
@@ -269,6 +278,7 @@ impl Default for DatabaseTemplate {
             terminal_job_expire_ms: None,
             slatedb: None,
             memory_cache: None,
+            compaction_segment: None,
         }
     }
 }
@@ -536,6 +546,9 @@ pub struct DatabaseConfig {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// See `DatabaseTemplate::compaction_segment`.
+    #[serde(default)]
+    pub compaction_segment: Option<crate::segment::SegmentStrategy>,
 }
 
 impl Default for DatabaseConfig {
@@ -550,6 +563,7 @@ impl Default for DatabaseConfig {
             terminal_job_expire_ms: None,
             slatedb: None,
             memory_cache: None,
+            compaction_segment: None,
         }
     }
 }

@@ -207,7 +207,7 @@ impl JobStoreShard {
         let num_attempts = params.attempts.len() as u32;
         for (i, imported) in params.attempts.iter().enumerate() {
             let attempt_number = (i as u32) + 1;
-            let task_id = Uuid::new_v4().to_string();
+            let task_id = Uuid::now_v7().to_string();
 
             let status = match &imported.status {
                 ImportedAttemptStatus::Succeeded { result } => AttemptStatus::Succeeded {
@@ -255,7 +255,7 @@ impl JobStoreShard {
         let mut grants = Vec::new();
         if !is_terminal {
             let next_attempt = num_attempts + 1;
-            let task_id = Uuid::new_v4().to_string();
+            let task_id = Uuid::now_v7().to_string();
 
             grants = self
                 .enqueue_limit_task_at_index(
@@ -302,7 +302,7 @@ impl JobStoreShard {
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
-            })
+            ..Default::default()})
             .await
         {
             if let Some(op) = write_op {
@@ -484,7 +484,7 @@ impl JobStoreShard {
         for i in existing_count..params.attempts.len() {
             let imported = &params.attempts[i];
             let attempt_number = (i as u32) + 1;
-            let task_id = Uuid::new_v4().to_string();
+            let task_id = Uuid::now_v7().to_string();
 
             let status = match &imported.status {
                 ImportedAttemptStatus::Succeeded { result } => AttemptStatus::Succeeded {
@@ -630,7 +630,7 @@ impl JobStoreShard {
         let mut grants = Vec::new();
         if !is_terminal {
             let next_attempt = total_attempts + 1;
-            let new_task_id = Uuid::new_v4().to_string();
+            let new_task_id = Uuid::now_v7().to_string();
 
             // [SILO-REIMP-8] status = Scheduled
             // [SILO-REIMP-9] new task in DB queue, old tasks for j removed
@@ -687,7 +687,7 @@ impl JobStoreShard {
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
-            })
+            ..Default::default()})
             .await
         {
             if let Some(op) = write_op {

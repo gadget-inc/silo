@@ -803,10 +803,9 @@ cache_puts = true
         slatedb_settings.l0_max_ssts, defaults.l0_max_ssts,
         "l0_max_ssts should use default"
     );
-    assert_eq!(
-        slatedb_settings.filter_bits_per_key, defaults.filter_bits_per_key,
-        "filter_bits_per_key should use default"
-    );
+    // `filter_bits_per_key` moved out of `Settings` in slatedb
+    // 628821513 — it is now a `BloomFilterPolicy::new(bits_per_key)`
+    // argument set via `DbBuilder`. Nothing to assert on `Settings`.
     assert_eq!(
         slatedb_settings.object_store_cache_options.part_size_bytes,
         defaults.object_store_cache_options.part_size_bytes,

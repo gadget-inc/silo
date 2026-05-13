@@ -7,10 +7,21 @@
 //! - Strings use null-terminated escape encoding (embedded nulls are escaped)
 //! - Integers use big-endian encoding for correct lexicographic ordering
 //! - Tuples encode each field sequentially
+//!
+//! # Segment prefix
+//!
+//! When segment-oriented compaction is enabled (see [`crate::segment`]),
+//! every key is prefixed with a fixed-length segment-bucket marker
+//! derived from the entity id (UUIDv7 timestamp) or — for keys without
+//! a natural timestamp source — a constant sentinel. The segment-prefix
+//! comes *before* the namespace byte, so slatedb's `PrefixExtractor`
+//! sees it at offset 0. Parse functions transparently skip past it
+//! using [`crate::segment::prefix_len`].
 
 use storekey::{decode, encode_vec};
 
 use crate::job::{JobStatus, JobStatusKind};
+use crate::segment;
 
 pub mod prefix {
     pub const JOB_INFO: u8 = 0x01;
@@ -35,27 +46,82 @@ pub mod prefix {
     pub const COUNTER_TENANT_STATUS: u8 = 0xF8;
 }
 
-/// Encode a key with its namespace prefix.
-fn encode_with_prefix<T: storekey::Encode>(prefix: u8, data: &T) -> Vec<u8> {
-    let mut buf = vec![prefix];
+/// Encode a key with a caller-supplied segment prefix and the namespace
+/// byte. `segment_bytes` is empty when segmentation is disabled, so this
+/// degrades to the legacy `[prefix][encoded data]` layout.
+fn encode<T: storekey::Encode>(segment_bytes: &[u8], prefix: u8, data: &T) -> Vec<u8> {
     let encoded = encode_vec(data).expect("storekey encoding should not fail for valid data");
+    let mut buf = Vec::with_capacity(segment_bytes.len() + 1 + encoded.len());
+    buf.extend_from_slice(segment_bytes);
+    buf.push(prefix);
     buf.extend(encoded);
     buf
 }
 
+/// Encode a key whose segment bucket comes from a UUIDv7 entity id.
+fn encode_by_id<T: storekey::Encode>(id: &str, prefix: u8, data: &T) -> Vec<u8> {
+    encode(&segment::prefix_for_id(id), prefix, data)
+}
+
+/// Encode a key whose segment bucket comes from a Unix-ms timestamp
+/// already present in the key components.
+fn encode_by_unix_ms<T: storekey::Encode>(ms: i64, prefix: u8, data: &T) -> Vec<u8> {
+    encode(&segment::prefix_for_unix_ms(ms), prefix, data)
+}
+
+/// Encode a key that has no natural timestamp source — routes through
+/// the sentinel segment. All such keys share one segment, so this is
+/// the right choice only for low-cardinality records (counters,
+/// cleanup state, shard metadata) where co-location is harmless.
+fn encode_sentinel<T: storekey::Encode>(prefix: u8, data: &T) -> Vec<u8> {
+    encode(&segment::prefix_sentinel(), prefix, data)
+}
+
+/// Build a singleton key (no encoded body, just a single namespace
+/// byte) routed through the sentinel segment.
+fn singleton_sentinel(prefix: u8) -> Vec<u8> {
+    let seg = segment::prefix_sentinel();
+    let mut buf = Vec::with_capacity(seg.len() + 1);
+    buf.extend_from_slice(&seg);
+    buf.push(prefix);
+    buf
+}
+
+/// Strip the segment-prefix bytes off a stored key and verify its
+/// namespace byte. Returns the slice of bytes after the namespace byte,
+/// ready to feed to `storekey::decode`. The segment length is read
+/// dynamically from [`crate::segment::prefix_len`] so the same parse
+/// code works whether or not segmentation is enabled at runtime.
+fn after_prefix<'a>(key: &'a [u8], expected: u8) -> Option<&'a [u8]> {
+    let seg_len = segment::prefix_len();
+    if key.len() < seg_len + 1 {
+        return None;
+    }
+    if key[seg_len] != expected {
+        return None;
+    }
+    Some(&key[seg_len + 1..])
+}
+
 /// The KV store key for a given job's info by id.
 pub fn job_info_key(tenant: &str, job_id: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::JOB_INFO, &(tenant, job_id))
+    encode_by_id(job_id, prefix::JOB_INFO, &(tenant, job_id))
 }
 
-/// Prefix for scanning all jobs for a tenant.
+/// Prefix for scanning all jobs for a tenant. **Note**: when
+/// segmentation is enabled this no longer naturally matches stored
+/// keys (since each key starts with its segment bucket), so the
+/// returned bytes are only useful as a parse pattern, not a scan
+/// range. Callers that need to enumerate all tenant jobs must iterate
+/// per-segment.
 pub fn job_info_prefix(tenant: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::JOB_INFO, &(tenant,))
+    encode_sentinel(prefix::JOB_INFO, &(tenant,))
 }
 
-/// Prefix for scanning all jobs across all tenants.
+/// Prefix for scanning all jobs across all tenants. See
+/// [`job_info_prefix`] for the segmentation caveat.
 pub fn jobs_prefix() -> Vec<u8> {
-    vec![prefix::JOB_INFO]
+    singleton_sentinel(prefix::JOB_INFO)
 }
 
 /// Parsed job info key components.
@@ -67,26 +133,24 @@ pub struct ParsedJobInfoKey {
 
 /// Parse a job info key back to its components.
 pub fn parse_job_info_key(key: &[u8]) -> Option<ParsedJobInfoKey> {
-    if key.first() != Some(&prefix::JOB_INFO) {
-        return None;
-    }
-    let (tenant, job_id): (String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::JOB_INFO)?;
+    let (tenant, job_id): (String, String) = decode(rest).ok()?;
     Some(ParsedJobInfoKey { tenant, job_id })
 }
 
 /// The KV store key for a given job's status.
 pub fn job_status_key(tenant: &str, job_id: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::JOB_STATUS, &(tenant, job_id))
+    encode_by_id(job_id, prefix::JOB_STATUS, &(tenant, job_id))
 }
 
 /// Prefix for scanning all status records for a tenant.
 pub fn job_status_prefix(tenant: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::JOB_STATUS, &(tenant,))
+    encode_sentinel(prefix::JOB_STATUS, &(tenant,))
 }
 
 /// Prefix for scanning all status records across all tenants.
 pub fn jobs_status_prefix() -> Vec<u8> {
-    vec![prefix::JOB_STATUS]
+    singleton_sentinel(prefix::JOB_STATUS)
 }
 
 /// Parsed job status key components (same structure as job info).
@@ -98,10 +162,8 @@ pub struct ParsedJobStatusKey {
 
 /// Parse a job status key back to its components.
 pub fn parse_job_status_key(key: &[u8]) -> Option<ParsedJobStatusKey> {
-    if key.first() != Some(&prefix::JOB_STATUS) {
-        return None;
-    }
-    let (tenant, job_id): (String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::JOB_STATUS)?;
+    let (tenant, job_id): (String, String) = decode(rest).ok()?;
     Some(ParsedJobStatusKey { tenant, job_id })
 }
 
@@ -113,12 +175,16 @@ pub fn idx_status_time_key(
     job_id: &str,
 ) -> Vec<u8> {
     let inv: u64 = u64::MAX - (changed_at_ms.max(0) as u64);
-    encode_with_prefix(prefix::IDX_STATUS_TIME, &(tenant, status, inv, job_id))
+    encode_by_id(
+        job_id,
+        prefix::IDX_STATUS_TIME,
+        &(tenant, status, inv, job_id),
+    )
 }
 
 /// Prefix for scanning status index for a tenant and status.
 pub fn idx_status_time_prefix(tenant: &str, status: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::IDX_STATUS_TIME, &(tenant, status))
+    encode_sentinel(prefix::IDX_STATUS_TIME, &(tenant, status))
 }
 
 /// Prefix for scanning status index for a tenant, status, and time bound.
@@ -128,7 +194,7 @@ pub fn idx_status_time_prefix_with_time(
     status: &str,
     inverted_timestamp: u64,
 ) -> Vec<u8> {
-    encode_with_prefix(
+    encode_sentinel(
         prefix::IDX_STATUS_TIME,
         &(tenant, status, inverted_timestamp),
     )
@@ -136,12 +202,12 @@ pub fn idx_status_time_prefix_with_time(
 
 /// Prefix for scanning all status/time index entries for a single tenant (all statuses).
 pub fn idx_status_time_tenant_prefix(tenant: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::IDX_STATUS_TIME, &(tenant,))
+    encode_sentinel(prefix::IDX_STATUS_TIME, &(tenant,))
 }
 
 /// Prefix for scanning all status index entries (cross-tenant).
 pub fn idx_status_time_all_prefix() -> Vec<u8> {
-    vec![prefix::IDX_STATUS_TIME]
+    singleton_sentinel(prefix::IDX_STATUS_TIME)
 }
 
 /// Parsed status/time index key components.
@@ -162,11 +228,9 @@ impl ParsedStatusTimeIndexKey {
 
 /// Parse a status/time index key back to its components.
 pub fn parse_status_time_index_key(key: &[u8]) -> Option<ParsedStatusTimeIndexKey> {
-    if key.first() != Some(&prefix::IDX_STATUS_TIME) {
-        return None;
-    }
+    let rest = after_prefix(key, prefix::IDX_STATUS_TIME)?;
     let (tenant, status, inverted_timestamp, job_id): (String, String, u64, String) =
-        decode(&key[1..]).ok()?;
+        decode(rest).ok()?;
     Some(ParsedStatusTimeIndexKey {
         tenant,
         status,
@@ -191,18 +255,22 @@ pub fn status_index_timestamp(status: &JobStatus) -> i64 {
 
 /// Index: jobs by metadata key/value (unsorted within key/value).
 pub fn idx_metadata_key(tenant: &str, key: &str, value: &str, job_id: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::IDX_METADATA, &(tenant, key, value, job_id))
+    encode_by_id(
+        job_id,
+        prefix::IDX_METADATA,
+        &(tenant, key, value, job_id),
+    )
 }
 
 /// Prefix for scanning jobs by metadata key/value.
 pub fn idx_metadata_prefix(tenant: &str, key: &str, value: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::IDX_METADATA, &(tenant, key, value))
+    encode_sentinel(prefix::IDX_METADATA, &(tenant, key, value))
 }
 
 /// Prefix for scanning jobs by metadata key only (all values for a given tenant + key).
 /// Used as the end boundary for prefix scans over metadata values.
 pub fn idx_metadata_key_only_prefix(tenant: &str, key: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::IDX_METADATA, &(tenant, key))
+    encode_sentinel(prefix::IDX_METADATA, &(tenant, key))
 }
 
 /// Parsed metadata index key components.
@@ -216,10 +284,8 @@ pub struct ParsedMetadataIndexKey {
 
 /// Parse a metadata index key back to its components.
 pub fn parse_metadata_index_key(key: &[u8]) -> Option<ParsedMetadataIndexKey> {
-    if key.first() != Some(&prefix::IDX_METADATA) {
-        return None;
-    }
-    let (tenant, k, value, job_id): (String, String, String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::IDX_METADATA)?;
+    let (tenant, k, value, job_id): (String, String, String, String) = decode(rest).ok()?;
     Some(ParsedMetadataIndexKey {
         tenant,
         key: k,
@@ -236,7 +302,8 @@ pub fn task_key(
     job_id: &str,
     attempt: u32,
 ) -> Vec<u8> {
-    encode_with_prefix(
+    encode_by_id(
+        job_id,
         prefix::TASK,
         &(
             task_group,
@@ -250,12 +317,12 @@ pub fn task_key(
 
 /// Get the prefix for scanning all tasks in a specific task group.
 pub fn task_group_prefix(task_group: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::TASK, &(task_group,))
+    encode_sentinel(prefix::TASK, &(task_group,))
 }
 
 /// Get the prefix for scanning all task groups.
 pub fn tasks_prefix() -> Vec<u8> {
-    vec![prefix::TASK]
+    singleton_sentinel(prefix::TASK)
 }
 
 /// Parsed task key components.
@@ -270,11 +337,9 @@ pub struct ParsedTaskKey {
 
 /// Parse a task key back to its components.
 pub fn parse_task_key(key: &[u8]) -> Option<ParsedTaskKey> {
-    if key.first() != Some(&prefix::TASK) {
-        return None;
-    }
+    let rest = after_prefix(key, prefix::TASK)?;
     let (task_group, start_time_ms, priority, job_id, attempt): (String, u64, u8, String, u32) =
-        decode(&key[1..]).ok()?;
+        decode(rest).ok()?;
     Some(ParsedTaskKey {
         task_group,
         start_time_ms,
@@ -286,12 +351,12 @@ pub fn parse_task_key(key: &[u8]) -> Option<ParsedTaskKey> {
 
 /// Construct the key for a leased task by task id.
 pub fn leased_task_key(task_id: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::LEASE, &(task_id,))
+    encode_by_id(task_id, prefix::LEASE, &(task_id,))
 }
 
 /// Prefix for scanning all lease keys.
 pub fn leases_prefix() -> Vec<u8> {
-    vec![prefix::LEASE]
+    singleton_sentinel(prefix::LEASE)
 }
 
 /// Parsed lease key components.
@@ -302,21 +367,21 @@ pub struct ParsedLeaseKey {
 
 /// Parse a lease key back to its components.
 pub fn parse_lease_key(key: &[u8]) -> Option<ParsedLeaseKey> {
-    if key.first() != Some(&prefix::LEASE) {
-        return None;
-    }
-    let (task_id,): (String,) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::LEASE)?;
+    let (task_id,): (String,) = decode(rest).ok()?;
     Some(ParsedLeaseKey { task_id })
 }
 
 /// Construct the key for an attempt record.
 pub fn attempt_key(tenant: &str, job_id: &str, attempt: u32) -> Vec<u8> {
-    encode_with_prefix(prefix::ATTEMPT, &(tenant, job_id, attempt))
+    encode_by_id(job_id, prefix::ATTEMPT, &(tenant, job_id, attempt))
 }
 
 /// Construct the prefix for scanning all attempts of a job.
 pub fn attempt_prefix(tenant: &str, job_id: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::ATTEMPT, &(tenant, job_id))
+    // A job's attempts all share the job_id's segment, so we can route
+    // this prefix scan deterministically to a single segment.
+    encode_by_id(job_id, prefix::ATTEMPT, &(tenant, job_id))
 }
 
 /// Parsed attempt key components.
@@ -329,10 +394,8 @@ pub struct ParsedAttemptKey {
 
 /// Parse an attempt key back to its components.
 pub fn parse_attempt_key(key: &[u8]) -> Option<ParsedAttemptKey> {
-    if key.first() != Some(&prefix::ATTEMPT) {
-        return None;
-    }
-    let (tenant, job_id, attempt): (String, String, u32) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::ATTEMPT)?;
+    let (tenant, job_id, attempt): (String, String, u32) = decode(rest).ok()?;
     Some(ParsedAttemptKey {
         tenant,
         job_id,
@@ -356,7 +419,8 @@ pub fn concurrency_request_key(
     attempt_number: u32,
     suffix: &str,
 ) -> Vec<u8> {
-    encode_with_prefix(
+    encode_by_id(
+        job_id,
         prefix::CONCURRENCY_REQUEST,
         &(
             (tenant, queue, start_time_ms.max(0) as u64, priority),
@@ -367,12 +431,12 @@ pub fn concurrency_request_key(
 
 /// Prefix for scanning all requests for a tenant/queue.
 pub fn concurrency_request_prefix(tenant: &str, queue: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::CONCURRENCY_REQUEST, &(tenant, queue))
+    encode_sentinel(prefix::CONCURRENCY_REQUEST, &(tenant, queue))
 }
 
 /// Prefix for scanning all requests for a tenant.
 pub fn concurrency_request_tenant_prefix(tenant: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::CONCURRENCY_REQUEST, &(tenant,))
+    encode_sentinel(prefix::CONCURRENCY_REQUEST, &(tenant,))
 }
 
 /// Prefix for scanning a specific job's concurrency requests within a (tenant, queue, start_time, priority) bucket.
@@ -385,7 +449,8 @@ pub fn concurrency_request_job_prefix(
     job_id: &str,
     attempt_number: u32,
 ) -> Vec<u8> {
-    encode_with_prefix(
+    encode_by_id(
+        job_id,
         prefix::CONCURRENCY_REQUEST,
         &(
             tenant,
@@ -400,7 +465,7 @@ pub fn concurrency_request_job_prefix(
 
 /// Prefix for scanning all concurrency requests (cross-tenant).
 pub fn concurrency_requests_prefix() -> Vec<u8> {
-    vec![prefix::CONCURRENCY_REQUEST]
+    singleton_sentinel(prefix::CONCURRENCY_REQUEST)
 }
 
 /// Parsed concurrency request key components.
@@ -427,13 +492,11 @@ impl ParsedConcurrencyRequestKey {
 /// but nested tuples encode identically to flat tuples since encoding is sequential).
 #[allow(clippy::type_complexity)]
 pub fn parse_concurrency_request_key(key: &[u8]) -> Option<ParsedConcurrencyRequestKey> {
-    if key.first() != Some(&prefix::CONCURRENCY_REQUEST) {
-        return None;
-    }
+    let rest = after_prefix(key, prefix::CONCURRENCY_REQUEST)?;
     let ((tenant, queue, start_time_ms, priority), (job_id, attempt_number, suffix)): (
         (String, String, u64, u8),
         (String, u32, String),
-    ) = decode(&key[1..]).ok()?;
+    ) = decode(rest).ok()?;
     Some(ParsedConcurrencyRequestKey {
         tenant,
         queue,
@@ -447,22 +510,26 @@ pub fn parse_concurrency_request_key(key: &[u8]) -> Option<ParsedConcurrencyRequ
 
 /// Concurrency holders set key.
 pub fn concurrency_holder_key(tenant: &str, queue: &str, task_id: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::CONCURRENCY_HOLDER, &(tenant, queue, task_id))
+    encode_by_id(
+        task_id,
+        prefix::CONCURRENCY_HOLDER,
+        &(tenant, queue, task_id),
+    )
 }
 
 /// Prefix for scanning all holders (cross-tenant).
 pub fn concurrency_holders_prefix() -> Vec<u8> {
-    vec![prefix::CONCURRENCY_HOLDER]
+    singleton_sentinel(prefix::CONCURRENCY_HOLDER)
 }
 
 /// Prefix for scanning all holders for a tenant.
 pub fn concurrency_holders_tenant_prefix(tenant: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::CONCURRENCY_HOLDER, &(tenant,))
+    encode_sentinel(prefix::CONCURRENCY_HOLDER, &(tenant,))
 }
 
 /// Prefix for scanning all holders for a tenant/queue.
 pub fn concurrency_holders_queue_prefix(tenant: &str, queue: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::CONCURRENCY_HOLDER, &(tenant, queue))
+    encode_sentinel(prefix::CONCURRENCY_HOLDER, &(tenant, queue))
 }
 
 /// Parsed concurrency holder key components.
@@ -475,10 +542,8 @@ pub struct ParsedConcurrencyHolderKey {
 
 /// Parse a concurrency holder key back to its components.
 pub fn parse_concurrency_holder_key(key: &[u8]) -> Option<ParsedConcurrencyHolderKey> {
-    if key.first() != Some(&prefix::CONCURRENCY_HOLDER) {
-        return None;
-    }
-    let (tenant, queue, task_id): (String, String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::CONCURRENCY_HOLDER)?;
+    let (tenant, queue, task_id): (String, String, String) = decode(rest).ok()?;
     Some(ParsedConcurrencyHolderKey {
         tenant,
         queue,
@@ -489,7 +554,7 @@ pub fn parse_concurrency_holder_key(key: &[u8]) -> Option<ParsedConcurrencyHolde
 /// The KV store key for a job's cancellation flag.
 /// Cancellation is stored separately from status to allow dequeue to blindly write Running without losing cancellation info.
 pub fn job_cancelled_key(tenant: &str, job_id: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::JOB_CANCELLED, &(tenant, job_id))
+    encode_by_id(job_id, prefix::JOB_CANCELLED, &(tenant, job_id))
 }
 
 /// Parsed job cancelled key components.
@@ -501,17 +566,15 @@ pub struct ParsedJobCancelledKey {
 
 /// Parse a job cancelled key back to its components.
 pub fn parse_job_cancelled_key(key: &[u8]) -> Option<ParsedJobCancelledKey> {
-    if key.first() != Some(&prefix::JOB_CANCELLED) {
-        return None;
-    }
-    let (tenant, job_id): (String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::JOB_CANCELLED)?;
+    let (tenant, job_id): (String, String) = decode(rest).ok()?;
     Some(ParsedJobCancelledKey { tenant, job_id })
 }
 
 /// The KV store key for a floating concurrency limit's state.
 /// Stores the current max concurrency, last refresh time, and refresh task status.
 pub fn floating_limit_state_key(tenant: &str, queue_key: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::FLOATING_LIMIT, &(tenant, queue_key))
+    encode_sentinel(prefix::FLOATING_LIMIT, &(tenant, queue_key))
 }
 
 /// Parsed floating limit state key components.
@@ -523,61 +586,59 @@ pub struct ParsedFloatingLimitKey {
 
 /// Parse a floating limit state key back to its components.
 pub fn parse_floating_limit_key(key: &[u8]) -> Option<ParsedFloatingLimitKey> {
-    if key.first() != Some(&prefix::FLOATING_LIMIT) {
-        return None;
-    }
-    let (tenant, queue_key): (String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::FLOATING_LIMIT)?;
+    let (tenant, queue_key): (String, String) = decode(rest).ok()?;
     Some(ParsedFloatingLimitKey { tenant, queue_key })
 }
 
 /// Key for the total jobs counter for this shard.
 /// This counts all jobs that exist in the shard (not deleted).
 pub fn shard_total_jobs_counter_key() -> Vec<u8> {
-    vec![prefix::COUNTER_TOTAL_JOBS]
+    singleton_sentinel(prefix::COUNTER_TOTAL_JOBS)
 }
 
 /// Key for the completed jobs counter for this shard.
 /// This counts jobs that have reached a terminal state (Succeeded, Failed, or Cancelled).
 pub fn shard_completed_jobs_counter_key() -> Vec<u8> {
-    vec![prefix::COUNTER_COMPLETED_JOBS]
+    singleton_sentinel(prefix::COUNTER_COMPLETED_JOBS)
 }
 
 /// Key for storing cleanup progress checkpoint (for resumption after crash).
 pub fn cleanup_progress_key() -> Vec<u8> {
-    vec![prefix::CLEANUP_PROGRESS]
+    singleton_sentinel(prefix::CLEANUP_PROGRESS)
 }
 
 /// Key for storing cleanup completion marker.
 pub fn cleanup_complete_key() -> Vec<u8> {
-    vec![prefix::CLEANUP_COMPLETE]
+    singleton_sentinel(prefix::CLEANUP_COMPLETE)
 }
 
 /// Key for storing the authoritative cleanup status for this shard.
 /// This is the source of truth for whether the shard needs cleanup work.
 pub fn cleanup_status_key() -> Vec<u8> {
-    vec![prefix::CLEANUP_STATUS]
+    singleton_sentinel(prefix::CLEANUP_STATUS)
 }
 
 /// Key for storing the timestamp (ms) when the shard was first created/initialized.
 pub fn shard_created_at_key() -> Vec<u8> {
-    vec![prefix::SHARD_CREATED_AT]
+    singleton_sentinel(prefix::SHARD_CREATED_AT)
 }
 
 /// Key for storing the timestamp (ms) when cleanup completed for this shard.
 /// Only set after a split cleanup finishes.
 pub fn cleanup_completed_at_key() -> Vec<u8> {
-    vec![prefix::CLEANUP_COMPLETED_AT]
+    singleton_sentinel(prefix::CLEANUP_COMPLETED_AT)
 }
 
 /// Key for the per-queue concurrency requester counter.
 /// Tracks the number of pending concurrency requests for a specific tenant/queue.
 pub fn concurrency_requester_counter_key(tenant: &str, queue: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::COUNTER_CONCURRENCY_REQUESTERS, &(tenant, queue))
+    encode_sentinel(prefix::COUNTER_CONCURRENCY_REQUESTERS, &(tenant, queue))
 }
 
 /// Prefix for scanning all concurrency requester counters for a specific tenant.
 pub fn concurrency_requester_counter_tenant_prefix(tenant: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::COUNTER_CONCURRENCY_REQUESTERS, &(tenant,))
+    encode_sentinel(prefix::COUNTER_CONCURRENCY_REQUESTERS, &(tenant,))
 }
 
 /// Parsed concurrency requester counter key components.
@@ -591,15 +652,16 @@ pub struct ParsedConcurrencyRequesterCounterKey {
 pub fn parse_concurrency_requester_counter_key(
     key: &[u8],
 ) -> Option<ParsedConcurrencyRequesterCounterKey> {
-    if key.first() != Some(&prefix::COUNTER_CONCURRENCY_REQUESTERS) {
-        return None;
-    }
-    let (tenant, queue): (String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::COUNTER_CONCURRENCY_REQUESTERS)?;
+    let (tenant, queue): (String, String) = decode(rest).ok()?;
     Some(ParsedConcurrencyRequesterCounterKey { tenant, queue })
 }
 
 /// Construct a composite key for in-memory concurrency queue tracking.
 /// Uses storekey encoding for collision-safe (tenant, queue) pairing.
+///
+/// Not stored in slatedb — purely an in-memory lookup key, so the
+/// segment prefix is intentionally omitted.
 pub fn concurrency_counts_key(tenant: &str, queue: &str) -> Vec<u8> {
     encode_vec(&(tenant, queue)).expect("storekey encoding should not fail")
 }
@@ -607,17 +669,17 @@ pub fn concurrency_counts_key(tenant: &str, queue: &str) -> Vec<u8> {
 /// Key for a per-tenant, per-status counter.
 /// Tracks the number of jobs for each (tenant, status_kind) combination.
 pub fn tenant_status_counter_key(tenant: &str, status_kind: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::COUNTER_TENANT_STATUS, &(tenant, status_kind))
+    encode_sentinel(prefix::COUNTER_TENANT_STATUS, &(tenant, status_kind))
 }
 
 /// Prefix for scanning all tenant status counters.
 pub fn tenant_status_counter_prefix() -> Vec<u8> {
-    vec![prefix::COUNTER_TENANT_STATUS]
+    singleton_sentinel(prefix::COUNTER_TENANT_STATUS)
 }
 
 /// Prefix for scanning all tenant status counters for a specific tenant.
 pub fn tenant_status_counter_tenant_prefix(tenant: &str) -> Vec<u8> {
-    encode_with_prefix(prefix::COUNTER_TENANT_STATUS, &(tenant,))
+    encode_sentinel(prefix::COUNTER_TENANT_STATUS, &(tenant,))
 }
 
 /// Parsed tenant status counter key components.
@@ -629,10 +691,8 @@ pub struct ParsedTenantStatusCounterKey {
 
 /// Parse a tenant status counter key back to its components.
 pub fn parse_tenant_status_counter_key(key: &[u8]) -> Option<ParsedTenantStatusCounterKey> {
-    if key.first() != Some(&prefix::COUNTER_TENANT_STATUS) {
-        return None;
-    }
-    let (tenant, status_kind): (String, String) = decode(&key[1..]).ok()?;
+    let rest = after_prefix(key, prefix::COUNTER_TENANT_STATUS)?;
+    let (tenant, status_kind): (String, String) = decode(rest).ok()?;
     Some(ParsedTenantStatusCounterKey {
         tenant,
         status_kind,
@@ -666,4 +726,35 @@ pub fn end_bound(prefix: &[u8]) -> Vec<u8> {
     let mut fallback = prefix.to_vec();
     fallback.push(0xFF);
     fallback
+}
+
+// `idx_status_time_key`'s timestamp parameter is currently unused for
+// segment routing — the embedded changed_at_ms is informative but the
+// job_id's UUIDv7 stamp wins, since we want every key tied to a job to
+// land in the same segment regardless of which side-index touches it.
+// Keep this helper accessible for callers that want explicit per-ms
+// routing (e.g., tombstone scans built from a `cutoff_ms`).
+#[doc(hidden)]
+pub fn segment_prefix_for_ms(ms: i64) -> Vec<u8> {
+    segment::prefix_for_unix_ms(ms)
+}
+
+// Convenience re-export so callers can build segment-aware scan
+// ranges without depending on `crate::segment` directly.
+#[doc(hidden)]
+pub fn segment_prefix_for_id(id: &str) -> Vec<u8> {
+    segment::prefix_for_id(id)
+}
+
+#[doc(hidden)]
+pub fn segment_prefix_sentinel() -> Vec<u8> {
+    segment::prefix_sentinel()
+}
+
+#[allow(dead_code)]
+fn _unused_to_satisfy_compiler_for_encode_by_unix_ms(ms: i64) -> Vec<u8> {
+    // Retained as a callable reference so the helper isn't dead code
+    // when no key fn currently uses it. Future per-timestamp routing
+    // (e.g. cutoff tombstones) can swap a call site to use it.
+    encode_by_unix_ms(ms, prefix::IDX_STATUS_TIME, &("",))
 }

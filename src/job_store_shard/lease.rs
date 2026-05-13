@@ -73,7 +73,7 @@ impl JobStoreShard {
                 batch,
                 &WriteOptions {
                     await_durable: true,
-                },
+                ..Default::default()},
             )
             .await?;
 
@@ -241,7 +241,7 @@ impl JobStoreShard {
                         // the retry backoff period.
                         let next_attempt_number = attempt_number + 1;
                         let next_relative_attempt_number = relative_attempt_number + 1;
-                        let next_task_id = Uuid::new_v4().to_string();
+                        let next_task_id = Uuid::now_v7().to_string();
 
                         // [SILO-RETRY-5-CONC] Enqueue retry with skip_try_reserve=true.
                         // The old holder is still in-memory (released post-commit), so the
@@ -388,7 +388,7 @@ impl JobStoreShard {
                 batch,
                 &WriteOptions {
                     await_durable: true,
-                },
+                ..Default::default()},
             )
             .await
         {
@@ -742,7 +742,7 @@ impl JobStoreShard {
                 batch,
                 &WriteOptions {
                     await_durable: true,
-                },
+                ..Default::default()},
             )
             .await?;
 

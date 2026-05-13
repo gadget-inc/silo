@@ -93,6 +93,11 @@ pub struct OpenShardOptions {
     /// have their associated KV records re-put with a SlateDB row TTL of this
     /// many milliseconds. `None` disables the feature.
     pub terminal_job_expire_ms: Option<u64>,
+    /// When set, enables segment-oriented compaction by passing a
+    /// `SiloPrefixExtractor` to `DbBuilder`. Must match the value used
+    /// to create the shard — slatedb rejects opens whose extractor name
+    /// disagrees with the manifest. `None` opens in legacy mode.
+    pub compaction_segment: Option<crate::segment::SegmentStrategy>,
 }
 
 fn expand_slatedb_settings_for_shard(
@@ -174,6 +179,8 @@ pub enum JobStoreShardError {
     Codec(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
     #[error("lease not found for task id {0}")]
     LeaseNotFound(String),
     #[error("lease owner mismatch for task id {task_id}: expected {expected}, got {got}")]
@@ -323,6 +330,7 @@ impl JobStoreShard {
                 ),
                 enable_counter_reconciliation: cfg.enable_counter_reconciliation,
                 terminal_job_expire_ms: cfg.terminal_job_expire_ms,
+                compaction_segment: cfg.compaction_segment,
             },
             range,
         )
@@ -361,12 +369,29 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
             enable_counter_reconciliation,
             terminal_job_expire_ms,
+            compaction_segment,
         } = options;
+
+        if let Some(strategy) = compaction_segment {
+            crate::segment::init(strategy).map_err(|existing| {
+                JobStoreShardError::InvalidConfig(format!(
+                    "compaction_segment changed mid-process: configured {:?}, already set to {:?}",
+                    strategy, existing
+                ))
+            })?;
+        }
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
         let mut db_builder = slatedb::DbBuilder::new(db_path, store.clone())
             .with_merge_operator(counters::counter_merge_operator())
             .with_metrics_recorder(slatedb_metrics_recorder.clone());
+
+        if let Some(strategy) = compaction_segment {
+            db_builder = db_builder
+                .with_segment_extractor(Arc::new(crate::segment::SiloPrefixExtractor::new(
+                    strategy,
+                )));
+        }
 
         // Configure separate WAL object store if provided
         if let Some(wal) = wal_store {

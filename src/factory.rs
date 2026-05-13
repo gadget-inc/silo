@@ -193,6 +193,7 @@ impl ShardFactory {
                         ),
                         enable_counter_reconciliation: template.enable_counter_reconciliation,
                         terminal_job_expire_ms: template.terminal_job_expire_ms,
+                        compaction_segment: template.compaction_segment,
                     },
                     range.clone(),
                 )
@@ -576,6 +577,11 @@ impl ShardFactory {
         let mut parent_db_builder =
             slatedb::DbBuilder::new(parent_db_path.as_str(), Arc::clone(&parent_resolved.store))
                 .with_merge_operator(crate::job_store_shard::counter_merge_operator());
+        if let Some(strategy) = crate::segment::current() {
+            parent_db_builder = parent_db_builder.with_segment_extractor(Arc::new(
+                crate::segment::SiloPrefixExtractor::new(strategy),
+            ));
+        }
         if let Some(wal) = &parent_wal_store {
             parent_db_builder = parent_db_builder.with_wal_object_store(Arc::clone(wal));
         }
