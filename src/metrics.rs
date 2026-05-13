@@ -160,8 +160,8 @@ pub struct Metrics {
     concurrency_reconcile_duration: HistogramVec,
     concurrency_reconcile_keys_scanned: HistogramVec,
     concurrency_reconcile_queues_found: HistogramVec,
-    concurrency_reconcile_allocated_delta_bytes: HistogramVec,
-    concurrency_reconcile_resident_delta_bytes: HistogramVec,
+    concurrency_reconcile_peak_allocated_bytes: HistogramVec,
+    concurrency_reconcile_peak_resident_bytes: HistogramVec,
     concurrency_reconcile_total: CounterVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
@@ -467,18 +467,20 @@ impl Metrics {
 
     /// Record one pass of `ConcurrencyManager::reconcile_pending_requests`.
     ///
-    /// `allocated_delta` and `resident_delta` are jemalloc deltas (after - before)
-    /// captured around the scan. They are process-global, so concurrent work on
-    /// other shards bleeds in — but a sustained spike here when reconcile is the
-    /// dominant work isolates whether this scan is the OOM source.
+    /// `peak_allocated_bytes` / `peak_resident_bytes` are the maximum
+    /// `current - baseline` deltas observed across the sweep (sampled at each
+    /// iterator-drop point, when the SST iterator's working set is fully
+    /// realized). They are process-global, so concurrent work on other shards
+    /// bleeds in — but a sustained spike here when reconcile is the dominant
+    /// work isolates whether this scan is the OOM source.
     pub fn record_concurrency_reconcile(
         &self,
         shard: &str,
         duration_secs: f64,
         keys_scanned: u64,
         queues_found: u64,
-        allocated_delta_bytes: i64,
-        resident_delta_bytes: i64,
+        peak_allocated_bytes: i64,
+        peak_resident_bytes: i64,
     ) {
         self.concurrency_reconcile_total
             .with_label_values(&[shard])
@@ -492,15 +494,15 @@ impl Metrics {
         self.concurrency_reconcile_queues_found
             .with_label_values(&[shard])
             .observe(queues_found as f64);
-        // Clamp negative deltas to zero: histograms only meaningfully capture
-        // growth, and negatives mean other code freed more than reconcile
-        // allocated during the window (still useful as the bottom bucket).
-        self.concurrency_reconcile_allocated_delta_bytes
+        // Clamp negative peaks to zero: the peak tracker only updates on
+        // growth, but if jemalloc's stats epoch lands awkwardly the baseline
+        // can exceed every sample. Negatives aren't meaningful for a peak.
+        self.concurrency_reconcile_peak_allocated_bytes
             .with_label_values(&[shard])
-            .observe(allocated_delta_bytes.max(0) as f64);
-        self.concurrency_reconcile_resident_delta_bytes
+            .observe(peak_allocated_bytes.max(0) as f64);
+        self.concurrency_reconcile_peak_resident_bytes
             .with_label_values(&[shard])
-            .observe(resident_delta_bytes.max(0) as f64);
+            .observe(peak_resident_bytes.max(0) as f64);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1291,24 +1293,24 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
-    let concurrency_reconcile_allocated_delta_bytes = register(
+    let concurrency_reconcile_peak_allocated_bytes = register(
         &registry,
         HistogramVec::new(
             HistogramOpts::new(
-                "silo_concurrency_reconcile_allocated_delta_bytes",
-                "Process-global jemalloc stats.allocated delta (after - before) across a reconcile sweep",
+                "silo_concurrency_reconcile_peak_allocated_bytes",
+                "Peak in-flight jemalloc stats.allocated growth observed during a reconcile sweep (sampled at each iterator-drop point so SST iterator working sets are captured before they're freed)",
             )
             .buckets(RECONCILE_BYTES_BUCKETS.to_vec()),
             &["shard"],
         )?,
     );
 
-    let concurrency_reconcile_resident_delta_bytes = register(
+    let concurrency_reconcile_peak_resident_bytes = register(
         &registry,
         HistogramVec::new(
             HistogramOpts::new(
-                "silo_concurrency_reconcile_resident_delta_bytes",
-                "Process-global jemalloc stats.resident delta (after - before) across a reconcile sweep",
+                "silo_concurrency_reconcile_peak_resident_bytes",
+                "Peak jemalloc stats.resident growth observed during a reconcile sweep (high-water mark of resident pages caused by the scan; sticky relative to allocated)",
             )
             .buckets(RECONCILE_BYTES_BUCKETS.to_vec()),
             &["shard"],
@@ -1416,8 +1418,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_reconcile_duration,
         concurrency_reconcile_keys_scanned,
         concurrency_reconcile_queues_found,
-        concurrency_reconcile_allocated_delta_bytes,
-        concurrency_reconcile_resident_delta_bytes,
+        concurrency_reconcile_peak_allocated_bytes,
+        concurrency_reconcile_peak_resident_bytes,
         concurrency_reconcile_total,
         slatedb_durable_seq,
         slatedb_manifest_revisions,

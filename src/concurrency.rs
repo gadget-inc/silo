@@ -68,22 +68,35 @@ use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 use crate::task_broker::TaskBrokerRegistry;
 
-/// Probe for capturing jemalloc allocated/resident deltas across a code region.
+/// Probe for capturing the *peak* jemalloc allocated/resident growth across a
+/// code region with multiple natural sample points.
 ///
-/// `start()` records the current allocated/resident counters (after advancing
-/// the jemalloc stats epoch), and `finish()` re-reads them and returns the
-/// signed deltas. On non-unix or when jemalloc isn't built in, both values
-/// come back as zero.
+/// `start()` records the baseline counters. `observe()` re-reads the counters
+/// and updates the running max of `current - baseline`. `finish()` returns
+/// the peak deltas seen across all `observe()` calls.
 ///
-/// Note: jemalloc's `stats.*` counters are process-global, so concurrent work
-/// on other tasks bleeds into the delta. The delta is still useful as a
-/// directional signal when this scan dominates the shard's work during its
-/// run, and the histogram aggregates across many samples.
+/// This shape matters because the thing we want to size is *in-flight*
+/// allocations (e.g. an SST iterator's buffered blocks), not lasting growth.
+/// A naive before/after probe would miss everything the iterator allocated
+/// and freed before `finish()` — `stats::allocated` is current, not peak. By
+/// `observe()`-ing at each iterator drop point (after `RECONCILE_REOPEN_AFTER`
+/// keys), we capture the iterator's working set right before it's released.
+///
+/// `stats::resident` is sticky — jemalloc keeps physical pages around after
+/// `free` for arena reuse — so it grows monotonically over a region but is
+/// noisier and process-global. The peak metric on resident is roughly the
+/// high-water mark of physical pages this scan caused jemalloc to map.
+///
+/// On non-unix or when jemalloc isn't built in, all values are zero.
 struct ReconcileMemProbe {
     #[cfg(unix)]
-    allocated_before: i64,
+    allocated_baseline: i64,
     #[cfg(unix)]
-    resident_before: i64,
+    resident_baseline: i64,
+    #[cfg(unix)]
+    peak_allocated_delta: i64,
+    #[cfg(unix)]
+    peak_resident_delta: i64,
 }
 
 impl ReconcileMemProbe {
@@ -95,11 +108,14 @@ impl ReconcileMemProbe {
             // advance. If the call fails, we still capture whatever the cache
             // holds — the delta is a relative measure.
             let _ = tikv_jemalloc_ctl::epoch::advance();
-            let allocated_before = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as i64;
-            let resident_before = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as i64;
+            let allocated_baseline =
+                tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as i64;
+            let resident_baseline = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as i64;
             Self {
-                allocated_before,
-                resident_before,
+                allocated_baseline,
+                resident_baseline,
+                peak_allocated_delta: 0,
+                peak_resident_delta: 0,
             }
         }
         #[cfg(not(unix))]
@@ -108,16 +124,30 @@ impl ReconcileMemProbe {
         }
     }
 
-    fn finish(self) -> (i64, i64) {
+    /// Sample the current counters and update the peak deltas. Cheap enough
+    /// to call at each reopen point (every few thousand keys); too expensive
+    /// to call per-key (`epoch::advance` triggers a per-arena stats refresh).
+    fn observe(&mut self) {
         #[cfg(unix)]
         {
             let _ = tikv_jemalloc_ctl::epoch::advance();
-            let allocated_after = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as i64;
-            let resident_after = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as i64;
-            (
-                allocated_after - self.allocated_before,
-                resident_after - self.resident_before,
-            )
+            let allocated_now = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0) as i64;
+            let resident_now = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as i64;
+            let allocated_delta = allocated_now - self.allocated_baseline;
+            let resident_delta = resident_now - self.resident_baseline;
+            if allocated_delta > self.peak_allocated_delta {
+                self.peak_allocated_delta = allocated_delta;
+            }
+            if resident_delta > self.peak_resident_delta {
+                self.peak_resident_delta = resident_delta;
+            }
+        }
+    }
+
+    fn finish(self) -> (i64, i64) {
+        #[cfg(unix)]
+        {
+            (self.peak_allocated_delta, self.peak_resident_delta)
         }
         #[cfg(not(unix))]
         {
@@ -787,7 +817,7 @@ impl ConcurrencyManager {
     /// This is used at grant-scanner startup and by the shard's periodic
     /// reconciliation task to self-heal from missed notifications.
     pub async fn reconcile_pending_requests(&self, db: &InstrumentedDb, range: &ShardRange) {
-        let probe = ReconcileMemProbe::start();
+        let mut probe = ReconcileMemProbe::start();
         let t0 = std::time::Instant::now();
 
         let prefix = concurrency_requests_prefix();
@@ -833,8 +863,15 @@ impl ConcurrencyManager {
             loop {
                 let kv = match iter.next().await {
                     Ok(Some(kv)) => kv,
-                    Ok(None) => break 'outer,
+                    Ok(None) => {
+                        // Sample peak memory before the iterator is dropped
+                        // at the end of this scope so we capture whatever
+                        // working set it built up on this final pass.
+                        probe.observe();
+                        break 'outer;
+                    }
                     Err(e) => {
+                        probe.observe();
                         tracing::warn!(
                             error = %e,
                             "grant scanner: reconciliation scan iteration error"
@@ -857,6 +894,12 @@ impl ConcurrencyManager {
                 }
 
                 if keys_this_pass >= RECONCILE_REOPEN_AFTER {
+                    // Sample peak memory *before* the iterator is dropped:
+                    // its in-flight buffered SST blocks and decoded index
+                    // entries are what we're trying to size, and they're
+                    // gone once we drop it.
+                    probe.observe();
+
                     // Advance past this key. Appending a zero byte yields the
                     // lexicographically next key, which is the smallest key
                     // the next half-open scan must include. Drop the iterator
