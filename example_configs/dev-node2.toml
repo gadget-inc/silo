@@ -29,6 +29,11 @@ path = "./tmp/silo-data/%shard%"
 
 terminal_job_expire_ms = 100
 enable_counter_reconciliation = true
+# Segment-oriented compaction (slatedb RFC-0024). "minute" buckets keys
+# by the minute-of-hour (0..=59) of the entity's UUIDv7 timestamp —
+# short rotation suits process-compose dev runs where shards live
+# briefly. Use "date" for prod-like setups.
+compaction_segment = "minute"
 
 [database.slatedb]
 # flush memtable to ssts frequently for low latency writes
