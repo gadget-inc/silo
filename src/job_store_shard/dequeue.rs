@@ -387,7 +387,7 @@ impl JobStoreShard {
         let outcome = self
             .concurrency
             .process_ticket_request_task(
-                self.db.as_ref(),
+                &self.db,
                 shard_range,
                 &mut state.batch,
                 task_key,

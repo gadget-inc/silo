@@ -466,7 +466,7 @@ impl JobStoreShard {
                     let outcome = self
                         .concurrency
                         .handle_enqueue(
-                            self.db.as_ref(),
+                            &self.db,
                             &self.get_range(),
                             writer,
                             tenant,
@@ -523,7 +523,7 @@ impl JobStoreShard {
                     let outcome = self
                         .concurrency
                         .handle_enqueue(
-                            self.db.as_ref(),
+                            &self.db,
                             &self.get_range(),
                             writer,
                             tenant,

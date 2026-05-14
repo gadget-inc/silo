@@ -40,7 +40,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures::FutureExt;
 use futures::StreamExt;
+use futures::future::{BoxFuture, Shared};
 
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
@@ -89,6 +91,18 @@ impl From<crate::codec::CodecError> for ConcurrencyError {
     }
 }
 
+impl From<Arc<slatedb::Error>> for ConcurrencyError {
+    fn from(e: Arc<slatedb::Error>) -> Self {
+        // Slatedb errors aren't Clone, so the singleflight hydration future yields
+        // Arc<slatedb::Error> for shareable propagation. Stringify into the existing
+        // Slate variant to keep call-site `?` propagation uniform.
+        match Arc::try_unwrap(e) {
+            Ok(err) => ConcurrencyError::Slate(err),
+            Err(arc) => ConcurrencyError::Encoding(arc.to_string()),
+        }
+    }
+}
+
 /// Max in-flight `db.get(job_status_key)` lookups during a single
 /// `process_grants` pass. Caps slatedb-side block-fetch fan-out so the
 /// scanner can't pin unbounded `Bytes` while validating a large pending
@@ -129,21 +143,38 @@ pub enum RequestTicketTaskOutcome {
     JobMissing,
 }
 
+/// Shared future driving a one-shot hydration scan for a queue.
+///
+/// Concurrent first-touch callers all observe `Hydrating(_)` and `.await` the same
+/// `Shared` clone, so the underlying scan runs exactly once. The output is wrapped
+/// in `Arc` because `slatedb::Error` is not `Clone`, and `Shared::Output` must be.
+type HydrateFut = Shared<BoxFuture<'static, Result<(), Arc<slatedb::Error>>>>;
+
+enum HydrationState {
+    /// Never scanned (or last scan errored).
+    NotHydrated,
+    /// A scan is in flight; awaiters get the result from this shared future.
+    Hydrating(HydrateFut),
+    /// Holders set reflects the latest durable state for this shard's range.
+    Hydrated,
+}
+
 /// Per-queue state: hydration status and in-memory holder set.
 ///
-/// Hydration mutations from `hydrate_queue` and reservation mutations from
-/// `try_reserve_internal` both touch `holders` under the same map lock, so
-/// they are serialized. The hydration scan's `insert` is idempotent for any
-/// task_id, so a `try_reserve` racing in parallel with hydration is safe.
+/// The hydration future writes into `holders` (via the same map lock) before
+/// flipping `state` to `Hydrated`. Concurrent `try_reserve_internal` callers may
+/// also write to `holders` while the hydration future is still running; both
+/// paths take the same map lock so mutations are serialized, and the
+/// hydration `insert` is idempotent for any task_id.
 struct QueueEntry {
-    hydrated: bool,
+    state: HydrationState,
     holders: HashSet<String>,
 }
 
 impl QueueEntry {
     fn new() -> Self {
         Self {
-            hydrated: false,
+            state: HydrationState::NotHydrated,
             holders: HashSet::new(),
         }
     }
@@ -153,10 +184,14 @@ impl QueueEntry {
 ///
 /// Combines hydration tracking and holder sets in a single map so that each
 /// `try_reserve` / `release` call performs one lock acquisition and one
-/// lookup rather than two.
+/// lookup rather than two. Hydration is singleflighted: concurrent first-touch
+/// callers share a single `Shared<BoxFuture>` rather than each running its own
+/// scan.
 pub struct ConcurrencyCounts {
-    // Composite key: storekey-encoded (tenant, queue) -> per-queue state
-    queues: Mutex<HashMap<Vec<u8>, QueueEntry>>,
+    // Composite key: storekey-encoded (tenant, queue) -> per-queue state.
+    // Held in an Arc so the spawned hydration driver task can outlive the
+    // caller without borrowing `&self`.
+    queues: Arc<Mutex<HashMap<Vec<u8>, QueueEntry>>>,
 }
 
 impl Default for ConcurrencyCounts {
@@ -168,89 +203,73 @@ impl Default for ConcurrencyCounts {
 impl ConcurrencyCounts {
     pub fn new() -> Self {
         Self {
-            queues: Mutex::new(HashMap::new()),
+            queues: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// Hydrate a specific queue's concurrency holder state from durable storage.
-    ///
-    /// Uses the per-queue prefix for efficient scanning of only the relevant holders. The `range` parameter filters holders to only load those for tenants within the shard's range. This is critical after shard splits - both child shards clone the same holder records, and without filtering, both would think they own the same concurrency tickets, leading to limit violations.
-    pub async fn hydrate_queue(
-        &self,
-        db: &InstrumentedDb,
-        range: &ShardRange,
-        tenant: &str,
-        queue: &str,
-    ) -> Result<(), slatedb::Error> {
-        let key = concurrency_counts_key(tenant, queue);
-
-        // Scan holders for this specific tenant/queue using the queue prefix
-        let start = concurrency_holders_queue_prefix(tenant, queue);
-        let end = end_bound(&start);
-        let mut iter = db
-            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
-            .await?;
-
-        let mut task_ids = Vec::new();
-        loop {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-
-            // Parse holder key to extract tenant, queue, task_id
-            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
-                continue;
-            };
-
-            // Filter by shard range - only hydrate holders for tenants in this shard
-            if !range.contains_tenant(&parsed.tenant) {
-                tracing::debug!(
-                    tenant = %parsed.tenant,
-                    queue = %parsed.queue,
-                    task = %parsed.task_id,
-                    range = %range,
-                    "skipping holder outside shard range during queue hydration"
-                );
-                continue;
-            }
-
-            task_ids.push(parsed.task_id);
-        }
-
-        // Merge scanned ids into the queue entry and mark it hydrated under a single lock
-        {
-            let mut q = self.queues.lock().unwrap();
-            let entry = q.entry(key).or_insert_with(QueueEntry::new);
-            for task_id in task_ids {
-                entry.holders.insert(task_id);
-            }
-            entry.hydrated = true;
-        }
-
-        Ok(())
     }
 
     /// Ensure a queue is hydrated before checking capacity.
     /// Called by try_reserve on first access to each queue.
+    ///
     /// Fast path: if already hydrated, return immediately.
+    /// Slow path: if a scan is in flight, await it; otherwise build a new
+    /// scan future, store it on the entry, spawn a detached driver to keep
+    /// it making progress regardless of caller cancellation, and await.
     pub async fn ensure_hydrated(
         &self,
-        db: &InstrumentedDb,
+        db: &Arc<InstrumentedDb>,
         range: &ShardRange,
         tenant: &str,
         queue: &str,
-    ) -> Result<(), slatedb::Error> {
+    ) -> Result<(), Arc<slatedb::Error>> {
         let key = concurrency_counts_key(tenant, queue);
 
-        // Fast path: check the combined entry
-        {
-            let q = self.queues.lock().unwrap();
-            if q.get(&key).map(|e| e.hydrated).unwrap_or(false) {
-                return Ok(());
+        // Pick an action under the map lock, then drop the lock before awaiting.
+        let action: HydrateAction = {
+            let mut q = self.queues.lock().unwrap();
+            let entry = q.entry(key.clone()).or_insert_with(QueueEntry::new);
+            match &entry.state {
+                HydrationState::Hydrated => HydrateAction::Done,
+                HydrationState::Hydrating(fut) => HydrateAction::Wait(fut.clone()),
+                HydrationState::NotHydrated => {
+                    let fut = build_hydrate_future(
+                        Arc::clone(&self.queues),
+                        Arc::clone(db),
+                        range.clone(),
+                        tenant.to_string(),
+                        queue.to_string(),
+                        key.clone(),
+                    )
+                    .boxed()
+                    .shared();
+                    entry.state = HydrationState::Hydrating(fut.clone());
+                    // Detach a driver so the scan completes even if every awaiting
+                    // caller is cancelled. Dropping the JoinHandle is intentional.
+                    let driver = fut.clone();
+                    tokio::spawn(async move {
+                        let _ = driver.await;
+                    });
+                    HydrateAction::Wait(fut)
+                }
             }
-        }
+        }; // map lock dropped here
 
-        // Slow path: hydrate the queue
-        self.hydrate_queue(db, range, tenant, queue).await
+        match action {
+            HydrateAction::Done => Ok(()),
+            HydrateAction::Wait(fut) => match fut.await {
+                Ok(()) => Ok(()),
+                Err(arc_err) => {
+                    // Reset to NotHydrated so the next caller starts a fresh
+                    // future; do not cache errors permanently.
+                    let mut q = self.queues.lock().unwrap();
+                    if let Some(entry) = q.get_mut(&key)
+                        && matches!(entry.state, HydrationState::Hydrating(_))
+                    {
+                        entry.state = HydrationState::NotHydrated;
+                    }
+                    Err(arc_err)
+                }
+            },
+        }
     }
 
     /// Atomically try to reserve a concurrency slot.
@@ -262,14 +281,14 @@ impl ConcurrencyCounts {
     #[allow(clippy::too_many_arguments)]
     pub async fn try_reserve(
         &self,
-        db: &InstrumentedDb,
+        db: &Arc<InstrumentedDb>,
         range: &ShardRange,
         tenant: &str,
         queue: &str,
         task_id: &str,
         limit: usize,
         job_id: &str,
-    ) -> Result<bool, slatedb::Error> {
+    ) -> Result<bool, ConcurrencyError> {
         // Ensure the queue is hydrated before checking capacity
         self.ensure_hydrated(db, range, tenant, queue).await?;
 
@@ -319,7 +338,7 @@ impl ConcurrencyCounts {
     pub fn mark_hydrated(&self, tenant: &str, queue: &str) {
         let key = concurrency_counts_key(tenant, queue);
         let mut q = self.queues.lock().unwrap();
-        q.entry(key).or_insert_with(QueueEntry::new).hydrated = true;
+        q.entry(key).or_insert_with(QueueEntry::new).state = HydrationState::Hydrated;
     }
 
     /// Synchronous try_reserve for testing when the queue is known to be hydrated or when testing in-memory reservation logic without DB.
@@ -398,6 +417,67 @@ pub struct ConcurrencyCacheStats {
     pub queue_count: usize,
     /// Number of (tenant, queue) pairs that have been hydrated from durable storage.
     pub hydrated_queue_count: usize,
+}
+
+/// Local decision computed under the `queues` lock in `ensure_hydrated`,
+/// returned out of the locked scope so the caller can `.await` without
+/// holding the lock.
+enum HydrateAction {
+    Done,
+    Wait(HydrateFut),
+}
+
+/// Build the future that scans `concurrency_holders_queue_prefix(tenant, queue)`
+/// and, on success, merges results into the entry and flips state to `Hydrated`.
+/// `'static` because it must be `.shared()` and spawned as a detached driver.
+async fn build_hydrate_future(
+    queues: Arc<Mutex<HashMap<Vec<u8>, QueueEntry>>>,
+    db: Arc<InstrumentedDb>,
+    range: ShardRange,
+    tenant: String,
+    queue: String,
+    key: Vec<u8>,
+) -> Result<(), Arc<slatedb::Error>> {
+    let start = concurrency_holders_queue_prefix(&tenant, &queue);
+    let end = end_bound(&start);
+    let mut iter = db
+        .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+        .await
+        .map_err(Arc::new)?;
+
+    let mut task_ids = Vec::new();
+    loop {
+        let maybe = iter.next().await.map_err(Arc::new)?;
+        let Some(kv) = maybe else { break };
+
+        let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
+            continue;
+        };
+
+        // Filter by shard range - only hydrate holders for tenants in this shard
+        if !range.contains_tenant(&parsed.tenant) {
+            tracing::debug!(
+                tenant = %parsed.tenant,
+                queue = %parsed.queue,
+                task = %parsed.task_id,
+                range = %range,
+                "skipping holder outside shard range during queue hydration"
+            );
+            continue;
+        }
+
+        task_ids.push(parsed.task_id);
+    }
+
+    // Merge scanned ids and flip state to Hydrated under a single lock.
+    // Idempotent w.r.t. concurrent try_reserve_internal inserts.
+    let mut q = queues.lock().unwrap();
+    let entry = q.entry(key).or_insert_with(QueueEntry::new);
+    for tid in task_ids {
+        entry.holders.insert(tid);
+    }
+    entry.state = HydrationState::Hydrated;
+    Ok(())
 }
 
 /// The type of concurrency limit for a queue.
@@ -527,7 +607,7 @@ impl ConcurrencyManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_enqueue<W: WriteBatcher>(
         &self,
-        db: &InstrumentedDb,
+        db: &Arc<InstrumentedDb>,
         range: &ShardRange,
         writer: &mut W,
         tenant: &str,
@@ -644,7 +724,7 @@ impl ConcurrencyManager {
     #[allow(clippy::too_many_arguments)]
     pub async fn process_ticket_request_task(
         &self,
-        db: &InstrumentedDb,
+        db: &Arc<InstrumentedDb>,
         range: &ShardRange,
         batch: &mut WriteBatch,
         task_key: &[u8],
@@ -832,7 +912,7 @@ impl ConcurrencyManager {
     /// request queue is exhausted.
     pub(crate) async fn process_grants(
         &self,
-        db: &InstrumentedDb,
+        db: &Arc<InstrumentedDb>,
         range: &ShardRange,
         tenant: &str,
         queue: &str,

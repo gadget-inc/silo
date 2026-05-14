@@ -860,7 +860,7 @@ impl JobStoreShard {
     ) -> Vec<String> {
         let range = self.get_range();
         self.concurrency
-            .process_grants(self.db.as_ref(), &range, tenant, queue, count)
+            .process_grants(&self.db, &range, tenant, queue, count)
             .await
     }
 
