@@ -10,12 +10,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use rand::Rng;
+use silo::cluster_client::ClientConfig;
 use silo::pb::report_outcome_request::Outcome;
 use silo::pb::{
     ConcurrencyLimit, EnqueueRequest, LeaseTasksRequest, Limit, ReportOutcomeRequest,
     SerializedBytes, serialized_bytes,
 };
-use silo::cluster_client::ClientConfig;
 use silo::routing_client::RoutingClient;
 use silo::settings::LogFormat;
 use silo::trace;
