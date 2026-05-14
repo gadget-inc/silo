@@ -273,11 +273,16 @@ pub struct ConcurrencyCounts {
     /// across `.await`, matching the locking discipline at the top of this
     /// module.
     pending_reconciliations: Mutex<BTreeSet<(String, String, String)>>,
+    /// While `false`, `try_reserve_internal` declines grants so callers write
+    /// durable `TicketRequest`s until startup hydration completes.
+    grants_enabled: Arc<AtomicBool>,
 }
 
 impl Default for ConcurrencyCounts {
     fn default() -> Self {
-        Self::new()
+        // Defaulting to grants enabled keeps unit tests using
+        // `ConcurrencyCounts::new()`/`try_reserve_sync` behaving as before.
+        Self::with_config(false, Arc::new(AtomicBool::new(true)))
     }
 }
 
@@ -286,15 +291,22 @@ impl ConcurrencyCounts {
     /// through a real shard open; production code goes through
     /// [`ConcurrencyCounts::with_config`].
     pub fn new() -> Self {
-        Self::with_config(false)
+        Self::default()
     }
 
-    pub fn with_config(hydrate_all_at_startup: bool) -> Self {
+    pub fn with_config(hydrate_all_at_startup: bool, grants_enabled: Arc<AtomicBool>) -> Self {
         Self {
             queues: Arc::new(DashMap::new()),
             hydrate_all_at_startup,
             pending_reconciliations: Mutex::new(BTreeSet::new()),
+            grants_enabled,
         }
+    }
+
+    /// Return `true` when grants are currently enabled. Tests use this to wait
+    /// until startup hydration has flipped the gate.
+    pub fn grants_enabled(&self) -> bool {
+        self.grants_enabled.load(Ordering::SeqCst)
     }
 
     /// Eagerly hydrate every (tenant, queue) pair that has at least one
@@ -303,8 +315,8 @@ impl ConcurrencyCounts {
     /// from the very first operation.
     ///
     /// Queues with zero holders are deliberately skipped — they don't appear
-    /// in the scan, so they're never inserted into `holders` or
-    /// `hydrated_queues`. The lazy `ensure_hydrated` path remains responsible
+    /// in the scan, so no `QueueEntry` is added or marked `Hydrated`. The lazy
+    /// `ensure_hydrated` path remains responsible
     /// for them: when such a queue is first encountered after startup, the
     /// per-queue scan correctly finds zero durable holders (see the
     /// `omittedQueuesAreSafe` assertion in specs/job_shard.als).
@@ -474,6 +486,13 @@ impl ConcurrencyCounts {
         limit: usize,
         job_id: &str,
     ) -> bool {
+        // Startup hydration gate: while grants are disabled, behave as if the
+        // queue is at capacity. The caller falls through to creating a durable
+        // TicketRequest, which the grant scanner drains after hydration.
+        if !self.grants_enabled.load(Ordering::SeqCst) {
+            return false;
+        }
+
         let key = queue_key(tenant, queue);
         let (reserved, holders_len_after) = {
             let mut entry = self.queues.entry(key).or_insert_with(QueueEntry::new);
@@ -841,10 +860,11 @@ impl ConcurrencyManager {
         hydrate_all_at_startup: bool,
         grant_scanner_batch_size: usize,
         grant_scanner_buffer_size: usize,
+        grants_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             shard: shard.into(),
-            counts: ConcurrencyCounts::with_config(hydrate_all_at_startup),
+            counts: ConcurrencyCounts::with_config(hydrate_all_at_startup, grants_enabled),
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
@@ -873,6 +893,10 @@ impl ConcurrencyManager {
 
     fn chain_resumer(&self) -> Option<Arc<dyn LimitChainResumer>> {
         self.chain_resumer.lock().unwrap().clone()
+    /// Notify handle used by the shard's startup hydration task to wake the
+    /// grant scanner once `grants_enabled` flips to true.
+    pub fn wake_grant_scanner(&self) {
+        self.grant_notify.notify_one();
     }
 
     pub fn counts(&self) -> &ConcurrencyCounts {
@@ -1384,6 +1408,19 @@ impl ConcurrencyManager {
         self.grant_running.store(true, Ordering::SeqCst);
         let mgr = Arc::clone(self);
         tokio::spawn(async move {
+            // Wait until grants are enabled before the initial reconciliation
+            // scan. While hydration is still running the in-memory holders
+            // cache is incomplete; granting now could overcommit a queue.
+            // The shard's hydration completion path calls `wake_grant_scanner`,
+            // and `request_grant` also notifies, so we'll be woken once
+            // there's real work to do.
+            while !mgr.counts.grants_enabled() {
+                mgr.grant_notify.notified().await;
+                if !mgr.grant_running.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+
             // Startup: scan for existing pending requests
             mgr.reconcile_pending_requests(&db, &range).await;
 
@@ -1391,6 +1428,12 @@ impl ConcurrencyManager {
                 mgr.grant_notify.notified().await;
                 if !mgr.grant_running.load(Ordering::SeqCst) {
                     break;
+                }
+                // Defensive: a spurious notify before grants are enabled
+                // should not drain work. (The wait loop above already
+                // ensures the *first* reconciliation is gated.)
+                if !mgr.counts.grants_enabled() {
+                    continue;
                 }
 
                 // Inner loop: drain and process until no more pending work

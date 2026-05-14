@@ -95,6 +95,9 @@ impl JobStoreShard {
         tenant: &str,
         jobs: Vec<ImportJobParams>,
     ) -> Result<Vec<ImportJobResult>, JobStoreShardError> {
+        if !self.is_accepting_enqueues() {
+            return Err(JobStoreShardError::ShardHydrating);
+        }
         // Pre-check: reject the entire batch if any job is currently Running.
         for params in &jobs {
             if let Some(status) = self.get_job_status(tenant, &params.id).await?

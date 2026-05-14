@@ -157,12 +157,45 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             grant_scanner_buffer_size: silo::settings::DEFAULT_GRANT_SCANNER_BUFFER_SIZE,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
+            startup_hydration_timeout: None,
         },
         ShardRange::full(),
     )
     .await
     .expect("open shard");
     (tmp, shard)
+}
+
+/// Open a temp shard at `path` with a bounded `startup_hydration_timeout`.
+/// Use for tests that want to exercise the "open before hydration completes"
+/// path. Returns the shard; the caller owns the path/TempDir.
+pub async fn open_temp_shard_at_path_with_hydration_timeout(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::sync::Arc<JobStoreShard> {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let resolved = resolve_object_store(&Backend::Fs, path.to_string_lossy().as_ref())
+        .expect("resolve fs object store");
+    JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &resolved.canonical_path,
+        OpenShardOptions {
+            store: resolved.store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
+            rate_limiter,
+            metrics: None,
+            concurrency_reconcile_interval: Duration::from_millis(50),
+            enable_counter_reconciliation: false,
+            hydrate_all_at_startup: true,
+            startup_hydration_timeout: Some(timeout),
+        },
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard")
 }
 
 /// Open a temp shard with a specific range (useful for testing split-aware behavior)

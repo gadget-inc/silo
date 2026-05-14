@@ -290,6 +290,18 @@ pub struct DatabaseTemplate {
     /// the silo pod itself.
     #[serde(default)]
     pub periodic_full_compaction_s: Option<u64>,
+
+    /// Optional maximum time in milliseconds to spend on startup concurrency
+    /// hydration before opening the shard for enqueues. When unset (the
+    /// default) the shard blocks on hydration before going live. When set,
+    /// the shard becomes available for enqueues after at most this many
+    /// milliseconds even if hydration is still running; ticket granting stays
+    /// disabled until hydration completes. Concurrency-limited enqueues that
+    /// arrive in the gap are written as durable TicketRequests and drained
+    /// by the grant scanner once hydration finishes.
+    #[serde(default)]
+    pub startup_hydration_timeout_ms: Option<u64>,
+
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -319,6 +331,7 @@ impl Default for DatabaseTemplate {
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
+            startup_hydration_timeout_ms: None,
             slatedb: None,
             memory_cache: None,
         }
@@ -594,6 +607,9 @@ pub struct DatabaseConfig {
     /// See `DatabaseTemplate::terminal_job_expire_s` for details.
     #[serde(default)]
     pub terminal_job_expire_s: Option<u64>,
+    /// See `DatabaseTemplate::startup_hydration_timeout_ms` for details.
+    #[serde(default)]
+    pub startup_hydration_timeout_ms: Option<u64>,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -622,6 +638,7 @@ impl Default for DatabaseConfig {
             grant_scanner_buffer_size: default_grant_scanner_buffer_size(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
+            startup_hydration_timeout_ms: None,
             slatedb: None,
             memory_cache: None,
         }

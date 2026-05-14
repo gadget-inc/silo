@@ -118,6 +118,15 @@ pub struct OpenShardOptions {
     /// row TTL of this many seconds. `None` disables the feature for those
     /// jobs.
     pub terminal_job_expire_s: Option<u64>,
+    /// Maximum time to wait for startup concurrency hydration before opening
+    /// the shard for enqueues. `None` (default) preserves the synchronous
+    /// behavior: `open` blocks until the holders cache is fully hydrated, and
+    /// only then accepts enqueues / grants tickets. `Some(d)` opens after at
+    /// most `d` even if hydration is still running — ticket granting stays
+    /// disabled until hydration completes, so any concurrency-limited
+    /// enqueues that arrive in the gap are written as durable TicketRequests
+    /// and drained by the grant scanner once hydration finishes.
+    pub startup_hydration_timeout: Option<Duration>,
 }
 
 /// Compute the row TTL (`expire_ts`, epoch ms) for a job that reached the
@@ -216,6 +225,15 @@ pub struct JobStoreShard {
     /// TTL (seconds) applied to non-success terminal jobs' associated records
     /// (Failed, Cancelled, …). `None` disables the feature for those jobs.
     pub(crate) terminal_job_expire_s: Option<u64>,
+    /// Startup gate: false until startup hydration completes OR the configured
+    /// `startup_hydration_timeout` elapses. Gates the `enqueue` / `import_jobs`
+    /// entry points so callers can't slip work in before the shard is ready.
+    accepting_enqueues: Arc<std::sync::atomic::AtomicBool>,
+    /// Startup gate: false until startup hydration fully completes. Shared with
+    /// `ConcurrencyCounts` (which short-circuits `try_reserve_internal` while
+    /// false) and the grant scanner (which idles while false). Once hydration
+    /// finishes the open flow flips this to true and wakes the scanner.
+    grants_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Error)]
@@ -258,6 +276,8 @@ pub enum JobStoreShardError {
     JobNotLeaseable(#[from] JobNotLeaseableError),
     #[error("transaction conflict during {0}, exceeded max retries")]
     TransactionConflict(String),
+    #[error("shard not accepting enqueues yet (startup hydration in progress)")]
+    ShardHydrating,
 }
 
 /// Information about the LSM tree state of a shard's SlateDB instance.
@@ -399,6 +419,9 @@ impl JobStoreShard {
                 grant_scanner_buffer_size: cfg.grant_scanner_buffer_size,
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
+                startup_hydration_timeout: cfg
+                    .startup_hydration_timeout_ms
+                    .map(|ms| Duration::from_millis(ms)),
             },
             range,
         )
@@ -441,6 +464,7 @@ impl JobStoreShard {
             grant_scanner_buffer_size,
             completed_job_expire_s,
             terminal_job_expire_s,
+            startup_hydration_timeout,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -492,12 +516,19 @@ impl JobStoreShard {
         let shard_span = info_span!("shard", shard = %name);
         let db = db_builder.build().instrument(shard_span.clone()).await?;
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
+
+        let cancellation = CancellationToken::new();
+
+        let accepting_enqueues = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let grants_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
         let concurrency = Arc::new(ConcurrencyManager::new(
             name.clone(),
             metrics.clone(),
             hydrate_all_at_startup,
             grant_scanner_batch_size,
             grant_scanner_buffer_size,
+            Arc::clone(&grants_enabled),
         ));
 
         // Eagerly hydrate the in-memory holders cache from durable storage so
@@ -510,7 +541,80 @@ impl JobStoreShard {
         // singleflighted JIT `ensure_hydrated` path covers each queue on
         // first access.
         if hydrate_all_at_startup {
-            concurrency.counts().hydrate_all(&db, &range).await?;
+            accepting_enqueues.store(false, std::sync::atomic::Ordering::SeqCst);
+            grants_enabled.store(false, std::sync::atomic::Ordering::SeqCst);
+
+            // Run startup hydration. Two modes:
+            //   - `startup_hydration_timeout = None`: synchronous, block until
+            //     hydration is fully done. Both gates flip true before `open`
+            //     returns — behavior is identical to the pre-timer design.
+            //   - `Some(t)`: spawn hydration as a background task; open the shard
+            //     to enqueues after at most `t`. `grants_enabled` only flips when
+            //     hydration actually completes, so concurrency-limited enqueues
+            //     during the gap fall through to creating durable TicketRequests.
+            match startup_hydration_timeout {
+                None => {
+                    concurrency.counts().hydrate_all(&db, &range).await?;
+                    accepting_enqueues.store(true, std::sync::atomic::Ordering::SeqCst);
+                    grants_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+                    concurrency.wake_grant_scanner();
+                }
+                Some(t) => {
+                    let accept_for_timer = Arc::clone(&accepting_enqueues);
+                    let cancel_for_timer = cancellation.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep(t) => {
+                                if !accept_for_timer.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                    tracing::info!(
+                                        timeout_ms = t.as_millis() as u64,
+                                        "startup hydration timer fired; accepting enqueues with grants still gated"
+                                    );
+                                }
+                            }
+                            _ = cancel_for_timer.cancelled() => {}
+                        }
+                    });
+
+                    let concurrency_for_hydrate = Arc::clone(&concurrency);
+                    let db_for_hydrate = Arc::clone(&db);
+                    let range_for_hydrate = range.clone();
+                    let accept_for_hydrate = Arc::clone(&accepting_enqueues);
+                    let grants_for_hydrate = Arc::clone(&grants_enabled);
+                    let cancel_for_hydrate = cancellation.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            res = concurrency_for_hydrate
+                                .counts()
+                                .hydrate_all(&db_for_hydrate, &range_for_hydrate) =>
+                            {
+                                match res {
+                                    Ok(()) => {
+                                        accept_for_hydrate.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        grants_for_hydrate.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        concurrency_for_hydrate.wake_grant_scanner();
+                                        tracing::info!(
+                                            "startup hydration complete; grants enabled"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Fail closed: leave grants_enabled=false so
+                                        // we never grant from a partially-populated
+                                        // cache. The timer still flips
+                                        // accepting_enqueues so non-concurrency
+                                        // enqueues continue to flow.
+                                        tracing::error!(
+                                            error = %e,
+                                            "startup hydration failed; grants remain disabled"
+                                        );
+                                    }
+                                }
+                            }
+                            _ = cancel_for_hydrate.cancelled() => {}
+                        }
+                    });
+                }
+            }
         }
 
         let brokers = TaskBrokerRegistry::new(
@@ -519,6 +623,12 @@ impl JobStoreShard {
             metrics.clone(),
             range.clone(),
         );
+
+        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready.
+        // It takes the instrumented db so its writes are tagged with the shard span too.
+        // The scanner waits internally until `grants_enabled` flips before doing
+        // any work, so it's safe to start it even when hydration is in flight.
+        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
 
         let shard = Arc::new(Self {
             name,
@@ -531,7 +641,7 @@ impl JobStoreShard {
             wal_close_config,
             metrics,
             concurrency_reconcile_interval,
-            cancellation: CancellationToken::new(),
+            cancellation,
             store,
             db_path: db_path.to_string(),
             range: range.clone(),
@@ -539,6 +649,8 @@ impl JobStoreShard {
             background_action_queue_counts: DashMap::new(),
             completed_job_expire_s,
             terminal_job_expire_s,
+            accepting_enqueues,
+            grants_enabled,
         });
 
         // Install the chain resumer before starting the grant scanner so the
@@ -851,6 +963,16 @@ impl JobStoreShard {
                 tokio::select! {
                     biased;
                     _ = interval.tick() => {
+                        // Skip the reconciliation pass while startup hydration
+                        // is in progress — granting from a half-populated cache
+                        // could overcommit a queue. The shard's hydration
+                        // completion path flips this flag and wakes the
+                        // grant scanner, which performs the initial backlog
+                        // drain on its own.
+                        if !shard.concurrency.counts().grants_enabled() {
+                            continue;
+                        }
+                        
                         // Holders first: the request scan can grant new slots,
                         // and we want the in-memory holder set consistent
                         // before that grant decision runs. This is the safety
@@ -1061,6 +1183,20 @@ impl JobStoreShard {
         self.concurrency
             .reconcile_pending_holders(&self.db, &range)
             .await
+    }
+
+    /// True once the shard has started accepting enqueues (either startup
+    /// hydration finished, or `startup_hydration_timeout` elapsed).
+    pub fn is_accepting_enqueues(&self) -> bool {
+        self.accepting_enqueues
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// True once startup hydration has completed and the grant scanner is
+    /// allowed to grant tickets / drain the request backlog.
+    pub fn is_grants_enabled(&self) -> bool {
+        self.grants_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
