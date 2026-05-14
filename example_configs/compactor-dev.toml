@@ -34,12 +34,16 @@ max_sst_size = 4194304
 max_concurrent_compactions = 2
 max_fetch_tasks = 4
 
-# Leveled compaction scheduler. The compactor unconditionally wires up
-# LeveledCompactionSchedulerSupplier; these options tune its behavior and the
-# size-tiered L0 -> L1 step it composes. Sized for the dev `max_sst_size`
-# (64 MiB) so L1 fills with a handful of SSTs before cascading.
+# Leveled compaction scheduler. Sized for the bench dataset (~40 MiB total,
+# previously settling as size-tiered SR(0) ≈ 40 MiB + two small SRs ≈ 8 MiB).
+# Target shape: L3 absorbs the bulk, L1+L2 hold the recent ~8 MiB.
+#   L1 target = base                    = 4 MiB
+#   L2 target = base × mult             = 16 MiB
+#   L3 target = base × mult²            = 64 MiB (effective sink for 40 MiB)
+# mult=4 mirrors size-tiered's include_size_threshold default, so per-tier
+# growth roughly matches the size-tiered baseline.
 [compactor_options.scheduler_options]
 level0_file_num_compaction_trigger = "2"
-max_bytes_for_level_base = "16777216"   # 16 MiB — L1 cascades after a few rounds
-max_bytes_for_level_multiplier = "10.0"
-num_levels = "7"
+max_bytes_for_level_base = "4194304"
+max_bytes_for_level_multiplier = "4.0"
+num_levels = "3"
