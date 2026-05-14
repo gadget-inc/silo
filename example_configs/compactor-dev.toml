@@ -30,6 +30,16 @@ addr = "127.0.0.1:9092"
 
 [compactor_options]
 poll_interval = "5s"
-max_sst_size = 67108864
+max_sst_size = 4194304
 max_concurrent_compactions = 2
 max_fetch_tasks = 4
+
+# Leveled compaction scheduler. The compactor unconditionally wires up
+# LeveledCompactionSchedulerSupplier; these options tune its behavior and the
+# size-tiered L0 -> L1 step it composes. Sized for the dev `max_sst_size`
+# (64 MiB) so L1 fills with a handful of SSTs before cascading.
+[compactor_options.scheduler_options]
+level0_file_num_compaction_trigger = "2"
+max_bytes_for_level_base = "16777216"   # 16 MiB — L1 cascades after a few rounds
+max_bytes_for_level_multiplier = "10.0"
+num_levels = "7"

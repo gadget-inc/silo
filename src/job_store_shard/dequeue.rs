@@ -220,6 +220,7 @@ impl JobStoreShard {
                         state.batch,
                         &WriteOptions {
                             await_durable: true,
+                            ..Default::default()
                         },
                     )
                     .await

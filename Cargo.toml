@@ -126,9 +126,9 @@ tonic-build = "0.12"
 protoc-bin-vendored = "3.0"
 
 [patch.crates-io]
-slatedb = { git = "https://github.com/slatedb/slatedb", rev = "a0524976466c9a320106351b092c6c1ca00e4c52" }
-slatedb-common = { git = "https://github.com/slatedb/slatedb", rev = "a0524976466c9a320106351b092c6c1ca00e4c52" }
-slatedb-txn-obj = { git = "https://github.com/slatedb/slatedb", rev = "a0524976466c9a320106351b092c6c1ca00e4c52" }
+slatedb = { git = "https://github.com/kirinrastogi/slatedb", rev = "45b430a4457cfb40504d715386a8ce1a2bb2571b" }
+slatedb-common = { git = "https://github.com/kirinrastogi/slatedb", rev = "45b430a4457cfb40504d715386a8ce1a2bb2571b" }
+slatedb-txn-obj = { git = "https://github.com/kirinrastogi/slatedb", rev = "45b430a4457cfb40504d715386a8ce1a2bb2571b" }
 
 [profile.release]
 debug = 1     # debug info with line tables only for profiling

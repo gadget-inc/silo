@@ -682,8 +682,8 @@ impl JobStoreShard {
     /// Spawn a background task that periodically calls `reconcile_counters`.
     ///
     /// Unlike the concurrency reconciler (small scan, fast cadence), this task
-    /// scans all `JOB_INFO` + `JOB_STATUS` rows in the shard and so runs at
-    /// hourly cadence by default. To avoid all shards spiking object-store
+    /// scans all `JOB_INFO` + `JOB_STATUS` rows in the shard. To avoid all
+    /// shards spiking object-store
     /// reads at the same wall-clock minute on process boot, we sleep a
     /// shard-deterministic jitter `[0, interval)` before the first tick. The
     /// jitter is derived from the shard name's hash so that deterministic

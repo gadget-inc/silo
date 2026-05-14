@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use slatedb_common::metrics::DefaultMetricsRecorder;
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span, warn};
@@ -177,7 +177,10 @@ async fn run_once(
         .then(|| Arc::new(DefaultMetricsRecorder::new()));
 
     let mut builder = slatedb::CompactorBuilder::new(canonical_path.clone(), Arc::clone(&store))
-        .with_merge_operator(silo::job_store_shard::counter_merge_operator());
+        .with_merge_operator(silo::job_store_shard::counter_merge_operator())
+        .with_scheduler_supplier(Arc::new(
+            slatedb::leveled_compaction::LeveledCompactionSchedulerSupplier::new(),
+        ));
     if let Some(opts) = compactor_options {
         builder = builder.with_options(opts);
     }
@@ -229,10 +232,18 @@ async fn run_once(
             Some(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(SLATEDB_STAT_POLL_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut prev_expired_value: u64 = 0;
+                let mut prev_expired_merge: u64 = 0;
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {
                             m.slatedb.update(&shard_label, &rec);
+                            log_expired_entries_purged(
+                                &rec,
+                                &shard_label,
+                                &mut prev_expired_value,
+                                &mut prev_expired_merge,
+                            );
                         }
                         _ = poller_cancel.cancelled() => break,
                     }
@@ -282,4 +293,45 @@ async fn run_once(
     }
 
     result
+}
+
+/// Read the slatedb `compactor.expired_entries_purged{entry_type=...}` counters
+/// out of `rec`'s current snapshot and log a single line per tick when either
+/// counter advanced. `prev_*` track absolute values across calls so we can emit
+/// deltas alongside running totals.
+fn log_expired_entries_purged(
+    rec: &DefaultMetricsRecorder,
+    shard_label: &str,
+    prev_value: &mut u64,
+    prev_merge: &mut u64,
+) {
+    let snapshot = rec.snapshot();
+    let read = |entry_type: &str| -> u64 {
+        snapshot
+            .by_name_and_labels(
+                slatedb::compactor::stats::EXPIRED_ENTRIES_PURGED,
+                &[(slatedb::compactor::stats::ENTRY_TYPE_LABEL, entry_type)],
+            )
+            .and_then(|m| match m.value {
+                MetricValue::Counter(v) => Some(v),
+                _ => None,
+            })
+            .unwrap_or(0)
+    };
+    let value_total = read(slatedb::compactor::stats::ENTRY_TYPE_VALUE);
+    let merge_total = read(slatedb::compactor::stats::ENTRY_TYPE_MERGE);
+    let value_delta = value_total.saturating_sub(*prev_value);
+    let merge_delta = merge_total.saturating_sub(*prev_merge);
+    if value_delta > 0 || merge_delta > 0 {
+        info!(
+            shard = %shard_label,
+            value_delta,
+            merge_delta,
+            value_total,
+            merge_total,
+            "slatedb compactor purged expired entries",
+        );
+        *prev_value = value_total;
+        *prev_merge = merge_total;
+    }
 }

@@ -502,7 +502,6 @@ flush_interval = "50ms"
 manifest_poll_interval = "1s"
 manifest_update_timeout = "300s"
 min_filter_keys = 1000
-filter_bits_per_key = 10
 l0_sst_size_bytes = 33554432
 l0_max_ssts = 4
 max_unflushed_bytes = 536870912
@@ -802,10 +801,6 @@ cache_puts = true
     assert_eq!(
         slatedb_settings.l0_max_ssts, defaults.l0_max_ssts,
         "l0_max_ssts should use default"
-    );
-    assert_eq!(
-        slatedb_settings.filter_bits_per_key, defaults.filter_bits_per_key,
-        "filter_bits_per_key should use default"
     );
     assert_eq!(
         slatedb_settings.object_store_cache_options.part_size_bytes,
