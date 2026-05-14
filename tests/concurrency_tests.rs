@@ -131,7 +131,13 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
 
 #[silo::test]
 async fn periodic_reconcile_grants_pending_request_without_signal() {
-    let (_tmp, shard) = open_temp_shard_with_reconcile_interval_ms(50).await;
+    // Use a very long reconcile interval so the background task never fires
+    // during the test, then manually drive a single reconciliation pass via
+    // `reconcile_pending_concurrency_requests_once`. This keeps the
+    // pre-reconcile snapshot deterministic — under a short interval the
+    // background tick can consume the request between the put and the
+    // assertion, especially when other tests load the executor.
+    let (_tmp, shard) = open_temp_shard_with_reconcile_interval_ms(60 * 60 * 1000).await;
     let now = now_ms();
     let tenant = "-";
     let queue = "reconcile-q".to_string();
@@ -180,13 +186,20 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
         .await
         .expect("write pending concurrency request");
 
-    // The periodic reconciler may already have ticked and consumed the request by
-    // the time we observe it (especially under cargo test's parallel load), so we
-    // skip a deterministic "request == 1" snapshot here and rely on the
-    // end-to-end assertions below — holders becomes 1 and requests drains to 0 —
-    // to verify reconciliation processed the injected request.
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "request should be present before reconciliation"
+    );
 
-    // Periodic reconciliation should discover the orphaned request and grant it.
+    // Drive a single reconciliation pass deterministically rather than waiting
+    // on the background interval.
+    shard.reconcile_pending_concurrency_requests_once().await;
+
+    // After reconciliation, the orphaned request is granted: holder count
+    // becomes 1 and the pending request row is consumed. The grant scanner
+    // runs asynchronously after reconciliation enqueues the grant, so the
+    // holder side still needs a short poll.
     let holders = poll_until(
         || count_concurrency_holders(shard.db()),
         |count| *count == 1,
@@ -195,7 +208,7 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
     .await;
     assert_eq!(
         holders, 1,
-        "periodic reconciliation should grant request and create holder"
+        "reconciliation should grant request and create holder"
     );
 
     let requests_left = poll_until(
