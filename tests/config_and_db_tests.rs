@@ -597,7 +597,7 @@ enable_counter_reconciliation = true
 }
 
 #[silo::test]
-fn parse_toml_terminal_job_expire_ms_defaults_off() {
+fn parse_toml_terminal_job_expire_s_defaults_off() {
     let toml_str = r#"
 [database]
 backend = "fs"
@@ -605,22 +605,28 @@ path = "/tmp/silo-%shard%"
 "#;
     let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
     assert!(
-        cfg.database.terminal_job_expire_ms.is_none(),
-        "terminal_job_expire_ms should default to None (feature off)"
+        cfg.database.completed_job_expire_s.is_none(),
+        "completed_job_expire_s should default to None (feature off)"
+    );
+    assert!(
+        cfg.database.terminal_job_expire_s.is_none(),
+        "terminal_job_expire_s should default to None (feature off)"
     );
 }
 
 #[silo::test]
-fn parse_toml_terminal_job_expire_ms_opt_in() {
-    // 7 days in milliseconds.
+fn parse_toml_terminal_job_expire_s_opt_in() {
+    // 7 days in seconds.
     let toml_str = r#"
 [database]
 backend = "fs"
 path = "/tmp/silo-%shard%"
-terminal_job_expire_ms = 604800000
+completed_job_expire_s = 86400
+terminal_job_expire_s = 604800
 "#;
     let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
-    assert_eq!(cfg.database.terminal_job_expire_ms, Some(604_800_000));
+    assert_eq!(cfg.database.completed_job_expire_s, Some(86_400));
+    assert_eq!(cfg.database.terminal_job_expire_s, Some(604_800));
 }
 
 /// Guards against the manual `Default` impl on `DatabaseTemplate` drifting away
@@ -650,8 +656,12 @@ path = "/tmp/silo-%shard%"
         from_toml.database.enable_counter_reconciliation
     );
     assert_eq!(
-        from_default.terminal_job_expire_ms,
-        from_toml.database.terminal_job_expire_ms
+        from_default.completed_job_expire_s,
+        from_toml.database.completed_job_expire_s
+    );
+    assert_eq!(
+        from_default.terminal_job_expire_s,
+        from_toml.database.terminal_job_expire_s
     );
     assert!(from_default.wal.is_none() && from_toml.database.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.database.slatedb.is_none());
@@ -682,8 +692,12 @@ path = "/tmp/silo-shard"
         from_toml.enable_counter_reconciliation
     );
     assert_eq!(
-        from_default.terminal_job_expire_ms,
-        from_toml.terminal_job_expire_ms
+        from_default.completed_job_expire_s,
+        from_toml.completed_job_expire_s
+    );
+    assert_eq!(
+        from_default.terminal_job_expire_s,
+        from_toml.terminal_job_expire_s
     );
     assert!(from_default.wal.is_none() && from_toml.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.slatedb.is_none());

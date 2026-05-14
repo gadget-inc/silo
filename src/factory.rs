@@ -193,7 +193,8 @@ impl ShardFactory {
                         ),
                         enable_counter_reconciliation: template.enable_counter_reconciliation,
                         hydrate_all_at_startup: template.hydrate_all_at_startup,
-                        terminal_job_expire_ms: template.terminal_job_expire_ms,
+                        completed_job_expire_s: template.completed_job_expire_s,
+                        terminal_job_expire_s: template.terminal_job_expire_s,
                     },
                     range.clone(),
                 )

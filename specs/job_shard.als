@@ -214,8 +214,9 @@ fact wellFormed {
     
     -- Non-terminal, non-cancelled jobs are never dropped from existence.
     -- Jobs can leave `jobExistsAt` only via the `expireTerminalJob`
-    -- transition (gated by the `terminal_job_expire_ms` setting in the
-    -- Rust implementation, which attaches a SlateDB row TTL on the
+    -- transition (gated by the `completed_job_expire_s` /
+    -- `terminal_job_expire_s` settings in the Rust
+    -- implementation, which attach a SlateDB row TTL on the
     -- JOB_INFO/IDX/ATTEMPT records so they age out via compaction).
     -- Eligible Rust call sites:
     --   * lease.rs::expire_terminal_job_records, invoked when an attempt
@@ -1381,7 +1382,8 @@ pred reapExpiredLeaseReleaseTicket[tid: TaskId, q: Queue, t: Time, tnext: Time] 
 -- Transition: EXPIRE_TERMINAL_JOB - Drop a terminal job's records.
 --
 -- Models the optional TTL'd cleanup of terminal jobs. When the
--- `terminal_job_expire_ms` setting is configured (None = disabled), the
+-- `completed_job_expire_s` / `terminal_job_expire_s` settings are
+-- configured (None = disabled for that bucket), the
 -- implementation re-puts JOB_INFO, JOB_STATUS, IDX_STATUS_TIME,
 -- IDX_METADATA, ATTEMPT, and JOB_CANCELLED rows with a SlateDB row TTL at
 -- the moment a job reaches terminal status. After enough wall-clock time
@@ -1431,7 +1433,7 @@ pred reapExpiredLeaseReleaseTicket[tid: TaskId, q: Queue, t: Time, tnext: Time] 
 --
 -- See: src/job_store_shard/lease.rs::expire_terminal_job_records,
 --      src/job_store_shard/cancel.rs::cancel_job_inner,
---      src/settings.rs::terminal_job_expire_ms.
+--      src/settings.rs::completed_job_expire_s and terminal_job_expire_s.
 pred expireTerminalJob[j: Job, t: Time, tnext: Time] {
     -- [SILO-EXPIRE-1] Pre: job exists and is either terminal or cancelled.
     -- Cancelled-Running is allowed here at the spec level — the spec doesn't
@@ -2063,7 +2065,7 @@ pred step[t: Time, tnext: Time] {
     or (brokerScanCheckRateLimit[t, tnext])
     or (some tid: TaskId | dequeueDropRunAttempt[tid, t, tnext])
     or (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
-    -- Terminal-job expiration (gated by terminal_job_expire_ms in Rust)
+    -- Terminal-job expiration (gated by completed_job_expire_s / terminal_job_expire_s in Rust)
     or (some j: Job | expireTerminalJob[j, t, tnext])
     -- Stutter
     or stutter[t, tnext]

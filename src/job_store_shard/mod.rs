@@ -98,10 +98,15 @@ pub struct OpenShardOptions {
     /// Populated from `DatabaseConfig::hydrate_all_at_startup` /
     /// `DatabaseTemplate::hydrate_all_at_startup`; tests set it explicitly.
     pub hydrate_all_at_startup: bool,
-    /// When set, jobs reaching a terminal status (Succeeded/Failed/Cancelled)
-    /// have their associated KV records re-put with a SlateDB row TTL of this
-    /// many milliseconds. `None` disables the feature.
-    pub terminal_job_expire_ms: Option<u64>,
+    /// When set, jobs that reach Succeeded have their associated KV records
+    /// re-put with a SlateDB row TTL of this many seconds. `None` disables
+    /// the feature for successful jobs.
+    pub completed_job_expire_s: Option<u64>,
+    /// When set, jobs that reach any non-success terminal status (Failed,
+    /// Cancelled, …) have their associated KV records re-put with a SlateDB
+    /// row TTL of this many seconds. `None` disables the feature for those
+    /// jobs.
+    pub terminal_job_expire_s: Option<u64>,
 }
 
 fn expand_slatedb_settings_for_shard(
@@ -166,9 +171,12 @@ pub struct JobStoreShard {
     range: ShardRange,
     /// Metrics recorder for SlateDB, passed to DbBuilder and used for stats collection.
     slatedb_metrics_recorder: Arc<DefaultMetricsRecorder>,
-    /// When set, terminal jobs have their associated records re-put with a
-    /// SlateDB row TTL of this many milliseconds. `None` disables the feature.
-    pub(crate) terminal_job_expire_ms: Option<u64>,
+    /// TTL (seconds) applied to Succeeded jobs' associated records. `None`
+    /// disables the feature for successful jobs.
+    pub(crate) completed_job_expire_s: Option<u64>,
+    /// TTL (seconds) applied to non-success terminal jobs' associated records
+    /// (Failed, Cancelled, …). `None` disables the feature for those jobs.
+    pub(crate) terminal_job_expire_s: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -344,7 +352,8 @@ impl JobStoreShard {
                 ),
                 enable_counter_reconciliation: cfg.enable_counter_reconciliation,
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
-                terminal_job_expire_ms: cfg.terminal_job_expire_ms,
+                completed_job_expire_s: cfg.completed_job_expire_s,
+                terminal_job_expire_s: cfg.terminal_job_expire_s,
             },
             range,
         )
@@ -383,7 +392,8 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
             enable_counter_reconciliation,
             hydrate_all_at_startup,
-            terminal_job_expire_ms,
+            completed_job_expire_s,
+            terminal_job_expire_s,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -481,7 +491,8 @@ impl JobStoreShard {
             db_path: db_path.to_string(),
             range: range.clone(),
             slatedb_metrics_recorder,
-            terminal_job_expire_ms,
+            completed_job_expire_s,
+            terminal_job_expire_s,
         });
 
         // Periodically reconcile pending concurrency requests to self-heal from
@@ -802,6 +813,23 @@ impl JobStoreShard {
 
     pub fn db(&self) -> &InstrumentedDb {
         &self.db
+    }
+
+    /// Compute the row-TTL deadline for a job that just reached a terminal
+    /// status. Returns `None` (no TTL) when the relevant `*_expire_s` setting
+    /// is unset.
+    ///
+    /// `seconds: u64` is operator-supplied; saturating arithmetic keeps the
+    /// `u64 → i64` cast meaningful even if someone passes an absurd value
+    /// (would otherwise wrap to a negative `expire_ts`, which SlateDB
+    /// interprets as already-expired).
+    pub(crate) fn terminal_expire_ts(&self, kind: JobStatusKind, now_ms: i64) -> Option<i64> {
+        let seconds = match kind {
+            JobStatusKind::Succeeded => self.completed_job_expire_s?,
+            _ => self.terminal_job_expire_s?,
+        };
+        let ms_i64 = i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX);
+        Some(now_ms.saturating_add(ms_i64))
     }
 
     /// Snapshot the in-memory concurrency limit cache for use by the query system.

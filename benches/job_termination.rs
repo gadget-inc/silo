@@ -1,23 +1,24 @@
 //! A/B benchmark for the terminal-job expiration feature.
 //!
 //! Measures `report_attempt_outcome` throughput on the hot termination path
-//! both with and without `terminal_job_expire_ms` enabled, so we can quantify
+//! both with and without `completed_job_expire_s` enabled, so we can quantify
 //! the cost of the extra reads/writes (`JOB_INFO`, `IDX_METADATA`, attempt
-//! scan, and re-puts with TTL).
+//! scan, and re-puts with TTL). The bench drives Succeeded outcomes, so only
+//! `completed_job_expire_s` is exercised.
 //!
 //! Run with: `cargo bench --bench job_termination`.
 
 use silo::gubernator::NullGubernatorClient;
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
-use silo::settings::{Backend, DatabaseConfig, SEVEN_DAYS_MS};
+use silo::settings::{Backend, DatabaseConfig, SEVEN_DAYS_S};
 use silo::shard_range::ShardRange;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 async fn open_temp_shard(
     flush_interval_ms: u64,
-    terminal_job_expire_ms: Option<u64>,
+    completed_job_expire_s: Option<u64>,
 ) -> (tempfile::TempDir, Arc<JobStoreShard>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = DatabaseConfig {
@@ -28,7 +29,7 @@ async fn open_temp_shard(
             flush_interval: Some(Duration::from_millis(flush_interval_ms)),
             ..Default::default()
         }),
-        terminal_job_expire_ms,
+        completed_job_expire_s,
         ..Default::default()
     };
     let shard = JobStoreShard::open(&cfg, NullGubernatorClient::new(), None, ShardRange::full())
@@ -55,13 +56,13 @@ fn make_metadata(n: usize) -> Vec<(String, String)> {
 /// excluded from the timer).
 async fn measure_termination_throughput(
     flush_ms: u64,
-    terminal_job_expire_ms: Option<u64>,
+    completed_job_expire_s: Option<u64>,
     num_consumers: usize,
     total_jobs: usize,
     batch: usize,
     metadata_n: usize,
 ) -> f64 {
-    let (_tmp, shard) = open_temp_shard(flush_ms, terminal_job_expire_ms).await;
+    let (_tmp, shard) = open_temp_shard(flush_ms, completed_job_expire_s).await;
     let now_ms = now_ms();
 
     // Seed
@@ -135,7 +136,7 @@ async fn ab_row(label: &str, num_consumers: usize, total_jobs: usize, metadata_n
         measure_termination_throughput(1, None, num_consumers, total_jobs, 32, metadata_n).await;
     let with_ttl = measure_termination_throughput(
         1,
-        Some(SEVEN_DAYS_MS),
+        Some(SEVEN_DAYS_S),
         num_consumers,
         total_jobs,
         32,
@@ -152,7 +153,7 @@ async fn ab_row(label: &str, num_consumers: usize, total_jobs: usize, metadata_n
 async fn main() {
     println!("\n========================================");
     println!("Job Termination A/B Benchmark");
-    println!("(terminal_job_expire_ms None vs Some(7d))");
+    println!("(completed_job_expire_s None vs Some(7d))");
     println!("========================================\n");
 
     println!("--- Single consumer, 1000 jobs ---");

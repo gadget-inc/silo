@@ -85,17 +85,9 @@ impl JobStoreShard {
         // applied when this cancellation transitions the job to a terminal status
         // (i.e. it was previously Scheduled) so the records age out of slatedb
         // alongside the other terminal-job paths in `report_attempt_outcome`.
-        //
-        // `terminal_job_expire_ms: u64` is operator-supplied and realistic values
-        // are days/weeks (< 2^41). Saturate at `i64::MAX` to keep the u64→i64
-        // cast meaningful even if someone passes an absurd value (would otherwise
-        // wrap to a negative `expire_ts`, which SlateDB interprets as
-        // already-expired).
+        // Scheduled → Cancelled uses `terminal_job_expire_s`.
         let terminal_expire_ts: Option<i64> = if was_scheduled {
-            self.terminal_job_expire_ms.map(|ms| {
-                let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
-                now_ms.saturating_add(ms_i64)
-            })
+            self.terminal_expire_ts(JobStatusKind::Cancelled, now_ms)
         } else {
             None
         };

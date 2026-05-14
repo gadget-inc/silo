@@ -423,8 +423,8 @@ async fn restart_nonexistent_job_returns_not_found() {
     });
 }
 
-/// When `terminal_job_expire_ms` is set, the records written by the terminal
-/// outcome path carry a SlateDB row TTL with `expire_ts ≈ now + ttl_ms`.
+/// When `terminal_job_expire_s` is set, the records written by the terminal
+/// outcome path carry a SlateDB row TTL with `expire_ts ≈ now + ttl_s*1000`.
 /// SlateDB applies the TTL at compaction time, so this test verifies the
 /// per-row metadata directly rather than waiting for compaction to drop the
 /// row.
@@ -436,8 +436,9 @@ async fn restart_nonexistent_job_returns_not_found() {
 async fn terminal_records_are_tagged_with_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::{job_info_key, job_status_key};
-        let ttl_ms: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(ttl_ms).await;
+        let ttl_s: u64 = 7 * 24 * 60 * 60; // 7 days
+        let ttl_ms: i64 = ttl_s as i64 * 1000;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(ttl_s).await;
 
         let before_ms = now_ms();
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
@@ -489,8 +490,8 @@ async fn terminal_records_are_tagged_with_expire_ts() {
             let expire_ts = kv
                 .expire_ts
                 .expect("terminal record should carry expire_ts");
-            let lower = before_ms + ttl_ms as i64 - 5_000;
-            let upper = after_ms + ttl_ms as i64 + 5_000;
+            let lower = before_ms + ttl_ms - 5_000;
+            let upper = after_ms + ttl_ms + 5_000;
             assert!(
                 expire_ts >= lower && expire_ts <= upper,
                 "expire_ts {expire_ts} outside expected window [{lower}, {upper}] for key {key:?}"
@@ -499,7 +500,7 @@ async fn terminal_records_are_tagged_with_expire_ts() {
     });
 }
 
-/// Regression: when terminal_job_expire_ms is set, the ATTEMPT row for the
+/// Regression: when terminal_job_expire_s is set, the ATTEMPT row for the
 /// job's current attempt must reflect the **terminal** outcome status (e.g.
 /// Succeeded), not the prior Running status that was on disk before
 /// `report_attempt_outcome` ran. An earlier implementation re-scanned
@@ -513,7 +514,7 @@ async fn terminal_attempt_row_keeps_terminal_status_under_ttl() {
         use silo::job_attempt::{AttemptStatus, JobAttemptView};
         use silo::keys::attempt_key;
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
@@ -570,8 +571,7 @@ async fn terminal_idx_metadata_rows_are_tagged_with_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::idx_metadata_key;
 
-        let ttl_ms: u64 = 60_000;
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(ttl_ms).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let metadata = vec![
             ("env".to_string(), "prod".to_string()),
@@ -630,7 +630,7 @@ async fn terminal_idx_status_time_row_is_tagged_with_expire_ts() {
         use silo::job::JobStatusKind;
         use silo::keys::{idx_status_time_key, status_index_timestamp};
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
@@ -692,7 +692,7 @@ async fn cancelled_terminal_job_cancellation_row_is_tagged_with_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::job_cancelled_key;
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
@@ -751,7 +751,7 @@ async fn retry_branch_attempt_row_has_no_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::attempt_key;
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         // Retry policy so the first error leads to retry-scheduling, not Failed.
         let retry_policy = RetryPolicy {
@@ -818,14 +818,14 @@ async fn retry_branch_attempt_row_has_no_expire_ts() {
     });
 }
 
-/// End-to-end counter drift: enable a 50ms TTL with a fast slatedb
+/// End-to-end counter drift: enable a 1s TTL with a fast slatedb
 /// compactor, complete a job, wait long enough for the row to be dropped,
 /// and assert (a) JOB_STATUS reads as None (compaction dropped it), and
 /// (b) the tenant-status counter is "stale-high" relative to the live
 /// scan. Running the counter reconciler then re-derives the truth and
 /// brings the counter back in line. This exercises the exact production
 /// loop the example config recommends pairing with
-/// `terminal_job_expire_ms`.
+/// `terminal_job_expire_s`.
 #[silo::test]
 async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
     use silo::settings::{Backend, DatabaseConfig};
@@ -850,7 +850,8 @@ async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
                 }),
                 ..Default::default()
             }),
-            terminal_job_expire_ms: Some(50),
+            completed_job_expire_s: Some(1),
+            terminal_job_expire_s: Some(1),
             ..Default::default()
         };
         let rate_limiter = silo::gubernator::NullGubernatorClient::new();
@@ -999,7 +1000,7 @@ async fn ttl_dropped_row_drifts_counter_and_reconciler_fixes_it() {
 async fn ttl_unexpired_failed_job_is_still_restartable() {
     with_timeout!(30000, {
         // Long enough that the records can't expire during the test.
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
@@ -1392,8 +1393,9 @@ async fn cancel_scheduled_job_tags_records_with_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::{job_cancelled_key, job_info_key, job_status_key};
 
-        let ttl_ms: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(ttl_ms).await;
+        let ttl_s: u64 = 7 * 24 * 60 * 60; // 7 days
+        let ttl_ms: i64 = ttl_s as i64 * 1000;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(ttl_s).await;
 
         let before_ms = now_ms();
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
@@ -1416,7 +1418,7 @@ async fn cancel_scheduled_job_tags_records_with_expire_ts() {
         let after_ms = now_ms();
 
         // JOB_STATUS, JOB_INFO, and JOB_CANCELLED must all carry an `expire_ts`
-        // set to roughly `now + ttl_ms`. Allow a generous window around the
+        // set to roughly `now + ttl_s*1000`. Allow a generous window around the
         // wall-clock bounds (the implementation samples `now_ms` once per
         // cancellation call).
         let raw_db = shard.db();
@@ -1433,8 +1435,8 @@ async fn cancel_scheduled_job_tags_records_with_expire_ts() {
             let expire_ts = kv
                 .expire_ts
                 .expect("cancellation-terminal record should carry expire_ts");
-            let lower = before_ms + ttl_ms as i64 - 5_000;
-            let upper = after_ms + ttl_ms as i64 + 5_000;
+            let lower = before_ms + ttl_ms - 5_000;
+            let upper = after_ms + ttl_ms + 5_000;
             assert!(
                 expire_ts >= lower && expire_ts <= upper,
                 "expire_ts {expire_ts} outside expected window [{lower}, {upper}] for key {key:?}"
@@ -1452,7 +1454,7 @@ async fn cancel_scheduled_job_tags_idx_status_time_with_expire_ts() {
         use silo::job::JobStatusKind;
         use silo::keys::{idx_status_time_key, status_index_timestamp};
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
@@ -1505,7 +1507,7 @@ async fn cancel_scheduled_job_tags_idx_metadata_with_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::idx_metadata_key;
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let metadata = vec![
             ("env".to_string(), "prod".to_string()),
@@ -1555,7 +1557,7 @@ async fn cancel_scheduled_job_tags_prior_attempt_rows_with_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::attempt_key;
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let retry_policy = RetryPolicy {
             retry_count: 3,
@@ -1642,7 +1644,7 @@ async fn cancel_running_job_does_not_tag_records_with_expire_ts() {
     with_timeout!(20000, {
         use silo::keys::{job_cancelled_key, job_info_key, job_status_key};
 
-        let (_tmp, shard) = open_temp_shard_with_terminal_expire_ms(60_000).await;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
 
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let job_id = shard
@@ -1699,7 +1701,7 @@ async fn cancel_running_job_does_not_tag_records_with_expire_ts() {
     });
 }
 
-/// Sanity: when `terminal_job_expire_ms` is *not* configured, cancellation
+/// Sanity: when the terminal-expire feature is *not* configured, cancellation
 /// of a Scheduled job must NOT tag any record with `expire_ts`. Guards
 /// against an accidental hard-coded default that would enable the TTL
 /// feature for operators that haven't opted in.

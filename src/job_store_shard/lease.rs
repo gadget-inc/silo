@@ -118,19 +118,11 @@ impl JobStoreShard {
         }
 
         let now_ms = now_epoch_ms();
-        // Compute the row-TTL deadline for terminal records once, up front. We
-        // only know whether the outcome is terminal after matching on it below,
-        // but the value itself is outcome-independent so we resolve it here.
-        //
-        // `terminal_job_expire_ms: u64` is operator-supplied and realistic
-        // values are days/weeks (< 2^41). Saturate at `i64::MAX` to keep the
-        // u64→i64 cast meaningful even if someone passes an absurd value
-        // (would otherwise wrap to a negative `expire_ts`, which SlateDB
-        // interprets as already-expired).
-        let terminal_expire_ts: Option<i64> = self.terminal_job_expire_ms.map(|ms| {
-            let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
-            now_ms.saturating_add(ms_i64)
-        });
+        // The row-TTL deadline for terminal records depends on which terminal
+        // status the job reaches — `completed_job_expire_s` for Succeeded,
+        // `terminal_job_expire_s` for Failed/Cancelled. We resolve it inside
+        // each terminal branch below via `self.terminal_expire_ts(kind, now_ms)`.
+        let mut terminal_expire_ts: Option<i64> = None;
         let attempt_status = match &outcome {
             AttemptOutcome::Success { result } => AttemptStatus::Succeeded {
                 finished_at_ms: now_ms,
@@ -183,6 +175,8 @@ impl JobStoreShard {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
             AttemptOutcome::Success { .. } => {
                 let job_status = JobStatus::succeeded(now_ms);
+                terminal_expire_ts =
+                    self.terminal_expire_ts(crate::job::JobStatusKind::Succeeded, now_ms);
                 self.set_job_status_with_index_opts(
                     &mut DbWriteBatcher::new(&self.db, &mut batch),
                     &tenant,
@@ -201,6 +195,8 @@ impl JobStoreShard {
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
                 let job_status = JobStatus::cancelled(now_ms);
+                terminal_expire_ts =
+                    self.terminal_expire_ts(crate::job::JobStatusKind::Cancelled, now_ms);
                 self.set_job_status_with_index_opts(
                     &mut DbWriteBatcher::new(&self.db, &mut batch),
                     &tenant,
@@ -286,6 +282,8 @@ impl JobStoreShard {
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
                         let job_status = JobStatus::failed(now_ms);
+                        terminal_expire_ts =
+                            self.terminal_expire_ts(crate::job::JobStatusKind::Failed, now_ms);
                         self.set_job_status_with_index_opts(
                             &mut DbWriteBatcher::new(&self.db, &mut batch),
                             &tenant,
