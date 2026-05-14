@@ -129,12 +129,34 @@ pub enum RequestTicketTaskOutcome {
     JobMissing,
 }
 
-/// In-memory counts for concurrency holders
+/// Per-queue state: hydration status and in-memory holder set.
+///
+/// Hydration mutations from `hydrate_queue` and reservation mutations from
+/// `try_reserve_internal` both touch `holders` under the same map lock, so
+/// they are serialized. The hydration scan's `insert` is idempotent for any
+/// task_id, so a `try_reserve` racing in parallel with hydration is safe.
+struct QueueEntry {
+    hydrated: bool,
+    holders: HashSet<String>,
+}
+
+impl QueueEntry {
+    fn new() -> Self {
+        Self {
+            hydrated: false,
+            holders: HashSet::new(),
+        }
+    }
+}
+
+/// In-memory counts for concurrency holders.
+///
+/// Combines hydration tracking and holder sets in a single map so that each
+/// `try_reserve` / `release` call performs one lock acquisition and one
+/// lookup rather than two.
 pub struct ConcurrencyCounts {
-    // Composite key: storekey-encoded (tenant, queue) -> set of task ids holding tickets
-    holders: Mutex<HashMap<Vec<u8>, HashSet<String>>>,
-    // Track which (tenant, queue) keys have been hydrated from durable storage
-    hydrated_queues: Mutex<HashSet<Vec<u8>>>,
+    // Composite key: storekey-encoded (tenant, queue) -> per-queue state
+    queues: Mutex<HashMap<Vec<u8>, QueueEntry>>,
 }
 
 impl Default for ConcurrencyCounts {
@@ -146,8 +168,7 @@ impl Default for ConcurrencyCounts {
 impl ConcurrencyCounts {
     pub fn new() -> Self {
         Self {
-            holders: Mutex::new(HashMap::new()),
-            hydrated_queues: Mutex::new(HashSet::new()),
+            queues: Mutex::new(HashMap::new()),
         }
     }
 
@@ -195,19 +216,14 @@ impl ConcurrencyCounts {
             task_ids.push(parsed.task_id);
         }
 
-        // Update holders map
+        // Merge scanned ids into the queue entry and mark it hydrated under a single lock
         {
-            let mut h = self.holders.lock().unwrap();
-            let set = h.entry(key.clone()).or_default();
+            let mut q = self.queues.lock().unwrap();
+            let entry = q.entry(key).or_insert_with(QueueEntry::new);
             for task_id in task_ids {
-                set.insert(task_id);
+                entry.holders.insert(task_id);
             }
-        }
-
-        // Mark queue as hydrated
-        {
-            let mut hydrated = self.hydrated_queues.lock().unwrap();
-            hydrated.insert(key);
+            entry.hydrated = true;
         }
 
         Ok(())
@@ -225,10 +241,10 @@ impl ConcurrencyCounts {
     ) -> Result<(), slatedb::Error> {
         let key = concurrency_counts_key(tenant, queue);
 
-        // Fast path: check if already hydrated
+        // Fast path: check the combined entry
         {
-            let hydrated = self.hydrated_queues.lock().unwrap();
-            if hydrated.contains(&key) {
+            let q = self.queues.lock().unwrap();
+            if q.get(&key).map(|e| e.hydrated).unwrap_or(false) {
                 return Ok(());
             }
         }
@@ -272,16 +288,16 @@ impl ConcurrencyCounts {
     ) -> bool {
         let key = concurrency_counts_key(tenant, queue);
         let reserved = {
-            let mut h = self.holders.lock().unwrap();
-            let set = h.entry(key).or_default();
+            let mut q = self.queues.lock().unwrap();
+            let entry = q.entry(key).or_insert_with(QueueEntry::new);
 
             // Check if we're at capacity
-            if set.len() >= limit {
+            if entry.holders.len() >= limit {
                 return false;
             }
 
             // Reserve the slot atomically
-            set.insert(task_id.to_string());
+            entry.holders.insert(task_id.to_string());
             true
         };
 
@@ -302,8 +318,8 @@ impl ConcurrencyCounts {
     #[doc(hidden)]
     pub fn mark_hydrated(&self, tenant: &str, queue: &str) {
         let key = concurrency_counts_key(tenant, queue);
-        let mut hydrated = self.hydrated_queues.lock().unwrap();
-        hydrated.insert(key);
+        let mut q = self.queues.lock().unwrap();
+        q.entry(key).or_insert_with(QueueEntry::new).hydrated = true;
     }
 
     /// Synchronous try_reserve for testing when the queue is known to be hydrated or when testing in-memory reservation logic without DB.
@@ -324,9 +340,9 @@ impl ConcurrencyCounts {
     /// Release a reservation made by `try_reserve` if the DB write fails.
     pub fn release_reservation(&self, tenant: &str, queue: &str, task_id: &str) {
         let key = concurrency_counts_key(tenant, queue);
-        let mut h = self.holders.lock().unwrap();
-        if let Some(set) = h.get_mut(&key) {
-            set.remove(task_id);
+        let mut q = self.queues.lock().unwrap();
+        if let Some(entry) = q.get_mut(&key) {
+            entry.holders.remove(task_id);
         }
     }
 
@@ -335,9 +351,9 @@ impl ConcurrencyCounts {
     pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
         let key = concurrency_counts_key(tenant, queue);
         {
-            let mut h = self.holders.lock().unwrap();
-            if let Some(set) = h.get_mut(&key) {
-                set.remove(task_id);
+            let mut q = self.queues.lock().unwrap();
+            if let Some(entry) = q.get_mut(&key) {
+                entry.holders.remove(task_id);
             }
         }
 
@@ -352,9 +368,9 @@ impl ConcurrencyCounts {
     /// Get the current holder count for a queue.
     /// Useful for testing and debugging.
     pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
-        let h = self.holders.lock().unwrap();
+        let q = self.queues.lock().unwrap();
         let key = concurrency_counts_key(tenant, queue);
-        h.get(&key).map(|s| s.len()).unwrap_or(0)
+        q.get(&key).map(|e| e.holders.len()).unwrap_or(0)
     }
 
     /// Snapshot the sizes of the in-memory holders cache for metrics reporting.
