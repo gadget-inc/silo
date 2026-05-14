@@ -231,7 +231,7 @@ impl JobStoreShard {
                 }
                 // Put back all claimed entries since we didn't lease them durably
                 self.brokers.requeue(claimed);
-                return Err(JobStoreShardError::Slate(e));
+                return Err(JobStoreShardError::from(e));
             }
             dst_events::confirm_write(write_op);
 

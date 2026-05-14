@@ -294,7 +294,7 @@ impl JobStoreShard {
                     }
                 }
                 Ok(None) => break,
-                Err(e) => return Err(JobStoreShardError::Slate(e)),
+                Err(e) => return Err(JobStoreShardError::from(e)),
             }
         }
         Ok(results)
@@ -320,7 +320,7 @@ impl JobStoreShard {
                     }
                 }
                 Ok(None) => break,
-                Err(e) => return Err(JobStoreShardError::Slate(e)),
+                Err(e) => return Err(JobStoreShardError::from(e)),
             }
         }
         Ok(results)

@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use dashmap::DashMap;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::{BoxFuture, Shared};
@@ -71,12 +72,29 @@ use crate::task::{ConcurrencyAction, HolderRecord, Task};
 use crate::task_broker::TaskBrokerRegistry;
 
 /// Error type for concurrency operations that can fail due to storage or encoding errors.
+///
+/// `Slate` holds `Arc<slatedb::Error>` because `slatedb::Error` is not `Clone`,
+/// and singleflighted hydration must hand the same error to multiple awaiters via
+/// `Shared<...>::Output`. Holding the `Arc` directly preserves `kind()` so downstream
+/// retry logic (e.g. `retry_on_txn_conflict`) keeps working.
 #[derive(Debug, thiserror::Error)]
 pub enum ConcurrencyError {
-    #[error(transparent)]
-    Slate(#[from] slatedb::Error),
+    #[error("{0}")]
+    Slate(Arc<slatedb::Error>),
     #[error("encoding error: {0}")]
     Encoding(String),
+}
+
+impl From<slatedb::Error> for ConcurrencyError {
+    fn from(e: slatedb::Error) -> Self {
+        ConcurrencyError::Slate(Arc::new(e))
+    }
+}
+
+impl From<Arc<slatedb::Error>> for ConcurrencyError {
+    fn from(e: Arc<slatedb::Error>) -> Self {
+        ConcurrencyError::Slate(e)
+    }
 }
 
 impl From<String> for ConcurrencyError {
@@ -88,18 +106,6 @@ impl From<String> for ConcurrencyError {
 impl From<crate::codec::CodecError> for ConcurrencyError {
     fn from(e: crate::codec::CodecError) -> Self {
         ConcurrencyError::Encoding(e.to_string())
-    }
-}
-
-impl From<Arc<slatedb::Error>> for ConcurrencyError {
-    fn from(e: Arc<slatedb::Error>) -> Self {
-        // Slatedb errors aren't Clone, so the singleflight hydration future yields
-        // Arc<slatedb::Error> for shareable propagation. Stringify into the existing
-        // Slate variant to keep call-site `?` propagation uniform.
-        match Arc::try_unwrap(e) {
-            Ok(err) => ConcurrencyError::Slate(err),
-            Err(arc) => ConcurrencyError::Encoding(arc.to_string()),
-        }
     }
 }
 
@@ -180,18 +186,28 @@ impl QueueEntry {
     }
 }
 
+/// In-memory key for `ConcurrencyCounts.queues`. Two `Arc<str>` (tenant, queue)
+/// instead of a storekey-encoded `Vec<u8>` so per-call lookups avoid the
+/// storekey encode and the in-map keys are cheap to clone for spawned futures.
+type QueueKey = (Arc<str>, Arc<str>);
+
+fn queue_key(tenant: &str, queue: &str) -> QueueKey {
+    (Arc::from(tenant), Arc::from(queue))
+}
+
 /// In-memory counts for concurrency holders.
 ///
-/// Combines hydration tracking and holder sets in a single map so that each
-/// `try_reserve` / `release` call performs one lock acquisition and one
-/// lookup rather than two. Hydration is singleflighted: concurrent first-touch
-/// callers share a single `Shared<BoxFuture>` rather than each running its own
-/// scan.
+/// Backed by a `DashMap` so each call serializes only on its shard's lock
+/// rather than a single global mutex. Hydration is singleflighted: concurrent
+/// first-touch callers share a single `Shared<BoxFuture>` rather than each
+/// running its own scan.
+///
+/// **Locking discipline:** every DashMap guard (`entry`, `get`, `get_mut`)
+/// MUST be dropped before any `.await`. Holding a guard across an await on
+/// the same executor risks deadlocking the worker thread on its own shard
+/// lock. All such scopes in this file are explicit `{ ... }` blocks.
 pub struct ConcurrencyCounts {
-    // Composite key: storekey-encoded (tenant, queue) -> per-queue state.
-    // Held in an Arc so the spawned hydration driver task can outlive the
-    // caller without borrowing `&self`.
-    queues: Arc<Mutex<HashMap<Vec<u8>, QueueEntry>>>,
+    queues: Arc<DashMap<QueueKey, QueueEntry>>,
 }
 
 impl Default for ConcurrencyCounts {
@@ -203,7 +219,7 @@ impl Default for ConcurrencyCounts {
 impl ConcurrencyCounts {
     pub fn new() -> Self {
         Self {
-            queues: Arc::new(Mutex::new(HashMap::new())),
+            queues: Arc::new(DashMap::new()),
         }
     }
 
@@ -221,12 +237,14 @@ impl ConcurrencyCounts {
         tenant: &str,
         queue: &str,
     ) -> Result<(), Arc<slatedb::Error>> {
-        let key = concurrency_counts_key(tenant, queue);
+        let key = queue_key(tenant, queue);
 
-        // Pick an action under the map lock, then drop the lock before awaiting.
+        // Pick an action under the shard guard, then drop it before awaiting.
         let action: HydrateAction = {
-            let mut q = self.queues.lock().unwrap();
-            let entry = q.entry(key.clone()).or_insert_with(QueueEntry::new);
+            let mut entry = self
+                .queues
+                .entry(key.clone())
+                .or_insert_with(QueueEntry::new);
             match &entry.state {
                 HydrationState::Hydrated => HydrateAction::Done,
                 HydrationState::Hydrating(fut) => HydrateAction::Wait(fut.clone()),
@@ -251,24 +269,15 @@ impl ConcurrencyCounts {
                     HydrateAction::Wait(fut)
                 }
             }
-        }; // map lock dropped here
+        }; // shard guard dropped here
 
         match action {
             HydrateAction::Done => Ok(()),
-            HydrateAction::Wait(fut) => match fut.await {
-                Ok(()) => Ok(()),
-                Err(arc_err) => {
-                    // Reset to NotHydrated so the next caller starts a fresh
-                    // future; do not cache errors permanently.
-                    let mut q = self.queues.lock().unwrap();
-                    if let Some(entry) = q.get_mut(&key)
-                        && matches!(entry.state, HydrationState::Hydrating(_))
-                    {
-                        entry.state = HydrationState::NotHydrated;
-                    }
-                    Err(arc_err)
-                }
-            },
+            // The future itself resets state on error before resolving, so
+            // awaiters don't touch state here — if multiple awaiters did,
+            // a late one could clobber a *new* Hydrating(fut2) installed by
+            // a concurrent caller after a peer awaiter reset to NotHydrated.
+            HydrateAction::Wait(fut) => fut.await,
         }
     }
 
@@ -305,10 +314,9 @@ impl ConcurrencyCounts {
         limit: usize,
         job_id: &str,
     ) -> bool {
-        let key = concurrency_counts_key(tenant, queue);
+        let key = queue_key(tenant, queue);
         let reserved = {
-            let mut q = self.queues.lock().unwrap();
-            let entry = q.entry(key).or_insert_with(QueueEntry::new);
+            let mut entry = self.queues.entry(key).or_insert_with(QueueEntry::new);
 
             // Check if we're at capacity
             if entry.holders.len() >= limit {
@@ -318,7 +326,7 @@ impl ConcurrencyCounts {
             // Reserve the slot atomically
             entry.holders.insert(task_id.to_string());
             true
-        };
+        }; // shard guard dropped here
 
         if reserved {
             dst_events::emit(DstEvent::ConcurrencyTicketGranted {
@@ -336,9 +344,8 @@ impl ConcurrencyCounts {
     /// Useful for tests that want to use try_reserve_internal directly.
     #[doc(hidden)]
     pub fn mark_hydrated(&self, tenant: &str, queue: &str) {
-        let key = concurrency_counts_key(tenant, queue);
-        let mut q = self.queues.lock().unwrap();
-        q.entry(key).or_insert_with(QueueEntry::new).state = HydrationState::Hydrated;
+        let key = queue_key(tenant, queue);
+        self.queues.entry(key).or_insert_with(QueueEntry::new).state = HydrationState::Hydrated;
     }
 
     /// Synchronous try_reserve for testing when the queue is known to be hydrated or when testing in-memory reservation logic without DB.
@@ -358,23 +365,21 @@ impl ConcurrencyCounts {
 
     /// Release a reservation made by `try_reserve` if the DB write fails.
     pub fn release_reservation(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = concurrency_counts_key(tenant, queue);
-        let mut q = self.queues.lock().unwrap();
-        if let Some(entry) = q.get_mut(&key) {
+        let key = queue_key(tenant, queue);
+        if let Some(mut entry) = self.queues.get_mut(&key) {
             entry.holders.remove(task_id);
-        }
+        } // shard guard dropped here
     }
 
     /// Atomically release a task without granting to another.
     /// Used by callers post-commit after deleting a holder from the DB batch.
     pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = concurrency_counts_key(tenant, queue);
+        let key = queue_key(tenant, queue);
         {
-            let mut q = self.queues.lock().unwrap();
-            if let Some(entry) = q.get_mut(&key) {
+            if let Some(mut entry) = self.queues.get_mut(&key) {
                 entry.holders.remove(task_id);
             }
-        }
+        } // shard guard dropped here
 
         // Emit DST event for instrumentation
         dst_events::emit(DstEvent::ConcurrencyTicketReleased {
@@ -387,22 +392,26 @@ impl ConcurrencyCounts {
     /// Get the current holder count for a queue.
     /// Useful for testing and debugging.
     pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
-        let q = self.queues.lock().unwrap();
-        let key = concurrency_counts_key(tenant, queue);
-        q.get(&key).map(|e| e.holders.len()).unwrap_or(0)
+        let key = queue_key(tenant, queue);
+        self.queues
+            .get(&key)
+            .map(|entry| entry.holders.len())
+            .unwrap_or(0)
     }
 
     /// Snapshot the sizes of the in-memory holders cache for metrics reporting.
     pub fn cache_stats(&self) -> ConcurrencyCacheStats {
-        let (queue_count, total_holders) = {
-            let h = self.holders.lock().unwrap();
-            let total: usize = h.values().map(|s| s.len()).sum();
-            (h.len(), total)
-        };
-        let hydrated_queue_count = self.hydrated_queues.lock().unwrap().len();
+        let mut total_holders = 0usize;
+        let mut hydrated_queue_count = 0usize;
+        for entry in self.queues.iter() {
+            total_holders += entry.holders.len();
+            if matches!(entry.state, HydrationState::Hydrated) {
+                hydrated_queue_count += 1;
+            }
+        }
         ConcurrencyCacheStats {
             total_holders,
-            queue_count,
+            queue_count: self.queues.len(),
             hydrated_queue_count,
         }
     }
@@ -429,55 +438,80 @@ enum HydrateAction {
 
 /// Build the future that scans `concurrency_holders_queue_prefix(tenant, queue)`
 /// and, on success, merges results into the entry and flips state to `Hydrated`.
+/// On error, resets the entry's state to `NotHydrated` so the next caller starts
+/// a fresh scan; the future does this itself rather than letting awaiters do it,
+/// so that we can't clobber a `Hydrating(fut2)` installed by a concurrent caller
+/// after a peer awaiter reset to `NotHydrated`.
+///
 /// `'static` because it must be `.shared()` and spawned as a detached driver.
 async fn build_hydrate_future(
-    queues: Arc<Mutex<HashMap<Vec<u8>, QueueEntry>>>,
+    queues: Arc<DashMap<QueueKey, QueueEntry>>,
     db: Arc<InstrumentedDb>,
     range: ShardRange,
     tenant: String,
     queue: String,
-    key: Vec<u8>,
+    key: QueueKey,
 ) -> Result<(), Arc<slatedb::Error>> {
-    let start = concurrency_holders_queue_prefix(&tenant, &queue);
-    let end = end_bound(&start);
-    let mut iter = db
-        .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
-        .await
-        .map_err(Arc::new)?;
+    let scan_result: Result<Vec<String>, Arc<slatedb::Error>> = async {
+        let start = concurrency_holders_queue_prefix(&tenant, &queue);
+        let end = end_bound(&start);
+        let mut iter = db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await
+            .map_err(Arc::new)?;
 
-    let mut task_ids = Vec::new();
-    loop {
-        let maybe = iter.next().await.map_err(Arc::new)?;
-        let Some(kv) = maybe else { break };
+        let mut task_ids = Vec::new();
+        loop {
+            let maybe = iter.next().await.map_err(Arc::new)?;
+            let Some(kv) = maybe else { break };
 
-        let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
-            continue;
-        };
+            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
+                continue;
+            };
 
-        // Filter by shard range - only hydrate holders for tenants in this shard
-        if !range.contains_tenant(&parsed.tenant) {
-            tracing::debug!(
-                tenant = %parsed.tenant,
-                queue = %parsed.queue,
-                task = %parsed.task_id,
-                range = %range,
-                "skipping holder outside shard range during queue hydration"
-            );
-            continue;
+            // Filter by shard range - only hydrate holders for tenants in this shard
+            if !range.contains_tenant(&parsed.tenant) {
+                tracing::debug!(
+                    tenant = %parsed.tenant,
+                    queue = %parsed.queue,
+                    task = %parsed.task_id,
+                    range = %range,
+                    "skipping holder outside shard range during queue hydration"
+                );
+                continue;
+            }
+
+            task_ids.push(parsed.task_id);
         }
-
-        task_ids.push(parsed.task_id);
+        Ok(task_ids)
     }
+    .await;
 
-    // Merge scanned ids and flip state to Hydrated under a single lock.
-    // Idempotent w.r.t. concurrent try_reserve_internal inserts.
-    let mut q = queues.lock().unwrap();
-    let entry = q.entry(key).or_insert_with(QueueEntry::new);
-    for tid in task_ids {
-        entry.holders.insert(tid);
+    match scan_result {
+        Ok(task_ids) => {
+            // Merge scanned ids and flip state to Hydrated under a single shard guard.
+            // Idempotent w.r.t. concurrent try_reserve_internal inserts.
+            let mut entry = queues.entry(key).or_insert_with(QueueEntry::new);
+            for tid in task_ids {
+                entry.holders.insert(tid);
+            }
+            entry.state = HydrationState::Hydrated;
+            Ok(())
+        }
+        Err(arc_err) => {
+            // Reset state to NotHydrated so the next caller starts a fresh
+            // future. Only this future can be the `Hydrating(_)` we installed:
+            // success/error are the only state transitions, and `ensure_hydrated`
+            // only installs a new future when state is `NotHydrated`. So if state
+            // is still `Hydrating(_)` here, it is ours.
+            if let Some(mut entry) = queues.get_mut(&key)
+                && matches!(entry.state, HydrationState::Hydrating(_))
+            {
+                entry.state = HydrationState::NotHydrated;
+            }
+            Err(arc_err)
+        }
     }
-    entry.state = HydrationState::Hydrated;
-    Ok(())
 }
 
 /// The type of concurrency limit for a queue.
