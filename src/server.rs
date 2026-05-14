@@ -2158,8 +2158,13 @@ where
                 _ = interval.tick() => {
                     if let Some(ref m) = metrics_for_scrape {
                         for (shard_id, shard) in metrics_factory.instances().iter() {
+                            let shard_label = shard_id.to_string();
                             let recorder = shard.slatedb_metrics_recorder();
-                            m.update_slatedb_stats(&shard_id.to_string(), recorder);
+                            m.update_slatedb_stats(&shard_label, recorder);
+                            m.set_concurrency_holders_cache_stats(
+                                &shard_label,
+                                shard.concurrency_cache_stats(),
+                            );
                         }
                     }
                 }

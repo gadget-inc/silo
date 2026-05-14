@@ -766,6 +766,11 @@ impl JobStoreShard {
     pub fn broker_buffer_len(&self) -> usize {
         self.brokers.buffer_len()
     }
+
+    /// Snapshot the sizes of the in-memory concurrency holders cache.
+    pub fn concurrency_cache_stats(&self) -> crate::concurrency::ConcurrencyCacheStats {
+        self.concurrency.cache_stats()
+    }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_metrics_recorder(&self) -> &Arc<DefaultMetricsRecorder> {

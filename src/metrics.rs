@@ -129,6 +129,9 @@ pub struct Metrics {
 
     // Concurrency metrics
     concurrency_tickets_granted: CounterVec,
+    concurrency_holders_cache_holders: GaugeVec,
+    concurrency_holders_cache_queues: GaugeVec,
+    concurrency_holders_cache_hydrated_queues: GaugeVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -429,6 +432,23 @@ impl Metrics {
         self.concurrency_tickets_granted
             .with_label_values(&[shard, path.as_str()])
             .inc_by(n as f64);
+    }
+
+    /// Update the in-memory concurrency holders cache size gauges for a shard.
+    pub fn set_concurrency_holders_cache_stats(
+        &self,
+        shard: &str,
+        stats: crate::concurrency::ConcurrencyCacheStats,
+    ) {
+        self.concurrency_holders_cache_holders
+            .with_label_values(&[shard])
+            .set(stats.total_holders as f64);
+        self.concurrency_holders_cache_queues
+            .with_label_values(&[shard])
+            .set(stats.queue_count as f64);
+        self.concurrency_holders_cache_hydrated_queues
+            .with_label_values(&[shard])
+            .set(stats.hydrated_queue_count as f64);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1172,6 +1192,39 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_holders_cache_holders = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_concurrency_holders_cache_holders",
+                "Total number of holder entries in the in-memory concurrency holders cache",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_holders_cache_queues = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_concurrency_holders_cache_queues",
+                "Number of (tenant, queue) pairs tracked in the in-memory concurrency holders cache",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_holders_cache_hydrated_queues = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_concurrency_holders_cache_hydrated_queues",
+                "Number of (tenant, queue) pairs hydrated from durable storage into the concurrency holders cache",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // SlateDB watcher metrics (driven by Db::subscribe)
     let slatedb_durable_seq = register(
         &registry,
@@ -1270,6 +1323,9 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
         concurrency_tickets_granted,
+        concurrency_holders_cache_holders,
+        concurrency_holders_cache_queues,
+        concurrency_holders_cache_hydrated_queues,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
         slatedb_manifest_last_l0_seq,
