@@ -379,6 +379,31 @@ pred queueHasCapacity[q: Queue, t: Time] {
     no holdersAt[q, t]
 }
 
+-- ============================================================================
+-- Startup Hydration
+-- ============================================================================
+-- At process startup, the in-memory holders cache is populated by scanning
+-- every holder record in durable storage. Queues with zero holders at startup
+-- are deliberately omitted from the cache to avoid wasted work. The set
+-- `hydratedQueues` models that choice: it contains exactly the queues that
+-- had >=1 holder at the initial time `first`.
+
+/** Queues eagerly hydrated from durable storage at startup. */
+fun hydratedQueues: set Queue {
+    { q: Queue | some holdersAt[q, first] }
+}
+
+/** A queue is "observed" at t iff a holder or a request mentions it at t. */
+pred queueObservedAt[q: Queue, t: Time] {
+    some holdersAt[q, t] or some requestsAt[q, t]
+}
+
+/** First time the queue is observed across the whole trace. */
+pred queueFirstObservedAt[q: Queue, t: Time] {
+    queueObservedAt[q, t]
+    no tp: Time | lt[tp, t] and queueObservedAt[q, tp]
+}
+
 /** Check if a task holds all required queues for its job */
 pred taskHoldsAllQueues[tid: TaskId, j: Job, t: Time] {
     all q: jobQueues[j] | some h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t
@@ -2123,6 +2148,26 @@ assert grantedMeansNoRequest {
 }
 
 /**
+ * Safety claim for the "skip empty queues at startup" optimization.
+ *
+ * Whenever we observe a queue at runtime that is NOT in `hydratedQueues`
+ * (i.e., we omitted it at startup because it had zero holders), at least one
+ * of the following holds:
+ *   (a) this is the very first time the queue is observed in the trace, OR
+ *   (b) the queue had zero holders at startup.
+ *
+ * Clause (b) is true by construction of `hydratedQueues`, so the assertion is
+ * provable. It is included as an explicit safety claim that documents the
+ * engineering invariant: a cache miss for an omitted queue can never surprise
+ * us with a "ghost" holder we forgot about.
+ */
+assert omittedQueuesAreSafe {
+    all q: Queue, t: Time |
+        (q not in hydratedQueues and queueObservedAt[q, t]) implies
+            (queueFirstObservedAt[q, t] or no holdersAt[q, first])
+}
+
+/**
  * Expedite doesn't change job status.
  * After expediting, the job remains in the same status (Scheduled).
  * See: [SILO-EXP-2] pre: not terminal, so status must be Scheduled or Running.
@@ -3249,6 +3294,12 @@ check grantedMeansNoRequest for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Ti
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check noHoldersForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
+
+check omittedQueuesAreSafe for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
     6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
     8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,

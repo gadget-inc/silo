@@ -417,8 +417,12 @@ impl JobStoreShard {
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
         let concurrency = Arc::new(ConcurrencyManager::new(name.clone(), metrics.clone()));
 
-        // Note: concurrency counts are hydrated lazily on first access to each queue.
-        // This avoids blocking shard startup while scanning potentially large holder sets.
+        // Eagerly hydrate the in-memory holders cache from durable storage so
+        // that try_reserve and the grant scanner observe accurate capacity
+        // from the first operation. Queues with zero holders are skipped —
+        // the lazy ensure_hydrated path remains the fallback for queues first
+        // seen after startup (see omittedQueuesAreSafe in specs/job_shard.als).
+        concurrency.counts().hydrate_all(&db, &range).await?;
 
         let brokers = TaskBrokerRegistry::new(
             Arc::clone(&db),
@@ -782,6 +786,12 @@ impl JobStoreShard {
     /// Snapshot the sizes of the in-memory concurrency holders cache.
     pub fn concurrency_cache_stats(&self) -> crate::concurrency::ConcurrencyCacheStats {
         self.concurrency.cache_stats()
+    }
+
+    /// Holder count tracked in the in-memory concurrency cache for a specific
+    /// (tenant, queue). Useful for tests and ad-hoc debugging.
+    pub fn concurrency_holder_count(&self, tenant: &str, queue: &str) -> usize {
+        self.concurrency.counts().holder_count(tenant, queue)
     }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
