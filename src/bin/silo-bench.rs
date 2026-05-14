@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use rand::Rng;
+use silo::cluster_client::ClientConfig;
 use silo::pb::report_outcome_request::Outcome;
 use silo::pb::{
     ConcurrencyLimit, EnqueueRequest, LeaseTasksRequest, Limit, ReportOutcomeRequest,
@@ -77,6 +78,11 @@ struct Args {
     /// Enable structured JSON logging
     #[arg(long)]
     structured_logging: bool,
+
+    /// Bearer token for gRPC authentication.
+    /// Can also be set via SILO_AUTH_TOKEN environment variable.
+    #[arg(long, env = "SILO_AUTH_TOKEN")]
+    auth_token: Option<String>,
 }
 
 fn now_ms() -> i64 {
@@ -606,7 +612,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Discover cluster topology and create shared client
     info!("Discovering cluster topology...");
-    let client = RoutingClient::discover(&args.address).await?;
+    let client_config = ClientConfig {
+        auth_token: args.auth_token.clone(),
+        ..ClientConfig::default()
+    };
+    let client = RoutingClient::discover_with_config(&args.address, client_config).await?;
 
     let topo = client.topology();
     info!(
