@@ -356,6 +356,32 @@ impl ConcurrencyCounts {
         let key = concurrency_counts_key(tenant, queue);
         h.get(&key).map(|s| s.len()).unwrap_or(0)
     }
+
+    /// Snapshot the sizes of the in-memory holders cache for metrics reporting.
+    pub fn cache_stats(&self) -> ConcurrencyCacheStats {
+        let (queue_count, total_holders) = {
+            let h = self.holders.lock().unwrap();
+            let total: usize = h.values().map(|s| s.len()).sum();
+            (h.len(), total)
+        };
+        let hydrated_queue_count = self.hydrated_queues.lock().unwrap().len();
+        ConcurrencyCacheStats {
+            total_holders,
+            queue_count,
+            hydrated_queue_count,
+        }
+    }
+}
+
+/// Snapshot of the in-memory concurrency holders cache for metrics reporting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConcurrencyCacheStats {
+    /// Total number of holder entries across all tracked queues.
+    pub total_holders: usize,
+    /// Number of (tenant, queue) pairs currently tracked in the holders map.
+    pub queue_count: usize,
+    /// Number of (tenant, queue) pairs that have been hydrated from durable storage.
+    pub hydrated_queue_count: usize,
 }
 
 /// The type of concurrency limit for a queue.
@@ -411,6 +437,11 @@ impl ConcurrencyManager {
 
     pub fn counts(&self) -> &ConcurrencyCounts {
         &self.counts
+    }
+
+    /// Snapshot the sizes of the in-memory concurrency caches for metrics reporting.
+    pub fn cache_stats(&self) -> ConcurrencyCacheStats {
+        self.counts.cache_stats()
     }
 
     /// Cache the resolved concurrency limit for a queue. Called during enqueue and grant_next
