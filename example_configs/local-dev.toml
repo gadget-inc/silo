@@ -40,11 +40,11 @@ path = "/var/lib/silo/%shard%"
 # status. Either or both can be set independently.
 #
 # Counter accounting can drift slightly if shards close before terminal rows
-# are dropped — enable `enable_counter_reconciliation` to self-heal.
+# are dropped — set `counter_reconciliation_seconds = <interval>` to self-heal.
 # 7 days = 604_800 s, 1 day = 86_400 s.
 # completed_job_expire_s = 86400
 # terminal_job_expire_s = 604800
-# enable_counter_reconciliation = true
+# counter_reconciliation_seconds = 3600
 
 # Garbage collection — disabled by default in SlateDB!
 # Without this, old WAL files, SSTs, and manifests accumulate forever.

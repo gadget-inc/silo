@@ -612,7 +612,7 @@ pub async fn clone_golden_shard(
             concurrency_reconcile_interval: Duration::from_millis(
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
             ),
-            enable_counter_reconciliation: false,
+            counter_reconciliation_seconds: None,
             hydrate_all_at_startup: false,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,

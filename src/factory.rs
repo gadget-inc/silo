@@ -191,7 +191,7 @@ impl ShardFactory {
                         concurrency_reconcile_interval: Duration::from_millis(
                             template.concurrency_reconcile_interval_ms.max(1),
                         ),
-                        enable_counter_reconciliation: template.enable_counter_reconciliation,
+                        counter_reconciliation_seconds: template.counter_reconciliation_seconds,
                         hydrate_all_at_startup: template.hydrate_all_at_startup,
                         completed_job_expire_s: template.completed_job_expire_s,
                         terminal_job_expire_s: template.terminal_job_expire_s,
