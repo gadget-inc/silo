@@ -159,8 +159,8 @@ pub struct JobStoreShard {
 pub enum JobStoreShardError {
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
-    #[error(transparent)]
-    Slate(#[from] slatedb::Error),
+    #[error("{0}")]
+    Slate(Arc<slatedb::Error>),
     #[error("json serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("codec error: {0}")]
@@ -253,6 +253,18 @@ impl From<LsmState> for crate::pb::GetShardStorageInfoResponse {
 impl From<CodecError> for JobStoreShardError {
     fn from(e: CodecError) -> Self {
         JobStoreShardError::Codec(e.to_string())
+    }
+}
+
+impl From<slatedb::Error> for JobStoreShardError {
+    fn from(e: slatedb::Error) -> Self {
+        JobStoreShardError::Slate(Arc::new(e))
+    }
+}
+
+impl From<Arc<slatedb::Error>> for JobStoreShardError {
+    fn from(e: Arc<slatedb::Error>) -> Self {
+        JobStoreShardError::Slate(e)
     }
 }
 
@@ -860,7 +872,7 @@ impl JobStoreShard {
     ) -> Vec<String> {
         let range = self.get_range();
         self.concurrency
-            .process_grants(self.db.as_ref(), &range, tenant, queue, count)
+            .process_grants(&self.db, &range, tenant, queue, count)
             .await
     }
 

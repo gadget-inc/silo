@@ -186,11 +186,11 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
         .await
         .expect("write pending concurrency request");
 
-    assert_eq!(
-        count_concurrency_requests(shard.db()).await,
-        1,
-        "request should be present before reconciliation"
-    );
+    // The periodic reconciler may already have ticked and consumed the request by
+    // the time we observe it (especially under cargo test's parallel load), so we
+    // skip a deterministic "request == 1" snapshot here and rely on the
+    // end-to-end assertions below — holders becomes 1 and requests drains to 0 —
+    // to verify reconciliation processed the injected request.
 
     // Drive a single reconciliation pass deterministically rather than waiting
     // on the background interval.
