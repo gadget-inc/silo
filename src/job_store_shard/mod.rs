@@ -420,9 +420,14 @@ impl JobStoreShard {
         // Eagerly hydrate the in-memory holders cache from durable storage so
         // that try_reserve and the grant scanner observe accurate capacity
         // from the first operation. Queues with zero holders are skipped —
-        // the lazy ensure_hydrated path remains the fallback for queues first
-        // seen after startup (see omittedQueuesAreSafe in specs/job_shard.als).
-        concurrency.counts().hydrate_all(&db, &range).await?;
+        // when eager mode is enabled, `ensure_hydrated` treats such misses as
+        // empty hydrated queues (see omittedQueuesAreSafe in specs/job_shard.als).
+        //
+        // Gated by `SILO_HYDRATE_ALL=1`. Unset / `0` falls back to the
+        // singleflighted JIT path on first access.
+        if crate::concurrency::eager_hydration_enabled() {
+            concurrency.counts().hydrate_all(&db, &range).await?;
+        }
 
         let brokers = TaskBrokerRegistry::new(
             Arc::clone(&db),

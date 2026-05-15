@@ -37,6 +37,7 @@
 //!   this also catches any stale cancelled requests.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -196,6 +197,15 @@ fn queue_key(tenant: &str, queue: &str) -> QueueKey {
     (Arc::from(tenant), Arc::from(queue))
 }
 
+/// Reads `SILO_HYDRATE_ALL` once per process. When set to `1`, callers eagerly
+/// scan all queues at startup and treat `ensure_hydrated` misses as empty
+/// queues (`Hydrated` with no holders). When unset or any other value, the
+/// normal singleflighted JIT path runs on each miss.
+pub fn eager_hydration_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| matches!(std::env::var("SILO_HYDRATE_ALL").as_deref(), Ok("1")))
+}
+
 /// In-memory counts for concurrency holders.
 ///
 /// Backed by a `DashMap` so each call serializes only on its shard's lock
@@ -303,6 +313,11 @@ impl ConcurrencyCounts {
     /// Slow path: if a scan is in flight, await it; otherwise build a new
     /// scan future, store it on the entry, spawn a detached driver to keep
     /// it making progress regardless of caller cancellation, and await.
+    ///
+    /// When `SILO_HYDRATE_ALL=1`, `hydrate_all` has already loaded every
+    /// non-empty queue at startup, so a `NotHydrated` miss here is a queue
+    /// with zero durable holders. We flip it to `Hydrated` in place rather
+    /// than scanning durable storage again.
     pub async fn ensure_hydrated(
         &self,
         db: &Arc<InstrumentedDb>,
@@ -321,6 +336,13 @@ impl ConcurrencyCounts {
             match &entry.state {
                 HydrationState::Hydrated => HydrateAction::Done,
                 HydrationState::Hydrating(fut) => HydrateAction::Wait(fut.clone()),
+                HydrationState::NotHydrated if eager_hydration_enabled() => {
+                    // Startup `hydrate_all` already scanned every non-empty
+                    // queue, so a miss is an empty queue. Skip the per-queue
+                    // scan and treat as hydrated.
+                    entry.state = HydrationState::Hydrated;
+                    HydrateAction::Done
+                }
                 HydrationState::NotHydrated => {
                     let fut = build_hydrate_future(
                         Arc::clone(&self.queues),
