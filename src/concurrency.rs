@@ -224,68 +224,6 @@ impl ConcurrencyCounts {
         }
     }
 
-    /// Hydrate a specific queue's concurrency holder state from durable storage.
-    ///
-    /// Uses the per-queue prefix for efficient scanning of only the relevant holders. The `range` parameter filters holders to only load those for tenants within the shard's range. This is critical after shard splits - both child shards clone the same holder records, and without filtering, both would think they own the same concurrency tickets, leading to limit violations.
-    pub async fn hydrate_queue(
-        &self,
-        db: &InstrumentedDb,
-        range: &ShardRange,
-        tenant: &str,
-        queue: &str,
-    ) -> Result<(), slatedb::Error> {
-        let key = concurrency_counts_key(tenant, queue);
-
-        // Scan holders for this specific tenant/queue using the queue prefix
-        let start = concurrency_holders_queue_prefix(tenant, queue);
-        let end = end_bound(&start);
-        let mut iter = db
-            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
-            .await?;
-
-        let mut task_ids = Vec::new();
-        loop {
-            let maybe = iter.next().await?;
-            let Some(kv) = maybe else { break };
-
-            // Parse holder key to extract tenant, queue, task_id
-            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
-                continue;
-            };
-
-            // Filter by shard range - only hydrate holders for tenants in this shard
-            if !range.contains_tenant(&parsed.tenant) {
-                tracing::debug!(
-                    tenant = %parsed.tenant,
-                    queue = %parsed.queue,
-                    task = %parsed.task_id,
-                    range = %range,
-                    "skipping holder outside shard range during queue hydration"
-                );
-                continue;
-            }
-
-            task_ids.push(parsed.task_id);
-        }
-
-        // Update holders map
-        {
-            let mut h = self.holders.lock().unwrap();
-            let set = h.entry(key.clone()).or_default();
-            for task_id in task_ids {
-                set.insert(task_id);
-            }
-        }
-
-        // Mark queue as hydrated
-        {
-            let mut hydrated = self.hydrated_queues.lock().unwrap();
-            hydrated.insert(key);
-        }
-
-        Ok(())
-    }
-
     /// Eagerly hydrate every (tenant, queue) pair that has at least one
     /// in-range holder in durable storage. Called once at shard startup so
     /// that `try_reserve` and the grant scanner observe accurate capacity
@@ -315,7 +253,7 @@ impl ConcurrencyCounts {
 
         // Group task_ids by composite key. BTreeMap gives deterministic
         // iteration order for DST reproducibility.
-        let mut grouped: BTreeMap<Vec<u8>, HashSet<String>> = BTreeMap::new();
+        let mut grouped: BTreeMap<QueueKey, HashSet<String>> = BTreeMap::new();
         loop {
             let Some(kv) = iter.next().await? else { break };
             let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
@@ -331,20 +269,23 @@ impl ConcurrencyCounts {
                 );
                 continue;
             }
-            let key = concurrency_counts_key(&parsed.tenant, &parsed.queue);
+            let key = queue_key(&parsed.tenant, &parsed.queue);
             grouped.entry(key).or_default().insert(parsed.task_id);
         }
 
         let queue_count = grouped.len();
         let holder_count: usize = grouped.values().map(|s| s.len()).sum();
 
-        {
-            let mut h = self.holders.lock().unwrap();
-            let mut hydrated = self.hydrated_queues.lock().unwrap();
-            for (key, set) in grouped {
-                h.insert(key.clone(), set);
-                hydrated.insert(key);
+        // DashMap shards are per-key, so we acquire each entry's guard
+        // individually and drop it at the end of the iteration. Called once
+        // at startup before workers run, so no concurrent `ensure_hydrated`
+        // can race here.
+        for (key, set) in grouped {
+            let mut entry = self.queues.entry(key).or_insert_with(QueueEntry::new);
+            for task_id in set {
+                entry.holders.insert(task_id);
             }
+            entry.state = HydrationState::Hydrated;
         }
 
         tracing::info!(
