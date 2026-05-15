@@ -29,6 +29,9 @@ fn fs_config(path: &std::path::Path) -> DatabaseConfig {
         backend: Backend::Fs,
         path: path.to_string_lossy().to_string(),
         slatedb: Some(fast_flush_slatedb_settings()),
+        // These tests exercise the eager startup-hydration path, so opt in
+        // explicitly here regardless of the global default.
+        hydrate_all_at_startup: true,
         ..Default::default()
     }
 }

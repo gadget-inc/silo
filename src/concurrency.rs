@@ -37,7 +37,6 @@
 //!   this also catches any stale cancelled requests.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -197,15 +196,6 @@ fn queue_key(tenant: &str, queue: &str) -> QueueKey {
     (Arc::from(tenant), Arc::from(queue))
 }
 
-/// Reads `SILO_HYDRATE_ALL` once per process. When set to `1`, callers eagerly
-/// scan all queues at startup and treat `ensure_hydrated` misses as empty
-/// queues (`Hydrated` with no holders). When unset or any other value, the
-/// normal singleflighted JIT path runs on each miss.
-pub fn eager_hydration_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| matches!(std::env::var("SILO_HYDRATE_ALL").as_deref(), Ok("1")))
-}
-
 /// In-memory counts for concurrency holders.
 ///
 /// Backed by a `DashMap` so each call serializes only on its shard's lock
@@ -219,6 +209,11 @@ pub fn eager_hydration_enabled() -> bool {
 /// lock. All such scopes in this file are explicit `{ ... }` blocks.
 pub struct ConcurrencyCounts {
     queues: Arc<DashMap<QueueKey, QueueEntry>>,
+    /// When `true`, `ensure_hydrated` treats `NotHydrated` misses as
+    /// already-hydrated empty queues — startup `hydrate_all` is expected to
+    /// have already scanned every non-empty queue. When `false`, the
+    /// singleflighted per-queue scan runs on miss.
+    hydrate_all_at_startup: bool,
 }
 
 impl Default for ConcurrencyCounts {
@@ -228,9 +223,17 @@ impl Default for ConcurrencyCounts {
 }
 
 impl ConcurrencyCounts {
+    /// JIT-hydration ConcurrencyCounts. Used by unit tests that don't go
+    /// through a real shard open; production code goes through
+    /// [`ConcurrencyCounts::with_config`].
     pub fn new() -> Self {
+        Self::with_config(false)
+    }
+
+    pub fn with_config(hydrate_all_at_startup: bool) -> Self {
         Self {
             queues: Arc::new(DashMap::new()),
+            hydrate_all_at_startup,
         }
     }
 
@@ -314,7 +317,7 @@ impl ConcurrencyCounts {
     /// scan future, store it on the entry, spawn a detached driver to keep
     /// it making progress regardless of caller cancellation, and await.
     ///
-    /// When `SILO_HYDRATE_ALL=1`, `hydrate_all` has already loaded every
+    /// When `hydrate_all_at_startup` is set, `hydrate_all` has already loaded every
     /// non-empty queue at startup, so a `NotHydrated` miss here is a queue
     /// with zero durable holders. We flip it to `Hydrated` in place rather
     /// than scanning durable storage again.
@@ -336,7 +339,7 @@ impl ConcurrencyCounts {
             match &entry.state {
                 HydrationState::Hydrated => HydrateAction::Done,
                 HydrationState::Hydrating(fut) => HydrateAction::Wait(fut.clone()),
-                HydrationState::NotHydrated if eager_hydration_enabled() => {
+                HydrationState::NotHydrated if self.hydrate_all_at_startup => {
                     // Startup `hydrate_all` already scanned every non-empty
                     // queue, so a miss is an empty queue. Skip the per-queue
                     // scan and treat as hydrated.
@@ -648,10 +651,14 @@ pub struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    pub fn new(shard: impl Into<String>, metrics: Option<Metrics>) -> Self {
+    pub fn new(
+        shard: impl Into<String>,
+        metrics: Option<Metrics>,
+        hydrate_all_at_startup: bool,
+    ) -> Self {
         Self {
             shard: shard.into(),
-            counts: ConcurrencyCounts::new(),
+            counts: ConcurrencyCounts::with_config(hydrate_all_at_startup),
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
