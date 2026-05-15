@@ -61,10 +61,11 @@ use crate::dst_events::{self, DstEvent};
 use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
-    concurrency_counts_key, concurrency_holder_key, concurrency_holders_queue_prefix,
-    concurrency_request_key, concurrency_request_prefix, concurrency_requester_counter_key,
-    concurrency_requests_prefix, end_bound, floating_limit_state_key, job_status_key,
-    parse_concurrency_holder_key, parse_concurrency_request_key, task_key,
+    concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
+    concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
+    concurrency_requester_counter_key, concurrency_requests_prefix, end_bound,
+    floating_limit_state_key, job_status_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, task_key,
 };
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
@@ -208,6 +209,11 @@ fn queue_key(tenant: &str, queue: &str) -> QueueKey {
 /// lock. All such scopes in this file are explicit `{ ... }` blocks.
 pub struct ConcurrencyCounts {
     queues: Arc<DashMap<QueueKey, QueueEntry>>,
+    /// When `true`, `ensure_hydrated` treats `NotHydrated` misses as
+    /// already-hydrated empty queues — startup `hydrate_all` is expected to
+    /// have already scanned every non-empty queue. When `false`, the
+    /// singleflighted per-queue scan runs on miss.
+    hydrate_all_at_startup: bool,
 }
 
 impl Default for ConcurrencyCounts {
@@ -217,10 +223,92 @@ impl Default for ConcurrencyCounts {
 }
 
 impl ConcurrencyCounts {
+    /// JIT-hydration ConcurrencyCounts. Used by unit tests that don't go
+    /// through a real shard open; production code goes through
+    /// [`ConcurrencyCounts::with_config`].
     pub fn new() -> Self {
+        Self::with_config(false)
+    }
+
+    pub fn with_config(hydrate_all_at_startup: bool) -> Self {
         Self {
             queues: Arc::new(DashMap::new()),
+            hydrate_all_at_startup,
         }
+    }
+
+    /// Eagerly hydrate every (tenant, queue) pair that has at least one
+    /// in-range holder in durable storage. Called once at shard startup so
+    /// that `try_reserve` and the grant scanner observe accurate capacity
+    /// from the very first operation.
+    ///
+    /// Queues with zero holders are deliberately skipped — they don't appear
+    /// in the scan, so they're never inserted into `holders` or
+    /// `hydrated_queues`. The lazy `ensure_hydrated` path remains responsible
+    /// for them: when such a queue is first encountered after startup, the
+    /// per-queue scan correctly finds zero durable holders (see the
+    /// `omittedQueuesAreSafe` assertion in specs/job_shard.als).
+    ///
+    /// The `range` parameter filters holders to only those for tenants within
+    /// the shard's range. This is critical after shard splits — both child
+    /// shards may see the same holder records in durable storage but only one
+    /// of them owns each tenant.
+    pub async fn hydrate_all(
+        &self,
+        db: &InstrumentedDb,
+        range: &ShardRange,
+    ) -> Result<(), slatedb::Error> {
+        let started_at = std::time::Instant::now();
+        let start = concurrency_holders_prefix();
+        let end = end_bound(&start);
+        let mut iter = db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
+
+        // Group task_ids by composite key. BTreeMap gives deterministic
+        // iteration order for DST reproducibility.
+        let mut grouped: BTreeMap<QueueKey, HashSet<String>> = BTreeMap::new();
+        loop {
+            let Some(kv) = iter.next().await? else { break };
+            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
+                continue;
+            };
+            if !range.contains_tenant(&parsed.tenant) {
+                tracing::debug!(
+                    tenant = %parsed.tenant,
+                    queue = %parsed.queue,
+                    task = %parsed.task_id,
+                    range = %range,
+                    "skipping holder outside shard range during startup hydration"
+                );
+                continue;
+            }
+            let key = queue_key(&parsed.tenant, &parsed.queue);
+            grouped.entry(key).or_default().insert(parsed.task_id);
+        }
+
+        let queue_count = grouped.len();
+        let holder_count: usize = grouped.values().map(|s| s.len()).sum();
+
+        // DashMap shards are per-key, so we acquire each entry's guard
+        // individually and drop it at the end of the iteration. Called once
+        // at startup before workers run, so no concurrent `ensure_hydrated`
+        // can race here.
+        for (key, set) in grouped {
+            let mut entry = self.queues.entry(key).or_insert_with(QueueEntry::new);
+            for task_id in set {
+                entry.holders.insert(task_id);
+            }
+            entry.state = HydrationState::Hydrated;
+        }
+
+        tracing::info!(
+            queues = queue_count,
+            holders = holder_count,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "hydrated concurrency holders cache at startup"
+        );
+        Ok(())
     }
 
     /// Ensure a queue is hydrated before checking capacity.
@@ -230,6 +318,11 @@ impl ConcurrencyCounts {
     /// Slow path: if a scan is in flight, await it; otherwise build a new
     /// scan future, store it on the entry, spawn a detached driver to keep
     /// it making progress regardless of caller cancellation, and await.
+    ///
+    /// When `hydrate_all_at_startup` is set, `hydrate_all` has already loaded every
+    /// non-empty queue at startup, so a `NotHydrated` miss here is a queue
+    /// with zero durable holders. We flip it to `Hydrated` in place rather
+    /// than scanning durable storage again.
     pub async fn ensure_hydrated(
         &self,
         db: &Arc<InstrumentedDb>,
@@ -248,6 +341,13 @@ impl ConcurrencyCounts {
             match &entry.state {
                 HydrationState::Hydrated => HydrateAction::Done,
                 HydrationState::Hydrating(fut) => HydrateAction::Wait(fut.clone()),
+                HydrationState::NotHydrated if self.hydrate_all_at_startup => {
+                    // Startup `hydrate_all` already scanned every non-empty
+                    // queue, so a miss is an empty queue. Skip the per-queue
+                    // scan and treat as hydrated.
+                    entry.state = HydrationState::Hydrated;
+                    HydrateAction::Done
+                }
                 HydrationState::NotHydrated => {
                     let fut = build_hydrate_future(
                         Arc::clone(&self.queues),
@@ -553,10 +653,14 @@ pub struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    pub fn new(shard: impl Into<String>, metrics: Option<Metrics>) -> Self {
+    pub fn new(
+        shard: impl Into<String>,
+        metrics: Option<Metrics>,
+        hydrate_all_at_startup: bool,
+    ) -> Self {
         Self {
             shard: shard.into(),
-            counts: ConcurrencyCounts::new(),
+            counts: ConcurrencyCounts::with_config(hydrate_all_at_startup),
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),

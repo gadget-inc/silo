@@ -193,6 +193,10 @@ fn default_enable_counter_reconciliation() -> bool {
     false
 }
 
+fn default_hydrate_all_at_startup() -> bool {
+    false
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -224,6 +228,13 @@ pub struct DatabaseTemplate {
     /// are unaffected. Defaults to false (reconciliation disabled).
     #[serde(default = "default_enable_counter_reconciliation")]
     pub enable_counter_reconciliation: bool,
+    /// When true, scan every concurrency holder into the in-memory cache before
+    /// the shard accepts traffic, and treat later `ensure_hydrated` misses as
+    /// empty queues. When false, no startup scan runs and the singleflighted
+    /// per-queue `ensure_hydrated` path hydrates each queue lazily on first
+    /// access. Defaults to false.
+    #[serde(default = "default_hydrate_all_at_startup")]
+    pub hydrate_all_at_startup: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -247,6 +258,7 @@ impl Default for DatabaseTemplate {
             apply_wal_on_close: default_apply_wal_on_close(),
             concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
             enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            hydrate_all_at_startup: default_hydrate_all_at_startup(),
             slatedb: None,
             memory_cache: None,
         }
@@ -500,6 +512,11 @@ pub struct DatabaseConfig {
     /// See `DatabaseTemplate::enable_counter_reconciliation` for details.
     #[serde(default = "default_enable_counter_reconciliation")]
     pub enable_counter_reconciliation: bool,
+    /// When true, eagerly scan every concurrency holder into the in-memory
+    /// cache at startup. See `DatabaseTemplate::hydrate_all_at_startup` for
+    /// details. Defaults to false.
+    #[serde(default = "default_hydrate_all_at_startup")]
+    pub hydrate_all_at_startup: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -523,6 +540,7 @@ impl Default for DatabaseConfig {
             wal: None,
             apply_wal_on_close: default_apply_wal_on_close(),
             enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            hydrate_all_at_startup: default_hydrate_all_at_startup(),
             slatedb: None,
             memory_cache: None,
         }

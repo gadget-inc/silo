@@ -89,6 +89,15 @@ pub struct OpenShardOptions {
     /// standalone compactor dropping terminal job rows; deployments that run
     /// the standalone compactor enable it. Defaults to off.
     pub enable_counter_reconciliation: bool,
+    /// When true, scan every concurrency holder into the in-memory cache
+    /// before opening the shard for ticket granting, and treat
+    /// `ensure_hydrated` misses thereafter as empty queues. When false, no
+    /// startup scan runs and the singleflighted per-queue `ensure_hydrated`
+    /// path hydrates each queue lazily on first access.
+    ///
+    /// Populated from `DatabaseConfig::hydrate_all_at_startup` /
+    /// `DatabaseTemplate::hydrate_all_at_startup`; tests set it explicitly.
+    pub hydrate_all_at_startup: bool,
 }
 
 fn expand_slatedb_settings_for_shard(
@@ -327,6 +336,7 @@ impl JobStoreShard {
                     crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
                 ),
                 enable_counter_reconciliation: cfg.enable_counter_reconciliation,
+                hydrate_all_at_startup: cfg.hydrate_all_at_startup,
             },
             range,
         )
@@ -364,6 +374,7 @@ impl JobStoreShard {
             metrics,
             concurrency_reconcile_interval,
             enable_counter_reconciliation,
+            hydrate_all_at_startup,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -415,10 +426,24 @@ impl JobStoreShard {
         let shard_span = info_span!("shard", shard = %name);
         let db = db_builder.build().instrument(shard_span.clone()).await?;
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
-        let concurrency = Arc::new(ConcurrencyManager::new(name.clone(), metrics.clone()));
+        let concurrency = Arc::new(ConcurrencyManager::new(
+            name.clone(),
+            metrics.clone(),
+            hydrate_all_at_startup,
+        ));
 
-        // Note: concurrency counts are hydrated lazily on first access to each queue.
-        // This avoids blocking shard startup while scanning potentially large holder sets.
+        // Eagerly hydrate the in-memory holders cache from durable storage so
+        // that try_reserve and the grant scanner observe accurate capacity
+        // from the first operation. Queues with zero holders are skipped —
+        // when eager mode is enabled, `ensure_hydrated` treats such misses as
+        // empty hydrated queues (see omittedQueuesAreSafe in specs/job_shard.als).
+        //
+        // Controlled by `hydrate_all_at_startup`. When false, the
+        // singleflighted JIT `ensure_hydrated` path covers each queue on
+        // first access.
+        if hydrate_all_at_startup {
+            concurrency.counts().hydrate_all(&db, &range).await?;
+        }
 
         let brokers = TaskBrokerRegistry::new(
             Arc::clone(&db),
@@ -782,6 +807,12 @@ impl JobStoreShard {
     /// Snapshot the sizes of the in-memory concurrency holders cache.
     pub fn concurrency_cache_stats(&self) -> crate::concurrency::ConcurrencyCacheStats {
         self.concurrency.cache_stats()
+    }
+
+    /// Holder count tracked in the in-memory concurrency cache for a specific
+    /// (tenant, queue). Useful for tests and ad-hoc debugging.
+    pub fn concurrency_holder_count(&self, tenant: &str, queue: &str) -> usize {
+        self.concurrency.counts().holder_count(tenant, queue)
     }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
