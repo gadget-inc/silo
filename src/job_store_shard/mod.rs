@@ -126,7 +126,18 @@ pub struct OpenShardOptions {
     /// disabled until hydration completes, so any concurrency-limited
     /// enqueues that arrive in the gap are written as durable TicketRequests
     /// and drained by the grant scanner once hydration finishes.
+    ///
+    /// Only consulted when `hydrate_all_at_startup` is `true`.
     pub startup_hydration_timeout: Option<Duration>,
+    /// When `true`, scan every concurrency holder into the in-memory cache
+    /// before opening the shard for ticket granting, and treat
+    /// `ensure_hydrated` misses thereafter as empty queues. When `false`, no
+    /// startup scan runs and the singleflighted per-queue `ensure_hydrated`
+    /// path hydrates each queue lazily on first access.
+    ///
+    /// Binaries typically populate this from `SILO_HYDRATE_ALL`; tests set it
+    /// explicitly via `open_with_resolved_store`.
+    pub hydrate_all_at_startup: bool,
 }
 
 /// Compute the row TTL (`expire_ts`, epoch ms) for a job that reached the
@@ -421,7 +432,8 @@ impl JobStoreShard {
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 startup_hydration_timeout: cfg
                     .startup_hydration_timeout_ms
-                    .map(|ms| Duration::from_millis(ms)),
+                    .map(Duration::from_millis),
+                hydrate_all_at_startup: crate::concurrency::eager_hydration_enabled(),
             },
             range,
         )
@@ -465,6 +477,7 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             startup_hydration_timeout,
+            hydrate_all_at_startup,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -537,13 +550,12 @@ impl JobStoreShard {
         // when eager mode is enabled, `ensure_hydrated` treats such misses as
         // empty hydrated queues (see omittedQueuesAreSafe in specs/job_shard.als).
         //
-        // Controlled by `hydrate_all_at_startup`. When false, the
-        // singleflighted JIT `ensure_hydrated` path covers each queue on
-        // first access.
+        // When `hydrate_all_at_startup` is false, skip the startup scan; the
+        // singleflighted JIT `ensure_hydrated` path covers each queue on first
+        // access and the enqueue/grant gates remain open.
         if hydrate_all_at_startup {
             accepting_enqueues.store(false, std::sync::atomic::Ordering::SeqCst);
             grants_enabled.store(false, std::sync::atomic::Ordering::SeqCst);
-
             // Run startup hydration. Two modes:
             //   - `startup_hydration_timeout = None`: synchronous, block until
             //     hydration is fully done. Both gates flip true before `open`
@@ -615,6 +627,12 @@ impl JobStoreShard {
                     });
                 }
             }
+        } else {
+            // JIT mode: no startup scan. `ensure_hydrated` populates each queue
+            // on first access (singleflighted), so there's no startup window to
+            // gate — open immediately.
+            accepting_enqueues.store(true, std::sync::atomic::Ordering::SeqCst);
+            grants_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         let brokers = TaskBrokerRegistry::new(

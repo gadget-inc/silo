@@ -200,6 +200,7 @@ impl ShardFactory {
                         startup_hydration_timeout: template
                             .startup_hydration_timeout_ms
                             .map(Duration::from_millis),
+                        hydrate_all_at_startup: crate::concurrency::eager_hydration_enabled(),
                     },
                     range.clone(),
                 )

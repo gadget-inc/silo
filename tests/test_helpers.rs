@@ -158,12 +158,45 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             startup_hydration_timeout: None,
+            hydrate_all_at_startup: false,
         },
         ShardRange::full(),
     )
     .await
     .expect("open shard");
     (tmp, shard)
+}
+
+/// Open a shard at `path` with eager startup hydration enabled and the given
+/// shard range. Use for tests that need `hydrate_all` to run on open so that
+/// previously-planted holder records land in the in-memory cache.
+pub async fn open_shard_at_path_eager(
+    path: &std::path::Path,
+    range: ShardRange,
+) -> std::sync::Arc<JobStoreShard> {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let resolved = resolve_object_store(&Backend::Fs, path.to_string_lossy().as_ref())
+        .expect("resolve fs object store");
+    JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &resolved.canonical_path,
+        OpenShardOptions {
+            store: resolved.store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
+            rate_limiter,
+            metrics: None,
+            concurrency_reconcile_interval: Duration::from_millis(50),
+            enable_counter_reconciliation: false,
+            startup_hydration_timeout: None,
+            hydrate_all_at_startup: true,
+        },
+        range,
+    )
+    .await
+    .expect("open shard")
 }
 
 /// Open a temp shard at `path` with a bounded `startup_hydration_timeout`.
@@ -191,6 +224,8 @@ pub async fn open_temp_shard_at_path_with_hydration_timeout(
             enable_counter_reconciliation: false,
             hydrate_all_at_startup: true,
             startup_hydration_timeout: Some(timeout),
+            // The timeout knob only matters under eager hydration.
+            hydrate_all_at_startup: true,
         },
         ShardRange::full(),
     )

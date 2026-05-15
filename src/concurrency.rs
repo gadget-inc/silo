@@ -280,7 +280,7 @@ pub struct ConcurrencyCounts {
 
 impl Default for ConcurrencyCounts {
     fn default() -> Self {
-        // Defaulting to grants enabled keeps unit tests using
+        // Defaulting to grants enabled + JIT hydration keeps unit tests using
         // `ConcurrencyCounts::new()`/`try_reserve_sync` behaving as before.
         Self::with_config(false, Arc::new(AtomicBool::new(true)))
     }

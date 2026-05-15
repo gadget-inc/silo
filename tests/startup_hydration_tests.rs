@@ -72,12 +72,9 @@ async fn eager_hydration_loads_existing_holders_at_startup() {
     shard1.db().flush().await.expect("flush");
     shard1.close().await.expect("close");
 
-    // Phase 2: reopen — eager hydration must populate the cache from the
-    // holders we just planted.
-    let shard2 =
-        silo::job_store_shard::JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
-            .await
-            .expect("open shard2");
+    // Phase 2: reopen with eager hydration — `hydrate_all` must populate the
+    // cache from the holders we just planted.
+    let shard2 = open_shard_at_path_eager(tmp.path(), ShardRange::full()).await;
 
     assert_eq!(shard2.concurrency_holder_count("tenant-a", "queue-1"), 2);
     assert_eq!(shard2.concurrency_holder_count("tenant-a", "queue-2"), 1);
@@ -167,9 +164,7 @@ async fn eager_hydration_filters_by_shard_range() {
     assert!(half_range.contains_tenant(&lo_tenant));
     assert!(!half_range.contains_tenant(&hi_tenant));
 
-    let shard2 = silo::job_store_shard::JobStoreShard::open(&cfg, rate_limiter, None, half_range)
-        .await
-        .expect("open shard2");
+    let shard2 = open_shard_at_path_eager(tmp.path(), half_range).await;
 
     assert_eq!(shard2.concurrency_holder_count(&lo_tenant, "q"), 1);
     assert_eq!(
