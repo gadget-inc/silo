@@ -258,6 +258,7 @@ impl ConcurrencyCounts {
         db: &InstrumentedDb,
         range: &ShardRange,
     ) -> Result<(), slatedb::Error> {
+        let started_at = std::time::Instant::now();
         let start = concurrency_holders_prefix();
         let end = end_bound(&start);
         let mut iter = db
@@ -304,6 +305,7 @@ impl ConcurrencyCounts {
         tracing::info!(
             queues = queue_count,
             holders = holder_count,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
             "hydrated concurrency holders cache at startup"
         );
         Ok(())

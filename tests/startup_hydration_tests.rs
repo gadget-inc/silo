@@ -91,10 +91,22 @@ async fn eager_hydration_loads_existing_holders_at_startup() {
 
 /// A freshly opened shard with no holders has an empty cache — zero-holder
 /// queues are skipped, including the case where there are no queues at all.
+/// Uses `fs_config` (eager mode enabled) so this actually exercises the
+/// `hydrate_all` path on an empty shard.
 #[silo::test]
 async fn eager_hydration_is_a_noop_when_no_holders_exist() {
-    let (_tmp, shard) = open_temp_shard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = fs_config(tmp.path());
+    let rate_limiter = MockGubernatorClient::new_arc();
+
+    let shard =
+        silo::job_store_shard::JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
+            .await
+            .expect("open shard");
+
     assert_eq!(shard.concurrency_holder_count("any-tenant", "any-queue"), 0);
+
+    shard.close().await.expect("close");
 }
 
 /// After a shard split, both child shards see the same holder records in
