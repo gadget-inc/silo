@@ -25,8 +25,8 @@ version = "0.3.0"
 [dependencies]
 clap = { version = "4.3.14", features = ["derive", "env"] }
 futures = "0.3"
-slatedb = "0.12"
-slatedb-common = "0.12"
+slatedb = "0.13"
+slatedb-common = "0.13"
 object_store = { version = "0.12", features = ["gcp"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
