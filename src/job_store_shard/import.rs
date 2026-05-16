@@ -302,6 +302,7 @@ impl JobStoreShard {
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
+                ..Default::default()
             })
             .await
         {
@@ -687,6 +688,7 @@ impl JobStoreShard {
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
+                ..Default::default()
             })
             .await
         {

@@ -215,6 +215,7 @@ impl JobStoreShard {
         // Commit the transaction with durable writes
         txn.commit_with_options(&WriteOptions {
             await_durable: true,
+            ..Default::default()
         })
         .await?;
 
