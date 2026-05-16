@@ -125,11 +125,6 @@ http-body-util = "0.1"
 tonic-build = "0.12"
 protoc-bin-vendored = "3.0"
 
-[patch.crates-io]
-slatedb = { git = "https://github.com/slatedb/slatedb", rev = "a0524976466c9a320106351b092c6c1ca00e4c52" }
-slatedb-common = { git = "https://github.com/slatedb/slatedb", rev = "a0524976466c9a320106351b092c6c1ca00e4c52" }
-slatedb-txn-obj = { git = "https://github.com/slatedb/slatedb", rev = "a0524976466c9a320106351b092c6c1ca00e4c52" }
-
 [profile.release]
 debug = 1     # debug info with line tables only for profiling
 strip = false # do not strip symbols for profiling
