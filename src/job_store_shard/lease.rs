@@ -72,6 +72,7 @@ impl JobStoreShard {
                 batch,
                 &WriteOptions {
                     await_durable: true,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -316,6 +317,7 @@ impl JobStoreShard {
                 batch,
                 &WriteOptions {
                     await_durable: true,
+                    ..Default::default()
                 },
             )
             .await
@@ -574,6 +576,7 @@ impl JobStoreShard {
                 batch,
                 &WriteOptions {
                     await_durable: true,
+                    ..Default::default()
                 },
             )
             .await?;
