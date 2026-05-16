@@ -81,7 +81,7 @@ async fn concurrency_shared_across_task_groups() {
     // Should only have RequestTicket, not RunAttempt
     let run_attempts: Vec<_> = tasks2
         .iter()
-        .filter(|t| t.attempt().task_id().len() > 0)
+        .filter(|t| !t.attempt().task_id().is_empty())
         .collect();
     assert_eq!(
         run_attempts.len(),
@@ -2235,4 +2235,295 @@ async fn grant_scanner_drains_backlog_larger_than_max_per_pass() {
         "all request records should be consumed"
     );
     assert_eq!(count_concurrency_holders(shard.db()).await, N);
+}
+
+/// Reproduces a Gadget production report: jobs enqueued with TWO concurrency limits
+/// (a floating "platform" limit + a user-named fixed concurrency limit, e.g.
+/// `exampleshopname.myshopify.com`) advance through the first (platform) limit
+/// but the user-named queue never gets a holder or request — workers therefore see
+/// no leases for that queue.
+///
+/// Mirrors `SiloActionStore.createAction` which constructs:
+///   limits[0] = FloatingConcurrency(platform-tenant-env-…)
+///   limits[1] = Concurrency(action.queue)
+#[silo::test]
+async fn enqueue_with_two_concurrency_limits_grants_both() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+
+    let platform_queue = "platform-tenant-env-123".to_string();
+    let user_queue = "exampleshopname.myshopify.com".to_string();
+
+    let _job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: platform_queue.clone(),
+                    default_max_concurrency: 100,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: user_queue.clone(),
+                    max_concurrency: 5,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue with two limits");
+
+    let total_holders = count_concurrency_holders(shard.db()).await;
+    let platform_holders = count_holders_for_queue(shard.db(), tenant, &platform_queue).await;
+    let user_holders = count_holders_for_queue(shard.db(), tenant, &user_queue).await;
+
+    println!(
+        "total_holders={}, platform_holders={}, user_holders={}",
+        total_holders, platform_holders, user_holders
+    );
+
+    assert_eq!(
+        platform_holders, 1,
+        "platform queue should have a holder for the granted floating limit"
+    );
+    assert_eq!(
+        user_holders, 1,
+        "user queue should have a holder for the granted fixed concurrency limit \
+         — if this is 0, the second limit was silently skipped at enqueue"
+    );
+}
+
+/// Verifies the held_queues subtlety in append_grant_edits: when multiple limits
+/// each grant immediately, append_grant_edits writes interim RunAttempts with
+/// only the current queue in held_queues. The loop's terminal branch must
+/// overwrite the same task_key with the full accumulated held_queues — and
+/// reporting the worker outcome must release BOTH holders.
+///
+/// If only one queue is released on outcome, the other holder leaks and that
+/// queue's capacity is permanently consumed.
+#[silo::test]
+async fn two_concurrency_limits_release_both_holders_on_success() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+
+    let platform_queue = "platform-tenant-env-456".to_string();
+    let user_queue = "exampleshopname.myshopify.com".to_string();
+
+    let _job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: platform_queue.clone(),
+                    default_max_concurrency: 100,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: user_queue.clone(),
+                    max_concurrency: 5,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue with two limits");
+
+    // Sanity: a holder exists on each queue.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &platform_queue).await,
+        1
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &user_queue).await,
+        1
+    );
+
+    // Dequeue the RunAttempt and verify the lease record's held_queues
+    // contains BOTH queues so ReportOutcome can release them all.
+    let tasks = shard
+        .dequeue("w1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1, "the RunAttempt should be leaseable");
+    let task_id = tasks[0].attempt().task_id().to_string();
+
+    // Read the lease record to confirm held_queues was preserved end-to-end.
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present after dequeue");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    assert!(
+        held.iter().any(|q| q == &platform_queue),
+        "lease held_queues should include platform queue, got {:?}",
+        held
+    );
+    assert!(
+        held.iter().any(|q| q == &user_queue),
+        "lease held_queues should include user queue — if missing, the final \
+         RunAttempt overwrite dropped the earlier granted queue. Got {:?}",
+        held
+    );
+    assert_eq!(
+        held.len(),
+        2,
+        "lease held_queues should be exactly the two granted queues, got {:?}",
+        held
+    );
+
+    // Report success — silo must release holders for BOTH queues.
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &platform_queue).await,
+        0,
+        "platform queue holder should be released after outcome"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &user_queue).await,
+        0,
+        "user queue holder should be released after outcome — leak indicates \
+         held_queues wasn't fully populated on the final RunAttempt"
+    );
+}
+
+/// When a job has limits = [A, B] and A grants but B is at capacity, the
+/// `append_grant_edits` call for A writes an interim RunAttempt at task_key.
+/// `append_request_edits` for B only writes a concurrency request record — it
+/// does NOT delete/overwrite the task at task_key. If this bug is real, a
+/// worker can dequeue and run the RunAttempt for a job that should be blocked
+/// on B, violating the B limit.
+#[silo::test]
+async fn second_limit_request_must_not_leave_runnable_task() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "queue-a".to_string();
+    let queue_b = "queue-b".to_string();
+
+    // Fill queue B to capacity: enqueue job1 with only limit B, then dequeue
+    // it so the holder persists.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_b.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let job1_tasks = shard
+        .dequeue("w1", "default", 1)
+        .await
+        .expect("deq job1")
+        .tasks;
+    assert_eq!(job1_tasks.len(), 1, "job1 should be runnable");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_b).await,
+        1,
+        "queue B should be at capacity (1 holder)"
+    );
+
+    // Enqueue job2 with [A, B]. A grants immediately; B is full so returns a
+    // TicketRequested.
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    // A concurrency request for queue B should exist for job2.
+    assert!(
+        count_concurrency_requests(shard.db()).await >= 1,
+        "expected a concurrency request to be written for job2 on queue B"
+    );
+
+    // The critical assertion: dequeue must not return a RunAttempt for job2.
+    // If the interim RunAttempt from A's append_grant_edits was left at
+    // task_key, a worker will pick it up and run the job while B is at
+    // capacity — violating the B limit.
+    let job2_tasks = shard
+        .dequeue("w2", "default", 1)
+        .await
+        .expect("deq job2")
+        .tasks;
+    assert_eq!(
+        job2_tasks.len(),
+        0,
+        "job2 must not be runnable while queue B is at capacity — a stale \
+         RunAttempt at task_key from limit[0]'s append_grant_edits was not \
+         removed when limit[1] returned TicketRequested. \
+         Got task: {:?}",
+        job2_tasks
+            .first()
+            .map(|t| t.attempt().task_id().to_string()),
+    );
+}
+
+/// Helper: count concurrency holder keys for a specific (tenant, queue) pair.
+async fn count_holders_for_queue(
+    db: &silo::instrumented_db::InstrumentedDb,
+    tenant: &str,
+    queue: &str,
+) -> usize {
+    let start = silo::keys::concurrency_holders_queue_prefix(tenant, queue);
+    let end = silo::keys::end_bound(&start);
+    let mut iter = db
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .expect("scan holders");
+    let mut count = 0;
+    while let Ok(Some(_)) = iter.next().await {
+        count += 1;
+    }
+    count
 }
