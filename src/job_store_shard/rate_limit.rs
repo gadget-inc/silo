@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::gubernator::{GubernatorError, RateLimitResult};
 use crate::job_store_shard::helpers::{WriteBatcher, put_task};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::task::{GubernatorRateLimitData, Task};
+use crate::task::{GubernatorRateLimitData, HeldQueue, Task};
 
 impl JobStoreShard {
     /// Schedule a rate limit check retry task
@@ -22,7 +22,7 @@ impl JobStoreShard {
         retry_count: u32,
         started_at_ms: i64,
         priority: u8,
-        held_queues: &[String],
+        held_queues: &[HeldQueue],
         retry_at_ms: i64,
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {

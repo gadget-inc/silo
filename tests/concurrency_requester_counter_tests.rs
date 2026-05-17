@@ -310,6 +310,9 @@ async fn inject_fake_request(
         attempt_number: attempt,
         relative_attempt_number: attempt,
         task_group: "default".to_string(),
+        held_queues: vec![],
+        limit_index: 0,
+        total_limits: 1,
     };
     let action_val = encode_concurrency_action(&action);
     db.put(&req_key, &action_val)

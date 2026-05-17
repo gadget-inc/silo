@@ -69,7 +69,7 @@ use crate::keys::{
 };
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
-use crate::task::{ConcurrencyAction, HolderRecord, Task};
+use crate::task::{ConcurrencyAction, HeldQueue, HolderRecord, Task};
 use crate::task_broker::TaskBrokerRegistry;
 
 /// Error type for concurrency operations that can fail due to storage or encoding errors.
@@ -759,6 +759,9 @@ impl ConcurrencyManager {
         attempt_number: u32,
         relative_attempt_number: u32,
         skip_try_reserve: bool,
+        held_queues_so_far: &[HeldQueue],
+        limit_index_in_order: u32,
+        total_limits: u32,
     ) -> Result<Option<RequestTicketOutcome>, ConcurrencyError> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
@@ -793,6 +796,7 @@ impl ConcurrencyManager {
                 attempt_number,
                 relative_attempt_number,
                 task_group,
+                held_queues_so_far,
             )?;
             if let Some(ref m) = self.metrics {
                 m.record_concurrency_tickets_granted(
@@ -819,6 +823,9 @@ impl ConcurrencyManager {
                 attempt_number,
                 relative_attempt_number,
                 task_group,
+                held_queues_so_far,
+                limit_index_in_order,
+                total_limits,
             )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
                 queue: queue.clone(),
@@ -837,6 +844,9 @@ impl ConcurrencyManager {
                 relative_attempt_number,
                 request_id: request_id.clone(),
                 task_group: task_group.to_string(),
+                held_queues: held_queues_so_far.to_vec(),
+                limit_index: limit_index_in_order,
+                total_limits,
             };
             let ticket_value = encode_task(&ticket);
             writer.put(
@@ -1091,6 +1101,9 @@ impl ConcurrencyManager {
             start_time_ms: i64,
             priority: u8,
             task_group: String,
+            held_queues: Vec<HeldQueue>,
+            limit_index: u32,
+            total_limits: u32,
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
@@ -1201,6 +1214,18 @@ impl ConcurrencyManager {
                     };
                 }
 
+                let held_queues: Vec<HeldQueue> = et
+                    .held_queues()
+                    .map(|v| {
+                        v.iter()
+                            .map(|hq| HeldQueue {
+                                queue: hq.queue().unwrap_or_default().to_string(),
+                                task_id: hq.task_id().unwrap_or_default().to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 scanned.push(ScannedRequest {
                     request_key: kv.key.to_vec(),
                     request_id,
@@ -1210,6 +1235,9 @@ impl ConcurrencyManager {
                     start_time_ms,
                     priority: et.priority(),
                     task_group: et.task_group().unwrap_or_default().to_string(),
+                    held_queues,
+                    limit_index: et.limit_index(),
+                    total_limits: et.total_limits(),
                 });
             }
 
@@ -1325,16 +1353,49 @@ impl ConcurrencyManager {
                     &holder_val,
                 );
 
-                // [SILO-GRANT-4] Create RunAttempt task
-                let tval = encode_task(&Task::RunAttempt {
-                    id: req.request_id.clone(),
-                    tenant: tenant.to_string(),
-                    job_id: req.job_id.clone(),
-                    attempt_number: req.attempt_number,
-                    relative_attempt_number: req.relative_attempt_number,
-                    held_queues: vec![queue.to_string()],
-                    task_group: req.task_group.clone(),
+                // Append the just-granted queue to the chain's held_queues,
+                // paired with the request_id that created its holder.
+                let mut held_queues: Vec<HeldQueue> = req.held_queues.clone();
+                held_queues.push(HeldQueue {
+                    queue: queue.to_string(),
+                    task_id: req.request_id.clone(),
                 });
+
+                let next_index = req.limit_index.saturating_add(1);
+                let task = if next_index >= req.total_limits {
+                    // Terminal: this was the last limit. Write the RunAttempt
+                    // with the full accumulated held_queues so report_outcome
+                    // can release every holder.
+                    // [SILO-GRANT-4]
+                    Task::RunAttempt {
+                        id: req.request_id.clone(),
+                        tenant: tenant.to_string(),
+                        job_id: req.job_id.clone(),
+                        attempt_number: req.attempt_number,
+                        relative_attempt_number: req.relative_attempt_number,
+                        held_queues,
+                        task_group: req.task_group.clone(),
+                    }
+                } else {
+                    // More limits remain: write a resume task that
+                    // `handle_resume_after_grant` will dispatch back into
+                    // `enqueue_limit_task_at_index`, mirroring how
+                    // `handle_check_rate_limit` resumes after a rate-limit
+                    // check passes.
+                    Task::ResumeAfterConcurrencyGrant {
+                        request_id: req.request_id.clone(),
+                        tenant: tenant.to_string(),
+                        job_id: req.job_id.clone(),
+                        attempt_number: req.attempt_number,
+                        relative_attempt_number: req.relative_attempt_number,
+                        task_group: req.task_group.clone(),
+                        held_queues,
+                        limit_index: next_index,
+                        start_at_ms: req.start_time_ms,
+                        priority: req.priority,
+                    }
+                };
+                let tval = encode_task(&task);
                 batch.put(
                     task_key(
                         &req.task_group,
@@ -1430,6 +1491,7 @@ fn append_grant_edits<W: WriteBatcher>(
     attempt_number: u32,
     relative_attempt_number: u32,
     task_group: &str,
+    held_queues_so_far: &[HeldQueue],
 ) -> Result<(), ConcurrencyError> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
@@ -1437,13 +1499,25 @@ fn append_grant_edits<W: WriteBatcher>(
     let holder_val = encode_holder(&holder);
     writer.put(concurrency_holder_key(tenant, queue, task_id), &holder_val)?;
 
+    // The interim RunAttempt holds the accumulated `held_queues_so_far` plus
+    // the just-granted queue (paired with `task_id`, which is the request_id
+    // that created the holder). It is either (a) overwritten in the terminal
+    // branch of `enqueue_limit_task_at_index` with the full accumulated
+    // `held_queues`, or (b) deleted by the `queued_with_request && !grants.is_empty()`
+    // cleanup in `enqueue.rs` when a later limit queues. Neither path may
+    // bypass that cleanup — see #317.
+    let mut held_queues: Vec<HeldQueue> = held_queues_so_far.to_vec();
+    held_queues.push(HeldQueue {
+        queue: queue.to_string(),
+        task_id: task_id.to_string(),
+    });
     let task = Task::RunAttempt {
         id: task_id.to_string(),
         tenant: tenant.to_string(),
         job_id: job_id.to_string(),
         attempt_number,
         relative_attempt_number,
-        held_queues: vec![queue.to_string()],
+        held_queues,
         task_group: task_group.to_string(),
     };
     let task_value = encode_task(&task);
@@ -1466,6 +1540,9 @@ fn append_request_edits<W: WriteBatcher>(
     attempt_number: u32,
     relative_attempt_number: u32,
     task_group: &str,
+    held_queues_so_far: &[HeldQueue],
+    limit_index: u32,
+    total_limits: u32,
 ) -> Result<(), ConcurrencyError> {
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms,
@@ -1474,6 +1551,9 @@ fn append_request_edits<W: WriteBatcher>(
         attempt_number,
         relative_attempt_number,
         task_group: task_group.to_string(),
+        held_queues: held_queues_so_far.to_vec(),
+        limit_index,
+        total_limits,
     };
     let action_val = encode_concurrency_action(&action);
     let suffix = format!("{:08x}", rand::random::<u32>());

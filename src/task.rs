@@ -9,6 +9,17 @@ use crate::job_attempt::JobAttemptView;
 /// Default lease duration for dequeued tasks (milliseconds)
 pub const DEFAULT_LEASE_MS: i64 = 10_000;
 
+/// A concurrency holder accumulated by the limit chain: the queue whose holder
+/// was created and the task_id that created it. Stored on every task variant
+/// that participates in the chain so each holder can be released via
+/// `concurrency_holder_key(tenant, queue, task_id)` with the *creator's*
+/// task_id rather than the lease/RunAttempt task_id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldQueue {
+    pub queue: String,
+    pub task_id: String,
+}
+
 /// A task is a unit of work that a worker needs to pickup and action to move the system forward.
 #[derive(Debug, Clone)]
 pub enum Task {
@@ -21,7 +32,7 @@ pub enum Task {
         attempt_number: u32,
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
-        held_queues: Vec<String>,
+        held_queues: Vec<HeldQueue>,
         task_group: String,
     },
     /// Internal: request a concurrency ticket for a queue at or after a specific time
@@ -37,6 +48,15 @@ pub enum Task {
         relative_attempt_number: u32,
         request_id: String,
         task_group: String,
+        /// Queues already held from earlier limits in the canonical-order chain
+        held_queues: Vec<HeldQueue>,
+        /// Position within the canonical limit-processing order at which this
+        /// RequestTicket was enqueued. On grant, the chain resumes at
+        /// `limit_index + 1`.
+        limit_index: u32,
+        /// Total number of limits in the job at queue-time, so the grant path
+        /// can decide terminal-vs-resume without re-reading job_info.
+        total_limits: u32,
     },
     /// Internal: check a Gubernator rate limit before proceeding
     CheckRateLimit {
@@ -58,8 +78,23 @@ pub enum Task {
         /// Priority for enqueueing subsequent tasks
         priority: u8,
         /// Queues already held from previous concurrency limits
-        held_queues: Vec<String>,
+        held_queues: Vec<HeldQueue>,
         task_group: String,
+    },
+    /// Internal: resume the limit chain after a queued concurrency ticket was
+    /// granted by `process_grants`. The granted queue has already been added
+    /// to `held_queues`; this task drives the chain forward at `limit_index`.
+    ResumeAfterConcurrencyGrant {
+        request_id: String,
+        tenant: String,
+        job_id: String,
+        attempt_number: u32,
+        relative_attempt_number: u32,
+        task_group: String,
+        held_queues: Vec<HeldQueue>,
+        limit_index: u32,
+        start_at_ms: i64,
+        priority: u8,
     },
     /// Worker task: refresh a floating concurrency limit's max concurrency value
     RefreshFloatingLimit {
@@ -81,6 +116,7 @@ impl Task {
             Task::RunAttempt { tenant, .. } => tenant,
             Task::RequestTicket { tenant, .. } => tenant,
             Task::CheckRateLimit { tenant, .. } => tenant,
+            Task::ResumeAfterConcurrencyGrant { tenant, .. } => tenant,
             Task::RefreshFloatingLimit { tenant, .. } => tenant,
         }
     }
@@ -149,6 +185,16 @@ pub enum ConcurrencyAction {
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
         task_group: String,
+        /// Queues already held from earlier limits in the canonical-order chain.
+        held_queues: Vec<HeldQueue>,
+        /// Position within the canonical limit-processing order at which this
+        /// request was enqueued. The grant path uses `limit_index + 1` as the
+        /// resume point.
+        limit_index: u32,
+        /// Total number of limits in the job at queue-time. The grant path
+        /// uses this to decide terminal-vs-resume without an extra job_info
+        /// lookup.
+        total_limits: u32,
     },
 }
 

@@ -7,7 +7,9 @@ use silo::codec::{
 };
 use silo::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
-use silo::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
+use silo::task::{
+    ConcurrencyAction, GubernatorRateLimitData, HeldQueue, HolderRecord, LeaseRecord, Task,
+};
 
 #[silo::test]
 fn test_task_roundtrip() {
@@ -17,7 +19,10 @@ fn test_task_roundtrip() {
         job_id: "job-1".to_string(),
         attempt_number: 1,
         relative_attempt_number: 1,
-        held_queues: vec!["queue-1".to_string()],
+        held_queues: vec![HeldQueue {
+            queue: "queue-1".to_string(),
+            task_id: "task-1".to_string(),
+        }],
         task_group: "default".to_string(),
     };
     let encoded = encode_task(&task);
@@ -37,7 +42,13 @@ fn test_task_roundtrip() {
             assert_eq!(job_id, "job-1");
             assert_eq!(attempt_number, 1);
             assert_eq!(relative_attempt_number, 1);
-            assert_eq!(held_queues, vec!["queue-1"]);
+            assert_eq!(
+                held_queues,
+                vec![HeldQueue {
+                    queue: "queue-1".to_string(),
+                    task_id: "task-1".to_string(),
+                }]
+            );
             assert_eq!(task_group, "default");
         }
         _ => panic!("unexpected task variant"),
@@ -124,6 +135,9 @@ fn test_concurrency_action_roundtrip() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        held_queues: vec![],
+        limit_index: 0,
+        total_limits: 1,
     };
     let encoded = encode_concurrency_action(&action);
     let decoded = decode_concurrency_action(encoded).unwrap();
@@ -134,6 +148,8 @@ fn test_concurrency_action_roundtrip() {
     assert_eq!(et.attempt_number(), 1);
     assert_eq!(et.relative_attempt_number(), 1);
     assert_eq!(et.task_group().unwrap(), "default");
+    assert_eq!(et.limit_index(), 0);
+    assert_eq!(et.total_limits(), 1);
 }
 
 #[silo::test]
@@ -148,6 +164,9 @@ fn test_request_ticket_roundtrip() {
         relative_attempt_number: 1,
         request_id: "req-abc".to_string(),
         task_group: "fast".to_string(),
+        held_queues: vec![],
+        limit_index: 0,
+        total_limits: 1,
     };
     let encoded = encode_task(&task);
     let decoded = decode_task(&encoded).unwrap();
@@ -162,6 +181,9 @@ fn test_request_ticket_roundtrip() {
             relative_attempt_number,
             request_id,
             task_group,
+            held_queues: _,
+            limit_index: _,
+            total_limits: _,
         } => {
             assert_eq!(queue, "q1");
             assert_eq!(start_time_ms, 5000);
@@ -202,7 +224,16 @@ fn test_check_rate_limit_roundtrip() {
         retry_count: 1,
         started_at_ms: 9000,
         priority: 7,
-        held_queues: vec!["hq-1".to_string(), "hq-2".to_string()],
+        held_queues: vec![
+            HeldQueue {
+                queue: "hq-1".to_string(),
+                task_id: "task-99".to_string(),
+            },
+            HeldQueue {
+                queue: "hq-2".to_string(),
+                task_id: "task-99".to_string(),
+            },
+        ],
         task_group: "default".to_string(),
     };
     let encoded = encode_task(&task);
@@ -242,7 +273,19 @@ fn test_check_rate_limit_roundtrip() {
             assert_eq!(retry_count, 1);
             assert_eq!(started_at_ms, 9000);
             assert_eq!(priority, 7);
-            assert_eq!(held_queues, vec!["hq-1", "hq-2"]);
+            assert_eq!(
+                held_queues,
+                vec![
+                    HeldQueue {
+                        queue: "hq-1".to_string(),
+                        task_id: "task-99".to_string(),
+                    },
+                    HeldQueue {
+                        queue: "hq-2".to_string(),
+                        task_id: "task-99".to_string(),
+                    },
+                ]
+            );
             assert_eq!(task_group, "default");
         }
         _ => panic!("expected CheckRateLimit variant"),
@@ -375,7 +418,16 @@ fn test_decoded_lease_accessors_run_attempt() {
             job_id: "j1".to_string(),
             attempt_number: 3,
             relative_attempt_number: 2,
-            held_queues: vec!["q1".to_string(), "q2".to_string()],
+            held_queues: vec![
+                HeldQueue {
+                    queue: "q1".to_string(),
+                    task_id: "task-10".to_string(),
+                },
+                HeldQueue {
+                    queue: "q2".to_string(),
+                    task_id: "task-10".to_string(),
+                },
+            ],
             task_group: "grp".to_string(),
         },
         expiry_ms: 50000,
@@ -390,7 +442,19 @@ fn test_decoded_lease_accessors_run_attempt() {
     assert_eq!(decoded.job_id(), "j1");
     assert_eq!(decoded.attempt_number(), 3);
     assert_eq!(decoded.relative_attempt_number(), 2);
-    assert_eq!(decoded.held_queues(), vec!["q1", "q2"]);
+    assert_eq!(
+        decoded.held_queues(),
+        vec![
+            HeldQueue {
+                queue: "q1".to_string(),
+                task_id: "task-10".to_string(),
+            },
+            HeldQueue {
+                queue: "q2".to_string(),
+                task_id: "task-10".to_string(),
+            },
+        ]
+    );
     assert_eq!(decoded.task_group(), "grp");
     assert_eq!(decoded.task_id(), Some("task-10"));
 
@@ -429,7 +493,7 @@ fn test_decoded_lease_accessors_refresh_floating_limit() {
     assert_eq!(decoded.job_id(), "");
     assert_eq!(decoded.attempt_number(), 0);
     assert_eq!(decoded.relative_attempt_number(), 0);
-    assert_eq!(decoded.held_queues(), Vec::<String>::new());
+    assert_eq!(decoded.held_queues(), Vec::<HeldQueue>::new());
     assert_eq!(decoded.task_group(), "workers");
     assert_eq!(decoded.task_id(), None);
 
@@ -465,7 +529,16 @@ fn test_decoded_task_run_attempt() {
         job_id: "job-zc-1".to_string(),
         attempt_number: 5,
         relative_attempt_number: 3,
-        held_queues: vec!["q1".to_string(), "q2".to_string()],
+        held_queues: vec![
+            HeldQueue {
+                queue: "q1".to_string(),
+                task_id: "task-zc-1".to_string(),
+            },
+            HeldQueue {
+                queue: "q2".to_string(),
+                task_id: "task-zc-1".to_string(),
+            },
+        ],
         task_group: "default".to_string(),
     };
     let encoded = encode_task(&task);
@@ -504,6 +577,9 @@ fn test_decoded_task_request_ticket() {
         relative_attempt_number: 1,
         request_id: "req-rt".to_string(),
         task_group: "fast".to_string(),
+        held_queues: vec![],
+        limit_index: 0,
+        total_limits: 1,
     };
     let encoded = encode_task(&task);
     let decoded = decode_task_validated(encoded).unwrap();

@@ -288,7 +288,10 @@ async fn check_rate_limit_max_retries_releases_held_queues() {
         retry_count: max_retries,
         started_at_ms: now_ms(),
         priority,
-        held_queues: vec![queue.to_string()],
+        held_queues: vec![silo::task::HeldQueue {
+            queue: queue.to_string(),
+            task_id: task_id.clone(),
+        }],
         task_group: task_group.to_string(),
     };
     let crl_key = task_key(task_group, now_ms(), priority, &job_id, attempt_number);
@@ -381,7 +384,10 @@ async fn check_rate_limit_missing_job_info_releases_held_queues() {
         retry_count: 0,
         started_at_ms: now_ms(),
         priority,
-        held_queues: vec![queue.to_string()],
+        held_queues: vec![silo::task::HeldQueue {
+            queue: queue.to_string(),
+            task_id: task_id.clone(),
+        }],
         task_group: task_group.to_string(),
     };
     let crl_key = task_key(task_group, now_ms(), priority, &job_id, attempt_number);

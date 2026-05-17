@@ -113,6 +113,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             }
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
+            Task::ResumeAfterConcurrencyGrant { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
         }
     }
@@ -175,6 +176,9 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        held_queues: vec![],
+        limit_index: 0,
+        total_limits: 1,
     };
     let request_key = concurrency_request_key(tenant, &queue, now, 10, &job_id, 1, "manual");
     let request_value = encode_concurrency_action(&action);
@@ -616,6 +620,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
+            Task::ResumeAfterConcurrencyGrant { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
         }
     }
@@ -718,6 +723,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         }
         Task::CheckRateLimit { .. } => {
             panic!("unexpected CheckRateLimit in tasks/ for this test")
+        }
+        Task::ResumeAfterConcurrencyGrant { .. } => {
+            panic!("unexpected ResumeAfterConcurrencyGrant in tasks/ for this test")
         }
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")

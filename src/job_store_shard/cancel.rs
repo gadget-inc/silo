@@ -13,7 +13,7 @@ use crate::keys::{
     concurrency_holder_key, concurrency_request_job_prefix, concurrency_requester_counter_key,
     end_bound, job_cancelled_key, job_info_key, job_status_key, task_key,
 };
-use crate::task::Task;
+use crate::task::{HeldQueue, Task};
 
 impl JobStoreShard {
     /// Cancel a job by id. Prevents further execution and signals running workers to stop.
@@ -88,8 +88,7 @@ impl JobStoreShard {
         let was_scheduled = status.kind == JobStatusKind::Scheduled;
 
         // Track concurrency state for post-commit cleanup
-        let mut held_queues_to_release: Vec<String> = Vec::new();
-        let mut task_id_for_release: Option<String> = None;
+        let mut held_queues_to_release: Vec<HeldQueue> = Vec::new();
         let mut deleted_task_key: Option<Vec<u8>> = None;
 
         // [SILO-CXL-3] For Scheduled jobs, eagerly delete task and concurrency state
@@ -138,16 +137,18 @@ impl JobStoreShard {
 
                     match decoded {
                         Task::RunAttempt {
-                            id: tid,
+                            id: _tid,
                             held_queues,
                             ..
                         } => {
-                            // Delete concurrency holders for each held queue
-                            for queue in &held_queues {
-                                txn.delete(concurrency_holder_key(tenant, queue, &tid))?;
+                            // Delete concurrency holders for each held queue,
+                            // using the *creator's* task_id (stored on each
+                            // HeldQueue) rather than the RunAttempt's id —
+                            // resume-after-grant chains span multiple task_ids.
+                            for hq in &held_queues {
+                                txn.delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id))?;
                             }
                             if !held_queues.is_empty() {
-                                task_id_for_release = Some(tid);
                                 held_queues_to_release = held_queues;
                             }
                         }
@@ -195,15 +196,13 @@ impl JobStoreShard {
             self.brokers.evict_keys(std::slice::from_ref(key));
         }
 
-        // Release concurrency holders from in-memory counts and signal grant scanner
-        if !held_queues_to_release.is_empty() {
-            let finished_task_id = task_id_for_release.as_deref().unwrap_or_default();
-            for queue in &held_queues_to_release {
-                self.concurrency
-                    .counts()
-                    .atomic_release(tenant, queue, finished_task_id);
-                self.concurrency.request_grant(tenant, queue);
-            }
+        // Release concurrency holders from in-memory counts and signal grant scanner.
+        // Each HeldQueue carries the task_id its in-memory reservation was indexed by.
+        for hq in &held_queues_to_release {
+            self.concurrency
+                .counts()
+                .atomic_release(tenant, &hq.queue, &hq.task_id);
+            self.concurrency.request_grant(tenant, &hq.queue);
         }
 
         Ok(())

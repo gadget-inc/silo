@@ -31,6 +31,15 @@ table KeyValuePair {
   value: string;
 }
 
+// Pair of (queue, task_id) identifying a concurrency holder created during the
+// limit chain. Each chain accumulates one HeldQueue per granted limit; the
+// task_id is the request_id that created the holder, used at release time to
+// look up `concurrency_holder_key(tenant, queue, task_id)`.
+table HeldQueue {
+  queue: string;
+  task_id: string;
+}
+
 table RetryPolicy {
   retry_count: uint32;
   initial_interval_ms: int64;
@@ -74,7 +83,7 @@ table RunAttempt {
   job_id: string;
   attempt_number: uint32;
   relative_attempt_number: uint32;
-  held_queues: [string];
+  held_queues: [HeldQueue];
   task_group: string;
 }
 
@@ -88,6 +97,9 @@ table RequestTicket {
   relative_attempt_number: uint32;
   request_id: string;
   task_group: string;
+  held_queues: [HeldQueue];
+  limit_index: uint32;
+  total_limits: uint32;
 }
 
 table CheckRateLimit {
@@ -101,8 +113,24 @@ table CheckRateLimit {
   retry_count: uint32;
   started_at_ms: int64;
   priority: ubyte;
-  held_queues: [string];
+  held_queues: [HeldQueue];
   task_group: string;
+}
+
+// Internal task variant: resume the limit chain after a queued ticket request
+// was granted by `process_grants`. Encodes everything needed to call back into
+// `enqueue_limit_task_at_index` to walk any remaining limits.
+table ResumeAfterConcurrencyGrant {
+  request_id: string;
+  tenant: string;
+  job_id: string;
+  attempt_number: uint32;
+  relative_attempt_number: uint32;
+  task_group: string;
+  held_queues: [HeldQueue];
+  limit_index: uint32;
+  start_at_ms: int64;
+  priority: ubyte;
 }
 
 table RefreshFloatingLimit {
@@ -120,6 +148,7 @@ union TaskVariant {
   RequestTicket,
   CheckRateLimit,
   RefreshFloatingLimit,
+  ResumeAfterConcurrencyGrant,
 }
 
 table Task {
@@ -237,6 +266,9 @@ table EnqueueTask {
   attempt_number: uint32;
   relative_attempt_number: uint32;
   task_group: string;
+  held_queues: [HeldQueue];
+  limit_index: uint32;
+  total_limits: uint32;
 }
 
 union ConcurrencyActionVariant {

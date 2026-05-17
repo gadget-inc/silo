@@ -621,6 +621,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             }
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
+            Task::ResumeAfterConcurrencyGrant { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
         }
     }
@@ -969,6 +970,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RunAttempt { .. } => panic!("unexpected RunAttempt before release"),
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
+            Task::ResumeAfterConcurrencyGrant { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
         }
     }
@@ -1638,6 +1640,9 @@ async fn grant_scanner_skips_stale_requests_and_grants_valid_ones() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            held_queues: vec![],
+            limit_index: 0,
+            total_limits: 1,
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
@@ -1699,6 +1704,9 @@ async fn grant_scanner_handles_all_stale_requests() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            held_queues: vec![],
+            limit_index: 0,
+            total_limits: 1,
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
@@ -1994,6 +2002,9 @@ async fn grant_scanner_interleaved_stale_and_valid_requests() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            held_queues: vec![],
+            limit_index: 0,
+            total_limits: 1,
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
@@ -2374,12 +2385,12 @@ async fn two_concurrency_limits_release_both_holders_on_success() {
     let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
     let held = decoded_lease.held_queues();
     assert!(
-        held.iter().any(|q| q == &platform_queue),
+        held.iter().any(|hq| hq.queue == platform_queue),
         "lease held_queues should include platform queue, got {:?}",
         held
     );
     assert!(
-        held.iter().any(|q| q == &user_queue),
+        held.iter().any(|hq| hq.queue == user_queue),
         "lease held_queues should include user queue — if missing, the final \
          RunAttempt overwrite dropped the earlier granted queue. Got {:?}",
         held
@@ -2506,6 +2517,453 @@ async fn second_limit_request_must_not_leave_runnable_task() {
         job2_tasks
             .first()
             .map(|t| t.attempt().task_id().to_string()),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Chain-of-limits regression tests for held_queues + bypass enforcement.
+//
+// PR #315 fixed multi-limit holder leaks at enqueue. PR #317 reordered
+// Concurrency before FloatingConcurrency so the common Gadget shape no
+// longer hit the latent grant-time leak. These tests cover the remaining
+// chain-time gaps that the resume-after-grant + per-queue task_id machinery
+// closes: holder preservation on grant-scanner promotion and enforcement
+// of limits-after-the-queued-one.
+// ---------------------------------------------------------------------------
+
+/// `[C1, C2]` where C1 grants immediately and C2 queues (other job holds C2).
+/// When the holder on C2 is freed, the promotion path must preserve the
+/// already-granted C1 holder AND enforce no bypass of any limit that follows
+/// C2 in the chain. Before the fix, `process_grants` wrote a RunAttempt with
+/// `held_queues = vec![C2]` only, orphaning the C1 holder; on report success
+/// the C1 slot leaked permanently.
+#[silo::test]
+async fn chain_c1_c2_promotion_preserves_prior_holder_and_releases_both() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue_c1 = "chain-c1-free".to_string();
+    let queue_c2 = "chain-c2-mutex".to_string();
+    let now = now_ms();
+
+    // Holder job for C2 — single-limit Concurrency with max=1, holds the slot.
+    let _holder_job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "holder"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_c2.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue holder");
+    let holder_tasks = shard
+        .dequeue("h", "default", 1)
+        .await
+        .expect("dequeue holder")
+        .tasks;
+    assert_eq!(holder_tasks.len(), 1);
+    let holder_task_id = holder_tasks[0].attempt().task_id().to_string();
+
+    // Target job — `[C1(free, max=5), C2(full, max=1)]`. C1 grants
+    // immediately, C2 queues. The interim RunAttempt is then dropped by
+    // PR #317's cleanup; the request record carries `held_queues = [{C1, T}]`.
+    let target_job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c1.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c2.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+
+    // C1 has the target's holder; C2 has the holder job's holder.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c1).await,
+        1
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c2).await,
+        1
+    );
+
+    // Free C2 by completing the holder job.
+    shard
+        .report_attempt_outcome(&holder_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report holder success");
+
+    // Poll for the target's RunAttempt to become dequeueable.
+    let target_tasks = poll_until(
+        || async {
+            shard
+                .dequeue("t", "default", 1)
+                .await
+                .expect("dq target")
+                .tasks
+        },
+        |t| !t.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(target_tasks.len(), 1, "target should become runnable");
+    assert_eq!(target_tasks[0].job().id(), target_job);
+    let target_task_id = target_tasks[0].attempt().task_id().to_string();
+
+    // Inspect the lease: held_queues must include BOTH C1 and C2.
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&target_task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    assert!(
+        held.iter().any(|hq| hq.queue == queue_c1),
+        "lease must carry C1 holder; pre-fix the promotion path dropped it. \
+         Got {:?}",
+        held
+    );
+    assert!(
+        held.iter().any(|hq| hq.queue == queue_c2),
+        "lease must carry C2 holder (just-granted queue). Got {:?}",
+        held
+    );
+
+    // Report success — both holders must drop to zero.
+    shard
+        .report_attempt_outcome(&target_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report target success");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c1).await,
+        0,
+        "C1 holder leaked: report_outcome only released the chained task_id, \
+         but the pre-fix held_queues dropped C1 entirely so its holder \
+         (under the original task_id) was never deleted"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c2).await,
+        0,
+        "C2 holder should be released"
+    );
+}
+
+/// Three-limit chain `[C1, C2, C3]`. C1 grants, C2 queues (other job holds it).
+/// On C2's promotion the chain must continue at C3 — not bypass C3 by leasing
+/// a RunAttempt directly. Tests that the new `ResumeAfterConcurrencyGrant`
+/// task fires and chains through `enqueue_limit_task_at_index` to the next
+/// limit, which sees C3 is full and writes a request.
+#[silo::test]
+async fn chain_3_limits_middle_queue_does_not_bypass_later_limits() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue_c1 = "chain3-c1".to_string();
+    let queue_c2 = "chain3-c2".to_string();
+    let queue_c3 = "chain3-c3".to_string();
+    let now = now_ms();
+
+    // Block C2 with a holder job.
+    let _c2_holder = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "c2-holder"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_c2.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue c2 holder");
+    let c2_holder_task = shard.dequeue("w", "default", 1).await.expect("dq").tasks;
+    let c2_holder_id = c2_holder_task[0].attempt().task_id().to_string();
+
+    // Block C3 with a holder job too.
+    let _c3_holder = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "c3-holder"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_c3.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue c3 holder");
+    let c3_holder_task = shard.dequeue("w", "default", 1).await.expect("dq").tasks;
+    let c3_holder_id = c3_holder_task[0].attempt().task_id().to_string();
+
+    // Target: `[C1 free, C2 full, C3 full]`. C1 grants, C2 queues.
+    let target_job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c1.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c2.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c3.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+    let _ = target_job;
+
+    // Free C2 — target's chain should advance to C3 and queue there, NOT
+    // produce a leasable RunAttempt.
+    shard
+        .report_attempt_outcome(&c2_holder_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("release c2");
+
+    // Give the grant scanner and resume task a chance to settle.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // No runnable target task: it must still be blocked on C3.
+    let target_attempt = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert!(
+        target_attempt.is_empty(),
+        "target must remain blocked on C3 — bypass would yield {:?}",
+        target_attempt
+            .first()
+            .map(|t| t.attempt().task_id().to_string())
+    );
+
+    // Free C3 — chain completes, target becomes runnable.
+    shard
+        .report_attempt_outcome(&c3_holder_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("release c3");
+    let target_runs = poll_until(
+        || async {
+            shard
+                .dequeue("worker", "default", 1)
+                .await
+                .expect("dq")
+                .tasks
+        },
+        |t| !t.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(target_runs.len(), 1, "target should run after C3 frees");
+    let target_task_id = target_runs[0].attempt().task_id().to_string();
+
+    // Lease should carry all three holders, each under the right task_id.
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&target_task_id))
+        .await
+        .expect("get lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    assert!(held.iter().any(|hq| hq.queue == queue_c1));
+    assert!(held.iter().any(|hq| hq.queue == queue_c2));
+    assert!(held.iter().any(|hq| hq.queue == queue_c3));
+    assert_eq!(held.len(), 3, "all three queues expected; got {:?}", held);
+
+    // Report success — every holder must release.
+    shard
+        .report_attempt_outcome(&target_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c1).await,
+        0
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c2).await,
+        0
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c3).await,
+        0
+    );
+}
+
+/// `[C(full), RateLimit]`. C queues. When C is freed, the resume path must
+/// hand off to the rate-limit branch — writing a `CheckRateLimit` task that
+/// carries the C holder with the request_id as its task_id. Tests the
+/// resume-after-grant → rate-limit handoff: this is the common Gadget shape
+/// when a tenant queue + an API rate limit are both configured.
+#[silo::test]
+async fn chain_concurrency_to_ratelimit_resumes_with_held_queue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue_c = "chain-c-rl".to_string();
+    let now = now_ms();
+
+    // Holder job for the Concurrency limit.
+    let _c_holder = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "c-holder"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_c.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue c-holder");
+    let c_holder_task = shard.dequeue("h", "default", 1).await.expect("dq").tasks;
+    let c_holder_id = c_holder_task[0].attempt().task_id().to_string();
+
+    // Target with `[C, RateLimit]`. Use a rate limit pointing at a name we
+    // won't actually call Gubernator for in this test (we tear down before).
+    // We're only interested in the structure: after C is freed, the chain
+    // must write a CheckRateLimit task — not a leasable RunAttempt.
+    let _target = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(silo::job::GubernatorRateLimit {
+                    name: "test-rl".to_string(),
+                    unique_key: "chain-rl-key".to_string(),
+                    limit: 100,
+                    duration_ms: 60_000,
+                    hits: 1,
+                    algorithm: silo::job::GubernatorAlgorithm::TokenBucket,
+                    behavior: 0,
+                    retry_policy: silo::job::RateLimitRetryPolicy {
+                        initial_backoff_ms: 10,
+                        max_backoff_ms: 1000,
+                        backoff_multiplier: 2.0,
+                        max_retries: 3,
+                    },
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+
+    // Free C — the grant scanner promotes target's request. Because limits
+    // remain (the RateLimit at index 1), `process_grants` writes a
+    // `ResumeAfterConcurrencyGrant` at target's task_key carrying the
+    // just-granted C holder paired with the request_id. The resume task is
+    // the contract we care about here — the subsequent RateLimit walk goes
+    // through standard `enqueue_limit_task_at_index` machinery already
+    // covered by other tests.
+    shard
+        .report_attempt_outcome(&c_holder_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("release c");
+
+    let resume = poll_until(
+        || async {
+            let kv = first_task_kv(shard.db()).await;
+            kv.and_then(|(_, v)| decode_task(&v).ok())
+        },
+        |t| matches!(t, Some(Task::ResumeAfterConcurrencyGrant { .. })),
+        5000,
+    )
+    .await;
+    let task = resume.expect("expected resume task to be written");
+    let (held, req_id, lim_idx) = match task {
+        Task::ResumeAfterConcurrencyGrant {
+            held_queues,
+            request_id,
+            limit_index,
+            ..
+        } => (held_queues, request_id, limit_index),
+        other => panic!("expected ResumeAfterConcurrencyGrant, got {:?}", other),
+    };
+    assert_eq!(
+        lim_idx, 1,
+        "resume must continue at the RateLimit (index 1)"
+    );
+    assert_eq!(
+        held.len(),
+        1,
+        "resume must carry exactly the just-granted C holder; got {:?}",
+        held
+    );
+    assert_eq!(held[0].queue, queue_c);
+    assert_eq!(
+        held[0].task_id, req_id,
+        "the holder's task_id must match the resume's request_id — that's the \
+         task_id `process_ticket_request_task` / `process_grants` used when \
+         creating the holder, and the release path looks holders up by it."
+    );
+
+    // Sanity: the actual holder row in storage uses (queue, request_id) too.
+    let holder = shard
+        .db()
+        .get(&concurrency_holder_key(tenant, &queue_c, &req_id))
+        .await
+        .expect("read holder");
+    assert!(
+        holder.is_some(),
+        "holder for granted C ticket must be keyed by request_id"
     );
 }
 

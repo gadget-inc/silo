@@ -186,6 +186,9 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             Task::CheckRateLimit { .. } => {
                 panic!("unexpected CheckRateLimit in tasks/ for this test")
             }
+            Task::ResumeAfterConcurrencyGrant { .. } => {
+                panic!("unexpected ResumeAfterConcurrencyGrant in tasks/ for this test")
+            }
             Task::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
             }
@@ -220,6 +223,9 @@ async fn error_with_retries_enqueues_next_attempt_until_limit() {
             }
             Task::CheckRateLimit { .. } => {
                 panic!("unexpected CheckRateLimit in tasks/ for this test")
+            }
+            Task::ResumeAfterConcurrencyGrant { .. } => {
+                panic!("unexpected ResumeAfterConcurrencyGrant in tasks/ for this test")
             }
             Task::RefreshFloatingLimit { .. } => {
                 panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
@@ -461,6 +467,9 @@ async fn retry_count_one_boundary_enqueues_attempt2_then_stops_on_second_error()
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
         Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
+        Task::ResumeAfterConcurrencyGrant { .. } => {
+            panic!("unexpected ResumeAfterConcurrencyGrant in tasks/ for this test")
+        }
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
         }
@@ -1053,6 +1062,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
             panic!("unexpected RequestTicket in tasks/ for this test")
         }
         Task::CheckRateLimit { .. } => panic!("unexpected CheckRateLimit in tasks/ for this test"),
+        Task::ResumeAfterConcurrencyGrant { .. } => {
+            panic!("unexpected ResumeAfterConcurrencyGrant in tasks/ for this test")
+        }
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
         }

@@ -274,9 +274,11 @@ impl JobStoreShard {
                         held_queues: Vec::new(),
                         task_group: &params.task_group,
                         skip_try_reserve: false,
+                        inline_terminal: false,
                     },
                 )
-                .await?;
+                .await?
+                .grants;
         }
 
         // Include counters in the transaction (unmark_write excludes them from conflict detection)
@@ -542,7 +544,7 @@ impl JobStoreShard {
         let priority = existing_job.priority();
         let stored_limits = existing_job.limits();
         let mut matched_task_keys: Vec<Vec<u8>> = Vec::new();
-        let mut released_holders: Vec<(String, Vec<String>)> = Vec::new();
+        let mut released_holders: Vec<(String, Vec<crate::task::HeldQueue>)> = Vec::new();
 
         if old_status.kind == JobStatusKind::Scheduled {
             // O(1) task key reconstruction from status fields (same pattern as cancel/expedite/lease)
@@ -577,9 +579,12 @@ impl JobStoreShard {
                         held_queues,
                         ..
                     } => {
-                        // Delete concurrency holders for each held queue
-                        for queue in &held_queues {
-                            let holder_key = concurrency_holder_key(tenant, queue, &tid);
+                        // Delete concurrency holders for each held queue, using
+                        // the *creator's* task_id (stored on each HeldQueue) so
+                        // the resume-after-grant path's mixed-task_id chains
+                        // release correctly.
+                        for hq in &held_queues {
+                            let holder_key = concurrency_holder_key(tenant, &hq.queue, &hq.task_id);
                             txn.delete(&holder_key)?;
                         }
                         if !held_queues.is_empty() {
@@ -654,9 +659,11 @@ impl JobStoreShard {
                         held_queues: Vec::new(),
                         task_group: &task_group,
                         skip_try_reserve: false,
+                        inline_terminal: false,
                     },
                 )
-                .await?;
+                .await?
+                .grants;
         }
         // [SILO-REIMP-7] If terminal: status is terminal, no new tasks
 
@@ -709,12 +716,14 @@ impl JobStoreShard {
 
         // Release in-memory holders and immediately request grant scanning.
         // This avoids waiting for periodic reconciliation when slots free up.
-        for (finished_task_id, held_queues) in &released_holders {
-            for queue in held_queues {
+        // `finished_task_id` is no longer the in-memory key — each HeldQueue
+        // carries the task_id its holder was indexed by.
+        for (_finished_task_id, held_queues) in &released_holders {
+            for hq in held_queues {
                 self.concurrency
                     .counts()
-                    .atomic_release(tenant, queue, finished_task_id);
-                self.concurrency.request_grant(tenant, queue);
+                    .atomic_release(tenant, &hq.queue, &hq.task_id);
+                self.concurrency.request_grant(tenant, &hq.queue);
             }
         }
 

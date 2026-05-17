@@ -4,7 +4,9 @@ use flatbuffers::FlatBufferBuilder;
 use crate::fb::silo::fb;
 use crate::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
-use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
+use crate::task::{
+    ConcurrencyAction, GubernatorRateLimitData, HeldQueue, HolderRecord, LeaseRecord, Task,
+};
 
 /// Error type for codec operations
 #[derive(Debug, Clone, thiserror::Error)]
@@ -44,6 +46,44 @@ fn build_kv_pair_offsets<'a, A: flatbuffers::Allocator + 'a>(
         .collect()
 }
 
+/// Build a vector of HeldQueue offsets.
+fn build_held_queue_offsets<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    held: &[HeldQueue],
+) -> flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<fb::HeldQueue<'a>>>>
+{
+    let offsets: Vec<_> = held
+        .iter()
+        .map(|hq| {
+            let queue = builder.create_string(&hq.queue);
+            let task_id = builder.create_string(&hq.task_id);
+            fb::HeldQueue::create(
+                builder,
+                &fb::HeldQueueArgs {
+                    queue: Some(queue),
+                    task_id: Some(task_id),
+                },
+            )
+        })
+        .collect();
+    builder.create_vector(&offsets)
+}
+
+/// Decode a flatbuffer `[HeldQueue]` vector into an owned `Vec<HeldQueue>`.
+fn fb_held_queues_to_owned(
+    held: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<fb::HeldQueue<'_>>>>,
+) -> Vec<HeldQueue> {
+    held.map(|v| {
+        v.iter()
+            .map(|hq| HeldQueue {
+                queue: hq.queue().unwrap_or_default().to_string(),
+                task_id: hq.task_id().unwrap_or_default().to_string(),
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Build a Task union (TaskVariant) into the builder. Returns (type, offset).
 fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
     builder: &mut FlatBufferBuilder<'a, A>,
@@ -65,11 +105,7 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
             let id = builder.create_string(id);
             let tenant = builder.create_string(tenant);
             let job_id = builder.create_string(job_id);
-            let hq: Vec<_> = held_queues
-                .iter()
-                .map(|s| builder.create_string(s))
-                .collect();
-            let held_queues = builder.create_vector(&hq);
+            let held_queues = build_held_queue_offsets(builder, held_queues);
             let task_group = builder.create_string(task_group);
             let ra = fb::RunAttempt::create(
                 builder,
@@ -95,12 +131,16 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
             relative_attempt_number,
             request_id,
             task_group,
+            held_queues,
+            limit_index,
+            total_limits,
         } => {
             let queue = builder.create_string(queue);
             let tenant = builder.create_string(tenant);
             let job_id = builder.create_string(job_id);
             let request_id = builder.create_string(request_id);
             let task_group = builder.create_string(task_group);
+            let held_queues = build_held_queue_offsets(builder, held_queues);
             let rt = fb::RequestTicket::create(
                 builder,
                 &fb::RequestTicketArgs {
@@ -113,6 +153,9 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
                     relative_attempt_number: *relative_attempt_number,
                     request_id: Some(request_id),
                     task_group: Some(task_group),
+                    held_queues: Some(held_queues),
+                    limit_index: *limit_index,
+                    total_limits: *total_limits,
                 },
             );
             (fb::TaskVariant::RequestTicket, rt.as_union_value())
@@ -152,11 +195,7 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
                     retry_max_retries: rate_limit.retry_max_retries,
                 },
             );
-            let hq: Vec<_> = held_queues
-                .iter()
-                .map(|s| builder.create_string(s))
-                .collect();
-            let held_queues = builder.create_vector(&hq);
+            let held_queues = build_held_queue_offsets(builder, held_queues);
             let task_group = builder.create_string(task_group);
             let crl = fb::CheckRateLimit::create(
                 builder,
@@ -205,6 +244,43 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
                 },
             );
             (fb::TaskVariant::RefreshFloatingLimit, rfl.as_union_value())
+        }
+        Task::ResumeAfterConcurrencyGrant {
+            request_id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            task_group,
+            held_queues,
+            limit_index,
+            start_at_ms,
+            priority,
+        } => {
+            let request_id = builder.create_string(request_id);
+            let tenant = builder.create_string(tenant);
+            let job_id = builder.create_string(job_id);
+            let task_group = builder.create_string(task_group);
+            let held_queues = build_held_queue_offsets(builder, held_queues);
+            let rg = fb::ResumeAfterConcurrencyGrant::create(
+                builder,
+                &fb::ResumeAfterConcurrencyGrantArgs {
+                    request_id: Some(request_id),
+                    tenant: Some(tenant),
+                    job_id: Some(job_id),
+                    attempt_number: *attempt_number,
+                    relative_attempt_number: *relative_attempt_number,
+                    task_group: Some(task_group),
+                    held_queues: Some(held_queues),
+                    limit_index: *limit_index,
+                    start_at_ms: *start_at_ms,
+                    priority: *priority,
+                },
+            );
+            (
+                fb::TaskVariant::ResumeAfterConcurrencyGrant,
+                rg.as_union_value(),
+            )
         }
     }
 }
@@ -474,9 +550,13 @@ pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Vec<u8> {
             attempt_number,
             relative_attempt_number,
             task_group,
+            held_queues,
+            limit_index,
+            total_limits,
         } => {
             let job_id = builder.create_string(job_id);
             let task_group = builder.create_string(task_group);
+            let held_queues = build_held_queue_offsets(&mut builder, held_queues);
             let et = fb::EnqueueTask::create(
                 &mut builder,
                 &fb::EnqueueTaskArgs {
@@ -486,6 +566,9 @@ pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Vec<u8> {
                     attempt_number: *attempt_number,
                     relative_attempt_number: *relative_attempt_number,
                     task_group: Some(task_group),
+                    held_queues: Some(held_queues),
+                    limit_index: *limit_index,
+                    total_limits: *total_limits,
                 },
             );
             let root = fb::ConcurrencyAction::create(
@@ -572,10 +655,7 @@ fn task_from_fb_variant(
                 job_id: ra.job_id().unwrap_or_default().to_string(),
                 attempt_number: ra.attempt_number(),
                 relative_attempt_number: ra.relative_attempt_number(),
-                held_queues: ra
-                    .held_queues()
-                    .map(|v| v.iter().map(|s| s.to_string()).collect())
-                    .unwrap_or_default(),
+                held_queues: fb_held_queues_to_owned(ra.held_queues()),
                 task_group: ra.task_group().unwrap_or_default().to_string(),
             })
         }
@@ -591,6 +671,9 @@ fn task_from_fb_variant(
                 relative_attempt_number: rt.relative_attempt_number(),
                 request_id: rt.request_id().unwrap_or_default().to_string(),
                 task_group: rt.task_group().unwrap_or_default().to_string(),
+                held_queues: fb_held_queues_to_owned(rt.held_queues()),
+                limit_index: rt.limit_index(),
+                total_limits: rt.total_limits(),
             })
         }
         fb::TaskVariant::CheckRateLimit => {
@@ -621,10 +704,7 @@ fn task_from_fb_variant(
                 retry_count: crl.retry_count(),
                 started_at_ms: crl.started_at_ms(),
                 priority: crl.priority(),
-                held_queues: crl
-                    .held_queues()
-                    .map(|v| v.iter().map(|s| s.to_string()).collect())
-                    .unwrap_or_default(),
+                held_queues: fb_held_queues_to_owned(crl.held_queues()),
                 task_group: crl.task_group().unwrap_or_default().to_string(),
             })
         }
@@ -638,6 +718,21 @@ fn task_from_fb_variant(
                 last_refreshed_at_ms: rfl.last_refreshed_at_ms(),
                 metadata: fb_kv_pairs_to_owned(rfl.metadata()),
                 task_group: rfl.task_group().unwrap_or_default().to_string(),
+            })
+        }
+        fb::TaskVariant::ResumeAfterConcurrencyGrant => {
+            let rg = unsafe { fb::ResumeAfterConcurrencyGrant::init_from_table(table) };
+            Ok(Task::ResumeAfterConcurrencyGrant {
+                request_id: rg.request_id().unwrap_or_default().to_string(),
+                tenant: rg.tenant().unwrap_or_default().to_string(),
+                job_id: rg.job_id().unwrap_or_default().to_string(),
+                attempt_number: rg.attempt_number(),
+                relative_attempt_number: rg.relative_attempt_number(),
+                task_group: rg.task_group().unwrap_or_default().to_string(),
+                held_queues: fb_held_queues_to_owned(rg.held_queues()),
+                limit_index: rg.limit_index(),
+                start_at_ms: rg.start_at_ms(),
+                priority: rg.priority(),
             })
         }
         _ => Err(CodecError::Flatbuffer(format!(
@@ -759,6 +854,7 @@ impl DecodedTask {
             RequestTicket => variant_as_request_ticket,
             CheckRateLimit => variant_as_check_rate_limit,
             RefreshFloatingLimit => variant_as_refresh_floating_limit,
+            ResumeAfterConcurrencyGrant => variant_as_resume_after_concurrency_grant,
         )
     }
 
@@ -768,6 +864,7 @@ impl DecodedTask {
             RequestTicket => variant_as_request_ticket,
             CheckRateLimit => variant_as_check_rate_limit,
             RefreshFloatingLimit => variant_as_refresh_floating_limit,
+            ResumeAfterConcurrencyGrant => variant_as_resume_after_concurrency_grant,
         )
     }
 
@@ -785,6 +882,10 @@ impl DecodedTask {
 
     pub fn as_refresh_floating_limit(&self) -> Option<fb::RefreshFloatingLimit<'_>> {
         self.fb().variant_as_refresh_floating_limit()
+    }
+
+    pub fn as_resume_after_concurrency_grant(&self) -> Option<fb::ResumeAfterConcurrencyGrant<'_>> {
+        self.fb().variant_as_resume_after_concurrency_grant()
     }
 
     /// Materialize a fully-owned Task from the FlatBuffer data.
@@ -860,6 +961,7 @@ impl DecodedLease {
             RequestTicket => task_as_request_ticket,
             CheckRateLimit => task_as_check_rate_limit,
             RefreshFloatingLimit => task_as_refresh_floating_limit,
+            ResumeAfterConcurrencyGrant => task_as_resume_after_concurrency_grant,
         )
     }
 
@@ -868,6 +970,7 @@ impl DecodedLease {
             RunAttempt => task_as_run_attempt,
             RequestTicket => task_as_request_ticket,
             CheckRateLimit => task_as_check_rate_limit,
+            ResumeAfterConcurrencyGrant => task_as_resume_after_concurrency_grant,
         )
     }
 
@@ -876,6 +979,7 @@ impl DecodedLease {
             RunAttempt => task_as_run_attempt,
             RequestTicket => task_as_request_ticket,
             CheckRateLimit => task_as_check_rate_limit,
+            ResumeAfterConcurrencyGrant => task_as_resume_after_concurrency_grant,
         )
     }
 
@@ -884,6 +988,7 @@ impl DecodedLease {
             RunAttempt => task_as_run_attempt,
             RequestTicket => task_as_request_ticket,
             CheckRateLimit => task_as_check_rate_limit,
+            ResumeAfterConcurrencyGrant => task_as_resume_after_concurrency_grant,
         )
     }
 
@@ -901,19 +1006,15 @@ impl DecodedLease {
         }
     }
 
-    pub fn held_queues(&self) -> Vec<String> {
+    pub fn held_queues(&self) -> Vec<HeldQueue> {
         let lr = self.fb();
         match lr.task_type() {
-            fb::TaskVariant::RunAttempt => lr
-                .task_as_run_attempt()
-                .and_then(|r| r.held_queues())
-                .map(|v| v.iter().map(|s| s.to_string()).collect())
-                .unwrap_or_default(),
-            fb::TaskVariant::CheckRateLimit => lr
-                .task_as_check_rate_limit()
-                .and_then(|r| r.held_queues())
-                .map(|v| v.iter().map(|s| s.to_string()).collect())
-                .unwrap_or_default(),
+            fb::TaskVariant::RunAttempt => {
+                fb_held_queues_to_owned(lr.task_as_run_attempt().and_then(|r| r.held_queues()))
+            }
+            fb::TaskVariant::CheckRateLimit => {
+                fb_held_queues_to_owned(lr.task_as_check_rate_limit().and_then(|r| r.held_queues()))
+            }
             _ => Vec::new(),
         }
     }
@@ -923,6 +1024,7 @@ impl DecodedLease {
             RunAttempt => task_as_run_attempt,
             RequestTicket => task_as_request_ticket,
             CheckRateLimit => task_as_check_rate_limit,
+            ResumeAfterConcurrencyGrant => task_as_resume_after_concurrency_grant,
             RefreshFloatingLimit => task_as_refresh_floating_limit,
         )
     }

@@ -241,9 +241,11 @@ impl JobStoreShard {
                                     held_queues: Vec::new(),
                                     task_group,
                                     skip_try_reserve: true,
+                                    inline_terminal: false,
                                 },
                             )
-                            .await?;
+                            .await?
+                            .grants;
 
                         // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                         let job_status =
@@ -282,9 +284,14 @@ impl JobStoreShard {
         }
 
         // [SILO-REL-1][SILO-RETRY-REL] Delete concurrency holders in the batch.
-        // In-memory release happens post-commit via atomic_release.
-        for queue in &held_queues_local {
-            batch.delete(concurrency_holder_key(&tenant, queue, task_id));
+        // In-memory release happens post-commit via atomic_release. Each
+        // HeldQueue carries the task_id of the request that *created* its
+        // holder — that's what `concurrency_holder_key` was indexed by. The
+        // lease's task_id is only correct for the initial-enqueue chain (where
+        // every holder shares one id); the resume-after-grant path produces
+        // chains whose holders span multiple task_ids.
+        for hq in &held_queues_local {
+            batch.delete(concurrency_holder_key(&tenant, &hq.queue, &hq.task_id));
         }
 
         // Two-phase DST events: emit before write for correct causal ordering,
@@ -333,10 +340,11 @@ impl JobStoreShard {
         dst_events::confirm_write(write_op);
 
         // Post-commit: release in-memory concurrency counts and signal grant scanner.
-        for queue in &held_queues_local {
+        for hq in &held_queues_local {
             let span = info_span!(
                 "concurrency.release",
-                queue = %queue,
+                queue = %hq.queue,
+                holder_task_id = %hq.task_id,
                 finished_task_id = %task_id
             );
             let _g = span.enter();
@@ -344,8 +352,8 @@ impl JobStoreShard {
 
             self.concurrency
                 .counts()
-                .atomic_release(&tenant, queue, task_id);
-            self.concurrency.request_grant(&tenant, queue);
+                .atomic_release(&tenant, &hq.queue, &hq.task_id);
+            self.concurrency.request_grant(&tenant, &hq.queue);
         }
         // If we scheduled a follow-up that is ready now, wake the scanner
         if let Some(nt) = followup_next_time

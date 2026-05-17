@@ -15,7 +15,7 @@ use crate::keys::{
     attempt_key, concurrency_holder_key, job_info_key, leased_task_key, parse_task_key,
 };
 use crate::shard_range::ShardRange;
-use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
+use crate::task::{DEFAULT_LEASE_MS, HeldQueue, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::BrokerTask;
 
 /// Mutable accumulators for a single dequeue iteration.
@@ -171,6 +171,10 @@ impl JobStoreShard {
                             &mut state, &entry.key, decoded, worker_id, now_ms, expiry_ms,
                         )
                         .await?;
+                    }
+                    fb::TaskVariant::ResumeAfterConcurrencyGrant => {
+                        self.handle_resume_after_grant(&mut state, &entry.key, decoded, now_ms)
+                            .await?;
                     }
                     other => {
                         return Err(JobStoreShardError::Codec(format!(
@@ -370,6 +374,18 @@ impl JobStoreShard {
         let relative_attempt_number = rt.relative_attempt_number();
         let request_id = rt.request_id().unwrap_or_default();
         let req_task_group = rt.task_group().unwrap_or_default();
+        let prior_held_queues: Vec<HeldQueue> = rt
+            .held_queues()
+            .map(|v| {
+                v.iter()
+                    .map(|hq| HeldQueue {
+                        queue: hq.queue().unwrap_or_default().to_string(),
+                        task_id: hq.task_id().unwrap_or_default().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let limit_index_at_queue_time = rt.limit_index();
         state.processed_internal = true;
         let tenant = tenant.to_string();
 
@@ -409,60 +425,105 @@ impl JobStoreShard {
                     .grants_to_rollback
                     .push((tenant.clone(), queue.clone(), request_id.clone()));
 
-                // Create RunAttempt task for the lease (new Task, not a copy)
-                let run = Task::RunAttempt {
-                    id: request_id.clone(),
-                    tenant: tenant.clone(),
-                    job_id: job_id.to_string(),
-                    attempt_number,
-                    relative_attempt_number,
-                    held_queues: vec![queue],
-                    task_group: req_task_group.to_string(),
-                };
-
-                let attempt_val = self
-                    .write_lease_and_attempt(
-                        &mut state.batch,
-                        worker_id,
-                        &run,
-                        &request_id,
-                        &tenant,
-                        job_id,
-                        attempt_number,
-                        relative_attempt_number,
-                        now_ms,
-                        expiry_ms,
-                    )
-                    .await?;
-
+                // Resume the chain at limit_index + 1. The just-granted queue
+                // is appended to held_queues, paired with `request_id` (the
+                // task_id that created its holder in
+                // `process_ticket_request_task`). If the chain walks to a
+                // terminal RunAttempt, we lease it in this iteration without
+                // a re-read; otherwise the resume task takes over and the
+                // worker leases on a subsequent pass.
                 let view = job_view.ok_or_else(|| {
                     JobStoreShardError::Codec(format!(
                         "job view missing for granted ticket, job_id={}",
                         job_id
                     ))
                 })?;
-                state
-                    .pending_attempts
-                    .push((tenant.clone(), view, attempt_val));
-                state.ack_deleted(task_key);
+                let limits = view.limits();
+                let mut full_held_queues = prior_held_queues.clone();
+                full_held_queues.push(HeldQueue {
+                    queue: queue.clone(),
+                    task_id: request_id.clone(),
+                });
+                let resume_index = (limit_index_at_queue_time + 1) as usize;
 
-                // Track for DST event emission after commit
-                state
-                    .leased_tasks_for_dst
-                    .push((tenant, job_id.to_string(), request_id));
+                let chain = self
+                    .enqueue_limit_task_at_index(
+                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                        LimitTaskParams {
+                            tenant: &tenant,
+                            task_id: &request_id,
+                            job_id,
+                            attempt_number,
+                            relative_attempt_number,
+                            limit_index: resume_index,
+                            limits: &limits,
+                            priority: rt.priority(),
+                            start_at_ms: now_ms,
+                            now_ms,
+                            held_queues: full_held_queues,
+                            task_group: req_task_group,
+                            skip_try_reserve: false,
+                            inline_terminal: true,
+                        },
+                    )
+                    .await?;
 
-                // Record concurrency ticket metric and ready-to-start latency
-                if let Some(ref m) = self.metrics {
+                for (q, tid) in chain.grants {
+                    state.grants_to_rollback.push((tenant.clone(), q, tid));
+                }
+
+                if let Some(run_attempt) = chain.terminal_run_attempt {
+                    // Chain reached a terminal RunAttempt — lease it now so
+                    // the worker can pick it up in this dequeue pass.
+                    let attempt_val = self
+                        .write_lease_and_attempt(
+                            &mut state.batch,
+                            worker_id,
+                            &run_attempt,
+                            &request_id,
+                            &tenant,
+                            job_id,
+                            attempt_number,
+                            relative_attempt_number,
+                            now_ms,
+                            expiry_ms,
+                        )
+                        .await?;
+                    state
+                        .pending_attempts
+                        .push((tenant.clone(), view, attempt_val));
+
+                    // Track for DST event emission after commit
+                    state
+                        .leased_tasks_for_dst
+                        .push((tenant, job_id.to_string(), request_id));
+
+                    if let Some(ref m) = self.metrics {
+                        m.record_concurrency_tickets_granted(
+                            self.name(),
+                            crate::metrics::GrantPath::Scanned,
+                            1,
+                        );
+                        if let Some(parsed) = parse_task_key(task_key) {
+                            let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
+                            m.record_ready_to_start_latency_ms(
+                                self.name(),
+                                req_task_group,
+                                latency_ms,
+                            );
+                        }
+                    }
+                } else if let Some(ref m) = self.metrics {
+                    // Chain wrote a follow-up task (CheckRateLimit or another
+                    // RequestTicket). Still record the grant, but no lease /
+                    // latency yet — the next stage will lease.
                     m.record_concurrency_tickets_granted(
                         self.name(),
                         crate::metrics::GrantPath::Scanned,
                         1,
                     );
-                    if let Some(parsed) = parse_task_key(task_key) {
-                        let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
-                        m.record_ready_to_start_latency_ms(self.name(), req_task_group, latency_ms);
-                    }
                 }
+                state.ack_deleted(task_key);
             }
             RequestTicketTaskOutcome::Requested => {
                 // Release inflight only; task key remains in DB and must be eligible
@@ -470,7 +531,19 @@ impl JobStoreShard {
                 state.ack_release(task_key);
             }
             RequestTicketTaskOutcome::JobMissing => {
-                // process_ticket_request_task deleted the task key.
+                // process_ticket_request_task deleted the task key. Also
+                // release any holders from earlier limits in the chain — the
+                // job is gone so they're definitively orphaned.
+                for hq in &prior_held_queues {
+                    state
+                        .batch
+                        .delete(concurrency_holder_key(&tenant, &hq.queue, &hq.task_id));
+                    state.holder_releases.push((
+                        tenant.clone(),
+                        hq.queue.clone(),
+                        hq.task_id.clone(),
+                    ));
+                }
                 state.ack_deleted(task_key);
             }
         }
@@ -521,15 +594,14 @@ impl JobStoreShard {
                     // Drop the task and release any concurrency holders it
                     // carries from earlier chained limits. Symmetric with the
                     // missing-job_info path below and with handle_run_attempt.
-                    for q in held_queues.iter() {
-                        let queue = q.clone();
+                    for hq in held_queues.iter() {
                         state
                             .batch
-                            .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                            .delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id));
                         state.holder_releases.push((
                             tenant.to_string(),
-                            queue,
-                            check_task_id.to_string(),
+                            hq.queue.clone(),
+                            hq.task_id.clone(),
                         ));
                     }
                     return Ok(());
@@ -538,15 +610,14 @@ impl JobStoreShard {
             None => {
                 // Job missing — drop the task and release any concurrency
                 // holders it carries from earlier chained limits.
-                for q in held_queues.iter() {
-                    let queue = q.clone();
+                for hq in held_queues.iter() {
                     state
                         .batch
-                        .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                        .delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id));
                     state.holder_releases.push((
                         tenant.to_string(),
-                        queue,
-                        check_task_id.to_string(),
+                        hq.queue.clone(),
+                        hq.task_id.clone(),
                     ));
                 }
                 return Ok(());
@@ -559,7 +630,7 @@ impl JobStoreShard {
         match rate_limit_result {
             Ok(result) if result.under_limit => {
                 // Rate limit passed! Proceed to next limit or RunAttempt
-                let grants = self
+                let chain = self
                     .enqueue_limit_task_at_index(
                         &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                         LimitTaskParams {
@@ -576,11 +647,12 @@ impl JobStoreShard {
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,
                             skip_try_reserve: false,
+                            inline_terminal: false,
                         },
                     )
                     .await?;
                 // Track any immediate grants for rollback if DB write fails
-                for (queue, task_id) in grants {
+                for (queue, task_id) in chain.grants {
                     state
                         .grants_to_rollback
                         .push((tenant.clone(), queue, task_id));
@@ -600,15 +672,14 @@ impl JobStoreShard {
                     // carries from earlier chained limits. Without this, a
                     // stranded holder permanently consumes a slot for the
                     // queue.
-                    for q in held_queues.iter() {
-                        let queue = q.clone();
+                    for hq in held_queues.iter() {
                         state
                             .batch
-                            .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                            .delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id));
                         state.holder_releases.push((
                             tenant.to_string(),
-                            queue,
-                            check_task_id.to_string(),
+                            hq.queue.clone(),
+                            hq.task_id.clone(),
                         ));
                     }
                     return Ok(());
@@ -655,6 +726,117 @@ impl JobStoreShard {
                     check_task_group,
                 )?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Process a ResumeAfterConcurrencyGrant task: load the job's limits and
+    /// re-enter the limit chain at `limit_index`. Mirrors the pass-through path
+    /// in `handle_check_rate_limit` but skips the rate-limit call — the
+    /// previous limit was a concurrency limit that was already granted by
+    /// `process_grants` and recorded on `held_queues`.
+    async fn handle_resume_after_grant(
+        &self,
+        state: &mut DequeueIterationState,
+        task_key: &[u8],
+        decoded: &DecodedTask,
+        now_ms: i64,
+    ) -> Result<(), JobStoreShardError> {
+        let Task::ResumeAfterConcurrencyGrant {
+            request_id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            task_group,
+            held_queues,
+            limit_index,
+            start_at_ms,
+            priority,
+        } = decoded.to_task()?
+        else {
+            return Err(JobStoreShardError::Codec(
+                "expected ResumeAfterConcurrencyGrant variant".to_string(),
+            ));
+        };
+
+        state.processed_internal = true;
+        state.batch.delete(task_key);
+        state.ack_deleted(task_key);
+
+        // Load job info to get the full limits list
+        let job_key = job_info_key(&tenant, &job_id);
+        let maybe_job = self.db.get(&job_key).await?;
+        let job_view = match maybe_job {
+            Some(bytes) => match JobView::new(bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Release every holder under its own task_id and exit.
+                    for hq in &held_queues {
+                        state
+                            .batch
+                            .delete(concurrency_holder_key(&tenant, &hq.queue, &hq.task_id));
+                        state.holder_releases.push((
+                            tenant.clone(),
+                            hq.queue.clone(),
+                            hq.task_id.clone(),
+                        ));
+                    }
+                    return Ok(());
+                }
+            },
+            None => {
+                for hq in &held_queues {
+                    state
+                        .batch
+                        .delete(concurrency_holder_key(&tenant, &hq.queue, &hq.task_id));
+                    state.holder_releases.push((
+                        tenant.clone(),
+                        hq.queue.clone(),
+                        hq.task_id.clone(),
+                    ));
+                }
+                return Ok(());
+            }
+        };
+
+        // IMPORTANT: pass `start_at_ms: now_ms` rather than the original
+        // `start_at_ms` decoded from the resume task. The original task at
+        // task_key(...,start_at_ms) was just ack_deleted, which installs a
+        // broker tombstone on that key for ~64 scan generations. If any
+        // subsequent chain step (a re-promoted request or another resume task)
+        // writes a fresh task at the SAME task_key, the broker scanner would
+        // suppress it. Using `now_ms` shifts every downstream task_key to a
+        // strictly-later timestamp, sidestepping the tombstone. This mirrors
+        // the start_at_ms = now_ms pattern in `handle_check_rate_limit`.
+        let _ = start_at_ms; // kept on the task for diagnostics/expedite paths
+        let chain = self
+            .enqueue_limit_task_at_index(
+                &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                LimitTaskParams {
+                    tenant: &tenant,
+                    task_id: &request_id,
+                    job_id: &job_id,
+                    attempt_number,
+                    relative_attempt_number,
+                    limit_index: limit_index as usize,
+                    limits: &job_view.limits(),
+                    priority,
+                    start_at_ms: now_ms,
+                    now_ms,
+                    held_queues,
+                    task_group: &task_group,
+                    skip_try_reserve: false,
+                    inline_terminal: false,
+                },
+            )
+            .await?;
+
+        for (queue, task_id) in chain.grants {
+            state
+                .grants_to_rollback
+                .push((tenant.clone(), queue, task_id));
         }
 
         Ok(())
@@ -734,14 +916,15 @@ impl JobStoreShard {
             state.batch.delete(task_key);
             state.ack_deleted(task_key);
             if let Some(held) = ra.held_queues() {
-                for q in held.iter() {
-                    let queue = q.to_string();
+                for hq in held.iter() {
+                    let queue = hq.queue().unwrap_or_default().to_string();
+                    let holder_task_id = hq.task_id().unwrap_or_default().to_string();
                     state
                         .batch
-                        .delete(concurrency_holder_key(tenant, &queue, task_id));
+                        .delete(concurrency_holder_key(tenant, &queue, &holder_task_id));
                     state
                         .holder_releases
-                        .push((tenant.to_string(), queue, task_id.to_string()));
+                        .push((tenant.to_string(), queue, holder_task_id));
                 }
             }
             tracing::warn!(

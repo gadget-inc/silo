@@ -21,7 +21,7 @@ use crate::keys::{
     task_key, tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
-use crate::task::{GubernatorRateLimitData, Task};
+use crate::task::{GubernatorRateLimitData, HeldQueue, Task};
 
 /// Parameters for creating limit-processing tasks.
 /// Bundles the many fields needed by `enqueue_limit_task_at_index` into a single struct.
@@ -36,13 +36,21 @@ pub(crate) struct LimitTaskParams<'a> {
     pub priority: u8,
     pub start_at_ms: i64,
     pub now_ms: i64,
-    pub held_queues: Vec<String>,
+    pub held_queues: Vec<HeldQueue>,
     pub task_group: &'a str,
     /// When true, skip try_reserve and always go through the request queue.
     /// Used for retry scheduling where the old holder is still in-memory (released post-commit).
     /// This matches the Alloy model's completeFailureRetryReleaseTicket which creates a
     /// TicketRequest, not an immediate holder.
     pub skip_try_reserve: bool,
+    /// When true and the chain reaches a terminal `Task::RunAttempt`, do NOT
+    /// write it to `task_key` in the DB — just return it on
+    /// `EnqueueChainResult::terminal_run_attempt` so the caller can lease it
+    /// in place. Set by `handle_request_ticket`'s grant path, which leases
+    /// the task within the same dequeue iteration and would otherwise leave a
+    /// stale RunAttempt at `task_key` that the broker can re-scan and grant a
+    /// second lease for the same job.
+    pub inline_terminal: bool,
 }
 
 /// Canonical processing order for a job's limits: Concurrency first, then
@@ -52,6 +60,14 @@ pub(crate) struct LimitTaskParams<'a> {
 /// strictly-tighter Concurrency limit blocks the job *before* it acquires a
 /// FloatingConcurrency slot — otherwise the FC grant produces a leasable
 /// `RunAttempt[FC]` that bypasses the still-full Concurrency limit.
+///
+/// IMPORTANT: This order is wire-format-load-bearing. The position within
+/// this canonical order is stored in `EnqueueTask.limit_index` and
+/// `RequestTicket.limit_index` so that promotion paths (the grant scanner,
+/// `handle_check_rate_limit`, `handle_resume_after_grant`) can pick up at
+/// `limit_index + 1`. Changing the sort key here would make in-flight
+/// requests resume at the wrong position; any change must either drain the
+/// pending request queue first or version-gate the encoding.
 pub(crate) fn limit_processing_order(limits: &[Limit]) -> Vec<usize> {
     let kind_rank = |i: usize| -> u8 {
         match &limits[i] {
@@ -73,6 +89,19 @@ enum GrantResult {
     Queued,
 }
 
+/// Result of `enqueue_limit_task_at_index`. The `grants` field is the
+/// (queue, task_id) pairs of in-memory reservations that need to be rolled
+/// back if the durable batch write fails. The `terminal_run_attempt` field
+/// is populated when the chain walked all the way to a terminal
+/// `Task::RunAttempt` write at the leasable task_key — the dequeue path
+/// uses this to hand the task to `write_lease_and_attempt` without an
+/// extra DB read. Other callers (`enqueue_batch`, retry scheduling, the
+/// rate-limit pass-through) can ignore it.
+pub(crate) struct EnqueueChainResult {
+    pub grants: Vec<(String, String)>,
+    pub terminal_run_attempt: Option<Task>,
+}
+
 /// Process the outcome of a `handle_enqueue` call, updating shared loop state.
 /// Returns `Granted` if the caller should continue to the next limit, or `Queued`
 /// if the caller should return early.
@@ -81,7 +110,7 @@ fn record_grant_outcome(
     queue_key: &str,
     grants: &mut Vec<(String, String)>,
     current_task_id: &str,
-    current_held_queues: &mut Vec<String>,
+    current_held_queues: &mut Vec<HeldQueue>,
     current_index: &mut usize,
 ) -> GrantResult {
     match outcome {
@@ -93,16 +122,19 @@ fn record_grant_outcome(
             // which rewrites the RunAttempt with the full accumulated
             // current_held_queues so ReportOutcome can release every holder.
             //
-            // Crucially, `current_task_id` is NOT cycled here. The chained
-            // cleanup paths (handle_check_rate_limit, handle_run_attempt) all
-            // release holders by `concurrency_holder_key(tenant, queue,
-            // <chained_task_id>)`, so every holder we accumulate across the
-            // limit chain must share one task_id — the one carried forward to
-            // the final RunAttempt / CheckRateLimit task. Cycling here left
-            // earlier-granted holders orphaned and produced leaked slots on
-            // outcome release.
+            // Each HeldQueue records the task_id that created its holder —
+            // that's what the release path uses to look up
+            // `concurrency_holder_key(tenant, queue, task_id)`. Within the
+            // initial-enqueue chain this happens to equal `current_task_id`,
+            // but pairing it explicitly removes the implicit invariant that
+            // every holder in a chain must share one task_id (the resume-
+            // after-grant path generates holders under request_ids that
+            // differ from the final RunAttempt's `id`).
             grants.push((queue_key.to_string(), current_task_id.to_string()));
-            current_held_queues.push(queue_key.to_string());
+            current_held_queues.push(HeldQueue {
+                queue: queue_key.to_string(),
+                task_id: current_task_id.to_string(),
+            });
             *current_index += 1;
             GrantResult::Granted
         }
@@ -388,25 +420,28 @@ impl JobStoreShard {
 
         Self::write_job_status_with_index(writer, tenant, job_id, job_status)?;
 
-        self.enqueue_limit_task_at_index(
-            writer,
-            LimitTaskParams {
-                tenant,
-                task_id: &first_task_id,
-                job_id,
-                attempt_number: 1,
-                relative_attempt_number: 1,
-                limit_index: 0,
-                limits: &job.limits,
-                priority,
-                start_at_ms,
-                now_ms,
-                held_queues: Vec::new(),
-                task_group,
-                skip_try_reserve: false,
-            },
-        )
-        .await
+        Ok(self
+            .enqueue_limit_task_at_index(
+                writer,
+                LimitTaskParams {
+                    tenant,
+                    task_id: &first_task_id,
+                    job_id,
+                    attempt_number: 1,
+                    relative_attempt_number: 1,
+                    limit_index: 0,
+                    limits: &job.limits,
+                    priority,
+                    start_at_ms,
+                    now_ms,
+                    held_queues: Vec::new(),
+                    task_group,
+                    skip_try_reserve: false,
+                    inline_terminal: false,
+                },
+            )
+            .await?
+            .grants)
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
@@ -453,7 +488,7 @@ impl JobStoreShard {
         &self,
         writer: &mut W,
         params: LimitTaskParams<'_>,
-    ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+    ) -> Result<EnqueueChainResult, JobStoreShardError> {
         let LimitTaskParams {
             tenant,
             task_id,
@@ -468,6 +503,7 @@ impl JobStoreShard {
             held_queues,
             task_group,
             skip_try_reserve,
+            inline_terminal,
         } = params;
         // Walk limits in the canonical processing order (see
         // `limit_processing_order`). `current_index` and the `limit_index`
@@ -475,6 +511,7 @@ impl JobStoreShard {
         // order function is deterministic on `limits`, so dequeue's
         // `limit_index + 1` continuation lands on the correct next entry.
         let order = limit_processing_order(limits);
+        let total_limits = limits.len() as u32;
         let mut grants = Vec::new();
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
@@ -492,16 +529,24 @@ impl JobStoreShard {
                     held_queues: current_held_queues,
                     task_group: task_group.to_string(),
                 };
-                put_task(
-                    writer,
-                    task_group,
-                    start_at_ms,
-                    priority,
-                    job_id,
-                    attempt_number,
-                    &run_task,
-                )?;
-                return Ok(grants);
+                // Skip the DB put when the caller is going to lease the
+                // RunAttempt inline this iteration — otherwise the broker can
+                // re-scan it from `task_key` and hand out a second lease.
+                if !inline_terminal {
+                    put_task(
+                        writer,
+                        task_group,
+                        start_at_ms,
+                        priority,
+                        job_id,
+                        attempt_number,
+                        &run_task,
+                    )?;
+                }
+                return Ok(EnqueueChainResult {
+                    grants,
+                    terminal_run_attempt: Some(run_task),
+                });
             }
 
             match &limits[order[current_index]] {
@@ -524,6 +569,9 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                             skip_try_reserve,
+                            &current_held_queues,
+                            current_index as u32,
+                            total_limits,
                         )
                         .await?;
 
@@ -558,7 +606,10 @@ impl JobStoreShard {
                                 attempt_number,
                             ))?;
                         }
-                        return Ok(grants);
+                        return Ok(EnqueueChainResult {
+                            grants,
+                            terminal_run_attempt: None,
+                        });
                     }
                 }
 
@@ -593,6 +644,9 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                             skip_try_reserve,
+                            &current_held_queues,
+                            current_index as u32,
+                            total_limits,
                         )
                         .await?;
 
@@ -646,7 +700,10 @@ impl JobStoreShard {
                                 attempt_number,
                             ))?;
                         }
-                        return Ok(grants);
+                        return Ok(EnqueueChainResult {
+                            grants,
+                            terminal_run_attempt: None,
+                        });
                     }
                 }
 
@@ -675,7 +732,10 @@ impl JobStoreShard {
                         attempt_number,
                         &task,
                     )?;
-                    return Ok(grants);
+                    return Ok(EnqueueChainResult {
+                        grants,
+                        terminal_run_attempt: None,
+                    });
                 }
             }
         }
