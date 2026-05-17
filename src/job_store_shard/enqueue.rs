@@ -18,7 +18,7 @@ use crate::job_store_shard::helpers::{
 };
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
-    tenant_status_counter_key,
+    task_key, tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -535,6 +535,9 @@ impl JobStoreShard {
                         crate::concurrency::ConcurrencyLimitType::Fixed,
                     );
 
+                    let queued_with_request =
+                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
+
                     if matches!(
                         record_grant_outcome(
                             outcome,
@@ -546,6 +549,15 @@ impl JobStoreShard {
                         ),
                         GrantResult::Queued
                     ) {
+                        if queued_with_request && !grants.is_empty() {
+                            writer.delete(task_key(
+                                task_group,
+                                start_at_ms,
+                                priority,
+                                job_id,
+                                attempt_number,
+                            ))?;
+                        }
                         return Ok(grants);
                     }
                 }
@@ -611,6 +623,9 @@ impl JobStoreShard {
                         )?;
                     }
 
+                    let queued_with_request =
+                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
+
                     if matches!(
                         record_grant_outcome(
                             outcome,
@@ -622,6 +637,15 @@ impl JobStoreShard {
                         ),
                         GrantResult::Queued
                     ) {
+                        if queued_with_request && !grants.is_empty() {
+                            writer.delete(task_key(
+                                task_group,
+                                start_at_ms,
+                                priority,
+                                job_id,
+                                attempt_number,
+                            ))?;
+                        }
                         return Ok(grants);
                     }
                 }
