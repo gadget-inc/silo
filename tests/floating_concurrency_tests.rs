@@ -2041,3 +2041,199 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     let lease_exists = shard.db().get(&lease_key).await.expect("db get").is_some();
     assert!(!lease_exists, "lease should be deleted after reaping");
 }
+
+/// Regression for the user-reported deadlock: with limits ordered
+/// `[FloatingConcurrency, Concurrency]` (the order our app emits today),
+/// jobs can become FC holders waiting on Concurrency. When they're later
+/// promoted to runnable, the promotion path
+/// (`dequeue::handle_request_ticket` for `Task::RequestTicket`, or
+/// `concurrency::grant_next` for `concurrency_request_key` requests) builds a
+/// `RunAttempt` whose `held_queues = vec![granted_queue]` only — the
+/// previously-granted FC slot is dropped from the lease. On completion only
+/// the Concurrency holder is released; the FC holder row is orphaned.
+///
+/// With FC capacity = 1, one orphan permanently saturates the shared FC key.
+/// Unrelated FC-only jobs queued on that key never get granted and the entire
+/// FC key wedges — which is exactly the user's symptom: jobs "stuck" on the
+/// shared platform queue.
+///
+/// Construction:
+///  - FC key `platform-tenant-env-123` with max_concurrency = 1
+///  - C  key `my-queue` with max_concurrency = 1
+///  - Job A: only Concurrency. Leased and held to saturate C while we set up
+///    the wedge.
+///  - Job B: `[FC, C]` in buggy caller order, scheduled in the future. With
+///    the buggy iteration order, FC `try_reserve` succeeds first (FC empty
+///    → holder created, RunAttempt[FC] written at the future task_key); then
+///    C `try_reserve` fails (A holds C). Because `start_at_ms > now_ms`,
+///    `handle_enqueue` takes its third branch and writes a
+///    `Task::RequestTicket[C]` at the SAME future task_key, overwriting
+///    RunAttempt[FC]. The FC HOLDER row persists.
+///  - Job D: only FloatingConcurrency. Pre-bug it queues for FC and never
+///    runs because the FC holder count never drops below 1.
+///
+/// When time advances past B's start_at_ms, the broker leases the
+/// RequestTicket. `handle_request_ticket` grants C and writes a RunAttempt
+/// with `held_queues = [C]` only — FC is dropped. B completes → only C is
+/// released → FC holder for B's initial task_id is orphaned → D wedges.
+///
+/// Fix: process Concurrency before FloatingConcurrency in
+/// `enqueue_limit_task_at_index`. Under the fix B's `try_reserve` on C fails
+/// before any FC slot is granted — no FC holder is ever created for B, so no
+/// orphan, and D runs normally.
+#[silo::test]
+async fn fc_before_concurrency_wedges_floating_only_jobs_via_orphaned_holder() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    let floating_key = "platform-tenant-env-123".to_string();
+    let concurrency_key = "my-queue".to_string();
+    let refresh_interval_ms = 60_000i64;
+
+    let concurrency_only = || {
+        vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: concurrency_key.clone(),
+            max_concurrency: 1,
+        })]
+    };
+    let both_buggy_order = || {
+        vec![
+            silo::job::Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                key: floating_key.clone(),
+                default_max_concurrency: 1,
+                refresh_interval_ms,
+                metadata: vec![],
+            }),
+            silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: concurrency_key.clone(),
+                max_concurrency: 1,
+            }),
+        ]
+    };
+    let floating_only = || {
+        vec![silo::job::Limit::FloatingConcurrency(
+            silo::job::FloatingConcurrencyLimit {
+                key: floating_key.clone(),
+                default_max_concurrency: 1,
+                refresh_interval_ms,
+                metadata: vec![],
+            },
+        )]
+    };
+
+    // 1. Job A (only C) — leased and held throughout. Saturates C.
+    let job_a = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"name": "A"})),
+            concurrency_only(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue A");
+    let leased_a = shard
+        .dequeue("worker-a", "default", 1)
+        .await
+        .expect("dequeue A")
+        .tasks;
+    assert_eq!(leased_a.len(), 1, "Job A should lease (holds C)");
+    assert_eq!(leased_a[0].job().id(), job_a);
+    let a_task = leased_a[0].attempt().task_id().to_string();
+
+    // 2. Job B with [FC, C] in buggy order, scheduled in the future. Pre-fix:
+    //    FC try_reserve succeeds → FC holder + RunAttempt[FC] at the future
+    //    task_key. C try_reserve fails (A holds) AND start_at_ms > now_ms →
+    //    Task::RequestTicket[C] is written at the SAME task_key, overwriting
+    //    the FC RunAttempt. The FC HOLDER row persists.
+    let future_start = now + 200;
+    let job_b = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            future_start,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"name": "B"})),
+            both_buggy_order(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue B");
+
+    // 3. Job D (only FC) wants the FC slot. Pre-bug it queues for FC and
+    //    never gets granted because B's orphan holder permanently saturates
+    //    FC. Post-fix B never holds FC, so D runs normally.
+    let job_d = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"name": "D"})),
+            floating_only(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue D");
+
+    // 4. Complete A → C is released so B's RequestTicket can be granted on C
+    //    when time advances.
+    shard
+        .report_attempt_outcome(&a_task, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete A");
+
+    // 5. Drain: dequeue + complete in a loop until both B and D have run, or
+    //    timeout. Pre-fix: B's promotion via `handle_request_ticket` writes a
+    //    lease with `held_queues=[C]` only; on complete only C is released
+    //    and the FC holder from B's initial enqueue is orphaned. With FC=1,
+    //    that orphan permanently saturates FC and Job D never gets leased,
+    //    so the loop times out without D. Post-fix B never holds FC, D grabs
+    //    FC at enqueue and runs immediately, and B's promotion path is
+    //    harmless because there's no FC slot to drop.
+    let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(8) {
+        let r = shard
+            .dequeue("worker-drain", "default", 1)
+            .await
+            .expect("dequeue drain");
+        if r.tasks.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        } else {
+            for t in &r.tasks {
+                let task_id = t.attempt().task_id().to_string();
+                shard
+                    .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+                    .await
+                    .expect("report drain");
+                completed.insert(t.job().id().to_string());
+            }
+        }
+        if completed.contains(&job_b) && completed.contains(&job_d) {
+            break;
+        }
+    }
+
+    assert!(
+        completed.contains(&job_d),
+        "Job D wedged behind orphan FloatingConcurrency holder from Job B \
+         (B's lease lost its FC slot during the RequestTicket → RunAttempt promotion). \
+         Completed: {:?}",
+        completed,
+    );
+    assert!(
+        completed.contains(&job_b),
+        "Job B did not run; promotion of its future-scheduled RequestTicket[C] failed. \
+         Completed: {:?}",
+        completed,
+    );
+}

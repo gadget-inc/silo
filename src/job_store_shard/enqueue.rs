@@ -18,7 +18,7 @@ use crate::job_store_shard::helpers::{
 };
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
-    tenant_status_counter_key,
+    task_key, tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -43,6 +43,26 @@ pub(crate) struct LimitTaskParams<'a> {
     /// This matches the Alloy model's completeFailureRetryReleaseTicket which creates a
     /// TicketRequest, not an immediate holder.
     pub skip_try_reserve: bool,
+}
+
+/// Canonical processing order for a job's limits: Concurrency first, then
+/// FloatingConcurrency, then RateLimit, stable within each kind. Returns
+/// indices into the caller-provided `limits` slice. A `Limit::Concurrency`
+/// must always be processed before any `Limit::FloatingConcurrency` so a
+/// strictly-tighter Concurrency limit blocks the job *before* it acquires a
+/// FloatingConcurrency slot — otherwise the FC grant produces a leasable
+/// `RunAttempt[FC]` that bypasses the still-full Concurrency limit.
+pub(crate) fn limit_processing_order(limits: &[Limit]) -> Vec<usize> {
+    let kind_rank = |i: usize| -> u8 {
+        match &limits[i] {
+            Limit::Concurrency(_) => 0,
+            Limit::FloatingConcurrency(_) => 1,
+            Limit::RateLimit(_) => 2,
+        }
+    };
+    let mut order: Vec<usize> = (0..limits.len()).collect();
+    order.sort_by_key(|&i| kind_rank(i));
+    order
 }
 
 /// Whether a concurrency grant was obtained or the job was queued for later.
@@ -449,6 +469,12 @@ impl JobStoreShard {
             task_group,
             skip_try_reserve,
         } = params;
+        // Walk limits in the canonical processing order (see
+        // `limit_processing_order`). `current_index` and the `limit_index`
+        // stored in `CheckRateLimit` tasks are positions in this order — the
+        // order function is deterministic on `limits`, so dequeue's
+        // `limit_index + 1` continuation lands on the correct next entry.
+        let order = limit_processing_order(limits);
         let mut grants = Vec::new();
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
@@ -478,7 +504,7 @@ impl JobStoreShard {
                 return Ok(grants);
             }
 
-            match &limits[current_index] {
+            match &limits[order[current_index]] {
                 Limit::Concurrency(cl) => {
                     // Try immediate grant for concurrency limits
                     let outcome = self
@@ -509,6 +535,9 @@ impl JobStoreShard {
                         crate::concurrency::ConcurrencyLimitType::Fixed,
                     );
 
+                    let queued_with_request =
+                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
+
                     if matches!(
                         record_grant_outcome(
                             outcome,
@@ -520,6 +549,15 @@ impl JobStoreShard {
                         ),
                         GrantResult::Queued
                     ) {
+                        if queued_with_request && !grants.is_empty() {
+                            writer.delete(task_key(
+                                task_group,
+                                start_at_ms,
+                                priority,
+                                job_id,
+                                attempt_number,
+                            ))?;
+                        }
                         return Ok(grants);
                     }
                 }
@@ -585,6 +623,9 @@ impl JobStoreShard {
                         )?;
                     }
 
+                    let queued_with_request =
+                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
+
                     if matches!(
                         record_grant_outcome(
                             outcome,
@@ -596,6 +637,15 @@ impl JobStoreShard {
                         ),
                         GrantResult::Queued
                     ) {
+                        if queued_with_request && !grants.is_empty() {
+                            writer.delete(task_key(
+                                task_group,
+                                start_at_ms,
+                                priority,
+                                job_id,
+                                attempt_number,
+                            ))?;
+                        }
                         return Ok(grants);
                     }
                 }
