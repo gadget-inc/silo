@@ -896,12 +896,12 @@ async fn concurrency_multiple_queues_per_job() {
         .await
         .expect("enqueue");
 
-    // Should get ticket for first queue immediately (api)
+    // Should get a ticket immediately — both queues have slots free.
     let tasks = shard.dequeue("w", "default", 1).await.expect("deq").tasks;
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].job().id(), job_id);
 
-    // Should have holder for api queue only (first limit)
+    // Should have a holder for both queues — every limit in the chain is gated.
     let api_holder = shard
         .db()
         .get(&concurrency_holder_key(
@@ -913,7 +913,6 @@ async fn concurrency_multiple_queues_per_job() {
         .expect("get api holder");
     assert!(api_holder.is_some(), "should have api holder");
 
-    // Should NOT have db holder yet (only first limit is gated)
     let db_holder = shard
         .db()
         .get(&concurrency_holder_key(
@@ -923,12 +922,9 @@ async fn concurrency_multiple_queues_per_job() {
         ))
         .await
         .expect("get db holder");
-    assert!(
-        db_holder.is_none(),
-        "should not have db holder (only first limit gated)"
-    );
+    assert!(db_holder.is_some(), "should have db holder");
 
-    // Complete job -> should release api holder
+    // Complete job -> should release both holders
     shard
         .report_attempt_outcome(
             tasks[0].attempt().task_id(),
@@ -937,7 +933,6 @@ async fn concurrency_multiple_queues_per_job() {
         .await
         .expect("report");
 
-    // All holders released
     assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }
 

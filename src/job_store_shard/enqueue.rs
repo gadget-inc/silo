@@ -60,21 +60,37 @@ fn record_grant_outcome(
     outcome: Option<RequestTicketOutcome>,
     queue_key: &str,
     grants: &mut Vec<(String, String)>,
-    current_task_id: &mut String,
+    current_task_id: &str,
     current_held_queues: &mut Vec<String>,
     current_index: &mut usize,
 ) -> GrantResult {
     match outcome {
-        None => {
-            // Granted immediately - record grant and continue to next limit
-            grants.push((queue_key.to_string(), current_task_id.clone()));
+        None | Some(RequestTicketOutcome::GrantedImmediately { .. }) => {
+            // Slot granted (or no limit existed) - record grant and continue to
+            // the next limit. The interim RunAttempt that handle_enqueue wrote
+            // via append_grant_edits is overwritten at the same task_key when
+            // the outer loop reaches its terminal "no more limits" branch,
+            // which rewrites the RunAttempt with the full accumulated
+            // current_held_queues so ReportOutcome can release every holder.
+            //
+            // Crucially, `current_task_id` is NOT cycled here. The chained
+            // cleanup paths (handle_check_rate_limit, handle_run_attempt) all
+            // release holders by `concurrency_holder_key(tenant, queue,
+            // <chained_task_id>)`, so every holder we accumulate across the
+            // limit chain must share one task_id — the one carried forward to
+            // the final RunAttempt / CheckRateLimit task. Cycling here left
+            // earlier-granted holders orphaned and produced leaked slots on
+            // outcome release.
+            grants.push((queue_key.to_string(), current_task_id.to_string()));
             current_held_queues.push(queue_key.to_string());
             *current_index += 1;
-            *current_task_id = Uuid::new_v4().to_string();
             GrantResult::Granted
         }
-        Some(_) => {
-            // Not granted - RequestTicket was created by handle_enqueue
+        Some(RequestTicketOutcome::TicketRequested { .. })
+        | Some(RequestTicketOutcome::FutureRequestTaskWritten { .. }) => {
+            // Not granted - a request/RequestTicket was already written by
+            // handle_enqueue. Stop processing further limits; remaining ones
+            // will be applied when the queued request is granted later.
             GrantResult::Queued
         }
     }
@@ -436,7 +452,7 @@ impl JobStoreShard {
         let mut grants = Vec::new();
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
-        let mut current_task_id = task_id.to_string();
+        let current_task_id = task_id.to_string();
 
         loop {
             if current_index >= limits.len() {
@@ -498,7 +514,7 @@ impl JobStoreShard {
                             outcome,
                             &cl.key,
                             &mut grants,
-                            &mut current_task_id,
+                            &current_task_id,
                             &mut current_held_queues,
                             &mut current_index,
                         ),
@@ -574,7 +590,7 @@ impl JobStoreShard {
                             outcome,
                             &fl.key,
                             &mut grants,
-                            &mut current_task_id,
+                            &current_task_id,
                             &mut current_held_queues,
                             &mut current_index,
                         ),
