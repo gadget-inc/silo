@@ -254,7 +254,6 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
             task_group,
             held_queues,
             limit_index,
-            start_at_ms,
             priority,
         } => {
             let request_id = builder.create_string(request_id);
@@ -273,7 +272,6 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
                     task_group: Some(task_group),
                     held_queues: Some(held_queues),
                     limit_index: *limit_index,
-                    start_at_ms: *start_at_ms,
                     priority: *priority,
                 },
             );
@@ -731,7 +729,6 @@ fn task_from_fb_variant(
                 task_group: rg.task_group().unwrap_or_default().to_string(),
                 held_queues: fb_held_queues_to_owned(rg.held_queues()),
                 limit_index: rg.limit_index(),
-                start_at_ms: rg.start_at_ms(),
                 priority: rg.priority(),
             })
         }

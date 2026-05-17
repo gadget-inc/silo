@@ -602,16 +602,29 @@ impl JobStoreShard {
                 // status-derived attempt/start fields (same approach as cancel).
                 // [SILO-REIMP-CONC-5] Scheduled old-state reimport performs targeted
                 // request-key cleanup for the old scheduled attempt.
-                self.delete_concurrency_requests_for_job(
-                    &txn,
-                    tenant,
-                    job_id,
-                    &stored_limits,
-                    attempt_number,
-                    start_time_ms,
-                    priority,
-                )
-                .await?;
+                // Mid-chain reimport: any held_queues carried on a pending
+                // EnqueueTask need to be released, otherwise reimport orphans
+                // earlier-granted holders.
+                let from_requests = self
+                    .delete_concurrency_requests_for_job(
+                        &txn,
+                        tenant,
+                        job_id,
+                        &stored_limits,
+                        attempt_number,
+                        start_time_ms,
+                        priority,
+                    )
+                    .await?;
+                if !from_requests.is_empty() {
+                    for hq in &from_requests {
+                        let holder_key = concurrency_holder_key(tenant, &hq.queue, &hq.task_id);
+                        txn.delete(&holder_key)?;
+                    }
+                    // Synthesize a "released" entry so the post-commit loop
+                    // drives atomic_release for each holder.
+                    released_holders.push((String::new(), from_requests));
+                }
             }
         }
 

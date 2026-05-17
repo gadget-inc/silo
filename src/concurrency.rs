@@ -1391,7 +1391,6 @@ impl ConcurrencyManager {
                         task_group: req.task_group.clone(),
                         held_queues,
                         limit_index: next_index,
-                        start_at_ms: req.start_time_ms,
                         priority: req.priority,
                     }
                 };

@@ -2,7 +2,9 @@
 
 use slatedb::IsolationLevel;
 
-use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
+use crate::codec::{
+    decode_cancellation_at_ms, decode_concurrency_action, decode_task, encode_job_cancellation,
+};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{
@@ -152,28 +154,67 @@ impl JobStoreShard {
                                 held_queues_to_release = held_queues;
                             }
                         }
-                        Task::RequestTicket { .. } => {
+                        Task::RequestTicket { held_queues, .. } => {
                             // FutureRequestTaskWritten case: the RequestTicket task IS the
-                            // pending request mechanism. Deleting the task is sufficient.
+                            // pending request mechanism, so deleting the task key cleans up
+                            // the request. Defensive: a queued chain may carry
+                            // `held_queues` from earlier limits — currently unreachable in
+                            // practice (the future-scheduled RequestTicket only writes from
+                            // the first limit, before any held_queues accumulate), but the
+                            // field is typed as a possibility so release them if present.
+                            for hq in &held_queues {
+                                txn.delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id))?;
+                            }
+                            if !held_queues.is_empty() {
+                                held_queues_to_release = held_queues;
+                            }
+                        }
+                        Task::ResumeAfterConcurrencyGrant { held_queues, .. } => {
+                            // Mid-chain resume task: release every accumulated holder
+                            // (under the request_id that created each row).
+                            for hq in &held_queues {
+                                txn.delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id))?;
+                            }
+                            if !held_queues.is_empty() {
+                                held_queues_to_release = held_queues;
+                            }
+                        }
+                        Task::CheckRateLimit { held_queues, .. } => {
+                            // Mid-chain rate-limit check: release any concurrency holders
+                            // accumulated from earlier limits in the chain.
+                            for hq in &held_queues {
+                                txn.delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id))?;
+                            }
+                            if !held_queues.is_empty() {
+                                held_queues_to_release = held_queues;
+                            }
                         }
                         _ => {
-                            // Other task types (CheckRateLimit, RefreshFloatingLimit, etc.)
+                            // Other task types (RefreshFloatingLimit, etc.)
                             // Just delete the task key above.
                         }
                     }
                 } else {
                     // No task found - check for TicketRequested case (request record
                     // exists but no task in DB queue). Scan for requests for this job.
-                    self.delete_concurrency_requests_for_job(
-                        &txn,
-                        tenant,
-                        id,
-                        &limits,
-                        attempt_number,
-                        start_time_ms,
-                        priority,
-                    )
-                    .await?;
+                    // Each ConcurrencyAction may carry held_queues from earlier-granted
+                    // limits in the chain — release those holders too, otherwise a
+                    // mid-chain cancel orphans the earlier-granted slots permanently.
+                    let mut from_requests = self
+                        .delete_concurrency_requests_for_job(
+                            &txn,
+                            tenant,
+                            id,
+                            &limits,
+                            attempt_number,
+                            start_time_ms,
+                            priority,
+                        )
+                        .await?;
+                    for hq in &from_requests {
+                        txn.delete(concurrency_holder_key(tenant, &hq.queue, &hq.task_id))?;
+                    }
+                    held_queues_to_release.append(&mut from_requests);
                 }
             }
         }
@@ -224,7 +265,11 @@ impl JobStoreShard {
         attempt_number: u32,
         start_time_ms: i64,
         priority: u8,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<Vec<HeldQueue>, JobStoreShardError> {
+        // Accumulate any held_queues carried by the deleted EnqueueTask actions.
+        // Mid-chain cancellations need to release earlier-granted holders that
+        // the request was carrying forward.
+        let mut collected_held_queues: Vec<HeldQueue> = Vec::new();
         for limit in limits {
             let queue_key = match limit {
                 Limit::Concurrency(cl) => &cl.key,
@@ -232,7 +277,7 @@ impl JobStoreShard {
                 Limit::RateLimit(_) => continue,
             };
 
-            let deleted = self
+            let (deleted, mut from_held) = self
                 .delete_concurrency_requests_with_prefix(
                     txn,
                     tenant,
@@ -243,26 +288,32 @@ impl JobStoreShard {
                     priority,
                 )
                 .await?;
+            collected_held_queues.append(&mut from_held);
 
             if !deleted {
                 // Fallback: try with start_time_ms=0 (immediate scheduling case)
-                self.delete_concurrency_requests_with_prefix(
-                    txn,
-                    tenant,
-                    job_id,
-                    queue_key,
-                    attempt_number,
-                    0,
-                    priority,
-                )
-                .await?;
+                let (_, mut from_held_fb) = self
+                    .delete_concurrency_requests_with_prefix(
+                        txn,
+                        tenant,
+                        job_id,
+                        queue_key,
+                        attempt_number,
+                        0,
+                        priority,
+                    )
+                    .await?;
+                collected_held_queues.append(&mut from_held_fb);
             }
         }
-        Ok(())
+        Ok(collected_held_queues)
     }
 
     /// Scan a narrow prefix for this job's concurrency requests and delete them.
-    /// Returns true if any requests were deleted.
+    /// Returns `(any_deleted, held_queues_collected)`: `any_deleted` controls the
+    /// caller's start_time_ms fallback, and `held_queues_collected` is the union
+    /// of `held_queues` carried by every deleted EnqueueTask — the caller releases
+    /// those holders.
     #[expect(clippy::too_many_arguments)]
     async fn delete_concurrency_requests_with_prefix(
         &self,
@@ -273,7 +324,7 @@ impl JobStoreShard {
         attempt_number: u32,
         start_time_ms: i64,
         priority: u8,
-    ) -> Result<bool, JobStoreShardError> {
+    ) -> Result<(bool, Vec<HeldQueue>), JobStoreShardError> {
         let prefix = concurrency_request_job_prefix(
             tenant,
             queue_key,
@@ -286,7 +337,22 @@ impl JobStoreShard {
         let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
 
         let mut deleted_count: i64 = 0;
+        let mut collected: Vec<HeldQueue> = Vec::new();
         while let Some(kv) = iter.next().await? {
+            // Decode the EnqueueTask before deleting so we can release any
+            // earlier-chain holders it carried forward. Malformed actions are
+            // still deleted to drain the queue, but their held_queues are lost.
+            if let Ok(decoded) = decode_concurrency_action(kv.value.clone())
+                && let Some(et) = decoded.fb().variant_as_enqueue_task()
+                && let Some(hq_vec) = et.held_queues()
+            {
+                for hq in hq_vec.iter() {
+                    collected.push(HeldQueue {
+                        queue: hq.queue().unwrap_or_default().to_string(),
+                        task_id: hq.task_id().unwrap_or_default().to_string(),
+                    });
+                }
+            }
             txn.delete(&kv.key)?;
             deleted_count += 1;
             tracing::debug!(
@@ -303,7 +369,7 @@ impl JobStoreShard {
             txn.unmark_write([counter_key.as_slice()])?;
         }
 
-        Ok(deleted_count > 0)
+        Ok((deleted_count > 0, collected))
     }
 
     /// Check if a job has been cancelled.

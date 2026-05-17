@@ -129,7 +129,6 @@ table ResumeAfterConcurrencyGrant {
   task_group: string;
   held_queues: [HeldQueue];
   limit_index: uint32;
-  start_at_ms: int64;
   priority: ubyte;
 }
 

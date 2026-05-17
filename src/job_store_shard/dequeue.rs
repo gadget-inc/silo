@@ -752,7 +752,6 @@ impl JobStoreShard {
             task_group,
             held_queues,
             limit_index,
-            start_at_ms,
             priority,
         } = decoded.to_task()?
         else {
@@ -801,16 +800,22 @@ impl JobStoreShard {
             }
         };
 
-        // IMPORTANT: pass `start_at_ms: now_ms` rather than the original
-        // `start_at_ms` decoded from the resume task. The original task at
-        // task_key(...,start_at_ms) was just ack_deleted, which installs a
-        // broker tombstone on that key for ~64 scan generations. If any
-        // subsequent chain step (a re-promoted request or another resume task)
-        // writes a fresh task at the SAME task_key, the broker scanner would
-        // suppress it. Using `now_ms` shifts every downstream task_key to a
-        // strictly-later timestamp, sidestepping the tombstone. This mirrors
-        // the start_at_ms = now_ms pattern in `handle_check_rate_limit`.
-        let _ = start_at_ms; // kept on the task for diagnostics/expedite paths
+        // IMPORTANT: pass `start_at_ms: now_ms` for downstream chain steps.
+        // The resume task at task_key(...,parsed_start_time) was just
+        // ack_deleted, which installs a broker tombstone on that key for ~64
+        // scan generations. If any subsequent chain step writes a fresh task
+        // at the SAME task_key, the broker scanner would suppress it. Using
+        // `now_ms` shifts every downstream task_key to a strictly-later
+        // timestamp, sidestepping the tombstone. This mirrors the
+        // `start_at_ms = now_ms` pattern in `handle_check_rate_limit`.
+        //
+        // TODO(metrics): this also means `ready_to_start_latency_ms` (emitted
+        // by `handle_run_attempt` from `parse_task_key(task_key).start_time_ms`)
+        // measures only from the last chain hop, not from the job's original
+        // schedule. Same limitation exists for the CheckRateLimit chain. A
+        // proper fix requires propagating an `original_start_at_ms` through
+        // every chain-task variant so the final lease can compute end-to-end
+        // latency.
         let chain = self
             .enqueue_limit_task_at_index(
                 &mut DbWriteBatcher::new(&self.db, &mut state.batch),

@@ -2967,6 +2967,155 @@ async fn chain_concurrency_to_ratelimit_resumes_with_held_queue() {
     );
 }
 
+/// `[C1, C2]` chain cancelled mid-flight: C1 granted, C2 queued as a request.
+/// `cancel_job` must clean up the request AND release the C1 holder.
+#[silo::test]
+async fn cancel_mid_chain_releases_prior_holders() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue_c1 = "cancel-mid-c1".to_string();
+    let queue_c2 = "cancel-mid-c2".to_string();
+    let now = now_ms();
+
+    let _c2_holder = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "c2-holder"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_c2.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue c2 holder");
+    let _ = shard.dequeue("h", "default", 1).await.expect("dq").tasks;
+
+    let target_job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c1.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c2.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c1).await,
+        1
+    );
+
+    shard
+        .cancel_job(tenant, &target_job)
+        .await
+        .expect("cancel target");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c1).await,
+        0,
+        "C1 holder leaked on cancel-mid-chain"
+    );
+}
+
+/// JobMissing arrival in `handle_request_ticket`: synthesize a
+/// `Task::RequestTicket` with prior `held_queues`, plant the corresponding
+/// holder rows, then dequeue. The handler must take the JobMissing branch
+/// (the job_id doesn't exist) and clean up both the task and the prior
+/// holders. Currently, the future-scheduled RequestTicket only writes from
+/// the first limit (before any held_queues accumulate), but the field is
+/// typed as a possibility — this exercises the contract.
+#[silo::test]
+async fn handle_request_ticket_job_missing_releases_prior_held_queues() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue_c1 = "rt-jm-c1".to_string();
+    let queue_c2 = "rt-jm-c2".to_string();
+    let now = now_ms();
+
+    let fake_job_id = "rt-jm-ghost-job".to_string();
+    let request_id = "rt-jm-req-1".to_string();
+    let prior_task_id = "rt-jm-prior-task".to_string();
+
+    let holder = silo::task::HolderRecord { granted_at_ms: now };
+    shard
+        .db()
+        .put(
+            &silo::keys::concurrency_holder_key(tenant, &queue_c1, &prior_task_id),
+            &silo::codec::encode_holder(&holder),
+        )
+        .await
+        .expect("plant holder");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c1).await,
+        1
+    );
+
+    let task = silo::task::Task::RequestTicket {
+        queue: queue_c2.clone(),
+        start_time_ms: now,
+        priority: 10,
+        tenant: tenant.to_string(),
+        job_id: fake_job_id.clone(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        request_id: request_id.clone(),
+        task_group: "default".to_string(),
+        held_queues: vec![silo::task::HeldQueue {
+            queue: queue_c1.clone(),
+            task_id: prior_task_id.clone(),
+        }],
+        limit_index: 0,
+        total_limits: 2,
+    };
+    let planted_task_key = silo::keys::task_key("default", now, 10, &fake_job_id, 1);
+    shard
+        .db()
+        .put(&planted_task_key, &silo::codec::encode_task(&task))
+        .await
+        .expect("plant request ticket");
+    shard.db().flush().await.expect("flush");
+
+    // Drive the broker until the JobMissing branch processes the planted
+    // task. Returns no leasable tasks (job is gone). The prior C1 holder
+    // and the task_key must both be cleaned up.
+    let _ = poll_until(
+        || async {
+            let _ = shard.dequeue("w", "default", 5).await.expect("dq").tasks;
+            shard
+                .db()
+                .get(&planted_task_key)
+                .await
+                .expect("read task_key")
+        },
+        |r| r.is_none(),
+        5000,
+    )
+    .await;
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c1).await,
+        0,
+        "prior chain holder leaked when handle_request_ticket hit JobMissing"
+    );
+}
+
 /// Helper: count concurrency holder keys for a specific (tenant, queue) pair.
 async fn count_holders_for_queue(
     db: &silo::instrumented_db::InstrumentedDb,

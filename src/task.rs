@@ -93,7 +93,6 @@ pub enum Task {
         task_group: String,
         held_queues: Vec<HeldQueue>,
         limit_index: u32,
-        start_at_ms: i64,
         priority: u8,
     },
     /// Worker task: refresh a floating concurrency limit's max concurrency value
