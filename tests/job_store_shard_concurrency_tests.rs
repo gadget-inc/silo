@@ -2671,6 +2671,169 @@ async fn chain_c1_c2_promotion_preserves_prior_holder_and_releases_both() {
     );
 }
 
+/// `[C, FC]` mixed-kind chain (the canonical Gadget shape post-PR #317
+/// reorder). C grants immediately; FC queues because another job is
+/// holding it. When the FC holder is released, the grant scanner must
+/// promote the target while preserving the C holder it already had.
+///
+/// `process_grants` doesn't differentiate fixed vs floating concurrency
+/// (it operates on the queue name + `held_queues` from the request, not
+/// on the limit kind), so the held_queues plumbing should work
+/// identically. This test locks that in and guards against future
+/// divergence.
+#[silo::test]
+async fn chain_c_then_fc_promotion_preserves_concurrency_holder() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue_c = "chain-c-fc-fixed".to_string();
+    let queue_fc = "chain-c-fc-floating".to_string();
+    let now = now_ms();
+
+    // Holder job for the FloatingConcurrency limit — single FC limit, max=1.
+    let _fc_holder = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "fc-holder"})),
+            vec![Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue_fc.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue fc holder");
+    let fc_holder_tasks = shard
+        .dequeue("h", "default", 1)
+        .await
+        .expect("dq fc holder")
+        .tasks;
+    assert_eq!(fc_holder_tasks.len(), 1);
+    let fc_holder_task_id = fc_holder_tasks[0].attempt().task_id().to_string();
+
+    // Target with `[C(free, max=5), FC(full, max=1)]`. With PR #317's
+    // reorder, C is processed first and grants immediately; FC then queues
+    // because the fc_holder occupies the FC slot.
+    let target_job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: queue_fc.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+
+    // Sanity: C has target's holder; FC has the fc_holder's holder.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c).await,
+        1,
+        "target should hold C immediately"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_fc).await,
+        1,
+        "fc_holder should hold FC"
+    );
+
+    // Free FC by completing the fc_holder.
+    shard
+        .report_attempt_outcome(
+            &fc_holder_task_id,
+            AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report fc_holder success");
+
+    // Target should now become runnable. The grant scanner promotes the
+    // queued FC request, and because total_limits == 2 and limit_index == 1
+    // (the FC position), next_index >= total_limits so a terminal RunAttempt
+    // is written directly — NOT a ResumeAfterConcurrencyGrant.
+    let target_tasks = poll_until(
+        || async {
+            shard
+                .dequeue("t", "default", 1)
+                .await
+                .expect("dq target")
+                .tasks
+        },
+        |t| !t.is_empty(),
+        5000,
+    )
+    .await;
+    assert_eq!(target_tasks.len(), 1, "target should become runnable");
+    assert_eq!(target_tasks[0].job().id(), target_job);
+    let target_task_id = target_tasks[0].attempt().task_id().to_string();
+
+    // Inspect the lease: held_queues must carry BOTH C and FC.
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&target_task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    assert!(
+        held.iter().any(|hq| hq.queue == queue_c),
+        "lease must carry the C holder (preserved across FC promotion); got {:?}",
+        held
+    );
+    assert!(
+        held.iter().any(|hq| hq.queue == queue_fc),
+        "lease must carry the FC holder (just-granted); got {:?}",
+        held
+    );
+    assert_eq!(
+        held.len(),
+        2,
+        "exactly the two granted queues; got {:?}",
+        held
+    );
+
+    // Report success — both holders must release.
+    shard
+        .report_attempt_outcome(&target_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report target success");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_c).await,
+        0,
+        "C holder leaked: the [C, FC] promotion path dropped the pre-granted \
+         C holder, or release_outcome failed to find the C holder under the \
+         original target task_id"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_fc).await,
+        0,
+        "FC holder should be released"
+    );
+}
+
 /// Three-limit chain `[C1, C2, C3]`. C1 grants, C2 queues (other job holds it).
 /// On C2's promotion the chain must continue at C3 — not bypass C3 by leasing
 /// a RunAttempt directly. Tests that the new `ResumeAfterConcurrencyGrant`
