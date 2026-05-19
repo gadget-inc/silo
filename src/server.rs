@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use rand::seq::SliceRandom;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast};
@@ -203,6 +205,12 @@ fn proto_metadata_to_domain(metadata: HashMap<String, String>) -> Option<Vec<(St
 /// server) don't take routing clients down with them.
 const CLUSTER_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Shared in-flight future returned to concurrent `GetClusterInfo` callers
+/// so a thundering herd collapses onto a single coordinator fetch. The
+/// `Ok` variant is the response to return; the `Err` variant is a status
+/// message to wrap in `Status::unavailable`.
+type ClusterInfoFuture = Shared<BoxFuture<'static, Result<GetClusterInfoResponse, String>>>;
+
 /// gRPC service implementation backed by a `ShardFactory`.
 #[derive(Clone)]
 pub struct SiloService {
@@ -213,6 +221,9 @@ pub struct SiloService {
     /// Last successful `GetClusterInfo` response, served as a fallback when
     /// the coordination layer is slow or unreachable.
     cluster_info_cache: Arc<Mutex<Option<GetClusterInfoResponse>>>,
+    /// In-flight `GetClusterInfo` future, shared across concurrent callers
+    /// so only one fetch hits the coordinator at a time.
+    cluster_info_inflight: Arc<Mutex<Option<ClusterInfoFuture>>>,
 }
 
 impl SiloService {
@@ -228,7 +239,98 @@ impl SiloService {
             cfg,
             metrics,
             cluster_info_cache: Arc::new(Mutex::new(None)),
+            cluster_info_inflight: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Build a `GetClusterInfoResponse` from the live coordination layer,
+    /// bounded by `CLUSTER_INFO_TIMEOUT` so a hung k8s/etcd backend can't
+    /// block routing clients indefinitely. On success we update the cache;
+    /// on timeout/error we serve the last good response.
+    async fn fetch_cluster_info(
+        coord: Arc<dyn Coordinator>,
+        cache: Arc<Mutex<Option<GetClusterInfoResponse>>>,
+    ) -> Result<GetClusterInfoResponse, String> {
+        let build = async {
+            let owner_map = coord
+                .get_shard_owner_map()
+                .await
+                .map_err(|e| format!("failed to get shard owner map: {}", e))?;
+
+            let shard_owners: Vec<ShardOwner> = owner_map
+                .shard_map
+                .shards()
+                .iter()
+                .map(|shard_info| {
+                    let grpc_addr = owner_map
+                        .shard_to_addr
+                        .get(&shard_info.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let node_id = owner_map
+                        .shard_to_node
+                        .get(&shard_info.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    ShardOwner {
+                        shard_id: shard_info.id.to_string(),
+                        grpc_addr,
+                        node_id,
+                        range_start: shard_info.range.start.clone(),
+                        range_end: shard_info.range.end.clone(),
+                        placement_ring: shard_info.placement_ring.clone(),
+                    }
+                })
+                .collect();
+
+            let member_infos = coord
+                .get_members()
+                .await
+                .map_err(|e| format!("failed to get cluster members: {}", e))?;
+            let members: Vec<ClusterMember> = member_infos
+                .iter()
+                .map(|m| ClusterMember {
+                    node_id: m.node_id.clone(),
+                    grpc_addr: m.grpc_addr.clone(),
+                    placement_rings: m.placement_rings.clone(),
+                })
+                .collect();
+
+            Ok::<GetClusterInfoResponse, String>(GetClusterInfoResponse {
+                num_shards: owner_map.num_shards() as u32,
+                shard_owners,
+                this_node_id: coord.node_id().to_string(),
+                this_grpc_addr: coord.grpc_addr().to_string(),
+                members,
+            })
+        };
+
+        let outcome = tokio::time::timeout(CLUSTER_INFO_TIMEOUT, build).await;
+        let fallback_reason = match outcome {
+            Ok(Ok(response)) => {
+                *cache.lock().await = Some(response.clone());
+                return Ok(response);
+            }
+            Ok(Err(e)) => format!("coordinator error: {}", e),
+            Err(_) => format!(
+                "coordinator did not respond within {}s",
+                CLUSTER_INFO_TIMEOUT.as_secs()
+            ),
+        };
+
+        let cached = cache.lock().await.clone();
+        if let Some(cached) = cached {
+            warn!(
+                reason = %fallback_reason,
+                "GetClusterInfo serving cached response — coordination layer unhealthy"
+            );
+            return Ok(cached);
+        }
+
+        Err(format!(
+            "GetClusterInfo unavailable: {} (no cached response yet)",
+            fallback_reason
+        ))
     }
 
     /// Parse a shard ID string into a ShardId.
@@ -675,92 +777,36 @@ impl Silo for SiloService {
         &self,
         _req: Request<GetClusterInfoRequest>,
     ) -> Result<Response<GetClusterInfoResponse>, Status> {
-        let coord = self.coordinator.clone();
-
-        // Build the response from the live coordination layer, bounded by a
-        // timeout so a hung k8s/etcd backend can't block routing clients
-        // indefinitely. On success we update the cache; on timeout/error we
-        // serve the last good response.
-        let build = async {
-            let owner_map = coord
-                .get_shard_owner_map()
-                .await
-                .map_err(|e| format!("failed to get shard owner map: {}", e))?;
-
-            let shard_owners: Vec<ShardOwner> = owner_map
-                .shard_map
-                .shards()
-                .iter()
-                .map(|shard_info| {
-                    let grpc_addr = owner_map
-                        .shard_to_addr
-                        .get(&shard_info.id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let node_id = owner_map
-                        .shard_to_node
-                        .get(&shard_info.id)
-                        .cloned()
-                        .unwrap_or_default();
-                    ShardOwner {
-                        shard_id: shard_info.id.to_string(),
-                        grpc_addr,
-                        node_id,
-                        range_start: shard_info.range.start.clone(),
-                        range_end: shard_info.range.end.clone(),
-                        placement_ring: shard_info.placement_ring.clone(),
+        // Collapse concurrent callers onto a single in-flight fetch. The
+        // shared future is installed under the lock, then awaited outside
+        // the lock so callers don't serialize on the slot.
+        let fut = {
+            let mut slot = self.cluster_info_inflight.lock().await;
+            match slot.as_ref() {
+                Some(existing) => existing.clone(),
+                None => {
+                    let coord = self.coordinator.clone();
+                    let cache = self.cluster_info_cache.clone();
+                    let inflight = self.cluster_info_inflight.clone();
+                    let fut: ClusterInfoFuture = async move {
+                        let result = Self::fetch_cluster_info(coord, cache).await;
+                        // Clear the slot so subsequent calls start a fresh
+                        // fetch rather than re-serving this resolved future.
+                        *inflight.lock().await = None;
+                        result
                     }
-                })
-                .collect();
-
-            let member_infos = coord
-                .get_members()
-                .await
-                .map_err(|e| format!("failed to get cluster members: {}", e))?;
-            let members: Vec<ClusterMember> = member_infos
-                .iter()
-                .map(|m| ClusterMember {
-                    node_id: m.node_id.clone(),
-                    grpc_addr: m.grpc_addr.clone(),
-                    placement_rings: m.placement_rings.clone(),
-                })
-                .collect();
-
-            Ok::<GetClusterInfoResponse, String>(GetClusterInfoResponse {
-                num_shards: owner_map.num_shards() as u32,
-                shard_owners,
-                this_node_id: coord.node_id().to_string(),
-                this_grpc_addr: coord.grpc_addr().to_string(),
-                members,
-            })
-        };
-
-        let outcome = tokio::time::timeout(CLUSTER_INFO_TIMEOUT, build).await;
-        let fallback_reason = match outcome {
-            Ok(Ok(response)) => {
-                *self.cluster_info_cache.lock().await = Some(response.clone());
-                return Ok(Response::new(response));
+                    .boxed()
+                    .shared();
+                    *slot = Some(fut.clone());
+                    fut
+                }
             }
-            Ok(Err(e)) => format!("coordinator error: {}", e),
-            Err(_) => format!(
-                "coordinator did not respond within {}s",
-                CLUSTER_INFO_TIMEOUT.as_secs()
-            ),
         };
 
-        let cached = self.cluster_info_cache.lock().await.clone();
-        if let Some(cached) = cached {
-            warn!(
-                reason = %fallback_reason,
-                "GetClusterInfo serving cached response — coordination layer unhealthy"
-            );
-            return Ok(Response::new(cached));
+        match fut.await {
+            Ok(response) => Ok(Response::new(response)),
+            Err(reason) => Err(Status::unavailable(reason)),
         }
-
-        Err(Status::unavailable(format!(
-            "GetClusterInfo unavailable: {} (no cached response yet)",
-            fallback_reason
-        )))
     }
 
     async fn enqueue(

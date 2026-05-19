@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use silo::coordination::{
@@ -28,6 +28,12 @@ use tonic::Request;
 struct HangingCoordinator {
     base: CoordinatorBase,
     hang: Arc<AtomicBool>,
+    /// Per-call artificial latency for `get_shard_owner_map` / `get_members`
+    /// (milliseconds). Used by the dedup test to create a window where many
+    /// callers can race into the in-flight slot.
+    delay_ms: Arc<AtomicU64>,
+    owner_map_calls: Arc<AtomicUsize>,
+    member_calls: Arc<AtomicUsize>,
 }
 
 impl HangingCoordinator {
@@ -40,6 +46,9 @@ impl HangingCoordinator {
         Self {
             base,
             hang: Arc::new(AtomicBool::new(false)),
+            delay_ms: Arc::new(AtomicU64::new(0)),
+            owner_map_calls: Arc::new(AtomicUsize::new(0)),
+            member_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -47,11 +56,28 @@ impl HangingCoordinator {
         self.hang.store(hang, Ordering::SeqCst);
     }
 
+    fn set_delay(&self, delay: Duration) {
+        self.delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn owner_map_call_count(&self) -> usize {
+        self.owner_map_calls.load(Ordering::SeqCst)
+    }
+
+    fn member_call_count(&self) -> usize {
+        self.member_calls.load(Ordering::SeqCst)
+    }
+
     async fn maybe_hang(&self) {
         if self.hang.load(Ordering::SeqCst) {
             // Sleep longer than the server's 5s GetClusterInfo timeout so the
             // server is forced into the cache-fallback path.
             tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        let delay = self.delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
 }
@@ -63,6 +89,7 @@ impl Coordinator for HangingCoordinator {
     }
 
     async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
+        self.member_calls.fetch_add(1, Ordering::SeqCst);
         self.maybe_hang().await;
         Ok(vec![MemberInfo {
             node_id: self.base.node_id.clone(),
@@ -74,6 +101,7 @@ impl Coordinator for HangingCoordinator {
     }
 
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
+        self.owner_map_calls.fetch_add(1, Ordering::SeqCst);
         self.maybe_hang().await;
         let shard_map = self.base.shard_map.lock().await;
         let mut shard_to_node = HashMap::new();
@@ -286,4 +314,80 @@ async fn get_cluster_info_refreshes_cache_after_recovery() {
     );
     assert_eq!(fresh.num_shards, cached.num_shards);
     assert_eq!(fresh.shard_owners.len(), cached.shard_owners.len());
+}
+
+/// Concurrent callers should collapse onto a single in-flight coordinator
+/// fetch rather than each issuing their own (thundering-herd defense). With
+/// the coordinator artificially slow, all N callers initiated within the
+/// fetch window must share the same underlying request.
+#[silo::test(flavor = "multi_thread")]
+async fn get_cluster_info_dedupes_concurrent_callers() {
+    let (svc, coord) = create_test_service().await;
+    // Slow enough that all callers will pile in before the first fetch resolves.
+    coord.set_delay(Duration::from_millis(300));
+
+    let svc = Arc::new(svc);
+    let n = 50;
+    let mut handles = Vec::with_capacity(n);
+    for _ in 0..n {
+        let svc = svc.clone();
+        handles.push(tokio::spawn(async move {
+            svc.get_cluster_info(Request::new(GetClusterInfoRequest {}))
+                .await
+                .expect("concurrent caller should succeed")
+                .into_inner()
+        }));
+    }
+
+    let mut responses = Vec::with_capacity(n);
+    for h in handles {
+        responses.push(h.await.expect("task joins cleanly"));
+    }
+
+    // Exactly one coordinator fetch should have occurred — every other
+    // caller must have awaited the shared in-flight future.
+    assert_eq!(
+        coord.owner_map_call_count(),
+        1,
+        "thundering herd should collapse to one get_shard_owner_map call, got {}",
+        coord.owner_map_call_count()
+    );
+    assert_eq!(
+        coord.member_call_count(),
+        1,
+        "thundering herd should collapse to one get_members call, got {}",
+        coord.member_call_count()
+    );
+
+    // All callers must observe the same response.
+    let first = &responses[0];
+    for (i, r) in responses.iter().enumerate() {
+        assert_eq!(
+            r.num_shards, first.num_shards,
+            "response {i} disagrees with the first on num_shards"
+        );
+        assert_eq!(
+            r.this_node_id, first.this_node_id,
+            "response {i} disagrees with the first on this_node_id"
+        );
+        assert_eq!(
+            r.shard_owners.len(),
+            first.shard_owners.len(),
+            "response {i} has a different shard_owners length"
+        );
+    }
+
+    // After the herd resolves, the in-flight slot is cleared so a fresh
+    // call hits the coordinator again.
+    coord.set_delay(Duration::ZERO);
+    let _ = svc
+        .get_cluster_info(Request::new(GetClusterInfoRequest {}))
+        .await
+        .expect("post-herd call should succeed");
+    assert_eq!(
+        coord.owner_map_call_count(),
+        2,
+        "a fresh call after the herd should produce a new fetch, got {}",
+        coord.owner_map_call_count()
+    );
 }
