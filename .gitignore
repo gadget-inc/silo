@@ -11,6 +11,7 @@
 
 .ai/.lnai-manifest.json
 .claude/settings.local.json
+.mcp.json
 
 # Auto-generated docs (built from proto files)
 /docs/src/content/docs/reference/rpc-reference.mdx
@@ -22,15 +23,21 @@
 .claude/settings.json
 .claude/skills/fix-ci
 .claude/skills/fix-dst
+.claude/skills/gcp-observability
+.claude/skills/silo
+.claude/skills/siloctl
 .codex/config.toml
 .codex/skills/fix-ci
 .codex/skills/fix-dst
+.codex/skills/gcp-observability
 .cursor/cli.json
 .cursor/mcp.json
 .cursor/rules/alloy.mdc
 .cursor/rules/dst.mdc
+.cursor/rules/gcp-observability.mdc
 .cursor/skills/fix-ci
 .cursor/skills/fix-dst
+.cursor/skills/gcp-observability
 AGENTS.md
 tests/turmoil/AGENTS.md
 # end lnai-generated
