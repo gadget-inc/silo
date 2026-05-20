@@ -2509,6 +2509,650 @@ async fn second_limit_request_must_not_leave_runnable_task() {
     );
 }
 
+// =============================================================================
+// Multi-limit grant tests (Concurrency + FloatingConcurrency combinations).
+//
+// These exercise both the immediate-grant path (all limits have capacity at
+// enqueue) and the deferred reconciliation path (one limit blocks, request is
+// written, grant scanner promotes the request to a RunAttempt once capacity
+// opens).
+//
+// In the deferred path the RunAttempt produced by `concurrency::process_grants`
+// (and the future-scheduled equivalent in `dequeue::handle_request_ticket`) is
+// constructed with `held_queues = vec![just_granted_queue]`. Any holders that
+// were granted earlier in the limit chain are missing from that list — so on
+// completion they leak — and any limits later in the chain are never acquired
+// at all, silently bypassing them. The tests below pin both shapes.
+// =============================================================================
+
+/// (1) Job with `[Concurrency, FloatingConcurrency]`, both with capacity, is
+/// granted at enqueue. Both holders must exist, the lease must list both
+/// queues, and completion must release both.
+#[silo::test]
+async fn enqueue_concurrency_and_floating_concurrency_grants_both_immediately() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let c_queue = "c-mlim-1".to_string();
+    let fc_queue = "fc-mlim-1".to_string();
+
+    let _job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: c_queue.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc_queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &c_queue).await,
+        1,
+        "C holder should exist"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc_queue).await,
+        1,
+        "FC holder should exist"
+    );
+
+    let tasks = shard
+        .dequeue("w1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1, "RunAttempt should be leasable");
+    let task_id = tasks[0].attempt().task_id().to_string();
+
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    assert!(held.iter().any(|q| q == &c_queue), "held_queues missing C: {:?}", held);
+    assert!(held.iter().any(|q| q == &fc_queue), "held_queues missing FC: {:?}", held);
+    assert_eq!(held.len(), 2, "expected exactly C+FC in held_queues, got {:?}", held);
+
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &c_queue).await,
+        0,
+        "C holder leaked"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc_queue).await,
+        0,
+        "FC holder leaked"
+    );
+}
+
+/// (2) Job with `[Concurrency, FloatingConcurrency, FloatingConcurrency]`, all
+/// with capacity, is granted at enqueue. All three holders must exist, lease
+/// lists all three queues, completion releases all three.
+#[silo::test]
+async fn enqueue_concurrency_and_two_floating_concurrency_grants_all_immediately() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let c_queue = "c-mlim-2".to_string();
+    let fc1_queue = "fc1-mlim-2".to_string();
+    let fc2_queue = "fc2-mlim-2".to_string();
+
+    let _job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: c_queue.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc1_queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc2_queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    for (label, q) in [("C", &c_queue), ("FC1", &fc1_queue), ("FC2", &fc2_queue)] {
+        assert_eq!(
+            count_holders_for_queue(shard.db(), tenant, q).await,
+            1,
+            "{label} holder should exist after immediate grant"
+        );
+    }
+
+    let tasks = shard
+        .dequeue("w1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    let task_id = tasks[0].attempt().task_id().to_string();
+
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    assert_eq!(held.len(), 3, "expected C + FC1 + FC2 in held_queues, got {:?}", held);
+    for q in [&c_queue, &fc1_queue, &fc2_queue] {
+        assert!(held.iter().any(|h| h == q), "held_queues missing {}: {:?}", q, held);
+    }
+
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    for (label, q) in [("C", &c_queue), ("FC1", &fc1_queue), ("FC2", &fc2_queue)] {
+        assert_eq!(
+            count_holders_for_queue(shard.db(), tenant, q).await,
+            0,
+            "{label} holder leaked"
+        );
+    }
+}
+
+/// (3) Job with `[Concurrency, FloatingConcurrency]` where the FC slot is full
+/// at enqueue. Canonical limit order is C-first, so:
+///   - C grants immediately (holder + grant recorded).
+///   - FC `try_reserve` fails → a `concurrency_request` for FC is written
+///     and the interim RunAttempt task_key is deleted ("Queued" outcome).
+/// We then free the FC slot, the grant scanner reconciles, and the request is
+/// promoted to a RunAttempt. The new RunAttempt's `held_queues` must include
+/// BOTH the FC slot it just received AND the C slot already held — otherwise
+/// the C holder is orphaned on completion.
+#[silo::test]
+async fn concurrency_then_floating_concurrency_queued_reconciles_with_both_holders() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let c_queue = "c-mlim-3".to_string();
+    let fc_queue = "fc-mlim-3".to_string();
+
+    // Saturate FC (capacity = 1) by enqueueing an FC-only job and leasing it.
+    let _saturator = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "saturator"})),
+            vec![Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                key: fc_queue.clone(),
+                default_max_concurrency: 1,
+                refresh_interval_ms: 60_000,
+                metadata: vec![],
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue saturator");
+    let sat_tasks = shard.dequeue("w-sat", "default", 1).await.expect("deq sat").tasks;
+    assert_eq!(sat_tasks.len(), 1, "saturator should lease");
+    let sat_task_id = sat_tasks[0].attempt().task_id().to_string();
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc_queue).await,
+        1,
+        "FC saturated"
+    );
+
+    // Enqueue target job [C, FC]. C grants (capacity=5), FC is full → request.
+    let job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: c_queue.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &c_queue).await,
+        1,
+        "C should be granted at enqueue (target)"
+    );
+    assert!(
+        count_concurrency_requests(shard.db()).await >= 1,
+        "FC should have a pending concurrency_request for target"
+    );
+
+    // Target must not be dequeueable yet — interim RunAttempt was deleted.
+    let pre = shard.dequeue("w-pre", "default", 1).await.expect("deq pre").tasks;
+    assert!(
+        pre.iter().all(|t| t.job().id() != job),
+        "target must not be runnable while FC is full"
+    );
+
+    // Free the FC slot — completing the saturator wakes the grant scanner.
+    shard
+        .report_attempt_outcome(&sat_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete saturator");
+
+    // Poll for target to be leasable.
+    let mut target_task_id: Option<String> = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let r = shard.dequeue("w-target", "default", 1).await.expect("deq target");
+        if let Some(t) = r.tasks.iter().find(|t| t.job().id() == job) {
+            target_task_id = Some(t.attempt().task_id().to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let target_task_id = target_task_id.expect(
+        "target job never became runnable after FC slot freed — grant scanner did not reconcile",
+    );
+
+    // The lease's held_queues must list both C and FC. If only FC is present,
+    // the grant scanner built the RunAttempt with `held_queues=vec![FC]` and
+    // dropped the pre-existing C holder.
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&target_task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    assert!(
+        held.iter().any(|q| q == &fc_queue),
+        "held_queues missing FC after reconciliation: {:?}",
+        held
+    );
+    assert!(
+        held.iter().any(|q| q == &c_queue),
+        "held_queues missing C after reconciliation — grant scanner built the \
+         RunAttempt with only the just-granted queue, dropping the C slot \
+         already held since enqueue. Got {:?}",
+        held
+    );
+    assert_eq!(held.len(), 2, "expected exactly C+FC in held_queues, got {:?}", held);
+
+    // Complete target — every holder it acquired across the chain must release.
+    shard
+        .report_attempt_outcome(&target_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report target success");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &c_queue).await,
+        0,
+        "C holder leaked after target completion — held_queues did not include C, \
+         so report_attempt_outcome never released it"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc_queue).await,
+        0,
+        "FC holder leaked after target completion"
+    );
+}
+
+/// (4) Job with `[Concurrency, FloatingConcurrency, FloatingConcurrency]` where
+/// FC1 is full at enqueue. Canonical order:
+///   - C grants immediately.
+///   - FC1 `try_reserve` fails → request written; FC2 is NEVER attempted at
+///     enqueue ("Queued" — caller returns after the first failure).
+/// When FC1 frees, the grant scanner promotes the request to a RunAttempt with
+/// `held_queues=vec![FC1]`. This drops the C holder *and* skips FC2 entirely.
+/// So the job runs without ever taking an FC2 slot, and on completion the C
+/// holder leaks.
+#[silo::test]
+async fn concurrency_two_floating_concurrency_queued_on_fc1_reconciles_with_all_three() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let c_queue = "c-mlim-4".to_string();
+    let fc1_queue = "fc1-mlim-4".to_string();
+    let fc2_queue = "fc2-mlim-4".to_string();
+
+    // Saturate FC1 (capacity = 1).
+    let _saturator = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "saturator"})),
+            vec![Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                key: fc1_queue.clone(),
+                default_max_concurrency: 1,
+                refresh_interval_ms: 60_000,
+                metadata: vec![],
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue saturator");
+    let sat_tasks = shard.dequeue("w-sat", "default", 1).await.expect("deq sat").tasks;
+    assert_eq!(sat_tasks.len(), 1);
+    let sat_task_id = sat_tasks[0].attempt().task_id().to_string();
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc1_queue).await,
+        1,
+        "FC1 saturated"
+    );
+
+    // Enqueue target [C, FC1, FC2]. C grants → FC1 blocked → request written.
+    // FC2 is never even attempted at enqueue.
+    let job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: c_queue.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc1_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc2_queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &c_queue).await,
+        1,
+        "C should be granted at enqueue (target)"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc2_queue).await,
+        0,
+        "FC2 must NOT be granted yet — FC1 blocked before it was reached"
+    );
+
+    // Free FC1.
+    shard
+        .report_attempt_outcome(&sat_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete saturator");
+
+    // Poll for target to be leasable.
+    let mut target_task_id: Option<String> = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let r = shard.dequeue("w-target", "default", 1).await.expect("deq target");
+        if let Some(t) = r.tasks.iter().find(|t| t.job().id() == job) {
+            target_task_id = Some(t.attempt().task_id().to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let target_task_id =
+        target_task_id.expect("target never became runnable — grant scanner did not reconcile");
+
+    // The grant scanner promoted the FC1 request directly to a RunAttempt
+    // without consulting the remaining limits. So:
+    //   - FC2 should have a holder (it didn't bypass)
+    //   - lease's held_queues should include C, FC1, FC2 (so completion
+    //     releases everything)
+    let fc2_holders_when_running =
+        count_holders_for_queue(shard.db(), tenant, &fc2_queue).await;
+    assert_eq!(
+        fc2_holders_when_running, 1,
+        "FC2 limit was silently bypassed — the queued path's RunAttempt skipped \
+         every limit after the one that triggered the queue. FC2 holders = {fc2_holders_when_running}"
+    );
+
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&target_task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    for q in [&c_queue, &fc1_queue, &fc2_queue] {
+        assert!(
+            held.iter().any(|h| h == q),
+            "held_queues missing {} after reconciliation; got {:?}",
+            q,
+            held
+        );
+    }
+    assert_eq!(held.len(), 3, "expected C + FC1 + FC2 in held_queues, got {:?}", held);
+
+    // Complete target — every limit's holder must release.
+    shard
+        .report_attempt_outcome(&target_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report target success");
+
+    for (label, q) in [
+        ("C", &c_queue),
+        ("FC1", &fc1_queue),
+        ("FC2", &fc2_queue),
+    ] {
+        assert_eq!(
+            count_holders_for_queue(shard.db(), tenant, q).await,
+            0,
+            "{label} holder leaked after target completion"
+        );
+    }
+}
+
+/// (6) Job with `[FloatingConcurrency, FloatingConcurrency]` where FC1 is full
+/// at enqueue. Canonical order keeps FCs in their relative input order, so:
+///   - FC1 blocks first → request written; FC2 never attempted at enqueue.
+/// When FC1 frees, the grant scanner promotes the request and the RunAttempt
+/// is constructed with only FC1 — FC2 is bypassed.
+#[silo::test]
+async fn two_floating_concurrency_queued_on_fc1_reconciles_with_both() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let fc1_queue = "fc1-mlim-6".to_string();
+    let fc2_queue = "fc2-mlim-6".to_string();
+
+    // Saturate FC1.
+    let _saturator = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "saturator"})),
+            vec![Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                key: fc1_queue.clone(),
+                default_max_concurrency: 1,
+                refresh_interval_ms: 60_000,
+                metadata: vec![],
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue saturator");
+    let sat_tasks = shard.dequeue("w-sat", "default", 1).await.expect("deq sat").tasks;
+    assert_eq!(sat_tasks.len(), 1);
+    let sat_task_id = sat_tasks[0].attempt().task_id().to_string();
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc1_queue).await,
+        1,
+        "FC1 saturated"
+    );
+
+    // Enqueue target [FC1, FC2]. FC1 blocks → request written; FC2 never
+    // attempted.
+    let job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc1_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc2_queue.clone(),
+                    default_max_concurrency: 5,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc2_queue).await,
+        0,
+        "FC2 must not be granted at enqueue — FC1 blocked first"
+    );
+
+    // Free FC1.
+    shard
+        .report_attempt_outcome(&sat_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete saturator");
+
+    // Poll for target.
+    let mut target_task_id: Option<String> = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let r = shard.dequeue("w-target", "default", 1).await.expect("deq target");
+        if let Some(t) = r.tasks.iter().find(|t| t.job().id() == job) {
+            target_task_id = Some(t.attempt().task_id().to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let target_task_id =
+        target_task_id.expect("target never became runnable — grant scanner did not reconcile");
+
+    // FC2 must hold a slot now; lease must list both FC1 and FC2.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &fc2_queue).await,
+        1,
+        "FC2 limit was silently bypassed — queued-path RunAttempt skipped \
+         every limit after FC1"
+    );
+
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&target_task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = decoded_lease.held_queues();
+    for q in [&fc1_queue, &fc2_queue] {
+        assert!(
+            held.iter().any(|h| h == q),
+            "held_queues missing {} after reconciliation; got {:?}",
+            q,
+            held
+        );
+    }
+    assert_eq!(held.len(), 2, "expected FC1 + FC2 in held_queues, got {:?}", held);
+
+    // Complete — both holders must release.
+    shard
+        .report_attempt_outcome(&target_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report target success");
+
+    for (label, q) in [("FC1", &fc1_queue), ("FC2", &fc2_queue)] {
+        assert_eq!(
+            count_holders_for_queue(shard.db(), tenant, q).await,
+            0,
+            "{label} holder leaked after target completion"
+        );
+    }
+}
+
 /// Helper: count concurrency holder keys for a specific (tenant, queue) pair.
 async fn count_holders_for_queue(
     db: &silo::instrumented_db::InstrumentedDb,
