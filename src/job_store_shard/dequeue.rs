@@ -455,13 +455,8 @@ impl JobStoreShard {
                     task_group: req_task_group.to_string(),
                 };
                 let cont_value = encode_task(&cont);
-                let new_task_key = crate::keys::task_key(
-                    req_task_group,
-                    now_ms,
-                    priority,
-                    job_id,
-                    attempt_number,
-                );
+                let new_task_key =
+                    crate::keys::task_key(req_task_group, now_ms, priority, job_id, attempt_number);
                 state.batch.put(&new_task_key, &cont_value);
                 let _ = start_time_ms;
 
@@ -798,9 +793,7 @@ impl JobStoreShard {
 
         // Track any immediate grants for rollback if the outer batch fails.
         for (queue, t_id) in grants {
-            state
-                .grants_to_rollback
-                .push((tenant.clone(), queue, t_id));
+            state.grants_to_rollback.push((tenant.clone(), queue, t_id));
         }
 
         Ok(())

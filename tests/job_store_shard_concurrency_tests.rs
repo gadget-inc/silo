@@ -2603,9 +2603,22 @@ async fn enqueue_concurrency_and_floating_concurrency_grants_both_immediately() 
         .expect("lease present");
     let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
     let held = decoded_lease.held_queues();
-    assert!(held.iter().any(|q| q == &c_queue), "held_queues missing C: {:?}", held);
-    assert!(held.iter().any(|q| q == &fc_queue), "held_queues missing FC: {:?}", held);
-    assert_eq!(held.len(), 2, "expected exactly C+FC in held_queues, got {:?}", held);
+    assert!(
+        held.iter().any(|q| q == &c_queue),
+        "held_queues missing C: {:?}",
+        held
+    );
+    assert!(
+        held.iter().any(|q| q == &fc_queue),
+        "held_queues missing FC: {:?}",
+        held
+    );
+    assert_eq!(
+        held.len(),
+        2,
+        "expected exactly C+FC in held_queues, got {:?}",
+        held
+    );
 
     shard
         .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
@@ -2692,9 +2705,19 @@ async fn enqueue_concurrency_and_two_floating_concurrency_grants_all_immediately
         .expect("lease present");
     let decoded_lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
     let held = decoded_lease.held_queues();
-    assert_eq!(held.len(), 3, "expected C + FC1 + FC2 in held_queues, got {:?}", held);
+    assert_eq!(
+        held.len(),
+        3,
+        "expected C + FC1 + FC2 in held_queues, got {:?}",
+        held
+    );
     for q in [&c_queue, &fc1_queue, &fc2_queue] {
-        assert!(held.iter().any(|h| h == q), "held_queues missing {}: {:?}", q, held);
+        assert!(
+            held.iter().any(|h| h == q),
+            "held_queues missing {}: {:?}",
+            q,
+            held
+        );
     }
 
     shard
@@ -2737,18 +2760,24 @@ async fn concurrency_then_floating_concurrency_queued_reconciles_with_both_holde
             now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"role": "saturator"})),
-            vec![Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
-                key: fc_queue.clone(),
-                default_max_concurrency: 1,
-                refresh_interval_ms: 60_000,
-                metadata: vec![],
-            })],
+            vec![Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: fc_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                },
+            )],
             None,
             "default",
         )
         .await
         .expect("enqueue saturator");
-    let sat_tasks = shard.dequeue("w-sat", "default", 1).await.expect("deq sat").tasks;
+    let sat_tasks = shard
+        .dequeue("w-sat", "default", 1)
+        .await
+        .expect("deq sat")
+        .tasks;
     assert_eq!(sat_tasks.len(), 1, "saturator should lease");
     let sat_task_id = sat_tasks[0].attempt().task_id().to_string();
     assert_eq!(
@@ -2795,7 +2824,11 @@ async fn concurrency_then_floating_concurrency_queued_reconciles_with_both_holde
     );
 
     // Target must not be dequeueable yet — interim RunAttempt was deleted.
-    let pre = shard.dequeue("w-pre", "default", 1).await.expect("deq pre").tasks;
+    let pre = shard
+        .dequeue("w-pre", "default", 1)
+        .await
+        .expect("deq pre")
+        .tasks;
     assert!(
         pre.iter().all(|t| t.job().id() != job),
         "target must not be runnable while FC is full"
@@ -2811,7 +2844,10 @@ async fn concurrency_then_floating_concurrency_queued_reconciles_with_both_holde
     let mut target_task_id: Option<String> = None;
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(5) {
-        let r = shard.dequeue("w-target", "default", 1).await.expect("deq target");
+        let r = shard
+            .dequeue("w-target", "default", 1)
+            .await
+            .expect("deq target");
         if let Some(t) = r.tasks.iter().find(|t| t.job().id() == job) {
             target_task_id = Some(t.attempt().task_id().to_string());
             break;
@@ -2845,7 +2881,12 @@ async fn concurrency_then_floating_concurrency_queued_reconciles_with_both_holde
          already held since enqueue. Got {:?}",
         held
     );
-    assert_eq!(held.len(), 2, "expected exactly C+FC in held_queues, got {:?}", held);
+    assert_eq!(
+        held.len(),
+        2,
+        "expected exactly C+FC in held_queues, got {:?}",
+        held
+    );
 
     // Complete target — every holder it acquired across the chain must release.
     shard
@@ -2893,18 +2934,24 @@ async fn concurrency_two_floating_concurrency_queued_on_fc1_reconciles_with_all_
             now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"role": "saturator"})),
-            vec![Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
-                key: fc1_queue.clone(),
-                default_max_concurrency: 1,
-                refresh_interval_ms: 60_000,
-                metadata: vec![],
-            })],
+            vec![Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: fc1_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                },
+            )],
             None,
             "default",
         )
         .await
         .expect("enqueue saturator");
-    let sat_tasks = shard.dequeue("w-sat", "default", 1).await.expect("deq sat").tasks;
+    let sat_tasks = shard
+        .dequeue("w-sat", "default", 1)
+        .await
+        .expect("deq sat")
+        .tasks;
     assert_eq!(sat_tasks.len(), 1);
     let sat_task_id = sat_tasks[0].attempt().task_id().to_string();
     assert_eq!(
@@ -2968,7 +3015,10 @@ async fn concurrency_two_floating_concurrency_queued_on_fc1_reconciles_with_all_
     let mut target_task_id: Option<String> = None;
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(5) {
-        let r = shard.dequeue("w-target", "default", 1).await.expect("deq target");
+        let r = shard
+            .dequeue("w-target", "default", 1)
+            .await
+            .expect("deq target");
         if let Some(t) = r.tasks.iter().find(|t| t.job().id() == job) {
             target_task_id = Some(t.attempt().task_id().to_string());
             break;
@@ -2983,8 +3033,7 @@ async fn concurrency_two_floating_concurrency_queued_on_fc1_reconciles_with_all_
     //   - FC2 should have a holder (it didn't bypass)
     //   - lease's held_queues should include C, FC1, FC2 (so completion
     //     releases everything)
-    let fc2_holders_when_running =
-        count_holders_for_queue(shard.db(), tenant, &fc2_queue).await;
+    let fc2_holders_when_running = count_holders_for_queue(shard.db(), tenant, &fc2_queue).await;
     assert_eq!(
         fc2_holders_when_running, 1,
         "FC2 limit was silently bypassed — the queued path's RunAttempt skipped \
@@ -3007,7 +3056,12 @@ async fn concurrency_two_floating_concurrency_queued_on_fc1_reconciles_with_all_
             held
         );
     }
-    assert_eq!(held.len(), 3, "expected C + FC1 + FC2 in held_queues, got {:?}", held);
+    assert_eq!(
+        held.len(),
+        3,
+        "expected C + FC1 + FC2 in held_queues, got {:?}",
+        held
+    );
 
     // Complete target — every limit's holder must release.
     shard
@@ -3015,11 +3069,7 @@ async fn concurrency_two_floating_concurrency_queued_on_fc1_reconciles_with_all_
         .await
         .expect("report target success");
 
-    for (label, q) in [
-        ("C", &c_queue),
-        ("FC1", &fc1_queue),
-        ("FC2", &fc2_queue),
-    ] {
+    for (label, q) in [("C", &c_queue), ("FC1", &fc1_queue), ("FC2", &fc2_queue)] {
         assert_eq!(
             count_holders_for_queue(shard.db(), tenant, q).await,
             0,
@@ -3050,18 +3100,24 @@ async fn two_floating_concurrency_queued_on_fc1_reconciles_with_both() {
             now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"role": "saturator"})),
-            vec![Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
-                key: fc1_queue.clone(),
-                default_max_concurrency: 1,
-                refresh_interval_ms: 60_000,
-                metadata: vec![],
-            })],
+            vec![Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: fc1_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                },
+            )],
             None,
             "default",
         )
         .await
         .expect("enqueue saturator");
-    let sat_tasks = shard.dequeue("w-sat", "default", 1).await.expect("deq sat").tasks;
+    let sat_tasks = shard
+        .dequeue("w-sat", "default", 1)
+        .await
+        .expect("deq sat")
+        .tasks;
     assert_eq!(sat_tasks.len(), 1);
     let sat_task_id = sat_tasks[0].attempt().task_id().to_string();
     assert_eq!(
@@ -3116,7 +3172,10 @@ async fn two_floating_concurrency_queued_on_fc1_reconciles_with_both() {
     let mut target_task_id: Option<String> = None;
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(5) {
-        let r = shard.dequeue("w-target", "default", 1).await.expect("deq target");
+        let r = shard
+            .dequeue("w-target", "default", 1)
+            .await
+            .expect("deq target");
         if let Some(t) = r.tasks.iter().find(|t| t.job().id() == job) {
             target_task_id = Some(t.attempt().task_id().to_string());
             break;
@@ -3150,7 +3209,12 @@ async fn two_floating_concurrency_queued_on_fc1_reconciles_with_both() {
             held
         );
     }
-    assert_eq!(held.len(), 2, "expected FC1 + FC2 in held_queues, got {:?}", held);
+    assert_eq!(
+        held.len(),
+        2,
+        "expected FC1 + FC2 in held_queues, got {:?}",
+        held
+    );
 
     // Complete — both holders must release.
     shard
