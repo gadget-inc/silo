@@ -839,14 +839,16 @@ async fn floating_limit_scanner_grants_waiter_while_one_holder_remains() {
         .await
         .expect("report success");
 
+    // The grant scanner emits a `ContinueLimits` task for the granted waiter;
+    // dequeue then re-enters the limit chain and writes a terminal RunAttempt
+    // at a fresh task_key. Accept either as evidence that the scanner granted.
     let has_j3_run = poll_until(
         || async {
             let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
-            tasks.iter().any(|t| {
-                matches!(
-                    t,
-                    Task::RunAttempt { job_id, .. } if job_id == &j3
-                )
+            tasks.iter().any(|t| match t {
+                Task::RunAttempt { job_id, .. } => job_id == &j3,
+                Task::ContinueLimits { job_id, .. } => job_id == &j3,
+                _ => false,
             })
         },
         |&found| found,
@@ -1405,16 +1407,16 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
         .await
         .expect("report j1 success");
 
-    // j2 should now have a RunAttempt task.
-    // Grants happen asynchronously via the background scanner, so poll.
+    // j2 should now have either a RunAttempt or a ContinueLimits task. The
+    // grant scanner emits a ContinueLimits first; dequeue re-enters the limit
+    // chain and writes the terminal RunAttempt later.
     let has_j2_run = poll_until(
         || async {
             let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
-            tasks.iter().any(|t| {
-                matches!(
-                    t,
-                    Task::RunAttempt { job_id, .. } if job_id == &j2
-                )
+            tasks.iter().any(|t| match t {
+                Task::RunAttempt { job_id, .. } => job_id == &j2,
+                Task::ContinueLimits { job_id, .. } => job_id == &j2,
+                _ => false,
             })
         },
         |&found| found,
@@ -1423,7 +1425,7 @@ async fn floating_limit_uses_dynamic_max_concurrency() {
     .await;
     assert!(
         has_j2_run,
-        "j2 should have RunAttempt task after j1 completes"
+        "j2 should have a granted task after j1 completes"
     );
 }
 

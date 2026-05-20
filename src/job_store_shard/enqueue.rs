@@ -524,6 +524,9 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                             skip_try_reserve,
+                            &current_held_queues,
+                            current_index as u32,
+                            limits,
                         )
                         .await?;
 
@@ -593,6 +596,9 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                             skip_try_reserve,
+                            &current_held_queues,
+                            current_index as u32,
+                            limits,
                         )
                         .await?;
 

@@ -114,6 +114,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::ContinueLimits { .. } => {}
         }
     }
 
@@ -175,6 +176,10 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        task_id: "manual".to_string(),
+        held_queues: vec![],
+        limit_index: 0,
+        limits: vec![],
     };
     let request_key = concurrency_request_key(tenant, &queue, now, 10, &job_id, 1, "manual");
     let request_value = encode_concurrency_action(&action);
@@ -617,6 +622,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::ContinueLimits { .. } => {}
         }
     }
 
@@ -721,6 +727,9 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         }
         Task::RefreshFloatingLimit { .. } => {
             panic!("unexpected RefreshFloatingLimit in tasks/ for this test")
+        }
+        Task::ContinueLimits { .. } => {
+            panic!("unexpected ContinueLimits in tasks/ for this test")
         }
     };
     assert_eq!(attempt2, 2);

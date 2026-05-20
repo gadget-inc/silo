@@ -3,7 +3,7 @@
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 
-use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_lease};
+use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_lease, encode_task};
 use crate::concurrency::RequestTicketTaskOutcome;
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
@@ -171,6 +171,10 @@ impl JobStoreShard {
                             &mut state, &entry.key, decoded, worker_id, now_ms, expiry_ms,
                         )
                         .await?;
+                    }
+                    fb::TaskVariant::ContinueLimits => {
+                        self.handle_continue_limits(&mut state, &entry.key, decoded, now_ms)
+                            .await?;
                     }
                     other => {
                         return Err(JobStoreShardError::Codec(format!(
@@ -348,7 +352,11 @@ impl JobStoreShard {
         Ok(attempt_val)
     }
 
-    /// Process a RequestTicket task: check cancellation, process concurrency ticket, maybe lease.
+    /// Process a RequestTicket task: check cancellation, process concurrency
+    /// ticket, and on grant emit a `Task::ContinueLimits` so dequeue can
+    /// re-enter the limit chain at the next index. The broker picks the
+    /// continuation up on a subsequent dequeue cycle, mirroring the pattern
+    /// used by `Task::CheckRateLimit`.
     #[allow(clippy::too_many_arguments)]
     async fn handle_request_ticket(
         &self,
@@ -356,9 +364,9 @@ impl JobStoreShard {
         task_key: &[u8],
         decoded: &DecodedTask,
         shard_range: &ShardRange,
-        worker_id: &str,
+        _worker_id: &str,
         now_ms: i64,
-        expiry_ms: i64,
+        _expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
         let rt = decoded.as_request_ticket().ok_or_else(|| {
             JobStoreShardError::Codec("expected RequestTicket variant".to_string())
@@ -368,8 +376,18 @@ impl JobStoreShard {
         let job_id = rt.job_id().unwrap_or_default();
         let attempt_number = rt.attempt_number();
         let relative_attempt_number = rt.relative_attempt_number();
-        let request_id = rt.request_id().unwrap_or_default();
+        // task_id is the original first_task_id shared by every holder in the
+        // chain. Used as the holder identity for the slot we're about to grant.
+        let task_id = rt.task_id().unwrap_or_default();
         let req_task_group = rt.task_group().unwrap_or_default();
+        let start_time_ms = rt.start_time_ms();
+        let priority = rt.priority();
+        let limit_index = rt.limit_index();
+        let prior_held_queues: Vec<String> = rt
+            .held_queues()
+            .map(|v| v.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let limits = crate::codec::fb_limit_entries_to_owned(rt.limits());
         state.processed_internal = true;
         let tenant = tenant.to_string();
 
@@ -377,14 +395,16 @@ impl JobStoreShard {
         // by cancel_job. If a stale task appears (e.g., retry after cancel), it will
         // be processed normally and the worker discovers cancellation via heartbeat.
 
-        // Load job info
+        // Load job info (only for the JobMissing branch; the new chain context
+        // lets us continue without consulting JobInfo.limits on the hot path).
         let job_key = job_info_key(&tenant, job_id);
         let maybe_job = self.db.get(&job_key).await?;
         let job_view = maybe_job
             .as_ref()
             .and_then(|bytes| JobView::new(bytes.clone()).ok());
 
-        // Process ticket via concurrency manager
+        // Process ticket via concurrency manager — writes the holder under
+        // `task_id`, deletes the ticket task_key, reserves the in-memory slot.
         let outcome = self
             .concurrency
             .process_ticket_request_task(
@@ -394,7 +414,7 @@ impl JobStoreShard {
                 task_key,
                 &tenant,
                 queue,
-                request_id,
+                task_id,
                 job_id,
                 attempt_number,
                 now_ms,
@@ -404,52 +424,48 @@ impl JobStoreShard {
 
         match outcome {
             RequestTicketTaskOutcome::Granted { request_id, queue } => {
-                // Track grant for rollback if DB write fails
+                // request_id here equals task_id (we passed task_id in above).
+                // Track grant for rollback if DB write fails.
                 state
                     .grants_to_rollback
                     .push((tenant.clone(), queue.clone(), request_id.clone()));
 
-                // Create RunAttempt task for the lease (new Task, not a copy)
-                let run = Task::RunAttempt {
-                    id: request_id.clone(),
+                // Append the just-granted queue to held_queues, then write a
+                // ContinueLimits task at the same task_key. Dequeue's handler
+                // for ContinueLimits will call enqueue_limit_task_at_index at
+                // limit_index + 1 to evaluate any remaining limits (or, if
+                // none, write the terminal RunAttempt).
+                let mut held_queues = prior_held_queues;
+                held_queues.push(queue);
+                // Use now_ms (not the ticket's start_time_ms) so the new
+                // task_key differs from the just-tombstoned ticket key. The
+                // broker's tombstone retention would otherwise suppress this
+                // re-pickup; see the same trick in `handle_check_rate_limit`.
+                let cont = Task::ContinueLimits {
+                    task_id: request_id.clone(),
                     tenant: tenant.clone(),
                     job_id: job_id.to_string(),
                     attempt_number,
                     relative_attempt_number,
-                    held_queues: vec![queue],
+                    held_queues,
+                    next_limit_index: limit_index + 1,
+                    limits,
+                    priority,
+                    start_time_ms: now_ms,
                     task_group: req_task_group.to_string(),
                 };
+                let cont_value = encode_task(&cont);
+                let new_task_key = crate::keys::task_key(
+                    req_task_group,
+                    now_ms,
+                    priority,
+                    job_id,
+                    attempt_number,
+                );
+                state.batch.put(&new_task_key, &cont_value);
+                let _ = start_time_ms;
 
-                let attempt_val = self
-                    .write_lease_and_attempt(
-                        &mut state.batch,
-                        worker_id,
-                        &run,
-                        &request_id,
-                        &tenant,
-                        job_id,
-                        attempt_number,
-                        relative_attempt_number,
-                        now_ms,
-                        expiry_ms,
-                    )
-                    .await?;
-
-                let view = job_view.ok_or_else(|| {
-                    JobStoreShardError::Codec(format!(
-                        "job view missing for granted ticket, job_id={}",
-                        job_id
-                    ))
-                })?;
-                state
-                    .pending_attempts
-                    .push((tenant.clone(), view, attempt_val));
                 state.ack_deleted(task_key);
-
-                // Track for DST event emission after commit
-                state
-                    .leased_tasks_for_dst
-                    .push((tenant, job_id.to_string(), request_id));
 
                 // Record concurrency ticket metric and ready-to-start latency
                 if let Some(ref m) = self.metrics {
@@ -463,6 +479,10 @@ impl JobStoreShard {
                         m.record_ready_to_start_latency_ms(self.name(), req_task_group, latency_ms);
                     }
                 }
+
+                // Wake the broker so the ContinueLimits task is picked up on
+                // the next dequeue cycle.
+                self.brokers.wakeup(req_task_group);
             }
             RequestTicketTaskOutcome::Requested => {
                 // Release inflight only; task key remains in DB and must be eligible
@@ -701,6 +721,87 @@ impl JobStoreShard {
             task_group: rfl.task_group().unwrap_or_default().to_string(),
         });
         state.ack_deleted(task_key);
+
+        Ok(())
+    }
+
+    /// Process a `Task::ContinueLimits`: re-enter the limit chain at
+    /// `next_limit_index` using the embedded chain context. This is the
+    /// counterpart to the rate-limit-passed branch of `handle_check_rate_limit`
+    /// — it's how the system advances past a queue that was deferred-granted
+    /// without reading `JobInfo.limits` on the hot path.
+    ///
+    /// If `next_limit_index` is past the end of the limits chain,
+    /// `enqueue_limit_task_at_index` writes the terminal `RunAttempt` at the
+    /// same task_key — the broker leases it on the next dequeue cycle.
+    async fn handle_continue_limits(
+        &self,
+        state: &mut DequeueIterationState,
+        task_key: &[u8],
+        decoded: &DecodedTask,
+        now_ms: i64,
+    ) -> Result<(), JobStoreShardError> {
+        let Task::ContinueLimits {
+            task_id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            held_queues,
+            next_limit_index,
+            limits,
+            priority,
+            start_time_ms,
+            task_group,
+        } = decoded.to_task()?
+        else {
+            return Err(JobStoreShardError::Codec(
+                "expected ContinueLimits variant".to_string(),
+            ));
+        };
+
+        state.processed_internal = true;
+        // Delete the ContinueLimits task itself and tombstone its key.
+        state.batch.delete(task_key);
+        state.ack_deleted(task_key);
+
+        // Use `now_ms` as start_at_ms when re-entering the chain so any
+        // chained task (CheckRateLimit, RunAttempt, RequestTicket, …) lands
+        // at a fresh task_key that doesn't collide with the just-tombstoned
+        // one. This mirrors how `handle_check_rate_limit` continues its
+        // chain (it also passes `start_at_ms: now_ms`). The original
+        // `start_time_ms` would land at the same key as the ContinueLimits
+        // we just acked, and the broker tombstone would suppress it.
+        let grants = self
+            .enqueue_limit_task_at_index(
+                &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                LimitTaskParams {
+                    tenant: &tenant,
+                    task_id: &task_id,
+                    job_id: &job_id,
+                    attempt_number,
+                    relative_attempt_number,
+                    limit_index: next_limit_index as usize,
+                    limits: &limits,
+                    priority,
+                    start_at_ms: now_ms,
+                    now_ms,
+                    held_queues,
+                    task_group: &task_group,
+                    skip_try_reserve: false,
+                },
+            )
+            .await?;
+        // Silence unused variable warning on start_time_ms; the value is
+        // load-bearing only on the originating side, not on continuation.
+        let _ = start_time_ms;
+
+        // Track any immediate grants for rollback if the outer batch fails.
+        for (queue, t_id) in grants {
+            state
+                .grants_to_rollback
+                .push((tenant.clone(), queue, t_id));
+        }
 
         Ok(())
     }

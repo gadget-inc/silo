@@ -622,6 +622,7 @@ async fn concurrency_queues_when_full_and_grants_on_release() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::ContinueLimits { .. } => {}
         }
     }
 
@@ -970,6 +971,7 @@ async fn concurrent_enqueues_while_holding_dont_bypass_limit() {
             Task::RequestTicket { .. } => {}
             Task::CheckRateLimit { .. } => {}
             Task::RefreshFloatingLimit { .. } => {}
+            Task::ContinueLimits { .. } => {}
         }
     }
 
@@ -1638,6 +1640,10 @@ async fn grant_scanner_skips_stale_requests_and_grants_valid_ones() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            task_id: format!("stale-tid-{}", i),
+            held_queues: vec![],
+            limit_index: 0,
+            limits: vec![],
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
@@ -1699,6 +1705,10 @@ async fn grant_scanner_handles_all_stale_requests() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            task_id: format!("ghost-tid-{}", i),
+            held_queues: vec![],
+            limit_index: 0,
+            limits: vec![],
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
@@ -1994,6 +2004,10 @@ async fn grant_scanner_interleaved_stale_and_valid_requests() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            task_id: format!("phantom-tid-{}", i),
+            held_queues: vec![],
+            limit_index: 0,
+            limits: vec![],
         };
         let key = silo::keys::concurrency_request_key(
             tenant,

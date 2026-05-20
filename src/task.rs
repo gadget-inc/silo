@@ -3,7 +3,7 @@
 //! This module contains the core task types that represent units of work
 //! in the system, along with associated records for leases and concurrency.
 
-use crate::job::{GubernatorRateLimit, JobView};
+use crate::job::{GubernatorRateLimit, JobView, Limit};
 use crate::job_attempt::JobAttemptView;
 
 /// Default lease duration for dequeued tasks (milliseconds)
@@ -35,8 +35,17 @@ pub enum Task {
         attempt_number: u32,
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
-        request_id: String,
+        /// The original first_task_id from the enqueue chain — shared identity
+        /// across every holder this job acquires.
+        task_id: String,
         task_group: String,
+        /// Queues already granted under task_id earlier in the chain.
+        held_queues: Vec<String>,
+        /// Canonical-order position of THIS queue in the limits chain.
+        limit_index: u32,
+        /// Full limits array, so the deferred-grant path can continue the
+        /// chain without a JobInfo lookup.
+        limits: Vec<Limit>,
     },
     /// Internal: check a Gubernator rate limit before proceeding
     CheckRateLimit {
@@ -72,6 +81,23 @@ pub enum Task {
         metadata: Vec<(String, String)>,
         task_group: String,
     },
+    /// Internal: chain-continuation task emitted by the deferred-grant paths
+    /// after a concurrency slot is granted. Dequeue picks this up and
+    /// re-enters `enqueue_limit_task_at_index` at `next_limit_index` to evaluate
+    /// the remaining limits in the canonical order.
+    ContinueLimits {
+        task_id: String,
+        tenant: String,
+        job_id: String,
+        attempt_number: u32,
+        relative_attempt_number: u32,
+        held_queues: Vec<String>,
+        next_limit_index: u32,
+        limits: Vec<Limit>,
+        priority: u8,
+        start_time_ms: i64,
+        task_group: String,
+    },
 }
 
 impl Task {
@@ -82,6 +108,7 @@ impl Task {
             Task::RequestTicket { tenant, .. } => tenant,
             Task::CheckRateLimit { tenant, .. } => tenant,
             Task::RefreshFloatingLimit { tenant, .. } => tenant,
+            Task::ContinueLimits { tenant, .. } => tenant,
         }
     }
 }
@@ -149,6 +176,16 @@ pub enum ConcurrencyAction {
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
         task_group: String,
+        /// The original first_task_id from the enqueue chain — shared identity
+        /// across every holder this job acquires.
+        task_id: String,
+        /// Queues already granted under task_id earlier in the chain.
+        held_queues: Vec<String>,
+        /// Canonical-order position of THIS queue in the limits chain.
+        limit_index: u32,
+        /// Full limits array, so the grant scanner can continue the chain
+        /// without a JobInfo lookup.
+        limits: Vec<Limit>,
     },
 }
 

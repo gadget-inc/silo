@@ -86,8 +86,18 @@ table RequestTicket {
   job_id: string;
   attempt_number: uint32;
   relative_attempt_number: uint32;
-  request_id: string;
+  // The original first_task_id from the enqueue chain. Used as holder identity
+  // for every queue granted across the chain so report_attempt_outcome can
+  // release them all by a single task_id.
+  task_id: string;
   task_group: string;
+  // Queues already granted under task_id earlier in the chain.
+  held_queues: [string];
+  // Canonical-order position of THIS queue in the limits chain.
+  limit_index: uint32;
+  // Full limits array, embedded so the deferred-grant path does not require a
+  // JobInfo lookup to continue the chain.
+  limits: [LimitEntry];
 }
 
 table CheckRateLimit {
@@ -115,11 +125,31 @@ table RefreshFloatingLimit {
   task_group: string;
 }
 
+// Chain-continuation task emitted by the deferred-grant paths after a
+// concurrency slot is granted. Dequeue picks this up and re-enters
+// enqueue_limit_task_at_index at next_limit_index, evaluating the remaining
+// limits in the canonical order. Carries the full limits array so no JobInfo
+// lookup is needed on the hot path.
+table ContinueLimits {
+  task_id: string;
+  tenant: string;
+  job_id: string;
+  attempt_number: uint32;
+  relative_attempt_number: uint32;
+  held_queues: [string];
+  next_limit_index: uint32;
+  limits: [LimitEntry];
+  priority: ubyte;
+  start_time_ms: int64;
+  task_group: string;
+}
+
 union TaskVariant {
   RunAttempt,
   RequestTicket,
   CheckRateLimit,
   RefreshFloatingLimit,
+  ContinueLimits,
 }
 
 table Task {
@@ -237,6 +267,16 @@ table EnqueueTask {
   attempt_number: uint32;
   relative_attempt_number: uint32;
   task_group: string;
+  // The original first_task_id from the enqueue chain. Used as holder identity
+  // for every queue granted across the chain.
+  task_id: string;
+  // Queues already granted under task_id earlier in the chain.
+  held_queues: [string];
+  // Canonical-order position of THIS queue in the limits chain.
+  limit_index: uint32;
+  // Full limits array, embedded so the grant scanner does not require a
+  // JobInfo lookup to continue the chain.
+  limits: [LimitEntry];
 }
 
 union ConcurrencyActionVariant {

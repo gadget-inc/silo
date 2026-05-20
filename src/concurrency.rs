@@ -759,6 +759,13 @@ impl ConcurrencyManager {
         attempt_number: u32,
         relative_attempt_number: u32,
         skip_try_reserve: bool,
+        // Chain context: passed through to the request record / future ticket so
+        // the deferred-grant path can continue the limit chain without a JobInfo
+        // lookup. All four refer to the FULL canonical-order chain (`chain_limits`,
+        // `chain_limit_index`) and the holders accumulated so far under `task_id`.
+        chain_held_queues: &[String],
+        chain_limit_index: u32,
+        chain_limits: &[crate::job::Limit],
     ) -> Result<Option<RequestTicketOutcome>, ConcurrencyError> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
@@ -813,20 +820,25 @@ impl ConcurrencyManager {
                 writer,
                 tenant,
                 queue,
+                task_id,
                 start_at_ms,
                 priority,
                 job_id,
                 attempt_number,
                 relative_attempt_number,
                 task_group,
+                chain_held_queues,
+                chain_limit_index,
+                chain_limits,
             )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
                 queue: queue.clone(),
             }))
         } else {
-            // Job scheduled for future: queue as RequestTicket task
-            let suffix = format!("{:08x}", rand::random::<u32>());
-            let request_id = format!("{job_id}:{attempt_number}:{suffix}");
+            // Job scheduled for future: queue as RequestTicket task. Use the
+            // chain's `task_id` as the ticket identity — every holder this job
+            // acquires across the chain shares one task_id so that completion
+            // releases them all via a single lease's `held_queues`.
             let ticket = Task::RequestTicket {
                 queue: queue.clone(),
                 start_time_ms: start_at_ms,
@@ -835,8 +847,11 @@ impl ConcurrencyManager {
                 job_id: job_id.to_string(),
                 attempt_number,
                 relative_attempt_number,
-                request_id: request_id.clone(),
+                task_id: task_id.to_string(),
                 task_group: task_group.to_string(),
+                held_queues: chain_held_queues.to_vec(),
+                limit_index: chain_limit_index,
+                limits: chain_limits.to_vec(),
             };
             let ticket_value = encode_task(&ticket);
             writer.put(
@@ -845,7 +860,7 @@ impl ConcurrencyManager {
             )?;
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
                 queue: queue.clone(),
-                task_id: request_id,
+                task_id: task_id.to_string(),
             }))
         }
     }
@@ -1084,13 +1099,23 @@ impl ConcurrencyManager {
 
         struct ScannedRequest {
             request_key: Vec<u8>,
-            request_id: String,
+            // The chain's original first_task_id, embedded in the request
+            // value. Used as the holder identity (matches earlier-granted
+            // holders for this job) so completion can release them all via
+            // one lease's `held_queues`.
+            task_id: String,
             job_id: String,
             attempt_number: u32,
             relative_attempt_number: u32,
             start_time_ms: i64,
             priority: u8,
             task_group: String,
+            // Chain continuation context — embedded in the EnqueueTask so the
+            // scanner can build a Task::ContinueLimits without consulting
+            // JobInfo on the hot path.
+            held_queues: Vec<String>,
+            limit_index: u32,
+            limits: Vec<crate::job::Limit>,
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
@@ -1157,10 +1182,20 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                let Some(parsed_req) = parsed_req else {
+                let Some(_parsed_req) = parsed_req else {
                     continue;
                 };
-                let request_id = parsed_req.request_id();
+                // Pull the chain identity and continuation context from the
+                // request value, not from the parsed key. Empty task_id here
+                // would indicate a malformed record (no longer expected: the
+                // DB is nuked between schema versions).
+                let task_id = et.task_id().unwrap_or_default().to_string();
+                let held_queues: Vec<String> = et
+                    .held_queues()
+                    .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
+                let limit_index = et.limit_index();
+                let limits = crate::codec::fb_limit_entries_to_owned(et.limits());
 
                 // Resolve max_concurrency from the first request whose job info is readable.
                 // Don't cache failures — a stale request's missing job shouldn't lock
@@ -1203,13 +1238,16 @@ impl ConcurrencyManager {
 
                 scanned.push(ScannedRequest {
                     request_key: kv.key.to_vec(),
-                    request_id,
+                    task_id,
                     job_id: job_id_str.to_string(),
                     attempt_number: et.attempt_number(),
                     relative_attempt_number: et.relative_attempt_number(),
                     start_time_ms,
                     priority: et.priority(),
                     task_group: et.task_group().unwrap_or_default().to_string(),
+                    held_queues,
+                    limit_index,
+                    limits,
                 });
             }
 
@@ -1305,10 +1343,14 @@ impl ConcurrencyManager {
                 }
 
                 // [SILO-GRANT-1] Pre: Queue has capacity — try to atomically reserve a slot
+                // Identity = the chain's task_id, NOT a parsed-key request_id.
+                // Earlier-granted holders for this job are already keyed by
+                // task_id; aligning here is what keeps the lease's held_queues
+                // releasable in one shot at completion.
                 if !self.counts.try_reserve_internal(
                     tenant,
                     queue,
-                    &req.request_id,
+                    &req.task_id,
                     limit,
                     &req.job_id,
                 ) {
@@ -1316,23 +1358,34 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                // [SILO-GRANT-3] Create holder
+                // [SILO-GRANT-3] Create holder keyed by task_id
                 let holder_val = encode_holder(&HolderRecord {
                     granted_at_ms: now_ms,
                 });
                 batch.put(
-                    concurrency_holder_key(tenant, queue, &req.request_id),
+                    concurrency_holder_key(tenant, queue, &req.task_id),
                     &holder_val,
                 );
 
-                // [SILO-GRANT-4] Create RunAttempt task
-                let tval = encode_task(&Task::RunAttempt {
-                    id: req.request_id.clone(),
+                // [SILO-GRANT-4] Emit a ContinueLimits chain-continuation task.
+                // held_queues is the accumulator from earlier in the chain with
+                // this just-granted queue appended; next_limit_index points one
+                // past this limit in the canonical order. Dequeue will
+                // re-enter `enqueue_limit_task_at_index` to evaluate the
+                // remaining limits (or write the terminal RunAttempt).
+                let mut held_queues = req.held_queues.clone();
+                held_queues.push(queue.to_string());
+                let tval = encode_task(&Task::ContinueLimits {
+                    task_id: req.task_id.clone(),
                     tenant: tenant.to_string(),
                     job_id: req.job_id.clone(),
                     attempt_number: req.attempt_number,
                     relative_attempt_number: req.relative_attempt_number,
-                    held_queues: vec![queue.to_string()],
+                    held_queues,
+                    next_limit_index: req.limit_index + 1,
+                    limits: req.limits.clone(),
+                    priority: req.priority,
+                    start_time_ms: req.start_time_ms,
                     task_group: req.task_group.clone(),
                 });
                 batch.put(
@@ -1347,7 +1400,7 @@ impl ConcurrencyManager {
                 );
                 batch.delete(&req.request_key);
 
-                grants.push((req.request_id.clone(), req.task_group.clone()));
+                grants.push((req.task_id.clone(), req.task_group.clone()));
             }
 
             // --- Per-pass commit ---
@@ -1378,8 +1431,8 @@ impl ConcurrencyManager {
                 .await
             {
                 // Roll back only this pass's reservations; prior committed passes stand.
-                for (request_id, _) in &grants {
-                    self.counts.release_reservation(tenant, queue, request_id);
+                for (task_id, _) in &grants {
+                    self.counts.release_reservation(tenant, queue, task_id);
                 }
                 tracing::warn!(
                     error = %e,
@@ -1390,10 +1443,10 @@ impl ConcurrencyManager {
                 return all_granted_groups;
             }
 
-            for (request_id, task_group) in &grants {
+            for (task_id, task_group) in &grants {
                 tracing::debug!(
                     queue = %queue,
-                    request_id = %request_id,
+                    task_id = %task_id,
                     task_group = %task_group,
                     "grant scanner: granted concurrency ticket"
                 );
@@ -1460,12 +1513,16 @@ fn append_request_edits<W: WriteBatcher>(
     writer: &mut W,
     tenant: &str,
     queue: &str,
+    task_id: &str,
     start_time_ms: i64,
     priority: u8,
     job_id: &str,
     attempt_number: u32,
     relative_attempt_number: u32,
     task_group: &str,
+    chain_held_queues: &[String],
+    chain_limit_index: u32,
+    chain_limits: &[crate::job::Limit],
 ) -> Result<(), ConcurrencyError> {
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms,
@@ -1474,9 +1531,16 @@ fn append_request_edits<W: WriteBatcher>(
         attempt_number,
         relative_attempt_number,
         task_group: task_group.to_string(),
+        task_id: task_id.to_string(),
+        held_queues: chain_held_queues.to_vec(),
+        limit_index: chain_limit_index,
+        limits: chain_limits.to_vec(),
     };
     let action_val = encode_concurrency_action(&action);
-    let suffix = format!("{:08x}", rand::random::<u32>());
+    // Use task_id as the request-key suffix. This ties the durable request
+    // record directly to the chain's identity, so when the grant scanner
+    // promotes it, the new holder it writes can be keyed by the same task_id
+    // that earlier-granted holders already use.
     let req_key = concurrency_request_key(
         tenant,
         queue,
@@ -1484,7 +1548,7 @@ fn append_request_edits<W: WriteBatcher>(
         priority,
         job_id,
         attempt_number,
-        &suffix,
+        task_id,
     );
     writer.put(&req_key, &action_val)?;
 

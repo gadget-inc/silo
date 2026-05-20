@@ -117,6 +117,19 @@ fn test_holder_roundtrip() {
 
 #[silo::test]
 fn test_concurrency_action_roundtrip() {
+    use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, Limit};
+    let limits = vec![
+        Limit::Concurrency(ConcurrencyLimit {
+            key: "q-c".to_string(),
+            max_concurrency: 7,
+        }),
+        Limit::FloatingConcurrency(FloatingConcurrencyLimit {
+            key: "q-fc".to_string(),
+            default_max_concurrency: 4,
+            refresh_interval_ms: 30_000,
+            metadata: vec![("k".to_string(), "v".to_string())],
+        }),
+    ];
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms: 1000,
         priority: 5,
@@ -124,6 +137,10 @@ fn test_concurrency_action_roundtrip() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        task_id: "task-abc".to_string(),
+        held_queues: vec!["q-c".to_string()],
+        limit_index: 1,
+        limits: limits.clone(),
     };
     let encoded = encode_concurrency_action(&action);
     let decoded = decode_concurrency_action(encoded).unwrap();
@@ -134,10 +151,26 @@ fn test_concurrency_action_roundtrip() {
     assert_eq!(et.attempt_number(), 1);
     assert_eq!(et.relative_attempt_number(), 1);
     assert_eq!(et.task_group().unwrap(), "default");
+    assert_eq!(et.task_id().unwrap(), "task-abc");
+    let held: Vec<String> = et
+        .held_queues()
+        .unwrap()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(held, vec!["q-c".to_string()]);
+    assert_eq!(et.limit_index(), 1);
+    let limits_decoded = silo::codec::fb_limit_entries_to_owned(et.limits());
+    assert_eq!(limits_decoded.len(), 2);
 }
 
 #[silo::test]
 fn test_request_ticket_roundtrip() {
+    use silo::job::{ConcurrencyLimit, Limit};
+    let limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: "q1".to_string(),
+        max_concurrency: 3,
+    })];
     let task = Task::RequestTicket {
         queue: "q1".to_string(),
         start_time_ms: 5000,
@@ -146,8 +179,11 @@ fn test_request_ticket_roundtrip() {
         job_id: "job-42".to_string(),
         attempt_number: 2,
         relative_attempt_number: 1,
-        request_id: "req-abc".to_string(),
+        task_id: "task-99".to_string(),
         task_group: "fast".to_string(),
+        held_queues: vec!["prev-q".to_string()],
+        limit_index: 0,
+        limits: limits.clone(),
     };
     let encoded = encode_task(&task);
     let decoded = decode_task(&encoded).unwrap();
@@ -160,8 +196,11 @@ fn test_request_ticket_roundtrip() {
             job_id,
             attempt_number,
             relative_attempt_number,
-            request_id,
+            task_id,
             task_group,
+            held_queues,
+            limit_index,
+            limits: decoded_limits,
         } => {
             assert_eq!(queue, "q1");
             assert_eq!(start_time_ms, 5000);
@@ -170,8 +209,11 @@ fn test_request_ticket_roundtrip() {
             assert_eq!(job_id, "job-42");
             assert_eq!(attempt_number, 2);
             assert_eq!(relative_attempt_number, 1);
-            assert_eq!(request_id, "req-abc");
+            assert_eq!(task_id, "task-99");
             assert_eq!(task_group, "fast");
+            assert_eq!(held_queues, vec!["prev-q".to_string()]);
+            assert_eq!(limit_index, 0);
+            assert_eq!(decoded_limits.len(), 1);
         }
         _ => panic!("expected RequestTicket variant"),
     }
@@ -502,8 +544,11 @@ fn test_decoded_task_request_ticket() {
         job_id: "j-rt".to_string(),
         attempt_number: 1,
         relative_attempt_number: 1,
-        request_id: "req-rt".to_string(),
+        task_id: "req-rt".to_string(),
         task_group: "fast".to_string(),
+        held_queues: vec![],
+        limit_index: 0,
+        limits: vec![],
     };
     let encoded = encode_task(&task);
     let decoded = decode_task_validated(encoded).unwrap();
