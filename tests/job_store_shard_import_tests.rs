@@ -3109,6 +3109,10 @@ async fn reimport_failed_to_scheduled_ignores_stale_concurrency_requests() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "reimp-stale-req-target:1:stale".to_string(),
+        limits: Vec::new(),
     };
     let stale_request_key = silo::keys::concurrency_request_key(
         "-",

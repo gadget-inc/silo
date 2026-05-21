@@ -3,7 +3,7 @@
 //! This module contains the core task types that represent units of work
 //! in the system, along with associated records for leases and concurrency.
 
-use crate::job::{GubernatorRateLimit, JobView};
+use crate::job::{GubernatorRateLimit, JobView, Limit};
 use crate::job_attempt::JobAttemptView;
 
 /// Default lease duration for dequeued tasks (milliseconds)
@@ -35,8 +35,19 @@ pub enum Task {
         attempt_number: u32,
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
-        request_id: String,
+        /// The chain's task identifier. Used as the holder/lease key, and
+        /// carried forward through the chain so prior holders remain
+        /// reachable by the same id.
+        task_id: String,
         task_group: String,
+        /// Position of the gating limit in the job's canonical limit order
+        /// (see `limit_processing_order`). When granted, chain resumes at
+        /// `limit_index + 1`.
+        limit_index: u32,
+        /// Concurrency queues already held by earlier chain steps.
+        held_queues: Vec<String>,
+        /// Full limits list, persisted so chain resume avoids a JobInfo fetch.
+        limits: Vec<Limit>,
     },
     /// Internal: check a Gubernator rate limit before proceeding
     CheckRateLimit {
@@ -149,6 +160,18 @@ pub enum ConcurrencyAction {
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
         task_group: String,
+        /// Position of the gating limit in the job's canonical limit order
+        /// (see `limit_processing_order`). When granted, the chain resumes
+        /// at `limit_index + 1`.
+        limit_index: u32,
+        /// Concurrency queues already held by earlier chain steps.
+        held_queues: Vec<String>,
+        /// The chain's task identifier. Used as the holder key for prior
+        /// grants and carried forward as the follow-up task's task_id when
+        /// the chain resumes.
+        task_id: String,
+        /// Full limits list, persisted so chain resume avoids JobInfo lookups.
+        limits: Vec<Limit>,
     },
 }
 

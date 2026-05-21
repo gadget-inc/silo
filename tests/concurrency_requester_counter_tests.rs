@@ -310,6 +310,10 @@ async fn inject_fake_request(
         attempt_number: attempt,
         relative_attempt_number: attempt,
         task_group: "default".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: format!("{}:{}:fake", fake_job_id, attempt),
+        limits: Vec::new(),
     };
     let action_val = encode_concurrency_action(&action);
     db.put(&req_key, &action_val)

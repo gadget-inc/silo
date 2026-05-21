@@ -124,6 +124,10 @@ fn test_concurrency_action_roundtrip() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "tid".to_string(),
+        limits: Vec::new(),
     };
     let encoded = encode_concurrency_action(&action);
     let decoded = decode_concurrency_action(encoded).unwrap();
@@ -146,8 +150,11 @@ fn test_request_ticket_roundtrip() {
         job_id: "job-42".to_string(),
         attempt_number: 2,
         relative_attempt_number: 1,
-        request_id: "req-abc".to_string(),
+        task_id: "req-abc".to_string(),
         task_group: "fast".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        limits: Vec::new(),
     };
     let encoded = encode_task(&task);
     let decoded = decode_task(&encoded).unwrap();
@@ -160,8 +167,11 @@ fn test_request_ticket_roundtrip() {
             job_id,
             attempt_number,
             relative_attempt_number,
-            request_id,
+            task_id,
             task_group,
+            limit_index,
+            held_queues,
+            limits,
         } => {
             assert_eq!(queue, "q1");
             assert_eq!(start_time_ms, 5000);
@@ -170,8 +180,11 @@ fn test_request_ticket_roundtrip() {
             assert_eq!(job_id, "job-42");
             assert_eq!(attempt_number, 2);
             assert_eq!(relative_attempt_number, 1);
-            assert_eq!(request_id, "req-abc");
+            assert_eq!(task_id, "req-abc");
             assert_eq!(task_group, "fast");
+            assert_eq!(limit_index, 0);
+            assert!(held_queues.is_empty());
+            assert!(limits.is_empty());
         }
         _ => panic!("expected RequestTicket variant"),
     }
@@ -502,8 +515,11 @@ fn test_decoded_task_request_ticket() {
         job_id: "j-rt".to_string(),
         attempt_number: 1,
         relative_attempt_number: 1,
-        request_id: "req-rt".to_string(),
+        task_id: "req-rt".to_string(),
         task_group: "fast".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        limits: Vec::new(),
     };
     let encoded = encode_task(&task);
     let decoded = decode_task_validated(encoded).unwrap();
