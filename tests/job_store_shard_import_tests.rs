@@ -3197,3 +3197,213 @@ async fn reimport_failed_to_scheduled_ignores_stale_concurrency_requests() {
         "grant scanner must not grant stale request attempts after reimport"
     );
 }
+
+/// Helper: count concurrency holders for (tenant, queue) via DB scan.
+async fn count_holders_for_queue(
+    db: &silo::instrumented_db::InstrumentedDb,
+    tenant: &str,
+    queue: &str,
+) -> usize {
+    let start = silo::keys::concurrency_holders_queue_prefix(tenant, queue);
+    let end = silo::keys::end_bound(&start);
+    let mut iter = db
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .expect("scan holders");
+    let mut count = 0;
+    while let Ok(Some(_)) = iter.next().await {
+        count += 1;
+    }
+    count
+}
+
+/// Reimporting a Scheduled job parked on a future `RequestTicket` (the
+/// `FutureRequestTaskWritten` outcome) must release every upstream chain
+/// grant carried on the ticket's `held_queues`.
+///
+/// Setup: job1 fills B (cap=1). job2 is future-scheduled with
+/// `[A (free), B (full)]`. The chain walker grants A and writes a future
+/// `RequestTicket` for B carrying `held_queues=[A]`. Reimport job2 with a
+/// new payload — the reimport tears down the old scheduling state and
+/// must release A's holder, otherwise the slot leaks forever.
+#[silo::test]
+async fn reimport_releases_held_queues_on_future_request_ticket() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let tenant = "-";
+    let queue_a = "reimp-rt-a".to_string();
+    let queue_b = "reimp-rt-b".to_string();
+    let now = test_helpers::now_ms();
+
+    // job1 holds B. Use the natural enqueue path; dequeue to lease.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue_b.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let _j1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+
+    // job2: future-scheduled with [A free, B full] AND an explicit id so we
+    // can reimport it.
+    let job2_id = "reimp-rt-job".to_string();
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            Some(job2_id.clone()),
+            10u8,
+            now + 600_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    // Chain grants A and writes the future ticket with held=[A].
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "chain should have granted A at enqueue"
+    );
+
+    // Reimport job2 with a fresh terminal attempt — replaces the old
+    // Scheduled state. The future RequestTicket gets torn down and its
+    // held_queues must be released.
+    let mut reimport = base_import_params(&job2_id);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue_a.clone(),
+        max_concurrency: 1,
+    })];
+    reimport.attempts = vec![succeeded_attempt(now + 1_000)];
+    let r = shard.import_jobs(tenant, vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Succeeded);
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "reimport must release the held_queues carried on the future RequestTicket"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue_a),
+        0,
+        "in-memory holder count for A must also drop to zero"
+    );
+}
+
+/// Reimporting a Scheduled job parked on an immediate deferred
+/// concurrency request (the `TicketRequested` outcome — no task in the
+/// DB queue, just a request key) must release every upstream chain grant
+/// the request value carries on its `held_queues`. The reimport path
+/// previously dropped the holders returned by
+/// `delete_concurrency_requests_for_job`.
+#[silo::test]
+async fn reimport_releases_held_queues_on_deferred_request() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let tenant = "-";
+    let queue_a = "reimp-def-a".to_string();
+    let queue_b = "reimp-def-b".to_string();
+    let now = test_helpers::now_ms();
+
+    // job1 holds B.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue_b.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let _j1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+
+    // job2: immediate [A free, B full] with an explicit id.
+    let job2_id = "reimp-def-job".to_string();
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            Some(job2_id.clone()),
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    // Chain grants A and writes a deferred B-request with held=[A].
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "chain should have granted A at enqueue"
+    );
+    assert!(
+        test_helpers::count_concurrency_requests(shard.db()).await >= 1,
+        "expected a deferred concurrency request"
+    );
+
+    // Reimport job2 — replaces the old scheduling state; the deferred
+    // request's held holders must be released.
+    let mut reimport = base_import_params(&job2_id);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue_a.clone(),
+        max_concurrency: 1,
+    })];
+    reimport.attempts = vec![succeeded_attempt(now + 1_000)];
+    let r = shard.import_jobs(tenant, vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Succeeded);
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "reimport must release held_queues from the deferred concurrency request"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue_a),
+        0,
+        "in-memory holder count for A must also drop to zero"
+    );
+}

@@ -3317,6 +3317,164 @@ async fn rate_limit_retry_preserves_chain_task_id() {
     );
 }
 
+/// Rate-limit retry must dodge the broker tombstone installed by the
+/// parent CheckRateLimit's ack-delete, even with zero (or near-zero)
+/// backoff. Pre-fix, `schedule_rate_limit_retry` wrote the retry at
+/// `task_key(retry_at_ms, …)` with no bump — if `retry_at_ms` collided
+/// with the parent's `start_time_ms` (zero backoff, or
+/// `reset_time_ms == parent.start_time_ms`), the retry write landed on
+/// the just-tombstoned key and was silently suppressed. The chain
+/// stalled and every entry in the CheckRateLimit's `held_queues`
+/// leaked.
+///
+/// This test scans the broker queue immediately after the first retry
+/// is scheduled and asserts the retry's persisted `start_time_ms` is
+/// strictly greater than the parent's — i.e. the dodge fires
+/// regardless of clock skew between enqueue and dequeue.
+#[silo::test]
+async fn rate_limit_retry_dodges_parent_tombstone_with_zero_backoff() {
+    use silo::gubernator::{GubernatorError, RateLimitClient, RateLimitResult};
+    use silo::pb::gubernator::Algorithm;
+
+    // Always-over-limit client so we can observe the retry that gets
+    // scheduled without it being consumed by a successful dequeue first.
+    struct AlwaysOverLimit;
+    #[async_trait::async_trait]
+    impl RateLimitClient for AlwaysOverLimit {
+        async fn check_rate_limit(
+            &self,
+            _name: &str,
+            _unique_key: &str,
+            _hits: i64,
+            limit: i64,
+            duration_ms: i64,
+            _algorithm: Algorithm,
+            _behavior: i32,
+        ) -> Result<RateLimitResult, GubernatorError> {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            Ok(RateLimitResult {
+                under_limit: false,
+                limit,
+                remaining: 0,
+                reset_time_ms: now_ms + duration_ms,
+                error: None,
+            })
+        }
+        async fn health_check(&self) -> Result<(String, i32), GubernatorError> {
+            Ok(("ok".to_string(), 1))
+        }
+    }
+
+    let (_tmp, shard) = open_temp_shard_with_rate_limiter(Arc::new(AlwaysOverLimit)).await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "rl-tomb-a".to_string();
+
+    // Zero-backoff rate-limit policy: this is the worst case for
+    // `retry_at_ms == parent_start_time_ms` collisions.
+    let rate_limit = GubernatorRateLimit {
+        name: "rl-tomb".to_string(),
+        unique_key: "rl-tomb-key".to_string(),
+        limit: 1,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            backoff_multiplier: 1.0,
+            max_retries: 10,
+        },
+    };
+
+    let _job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "rl-tomb"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(rate_limit),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    // Snapshot the parent CheckRateLimit's task_key start_time_ms before
+    // we let dequeue run.
+    let parent_start_time_ms = {
+        let start = silo::keys::tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        let mut found = None;
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(task) = decode_task(&kv.value)
+                && matches!(task, Task::CheckRateLimit { .. })
+            {
+                let parsed = silo::keys::parse_task_key(&kv.key).expect("parse task_key");
+                found = Some(parsed.start_time_ms as i64);
+                break;
+            }
+        }
+        found.expect("a CheckRateLimit task should be in the queue")
+    };
+
+    // Drive one dequeue — Gubernator returns over-limit, so the handler
+    // schedules a retry. With backoff=0 and `reset_time_ms` typically
+    // landing in the same wall-clock millisecond as `parent_start_time_ms`,
+    // pre-fix this would have produced a task_key that collides with the
+    // tombstone and gets suppressed; the retry would never re-appear in
+    // the queue.
+    let _ = shard.dequeue("w1", "default", 1).await.expect("dequeue");
+
+    // Scan again. The retry CheckRateLimit must be present AND its
+    // task_key's start_time_ms must be strictly greater than the
+    // parent's, demonstrating the dodge fired.
+    let retry_start_time_ms = {
+        let start = silo::keys::tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        let mut found = None;
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(task) = decode_task(&kv.value)
+                && matches!(task, Task::CheckRateLimit { .. })
+            {
+                let parsed = silo::keys::parse_task_key(&kv.key).expect("parse task_key");
+                found = Some(parsed.start_time_ms as i64);
+                break;
+            }
+        }
+        found
+    };
+    let retry_start_time_ms = retry_start_time_ms
+        .expect("retry CheckRateLimit should be in the queue after the over-limit response");
+
+    assert!(
+        retry_start_time_ms > parent_start_time_ms,
+        "retry's task_key start_time_ms ({retry_start_time_ms}) must be > parent's ({parent_start_time_ms}) to dodge the tombstone"
+    );
+}
+
 /// If the chain resumer is unavailable when the grant scanner runs (shard
 /// shutting down, or never installed), the scanner must release every
 /// in-memory reservation it made this pass and return without committing.
