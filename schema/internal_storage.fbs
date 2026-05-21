@@ -86,8 +86,24 @@ table RequestTicket {
   job_id: string;
   attempt_number: uint32;
   relative_attempt_number: uint32;
-  request_id: string;
+  /// The chain's task identifier. Used as the holder/lease key, and carried
+  /// forward through the chain so prior holders accumulated under the same
+  /// task_id remain reachable. Distinct from the random suffix in the task
+  /// key (which only ensures key uniqueness).
+  task_id: string;
   task_group: string;
+  /// Index into the job's canonical limit order (see limit_processing_order)
+  /// for the limit this ticket is gating on. When the ticket is granted, the
+  /// chain resumes at `limit_index + 1`.
+  limit_index: uint32;
+  /// Queues for which concurrency holders are already in place from earlier
+  /// chain steps (e.g., a Concurrency limit granted before this one blocked).
+  /// When the ticket is granted, the just-won queue is appended and the chain
+  /// continues.
+  held_queues: [string];
+  /// Full limits list for the job. Persisted here so chain resume at dequeue
+  /// time does not need to fetch JobInfo just to walk the next limits.
+  limits: [LimitEntry];
 }
 
 table CheckRateLimit {
@@ -237,6 +253,23 @@ table EnqueueTask {
   attempt_number: uint32;
   relative_attempt_number: uint32;
   task_group: string;
+  /// Index into the job's canonical limit order (see limit_processing_order)
+  /// for the limit this request is gating on. When the slot is granted by the
+  /// grant scanner, the chain resumes at `limit_index + 1`.
+  limit_index: uint32;
+  /// Queues for which concurrency holders are already in place from earlier
+  /// chain steps. The grant scanner appends the just-won queue and continues
+  /// the chain via `enqueue_limit_task_at_index`.
+  held_queues: [string];
+  /// The chain's task identifier. Used as the holder key for grants the
+  /// chain has accumulated so far, and as the task_id for any follow-up
+  /// task (`RunAttempt` / `CheckRateLimit`) written when the chain resumes.
+  /// Distinct from the random suffix in the request key (which only ensures
+  /// per-request uniqueness in durable storage).
+  task_id: string;
+  /// Full limits list for the job. Persisted here so the grant scanner can
+  /// walk the remaining limits without fetching JobInfo per grant.
+  limits: [LimitEntry];
 }
 
 union ConcurrencyActionVariant {

@@ -10,6 +10,7 @@ pub(crate) mod helpers;
 pub mod import;
 mod lease;
 mod lease_task;
+pub(crate) mod limit_chain;
 mod rate_limit;
 mod restart;
 mod scan;
@@ -322,6 +323,10 @@ impl From<crate::concurrency::ConcurrencyError> for JobStoreShardError {
         match e {
             crate::concurrency::ConcurrencyError::Slate(e) => JobStoreShardError::Slate(e),
             crate::concurrency::ConcurrencyError::Encoding(s) => JobStoreShardError::Codec(s),
+            crate::concurrency::ConcurrencyError::ShardShuttingDown => {
+                JobStoreShardError::Codec("shard shutting down".to_string())
+            }
+            crate::concurrency::ConcurrencyError::ChainResume(s) => JobStoreShardError::Codec(s),
         }
     }
 }
@@ -496,10 +501,6 @@ impl JobStoreShard {
             range.clone(),
         );
 
-        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready.
-        // It takes the instrumented db so its writes are tagged with the shard span too.
-        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
-
         let shard = Arc::new(Self {
             name,
             db,
@@ -519,6 +520,23 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
         });
+
+        // Install the chain resumer before starting the grant scanner so the
+        // scanner's first wake-up has a working callback for resuming limit
+        // chains after a deferred grant. Uses a Weak<JobStoreShard> internally
+        // so this trait object does not form a strong reference cycle.
+        shard
+            .concurrency
+            .set_chain_resumer(limit_chain::ShardChainResumer::install(&shard));
+
+        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready,
+        // and after the chain resumer is installed. It takes the instrumented db so its writes
+        // are tagged with the shard span too.
+        shard.concurrency.start_grant_scanner(
+            Arc::clone(&shard.db),
+            Arc::clone(&shard.brokers),
+            range.clone(),
+        );
 
         // Periodically reconcile pending concurrency requests to self-heal from
         // missed in-memory notifications or transient scanner failures.
