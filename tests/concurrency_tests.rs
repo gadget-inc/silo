@@ -142,8 +142,16 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
     let tenant = "-";
     let queue = "reconcile-q".to_string();
 
-    // Create a real job record that the grant scanner can resolve when granting.
-    // Use a future start time so no ready task exists for this job yet.
+    // Create a real job record that the grant scanner can resolve when
+    // granting. Use a future start time so no ready task exists for this
+    // job yet. Give the job a concurrency limit on `queue` so the injected
+    // request is well-formed — post-schema-update the scanner expects
+    // requests to persist their limits list and rejects ones with an empty
+    // list as corrupt.
+    let conc_limit = silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.clone(),
+        max_concurrency: 1,
+    });
     let job_id = shard
         .enqueue(
             tenant,
@@ -152,12 +160,46 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
             now + 60_000,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"reconcile": true})),
-            vec![],
+            vec![conc_limit.clone()],
             None,
             "default",
         )
         .await
         .expect("enqueue");
+
+    // The enqueue above grants the queue's only slot to this job and writes
+    // a holder under a freshly-generated task_id. Look that task_id up and
+    // clear it (DB + in-memory) so we can simulate an "orphan request"
+    // (durable request exists but the in-memory scanner notification was
+    // missed). The manual request below reuses the same task_id so the
+    // chain resumer's holder lookups stay coherent.
+    let holders_prefix = silo::keys::concurrency_holders_queue_prefix(tenant, &queue);
+    let mut iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(
+            holders_prefix.clone()..silo::keys::end_bound(&holders_prefix),
+            &silo::scan_options(),
+        )
+        .await
+        .expect("scan holders");
+    let kv = iter
+        .next()
+        .await
+        .expect("iter")
+        .expect("a holder must exist from the natural enqueue");
+    let holder_key = kv.key.to_vec();
+    let parsed = silo::keys::parse_concurrency_holder_key(&holder_key).expect("parse holder key");
+    let manual_task_id = parsed.task_id;
+    drop(iter);
+
+    let mut clear_batch = WriteBatch::new();
+    clear_batch.delete(&holder_key);
+    shard
+        .db()
+        .write(clear_batch)
+        .await
+        .expect("clear pre-existing holder");
+    shard.rollback_concurrency_grant_for_test(tenant, &queue, &manual_task_id);
 
     assert_eq!(
         count_concurrency_holders(shard.db()).await,
@@ -177,8 +219,8 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
         task_group: "default".to_string(),
         limit_index: 0,
         held_queues: Vec::new(),
-        task_id: format!("{}:1:manual", job_id),
-        limits: Vec::new(),
+        task_id: manual_task_id.clone(),
+        limits: vec![conc_limit.clone()],
     };
     let request_key = concurrency_request_key(tenant, &queue, now, 10, &job_id, 1, "manual");
     let request_value = encode_concurrency_action(&action);
