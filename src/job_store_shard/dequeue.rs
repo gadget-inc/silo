@@ -597,6 +597,45 @@ impl JobStoreShard {
         state.batch.delete(task_key);
         state.ack_deleted(task_key);
 
+        // Terminal-status short-circuit. Symmetric with handle_request_ticket:
+        // if the job is Succeeded/Failed/Cancelled there's no point calling
+        // Gubernator (wastes quota) or advancing the chain (leaks slots until
+        // a worker happens to discover cancellation on heartbeat). Drop the
+        // task and release any upstream holders the chain accumulated.
+        let drop_and_release = |state: &mut DequeueIterationState| {
+            for q in held_queues.iter() {
+                let queue = q.clone();
+                state
+                    .batch
+                    .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                state
+                    .holder_releases
+                    .push((tenant.to_string(), queue, check_task_id.to_string()));
+            }
+        };
+        match self.db.get(&job_status_key(tenant, job_id)).await? {
+            Some(raw) => match decode_job_status_owned(&raw) {
+                Ok(status)
+                    if matches!(
+                        status.kind,
+                        JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled
+                    ) =>
+                {
+                    drop_and_release(state);
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    drop_and_release(state);
+                    return Ok(());
+                }
+            },
+            None => {
+                drop_and_release(state);
+                return Ok(());
+            }
+        }
+
         // Load job info to get the full limits list
         let job_key = job_info_key(tenant, job_id);
         let maybe_job = self.db.get(&job_key).await?;
@@ -607,34 +646,14 @@ impl JobStoreShard {
                     // Drop the task and release any concurrency holders it
                     // carries from earlier chained limits. Symmetric with the
                     // missing-job_info path below and with handle_run_attempt.
-                    for q in held_queues.iter() {
-                        let queue = q.clone();
-                        state
-                            .batch
-                            .delete(concurrency_holder_key(tenant, &queue, check_task_id));
-                        state.holder_releases.push((
-                            tenant.to_string(),
-                            queue,
-                            check_task_id.to_string(),
-                        ));
-                    }
+                    drop_and_release(state);
                     return Ok(());
                 }
             },
             None => {
                 // Job missing — drop the task and release any concurrency
                 // holders it carries from earlier chained limits.
-                for q in held_queues.iter() {
-                    let queue = q.clone();
-                    state
-                        .batch
-                        .delete(concurrency_holder_key(tenant, &queue, check_task_id));
-                    state.holder_releases.push((
-                        tenant.to_string(),
-                        queue,
-                        check_task_id.to_string(),
-                    ));
-                }
+                drop_and_release(state);
                 return Ok(());
             }
         };

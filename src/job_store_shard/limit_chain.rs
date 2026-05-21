@@ -45,8 +45,11 @@ impl LimitChainResumer for ShardChainResumer {
             .ok_or(ConcurrencyError::ShardShuttingDown)?;
 
         // The full limits list rides on the deferred request/ticket value, so
-        // we never have to round-trip JobInfo here.
-        let now_ms = crate::job_store_shard::now_epoch_ms();
+        // we never have to round-trip JobInfo here. `now_ms` is threaded
+        // through from the scanner so the `task_key(now_ms, …)` we write
+        // here can't disagree with the `granted_at_ms` the scanner already
+        // baked into this batch.
+        let now_ms = params.now_ms;
 
         // `scheduled_at_ms` stays honest — the chain's original user-requested
         // start time — so the future-scheduling check and any persisted
