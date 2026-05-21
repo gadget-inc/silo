@@ -34,7 +34,22 @@ pub(crate) struct LimitTaskParams<'a> {
     pub limit_index: usize,
     pub limits: &'a [Limit],
     pub priority: u8,
-    pub start_at_ms: i64,
+    /// The job's user-requested start time. Used purely as the "is this
+    /// future-scheduled?" predicate (`scheduled_at_ms > now_ms` ⇒ write a
+    /// `Task::RequestTicket` instead of an in-queue request record) and as
+    /// the `start_time_ms` we persist on `EnqueueTask` so `process_grants`
+    /// can skip future-dated requests on resume.
+    pub scheduled_at_ms: i64,
+    /// The time component baked into every `task_key` / `concurrency_request_key`
+    /// this chain step writes. For a fresh enqueue this equals
+    /// `scheduled_at_ms` so a future-scheduled `RequestTicket` lands at the
+    /// future time. For a chain *resume* — `ShardChainResumer::resume_chain`
+    /// — this is `now_ms`, so the resumed task cannot collide with a broker
+    /// tombstone pinned by an earlier ack-delete at the original
+    /// `task_key(scheduled_at_ms, …)`. See
+    /// `project_broker_tombstone_chain_continuation` and the precedent in
+    /// `handle_request_ticket` (dequeue.rs).
+    pub task_key_start_ms: i64,
     pub now_ms: i64,
     pub held_queues: Vec<String>,
     pub task_group: &'a str,
@@ -399,7 +414,12 @@ impl JobStoreShard {
                 limit_index: 0,
                 limits: &job.limits,
                 priority,
-                start_at_ms,
+                // Fresh enqueue: scheduled and task_key time coincide. If the
+                // job is future-scheduled (`start_at_ms > now_ms`) the
+                // resulting `RequestTicket` lands at the future time so the
+                // broker picks it up exactly then.
+                scheduled_at_ms: start_at_ms,
+                task_key_start_ms: start_at_ms,
                 now_ms,
                 held_queues: Vec::new(),
                 task_group,
@@ -499,7 +519,8 @@ impl JobStoreShard {
             limit_index,
             limits,
             priority,
-            start_at_ms,
+            scheduled_at_ms,
+            task_key_start_ms,
             now_ms,
             held_queues,
             task_group,
@@ -530,7 +551,7 @@ impl JobStoreShard {
                 put_task(
                     writer,
                     task_group,
-                    start_at_ms,
+                    task_key_start_ms,
                     priority,
                     job_id,
                     attempt_number,
@@ -552,7 +573,8 @@ impl JobStoreShard {
                             &current_task_id,
                             job_id,
                             priority,
-                            start_at_ms,
+                            scheduled_at_ms,
+                            task_key_start_ms,
                             now_ms,
                             std::slice::from_ref(cl),
                             task_group,
@@ -590,7 +612,7 @@ impl JobStoreShard {
                         if queued_with_request && !grants.is_empty() {
                             writer.delete(task_key(
                                 task_group,
-                                start_at_ms,
+                                task_key_start_ms,
                                 priority,
                                 job_id,
                                 attempt_number,
@@ -624,7 +646,8 @@ impl JobStoreShard {
                             &current_task_id,
                             job_id,
                             priority,
-                            start_at_ms,
+                            scheduled_at_ms,
+                            task_key_start_ms,
                             now_ms,
                             std::slice::from_ref(&temp_cl),
                             task_group,
@@ -681,7 +704,7 @@ impl JobStoreShard {
                         if queued_with_request && !grants.is_empty() {
                             writer.delete(task_key(
                                 task_group,
-                                start_at_ms,
+                                task_key_start_ms,
                                 priority,
                                 job_id,
                                 attempt_number,
@@ -710,7 +733,7 @@ impl JobStoreShard {
                     put_task(
                         writer,
                         task_group,
-                        start_at_ms,
+                        task_key_start_ms,
                         priority,
                         job_id,
                         attempt_number,

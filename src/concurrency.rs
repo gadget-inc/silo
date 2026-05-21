@@ -839,7 +839,19 @@ impl ConcurrencyManager {
         task_id: &str,
         job_id: &str,
         priority: u8,
-        start_at_ms: i64,
+        // The job's user-requested start time. Drives the future-scheduling
+        // decision (`scheduled_at_ms > now_ms` ⇒ write a `Task::RequestTicket`
+        // at that future time) and is persisted as `start_time_ms` on any
+        // request record / RequestTicket task so `process_grants` can later
+        // skip future-dated requests.
+        scheduled_at_ms: i64,
+        // Time component for every `task_key` / `concurrency_request_key` this
+        // call writes. For a fresh enqueue this equals `scheduled_at_ms`. For
+        // a chain *resume* this is `now_ms`, so the resumed task can't
+        // collide with a broker tombstone pinned by an earlier ack-delete at
+        // `task_key(scheduled_at_ms, …)`. See
+        // `project_broker_tombstone_chain_continuation`.
+        task_key_start_ms: i64,
         now_ms: i64,
         limits: &[ConcurrencyLimit],
         task_group: &str,
@@ -887,7 +899,7 @@ impl ConcurrencyManager {
                 tenant,
                 queue,
                 task_id,
-                start_at_ms,
+                task_key_start_ms,
                 priority,
                 job_id,
                 attempt_number,
@@ -905,7 +917,7 @@ impl ConcurrencyManager {
                 task_id: task_id.to_string(),
                 queue: queue.clone(),
             }))
-        } else if start_at_ms <= now_ms {
+        } else if scheduled_at_ms <= now_ms {
             // [SILO-ENQ-CONC-4] [SILO-IMP-CONC-3] [SILO-REIMP-CONC-3] Queue is at capacity
             // [SILO-ENQ-CONC-5] [SILO-IMP-CONC-4] [SILO-REIMP-CONC-4] No task in DB queue, request created
             // [SILO-ENQ-CONC-6] Create request record instead
@@ -913,7 +925,7 @@ impl ConcurrencyManager {
                 writer,
                 tenant,
                 queue,
-                start_at_ms,
+                scheduled_at_ms,
                 priority,
                 job_id,
                 attempt_number,
@@ -933,9 +945,14 @@ impl ConcurrencyManager {
             // at dequeue time, the holder it creates joins the same task_id
             // as any prior holders accumulated by the chain (avoiding the
             // task_id mismatch that used to orphan earlier grants).
+            //
+            // For a future-scheduled enqueue the broker must see this task
+            // at the user-requested time, so `task_key_start_ms ==
+            // scheduled_at_ms` on this branch. (No call site sets them apart
+            // here — resume goes through the request branch above.)
             let ticket = Task::RequestTicket {
                 queue: queue.clone(),
-                start_time_ms: start_at_ms,
+                start_time_ms: scheduled_at_ms,
                 priority,
                 tenant: tenant.to_string(),
                 job_id: job_id.to_string(),
@@ -949,7 +966,13 @@ impl ConcurrencyManager {
             };
             let ticket_value = encode_task(&ticket);
             writer.put(
-                task_key(task_group, start_at_ms, priority, job_id, attempt_number),
+                task_key(
+                    task_group,
+                    task_key_start_ms,
+                    priority,
+                    job_id,
+                    attempt_number,
+                ),
                 &ticket_value,
             )?;
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
@@ -1546,7 +1569,7 @@ fn append_grant_edits<W: WriteBatcher>(
     tenant: &str,
     queue: &str,
     task_id: &str,
-    start_time_ms: i64,
+    task_key_start_ms: i64,
     priority: u8,
     job_id: &str,
     attempt_number: u32,
@@ -1570,7 +1593,13 @@ fn append_grant_edits<W: WriteBatcher>(
     };
     let task_value = encode_task(&task);
     writer.put(
-        task_key(task_group, start_time_ms, priority, job_id, attempt_number),
+        task_key(
+            task_group,
+            task_key_start_ms,
+            priority,
+            job_id,
+            attempt_number,
+        ),
         &task_value,
     )?;
 
