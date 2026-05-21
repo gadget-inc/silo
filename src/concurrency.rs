@@ -456,7 +456,7 @@ impl ConcurrencyCounts {
         job_id: &str,
     ) -> bool {
         let key = queue_key(tenant, queue);
-        let reserved = {
+        let (reserved, holders_len_after) = {
             let mut entry = self.queues.entry(key).or_insert_with(QueueEntry::new);
 
             // Check if we're at capacity
@@ -466,10 +466,25 @@ impl ConcurrencyCounts {
 
             // Reserve the slot atomically
             entry.holders.insert(task_id.to_string());
-            true
+            (true, entry.holders.len())
         }; // shard guard dropped here
 
         if reserved {
+            // Bench-debug: warn if a successful reserve lands above the limit.
+            // The check inside the lock guarantees this can't happen normally;
+            // a triggered warning indicates a logic bug (e.g. limit param
+            // mismatch, hydration race).
+            if holders_len_after > limit {
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue = %queue,
+                    task_id = %task_id,
+                    job_id = %job_id,
+                    limit = limit,
+                    holders_after = holders_len_after,
+                    "try_reserve_internal: reserved past limit (potential bug)"
+                );
+            }
             dst_events::emit(DstEvent::ConcurrencyTicketGranted {
                 tenant: tenant.to_string(),
                 queue: queue.to_string(),
