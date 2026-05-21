@@ -3169,6 +3169,154 @@ async fn cancel_deferred_concurrency_request_releases_held_queues() {
     );
 }
 
+/// Rate-limit retry must carry the chain's `task_id` forward. The chain's
+/// holders are keyed by that id; if the retry's CheckRateLimit gets a
+/// fresh UUID, the terminal RunAttempt's id diverges from the holders
+/// previously written by the chain and worker completion releases under
+/// the wrong key — leaking one slot per rate-limit retry.
+///
+/// This test exercises a job with `[Concurrency-A, RateLimit]` where
+/// Gubernator says "over" on the first check and "under" on the second.
+/// After the worker completes the RunAttempt, A must have zero holders.
+#[silo::test]
+async fn rate_limit_retry_preserves_chain_task_id() {
+    use silo::gubernator::{GubernatorError, RateLimitClient, RateLimitResult};
+    use silo::pb::gubernator::Algorithm;
+    use std::sync::atomic::AtomicU32;
+
+    /// Returns under_limit=false on the first N calls, then under_limit=true.
+    struct FailFirstThenPassClient {
+        fail_n: u32,
+        seen: AtomicU32,
+    }
+    #[async_trait::async_trait]
+    impl RateLimitClient for FailFirstThenPassClient {
+        async fn check_rate_limit(
+            &self,
+            _name: &str,
+            _unique_key: &str,
+            _hits: i64,
+            limit: i64,
+            duration_ms: i64,
+            _algorithm: Algorithm,
+            _behavior: i32,
+        ) -> Result<RateLimitResult, GubernatorError> {
+            let i = self.seen.fetch_add(1, Ordering::SeqCst);
+            let under_limit = i >= self.fail_n;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            Ok(RateLimitResult {
+                under_limit,
+                limit,
+                remaining: if under_limit { limit } else { 0 },
+                reset_time_ms: now_ms + duration_ms,
+                error: None,
+            })
+        }
+        async fn health_check(&self) -> Result<(String, i32), GubernatorError> {
+            Ok(("ok".to_string(), 1))
+        }
+    }
+
+    let client = Arc::new(FailFirstThenPassClient {
+        fail_n: 1,
+        seen: AtomicU32::new(0),
+    });
+    let (_tmp, shard) = open_temp_shard_with_rate_limiter(client.clone()).await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "rl-retry-a".to_string();
+
+    let rate_limit = GubernatorRateLimit {
+        name: "rl-retry".to_string(),
+        unique_key: "rl-retry-key".to_string(),
+        limit: 1,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 5,
+            max_backoff_ms: 50,
+            backoff_multiplier: 2.0,
+            max_retries: 10,
+        },
+    };
+
+    let _job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "rl-retry"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(rate_limit),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    // Chain grants A and writes a CheckRateLimit task; A's holder is in
+    // place under the chain's `task_id`.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "chain should have granted A at enqueue"
+    );
+
+    // Drive dequeues: first dequeue picks up the CheckRateLimit, which
+    // returns over-limit and schedules a retry. Second dequeue (after the
+    // retry's backoff) picks up the retry, which now passes and writes a
+    // RunAttempt under the *same* task_id.
+    let mut leased_task_id: Option<String> = None;
+    for _ in 0..50 {
+        let tasks = shard
+            .dequeue("w1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        if let Some(t) = tasks.into_iter().next() {
+            leased_task_id = Some(t.attempt().task_id().to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let leased_task_id = leased_task_id.expect("a RunAttempt should eventually be leased");
+    assert!(
+        client.seen.load(Ordering::SeqCst) >= 2,
+        "the rate limiter should have been called at least twice (one fail, one pass)"
+    );
+
+    // Complete the RunAttempt. The release path keys by the leased
+    // task_id; if the retry mints a fresh UUID, the holder key doesn't
+    // match and A leaks.
+    shard
+        .report_attempt_outcome(&leased_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete RunAttempt");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "A's holder must be released after the chain completes — rate-limit retry must reuse the chain's task_id"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue_a),
+        0,
+        "in-memory holder count for A must also drop to zero"
+    );
+}
+
 /// If the chain resumer is unavailable when the grant scanner runs (shard
 /// shutting down, or never installed), the scanner must release every
 /// in-memory reservation it made this pass and return without committing.
