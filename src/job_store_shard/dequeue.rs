@@ -141,7 +141,7 @@ impl JobStoreShard {
                     continue;
                 }
 
-                match decoded.variant_type() {
+                let handler_result: Result<(), JobStoreShardError> = match decoded.variant_type() {
                     fb::TaskVariant::RequestTicket => {
                         self.handle_request_ticket(
                             &mut state,
@@ -152,34 +152,48 @@ impl JobStoreShard {
                             now_ms,
                             expiry_ms,
                         )
-                        .await?;
+                        .await
                     }
                     fb::TaskVariant::CheckRateLimit => {
                         self.handle_check_rate_limit(&mut state, &entry.key, decoded, now_ms)
-                            .await?;
+                            .await
                     }
-                    fb::TaskVariant::RefreshFloatingLimit => {
-                        self.handle_refresh_floating_limit(
-                            &mut state,
-                            &mut refresh_out,
-                            &entry.key,
-                            decoded,
-                            worker_id,
-                            expiry_ms,
-                        )?;
-                    }
+                    fb::TaskVariant::RefreshFloatingLimit => self.handle_refresh_floating_limit(
+                        &mut state,
+                        &mut refresh_out,
+                        &entry.key,
+                        decoded,
+                        worker_id,
+                        expiry_ms,
+                    ),
                     fb::TaskVariant::RunAttempt => {
                         self.handle_run_attempt(
                             &mut state, &entry.key, decoded, worker_id, now_ms, expiry_ms,
                         )
-                        .await?;
+                        .await
                     }
-                    other => {
-                        return Err(JobStoreShardError::Codec(format!(
-                            "unexpected task variant {:?}",
-                            other
-                        )));
+                    other => Err(JobStoreShardError::Codec(format!(
+                        "unexpected task variant {:?}",
+                        other
+                    ))),
+                };
+
+                if let Err(e) = handler_result {
+                    // Handler bailed mid-iteration. The batch will not be
+                    // committed, but any in-memory `try_reserve` reservations
+                    // that handlers (or the chain walker beneath them) pushed
+                    // into `state.grants_to_rollback` are real — release them
+                    // here or they leak as phantom holders. The outer
+                    // `grants_to_rollback` accumulator is always empty at this
+                    // point (cleared at the end of the prior iteration, not
+                    // yet merged for this one), so draining `state` is
+                    // sufficient. `holder_releases` is paired with batched
+                    // deletes that will not happen, so it must NOT be drained.
+                    for (tenant, queue, task_id) in state.grants_to_rollback.drain(..) {
+                        self.concurrency.rollback_grant(&tenant, &queue, &task_id);
                     }
+                    self.brokers.requeue(claimed);
+                    return Err(e);
                 }
             }
 
@@ -405,6 +419,24 @@ impl JobStoreShard {
         // Existence check: a missing job_status means the job has been wiped,
         // so the ticket is orphan. Just delete it. Cheaper than a JobInfo
         // fetch.
+        //
+        // If the ticket is dropped (terminal/missing/unreadable status), any
+        // concurrency holders the chain already accumulated (carried in
+        // `stored_held_queues`) must be released — otherwise those slots are
+        // permanently leaked. Mirrors the missing-job_info branches in
+        // handle_check_rate_limit and handle_run_attempt.
+        let drop_ticket_and_release = |state: &mut DequeueIterationState| {
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
+            for q in stored_held_queues.iter() {
+                state
+                    .batch
+                    .delete(concurrency_holder_key(&tenant, q, &task_id));
+                state
+                    .holder_releases
+                    .push((tenant.clone(), q.clone(), task_id.clone()));
+            }
+        };
         match self.db.get(&job_status_key(&tenant, &job_id)).await? {
             Some(raw) => match decode_job_status_owned(&raw) {
                 Ok(status)
@@ -413,22 +445,19 @@ impl JobStoreShard {
                         JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled
                     ) =>
                 {
-                    // Terminal: drop the ticket, nothing to do.
-                    state.batch.delete(task_key);
-                    state.ack_deleted(task_key);
+                    // Terminal: drop the ticket and release upstream holders.
+                    drop_ticket_and_release(state);
                     return Ok(());
                 }
                 Ok(_) => {}
                 Err(_) => {
                     // Unreadable status — treat as missing.
-                    state.batch.delete(task_key);
-                    state.ack_deleted(task_key);
+                    drop_ticket_and_release(state);
                     return Ok(());
                 }
             },
             None => {
-                state.batch.delete(task_key);
-                state.ack_deleted(task_key);
+                drop_ticket_and_release(state);
                 return Ok(());
             }
         }

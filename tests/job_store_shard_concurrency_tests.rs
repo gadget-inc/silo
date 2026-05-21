@@ -2679,7 +2679,24 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
     let queue_a = "chain-bfull-a".to_string();
     let queue_b = "chain-bfull-b".to_string();
 
-    // job1 occupies the single B slot. A capacity is 2 (so it never gates).
+    // A has capacity 3 so all three jobs can take an A slot; B is the
+    // bottleneck. With A capacity 3 we guarantee job2 and job3 both reach
+    // limit_index=1 with held_queues=[A] and defer on B — that's the
+    // resumable-chain state this test pins.
+    let limits = || {
+        vec![
+            Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_a.clone(),
+                max_concurrency: 3,
+            }),
+            Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_b.clone(),
+                max_concurrency: 1,
+            }),
+        ]
+    };
+
+    // job1 grabs both A and B.
     let _job1 = shard
         .enqueue(
             tenant,
@@ -2688,16 +2705,7 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
             now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
-            vec![
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_a.clone(),
-                    max_concurrency: 2,
-                }),
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_b.clone(),
-                    max_concurrency: 1,
-                }),
-            ],
+            limits(),
             None,
             "default",
         )
@@ -2706,7 +2714,7 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
     let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
     assert_eq!(job1_tasks.len(), 1, "job1 should run");
 
-    // job2 also wants [A, B]. It grabs an A slot (capacity 2) and blocks on B.
+    // job2 grabs A, defers on B with limit_index=1, held_queues=[A].
     let _job2 = shard
         .enqueue(
             tenant,
@@ -2715,23 +2723,14 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
             now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
-            vec![
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_a.clone(),
-                    max_concurrency: 2,
-                }),
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_b.clone(),
-                    max_concurrency: 1,
-                }),
-            ],
+            limits(),
             None,
             "default",
         )
         .await
         .expect("enqueue job2");
 
-    // job3 also wants [A, B]. Grabs the last A slot, also blocks on B.
+    // job3 also grabs A, also defers on B with limit_index=1, held_queues=[A].
     let _job3 = shard
         .enqueue(
             tenant,
@@ -2740,56 +2739,31 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
             now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
-            vec![
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_a.clone(),
-                    max_concurrency: 2,
-                }),
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_b.clone(),
-                    max_concurrency: 1,
-                }),
-            ],
+            limits(),
             None,
             "default",
         )
         .await
         .expect("enqueue job3");
 
-    // Sanity: A is full (job1+2+3 = 3 holders but capacity 2 — wait, that's
-    // overcommit). Actually job1 grabbed A (1 holder), job2 grabbed A (2 holders),
-    // job3 cannot grab A (capacity 2) — so job3 blocks on A, not B.
-    //
-    // Re-think: we wanted both job2 and job3 to block on B with limit_index=1.
-    // To force that, A capacity must be ≥3 OR we need a different setup.
-    // Let me use max_concurrency: 3 for A so all three get A.
-    //
-    // Test setup correction: we're testing the case where two jobs win A but
-    // block on B. So A must have capacity ≥ 3 (job1+job2+job3 all hold A).
-    //
-    // The test as written above uses capacity 2, which means job3 blocks on A,
-    // not B. That's a different scenario. We need to fix it.
-    //
-    // Let me drop the bug-replication assertion and just assert that AFTER
-    // job1 completes (freeing both its holders), at most one of {job2, job3}
-    // becomes runnable — the other should still be queued on B with the
-    // chain's stored limit_index=1 and held_queues=[A].
-    //
-    // First: see the actual state. There should be 2 holders on A (job1+job2,
-    // job3 blocked on A) and 1 on B (job1).
-    assert!(count_holders_for_queue(shard.db(), tenant, &queue_a).await >= 2);
+    // All three should hold A; only job1 holds B.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        3,
+        "all three jobs should hold A"
+    );
     assert_eq!(
         count_holders_for_queue(shard.db(), tenant, &queue_b).await,
-        1
+        1,
+        "only job1 should hold B"
     );
 
     let job1_task_id = job1_tasks[0].attempt().task_id().to_string();
 
-    // Release job1 — frees one A slot and the only B slot. Whichever of
-    // {job2, job3} the scanner picks first claims B. The other is still
-    // gated on either A or B; with two concurrency requests in flight, the
-    // chain resumer for the granted job advances limit_index past its
-    // first-blocked limit and writes a new request for the remaining one.
+    // Release job1 — frees one A slot and the only B slot. The grant
+    // scanner gives B to one of {job2, job3}; that job's chain advances and
+    // it becomes runnable. The other still has its deferred B-request with
+    // limit_index=1 and held_queues=[A] persisted.
     shard
         .report_attempt_outcome(&job1_task_id, AttemptOutcome::Success { result: vec![] })
         .await
@@ -2853,14 +2827,13 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
             !et.task_id().unwrap_or_default().is_empty(),
             "deferred request must persist a task_id"
         );
-        // For a chain resumed past index 0, we expect either limit_index > 0
-        // (chain wrote a new request after granting an earlier queue) OR
-        // limit_index == 0 with held_queues empty (original first-limit block).
         let li = et.limit_index();
         let hq: Vec<String> = et
             .held_queues()
             .map(|v| v.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
+        // A chain resumed past index 0 must persist both limit_index AND a
+        // matching held_queues. Both must be non-empty and consistent.
         if li > 0 || !hq.is_empty() {
             saw_resumable_state = true;
             assert_eq!(
@@ -2869,12 +2842,140 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
                 "chain state consistency: limit_index should equal the count of held_queues for a non-initial deferred request; got li={li} hq={:?}",
                 hq
             );
+            assert!(
+                hq.iter().any(|q| q == &queue_a),
+                "deferred B-request must carry A in held_queues; got {:?}",
+                hq
+            );
         }
     }
-    // It's OK if no resumable state was observed (the un-granted job may
-    // still be the original first-limit block). The test mainly proves the
-    // chain-state fields are populated and self-consistent when present.
-    let _ = saw_resumable_state;
+    // With A capacity=3 the un-granted job is guaranteed to be deferred on
+    // B at limit_index=1 with held_queues=[A], so we MUST observe the
+    // resumable state.
+    assert!(
+        saw_resumable_state,
+        "expected at least one deferred concurrency request to carry resumed-chain state (limit_index>0, held_queues=[A])"
+    );
+}
+
+/// Cancelling a future-scheduled multi-concurrency job whose chain has
+/// already won an upstream slot must release that slot.
+///
+/// Setup: job1 holds B (capacity 1). job2 is future-scheduled with
+/// `[A (free), B (full)]`. The chain walker grants A immediately at enqueue
+/// time and writes a future `RequestTicket` for B carrying
+/// `held_queues=[A]`. Pre-fix the cancel path saw `Task::RequestTicket {..}`
+/// and only deleted the task — A's holder leaked.
+#[silo::test]
+async fn cancel_future_request_ticket_releases_held_queues() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "cancel-fut-a".to_string();
+    let queue_b = "cancel-fut-b".to_string();
+
+    // job1 fills B so job2 cannot grant B at enqueue time.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_b.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+    assert_eq!(job1_tasks.len(), 1, "job1 should run and hold B");
+
+    // job2: future-scheduled with [A free, B full]. Chain grants A and
+    // writes a future RequestTicket for B with held_queues=[A].
+    let future_at = now + 600_000;
+    let job2_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            future_at,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    // Sanity: job2's A holder is in place.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "job2 should have grabbed A at enqueue time"
+    );
+
+    // Sanity: a RequestTicket task exists in the queue for job2.
+    let req_ticket_present = {
+        let start = silo::keys::tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        let mut found = false;
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(task) = decode_task(&kv.value)
+                && let Task::RequestTicket {
+                    job_id,
+                    ref held_queues,
+                    ..
+                } = task
+                && job_id == job2_id
+            {
+                assert_eq!(
+                    held_queues.as_slice(),
+                    std::slice::from_ref(&queue_a),
+                    "future RequestTicket should carry [A] in held_queues"
+                );
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    assert!(
+        req_ticket_present,
+        "expected a future RequestTicket task for job2"
+    );
+
+    // Cancel job2 — the future RequestTicket carries held_queues=[A]; the
+    // cancel path must delete that holder so the slot doesn't leak.
+    shard
+        .cancel_job(tenant, &job2_id)
+        .await
+        .expect("cancel job2");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "cancelling a future RequestTicket must release prior chain holders on A"
+    );
 }
 
 /// Multi-limit chain resume — the case the old code was silently

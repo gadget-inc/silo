@@ -182,9 +182,24 @@ impl JobStoreShard {
                                 held_queues_to_release = held_queues;
                             }
                         }
-                        Task::RequestTicket { .. } => {
-                            // FutureRequestTaskWritten case: the RequestTicket task IS the
-                            // pending request mechanism. Deleting the task is sufficient.
+                        Task::RequestTicket {
+                            task_id: tid,
+                            held_queues,
+                            ..
+                        } => {
+                            // FutureRequestTaskWritten case: the RequestTicket
+                            // task is the pending request mechanism. Deleting
+                            // it stops the request. But a multi-limit chain
+                            // can reach this state with prior holders already
+                            // granted (carried on the ticket's `held_queues`);
+                            // those must be released or the slots leak.
+                            for queue in &held_queues {
+                                txn.delete(concurrency_holder_key(tenant, queue, &tid))?;
+                            }
+                            if !held_queues.is_empty() {
+                                task_id_for_release = Some(tid);
+                                held_queues_to_release = held_queues;
+                            }
                         }
                         _ => {
                             // Other task types (CheckRateLimit, RefreshFloatingLimit, etc.)
