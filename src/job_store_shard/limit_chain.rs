@@ -48,14 +48,17 @@ impl LimitChainResumer for ShardChainResumer {
         // we never have to round-trip JobInfo here.
         let now_ms = crate::job_store_shard::now_epoch_ms();
 
-        // Land the resumed chain's task_key at `now_ms`, not the original
-        // enqueue time. The broker tombstones any task_key it has ack-deleted,
-        // and an LSM scan can momentarily observe the interim RunAttempt that
-        // earlier chain steps wrote at `task_key(params.start_at_ms, ...)` —
-        // even though that interim is deleted in the same batch. Once a worker
-        // claims and ack-deletes that key, every later write at the same
-        // task_key is silently suppressed by the tombstone, which strands the
-        // holders this resumer just granted. Mirrors the precedent in
+        // `scheduled_at_ms` stays honest — the chain's original user-requested
+        // start time — so the future-scheduling check and any persisted
+        // `start_time_ms` on a follow-up request keep their semantics. But
+        // every `task_key` this walk writes lands at `now_ms`: the broker
+        // tombstones any task_key it has ack-deleted, and an LSM scan can
+        // momentarily observe the interim RunAttempt earlier chain steps
+        // wrote at `task_key(scheduled_at_ms, …)` even though that interim is
+        // deleted in the same batch. Once a worker claims and ack-deletes
+        // that key, every later write at the same task_key is silently
+        // suppressed by the tombstone, which strands the holders this
+        // resumer just granted. Mirrors the precedent in
         // `handle_request_ticket` (dequeue.rs) — see
         // `project_broker_tombstone_chain_continuation`.
         let mut writer = DbWriteBatcher::new(&shard.db, batch);
@@ -71,7 +74,8 @@ impl LimitChainResumer for ShardChainResumer {
                     limit_index: params.limit_index as usize,
                     limits: &params.limits,
                     priority: params.priority,
-                    start_at_ms: now_ms,
+                    scheduled_at_ms: params.start_at_ms,
+                    task_key_start_ms: now_ms,
                     now_ms,
                     held_queues: params.held_queues.clone(),
                     task_group: &params.task_group,

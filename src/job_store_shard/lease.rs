@@ -255,7 +255,15 @@ impl JobStoreShard {
                                     limit_index: 0,
                                     limits: &limits,
                                     priority,
-                                    start_at_ms: next_time,
+                                    // Retry: the user-requested next-run time
+                                    // is `next_time`; the task_key uses the
+                                    // same so the broker picks it up exactly
+                                    // then. `next_attempt_number` already
+                                    // differentiates this from the prior
+                                    // attempt's task_key, so no tombstone
+                                    // collision is possible here.
+                                    scheduled_at_ms: next_time,
+                                    task_key_start_ms: next_time,
                                     now_ms,
                                     held_queues: Vec::new(),
                                     task_group,
