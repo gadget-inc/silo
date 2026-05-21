@@ -1,7 +1,7 @@
 mod test_helpers;
 
 use silo::codec::{decode_task, encode_concurrency_action};
-use silo::job::Limit;
+use silo::job::{GubernatorAlgorithm, GubernatorRateLimit, Limit, RateLimitRetryPolicy};
 use silo::job_attempt::AttemptOutcome;
 use silo::keys::concurrency_holder_key;
 use silo::retry::RetryPolicy;
@@ -2875,6 +2875,226 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
     // still be the original first-limit block). The test mainly proves the
     // chain-state fields are populated and self-consistent when present.
     let _ = saw_resumable_state;
+}
+
+/// Multi-limit chain resume — the case the old code was silently
+/// shortcutting on: a job with `[Concurrency-A, Concurrency-B, RateLimit]`.
+/// Conc-A grants immediately at enqueue, Conc-B defers (capacity full), and
+/// when Conc-B later grants via the grant scanner the chain MUST resume into
+/// the RateLimit step (writing a `CheckRateLimit` task), not fabricate a
+/// terminal `RunAttempt` that bypasses the rate limit.
+///
+/// Pre-fix: the grant scanner wrote a `RunAttempt` directly with
+/// `held_queues = vec![conc_b]`, dropping Conc-A's holder and bypassing the
+/// rate limit entirely. This test pins both invariants:
+///   1. the follow-up task is a `CheckRateLimit`, not a `RunAttempt`;
+///   2. it carries `held_queues = [Conc-A, Conc-B]` so the rate-limit step
+///      releases both queues when it completes.
+#[silo::test]
+async fn deferred_concurrency_resumes_into_rate_limit() {
+    use silo::keys::{end_bound, tasks_prefix};
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "chain-rl-a".to_string();
+    let queue_b = "chain-rl-b".to_string();
+
+    let rate_limit = GubernatorRateLimit {
+        name: "api".to_string(),
+        unique_key: "chain-rl-key".to_string(),
+        limit: 100,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 10,
+            max_backoff_ms: 1000,
+            backoff_multiplier: 2.0,
+            max_retries: 10,
+        },
+    };
+
+    // Job 1: [A(cap=2), B(cap=1)] — chain grants both. Lease it and hold
+    // its slots so job 2 will defer on B.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 2,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+    assert_eq!(job1_tasks.len(), 1);
+    let job1_task_id = job1_tasks[0].attempt().task_id().to_string();
+
+    // Job 2: [A(cap=2), B(cap=1), RateLimit]. Conc-A still has a slot, so the
+    // chain grants A immediately; B is full so it defers via a
+    // concurrency_request_key. The chain does NOT reach RateLimit yet.
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 2,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(rate_limit.clone()),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    // Sanity: job 2 holds Conc-A but not Conc-B yet.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        2
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_b).await,
+        1
+    );
+
+    // No CheckRateLimit task should exist yet — the chain is parked on B.
+    assert_eq!(
+        count_check_rate_limit_tasks_for_tenant(shard.db(), tenant).await,
+        0,
+        "chain blocked on Conc-B should not have written a CheckRateLimit"
+    );
+
+    // Complete job 1 — releases its Conc-A and Conc-B holders. The grant
+    // scanner then promotes job 2's deferred Conc-B request, the chain
+    // resumes at limit_index = RateLimit, and writes a CheckRateLimit
+    // task carrying held_queues = [A, B].
+    shard
+        .report_attempt_outcome(&job1_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report job1 success");
+
+    // Poll for the CheckRateLimit task. Pre-fix the scanner would have
+    // written a RunAttempt and bypassed the rate limit — that assertion
+    // below would fail with `RunAttempt` instead.
+    let mut check_rl: Option<Task> = None;
+    for _ in 0..50 {
+        if let Some(t) = find_task_for_tenant(shard.db(), tenant).await
+            && matches!(t, Task::CheckRateLimit { .. })
+        {
+            check_rl = Some(t);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let check_rl = check_rl.expect(
+        "expected a CheckRateLimit task for job 2 after Conc-B was promoted by the grant scanner; \
+         if a RunAttempt was written instead, the chain shortcut bypassed RateLimit",
+    );
+
+    // Verify held_queues = [A, B] — Conc-A's prior grant survived into the
+    // resumed chain.
+    let Task::CheckRateLimit { held_queues, .. } = &check_rl else {
+        unreachable!("matched above");
+    };
+    assert!(
+        held_queues.iter().any(|q| q == &queue_a),
+        "CheckRateLimit must carry Conc-A's holder; held_queues={:?}",
+        held_queues
+    );
+    assert!(
+        held_queues.iter().any(|q| q == &queue_b),
+        "CheckRateLimit must carry Conc-B's holder; held_queues={:?}",
+        held_queues
+    );
+    assert_eq!(
+        held_queues.len(),
+        2,
+        "CheckRateLimit held_queues should be exactly [A, B]; got {:?}",
+        held_queues
+    );
+
+    // Holders for both queues should be present (the rate limit hasn't been
+    // checked yet, so neither slot has been released).
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_b).await,
+        1
+    );
+    let _ = end_bound(&tasks_prefix());
+}
+
+/// Helper: scan the tasks prefix and return the first task for the given
+/// tenant (used by `deferred_concurrency_resumes_into_rate_limit`).
+async fn find_task_for_tenant(
+    db: &silo::instrumented_db::InstrumentedDb,
+    tenant: &str,
+) -> Option<Task> {
+    let start = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&start);
+    let mut iter = db
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .ok()?;
+    while let Ok(Some(kv)) = iter.next().await {
+        if let Ok(task) = decode_task(&kv.value)
+            && task.tenant() == tenant
+        {
+            return Some(task);
+        }
+    }
+    None
+}
+
+/// Helper: count `CheckRateLimit` tasks for a tenant.
+async fn count_check_rate_limit_tasks_for_tenant(
+    db: &silo::instrumented_db::InstrumentedDb,
+    tenant: &str,
+) -> usize {
+    let start = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&start);
+    let mut iter = db
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .expect("scan tasks");
+    let mut count = 0;
+    while let Ok(Some(kv)) = iter.next().await {
+        if let Ok(task) = decode_task(&kv.value)
+            && task.tenant() == tenant
+            && matches!(task, Task::CheckRateLimit { .. })
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Helper: count concurrency holder keys for a specific (tenant, queue) pair.
