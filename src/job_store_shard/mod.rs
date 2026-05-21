@@ -978,6 +978,24 @@ impl JobStoreShard {
             .await
     }
 
+    /// Test-only: drop the installed chain resumer so the next
+    /// `process_concurrency_grants` exercises the scanner's
+    /// release-and-bail branch. Returns the removed resumer (caller may
+    /// drop it or re-install via `set_chain_resumer`).
+    pub fn take_chain_resumer_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::concurrency::LimitChainResumer>> {
+        self.concurrency.take_chain_resumer_for_test()
+    }
+
+    /// Test-only: release the in-memory reservation for a (tenant, queue,
+    /// task_id) tuple. Symmetric with `rollback_grant`'s rollback path,
+    /// exposed publicly so tests that fabricate orphan request scenarios
+    /// can clear the in-memory holder created by the natural enqueue path.
+    pub fn rollback_concurrency_grant_for_test(&self, tenant: &str, queue: &str, task_id: &str) {
+        self.concurrency.rollback_grant(tenant, queue, task_id);
+    }
+
     /// Fetch a job by id as a zero-copy archived view.
     pub async fn get_job(
         &self,

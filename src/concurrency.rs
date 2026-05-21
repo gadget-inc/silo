@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use futures::FutureExt;
@@ -116,6 +116,10 @@ pub struct ResumeChainParams {
     pub held_queues: Vec<String>,
     pub task_group: String,
     pub limits: Vec<Limit>,
+    /// The scanner's `now_ms`, threaded through verbatim so the resumer's
+    /// `task_key(now_ms, …)` writes can't disagree with the `granted_at_ms`
+    /// the scanner just wrote into the same batch.
+    pub now_ms: i64,
 }
 
 /// Bridge between the grant scanner / `process_grants` and the shard-level
@@ -712,7 +716,11 @@ pub struct ConcurrencyManager {
     /// creating a strong cycle). The grant scanner and `process_grants` both
     /// invoke this so chain continuation logic lives in exactly one place
     /// (`JobStoreShard::enqueue_limit_task_at_index`).
-    chain_resumer: OnceLock<Arc<dyn LimitChainResumer>>,
+    /// Chain resumer is installed exactly once at shard construction. Stored
+    /// behind a `Mutex<Option<…>>` rather than a `OnceLock` so tests can
+    /// `take_chain_resumer_for_test` to exercise the not-installed bailout
+    /// path; production code calls `set_chain_resumer` once and never clears.
+    chain_resumer: Mutex<Option<Arc<dyn LimitChainResumer>>>,
 }
 
 impl ConcurrencyManager {
@@ -729,18 +737,24 @@ impl ConcurrencyManager {
             grant_running: AtomicBool::new(false),
             limit_cache: Mutex::new(HashMap::new()),
             metrics,
-            chain_resumer: OnceLock::new(),
+            chain_resumer: Mutex::new(None),
         }
     }
 
     /// Install the limit-chain resumer. Must be called exactly once, after the
     /// owning `Arc<JobStoreShard>` exists, before the grant scanner can fire.
     pub fn set_chain_resumer(&self, resumer: Arc<dyn LimitChainResumer>) {
-        let _ = self.chain_resumer.set(resumer);
+        *self.chain_resumer.lock().unwrap() = Some(resumer);
     }
 
-    fn chain_resumer(&self) -> Option<&Arc<dyn LimitChainResumer>> {
-        self.chain_resumer.get()
+    /// Test-only: drop the installed chain resumer to exercise the
+    /// scanner's release-and-bail branch.
+    pub fn take_chain_resumer_for_test(&self) -> Option<Arc<dyn LimitChainResumer>> {
+        self.chain_resumer.lock().unwrap().take()
+    }
+
+    fn chain_resumer(&self) -> Option<Arc<dyn LimitChainResumer>> {
+        self.chain_resumer.lock().unwrap().clone()
     }
 
     pub fn counts(&self) -> &ConcurrencyCounts {
@@ -1190,7 +1204,7 @@ impl ConcurrencyManager {
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
-        let chain_resumer = self.chain_resumer().cloned();
+        let chain_resumer = self.chain_resumer();
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
         // granted `count` requests, or hit the end / capacity limit. Each pass
@@ -1279,11 +1293,27 @@ impl ConcurrencyManager {
                     .unwrap_or_default();
                 let limits = crate::codec::limit_entries_to_owned(et.limits());
 
-                // Resolve max_concurrency from the first request whose limits
-                // are populated (post-schema-update they always are). Don't
-                // cache failures — a stale request's missing limits shouldn't
-                // lock the limit to 1 for the rest of the scan.
-                if max_concurrency.is_none() && !limits.is_empty() {
+                if limits.is_empty() {
+                    // Post-schema-update every request has its limits
+                    // populated. An empty list is either a decode-shape
+                    // failure or a stale pre-deploy record. The chain
+                    // resumer with `limits=[]` would silently fall through
+                    // to a terminal RunAttempt that bypasses every gate —
+                    // safer to treat this exactly like a decode failure:
+                    // log, delete, skip.
+                    tracing::warn!(
+                        queue = %queue,
+                        job_id = %job_id_str,
+                        "grant scanner: request has no decoded limits; deleting"
+                    );
+                    batch.delete(&kv.key);
+                    stale_and_corrupt_count += 1;
+                    continue;
+                }
+
+                // Resolve max_concurrency from the first request's limits
+                // (always populated, per the check above).
+                if max_concurrency.is_none() {
                     let (l, lt) =
                         Self::resolve_queue_capacity_from_limits(db, tenant, queue, &limits).await;
                     self.cache_queue_limit(tenant, queue, l as u32, lt);
@@ -1471,6 +1501,7 @@ impl ConcurrencyManager {
                     held_queues: new_held,
                     task_group: req.task_group.clone(),
                     limits: req.limits.clone(),
+                    now_ms,
                 };
 
                 match resumer.resume_chain(&mut batch, resume_params).await {
