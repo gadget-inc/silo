@@ -628,3 +628,145 @@ async fn floating_concurrency_steady_state_zero_holders_after_full_cycle() {
         "per-tenant holder count must be zero too"
     );
 }
+
+/// Regression test for the broker-tombstone collision in process_grants' chain
+/// resumer.
+///
+/// Before the fix, `ShardChainResumer::resume_chain` re-emitted the resumed
+/// chain's `RunAttempt` task at `task_key(params.start_at_ms, …)` — the same
+/// task_key the original enqueue's chain had written (and the same batch had
+/// then deleted) when the job first queued. If the broker's scan happened to
+/// observe the interim RunAttempt before the delete won in the LSM, a worker
+/// could lease and ack-delete it, installing a tombstone for that task_key.
+/// The resumed chain's subsequent write at the same key was then silently
+/// suppressed, stranding the holders the resumer had just granted.
+///
+/// The fix lands the resumed task at `task_key(now_ms, …)` so the broker
+/// tombstone for the original key cannot suppress it — mirroring the
+/// long-standing precedent in `handle_request_ticket`. See
+/// `project_broker_tombstone_chain_continuation`.
+///
+/// This test pins down the simpler invariant the fix introduces: after a
+/// queued job is granted by `process_grants`, its terminal `RunAttempt` lives
+/// at a `task_key` whose `start_time_ms` is strictly greater than the job's
+/// original enqueue `start_at_ms`, provided enough wall-clock has passed.
+#[silo::test]
+async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
+    use silo::job::ConcurrencyLimit;
+    use silo::keys::{parse_task_key, tasks_prefix};
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "resume-chain-q".to_string();
+    let tenant = "-";
+
+    // Job A occupies the only Concurrency slot. Its RunAttempt is leased and
+    // acknowledged so any later write at the same task_key would be eligible
+    // for broker-tombstone suppression — that's exactly the trap the resumer
+    // needs to dodge.
+    let original_enqueue_ms = now_ms();
+    let _job_a = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            original_enqueue_ms,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "A"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue A");
+
+    // Job B has no slot to take — it queues as a concurrency request and the
+    // chain walker drops its interim RunAttempt at `task_key(original_enqueue_ms, …)`
+    // in the same batch as the request write.
+    let _job_b = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            original_enqueue_ms,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "B"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue B");
+
+    // Lease A.
+    let leased_a = shard.dequeue("w", "default", 1).await.expect("deq A").tasks;
+    assert_eq!(leased_a.len(), 1, "A should lease immediately");
+    let task_a_id = leased_a[0].attempt().task_id().to_string();
+
+    // Force a measurable wall-clock gap so that any later "now_ms" the resumer
+    // captures is strictly greater than `original_enqueue_ms`. Without this
+    // gap the assertion below would be vacuously satisfied by same-millisecond
+    // resolution rather than by the fix.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let before_release_ms = now_ms();
+    assert!(
+        before_release_ms > original_enqueue_ms,
+        "test setup must advance the wall clock past the original enqueue"
+    );
+
+    // Releasing A frees the slot; the grant scanner picks up B's request and
+    // calls `ShardChainResumer::resume_chain`, which now uses `now_ms` for the
+    // terminal RunAttempt's task_key.
+    shard
+        .report_attempt_outcome(&task_a_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report A");
+
+    // Poll for B's RunAttempt task to appear; the grant scanner runs
+    // asynchronously after the release.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut b_task_start_time_ms: Option<u64> = None;
+    while std::time::Instant::now() < deadline {
+        let start = tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard.db().scan::<Vec<u8>, _>(start..end).await.expect("scan tasks");
+        let mut found = None;
+        while let Some(kv) = iter.next().await.expect("iter") {
+            let Some(parsed) = parse_task_key(&kv.key) else { continue };
+            // The leased Job A's task_key has already been ack-deleted, so any
+            // surviving task at this point is Job B's resumed RunAttempt.
+            found = Some(parsed.start_time_ms);
+            break;
+        }
+        if let Some(t) = found {
+            b_task_start_time_ms = Some(t);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let b_start = b_task_start_time_ms
+        .expect("grant scanner failed to write Job B's RunAttempt within the deadline");
+
+    assert!(
+        b_start >= before_release_ms as u64,
+        "resumed chain must write at task_key(now_ms, …), not at the original \
+         enqueue's start_at_ms — got start_time_ms={} which is not >= now-at-release={}. \
+         A regression here re-introduces the broker-tombstone collision tracked in \
+         project_broker_tombstone_chain_continuation.",
+        b_start,
+        before_release_ms,
+    );
+    assert!(
+        b_start > original_enqueue_ms as u64,
+        "resumed RunAttempt's task_key still encodes the original enqueue time \
+         ({}), so any tombstone planted at that key would silently suppress this \
+         task — exactly the leak the fix is meant to prevent.",
+        original_enqueue_ms,
+    );
+}
