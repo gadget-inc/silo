@@ -940,7 +940,14 @@ impl ConcurrencyManager {
             // For a future-scheduled enqueue the broker must see this task
             // at the user-requested time, so `task_key_start_ms ==
             // scheduled_at_ms` on this branch. (No call site sets them apart
-            // here — resume goes through the request branch above.)
+            // here — resume goes through the request branch above.) If a
+            // future call site ever passes them apart, the persisted
+            // `start_time_ms` and the `task_key` would disagree and the
+            // broker would notice.
+            debug_assert_eq!(
+                scheduled_at_ms, task_key_start_ms,
+                "future RequestTicket: task_key_start_ms must equal scheduled_at_ms"
+            );
             let ticket = Task::RequestTicket {
                 queue: queue.clone(),
                 start_time_ms: scheduled_at_ms,
@@ -1239,6 +1246,12 @@ impl ConcurrencyManager {
                 let job_id_str = et.job_id().unwrap_or_default();
 
                 if start_time_ms > now_ms {
+                    // Concurrency request keys encode `start_time_ms` ahead of
+                    // the per-job suffix, so the scan iterates in ascending
+                    // start-time order. The first entry whose start_time_ms
+                    // exceeds now_ms guarantees every subsequent entry in the
+                    // scan also exceeds now_ms — breaking here is safe and
+                    // cannot skip an already-ready request.
                     iter_exhausted = true;
                     break;
                 }
