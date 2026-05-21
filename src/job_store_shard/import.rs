@@ -546,7 +546,11 @@ impl JobStoreShard {
         let priority = existing_job.priority();
         let stored_limits = existing_job.limits();
         let mut matched_task_keys: Vec<Vec<u8>> = Vec::new();
-        let mut released_holders: Vec<(String, Vec<String>)> = Vec::new();
+        // `(task_id, queue)` pairs whose in-memory slot must be released
+        // post-commit. Mirrors the structure used by `cancel.rs` so the same
+        // shape of holder releases (from a Task arm or from a deferred
+        // concurrency request scan) flows through one accumulator.
+        let mut released_holders: Vec<(String, String)> = Vec::new();
 
         if old_status.kind == JobStatusKind::Scheduled {
             // O(1) task key reconstruction from status fields (same pattern as cancel/expedite/lease)
@@ -580,18 +584,23 @@ impl JobStoreShard {
                         task_id: tid,
                         held_queues,
                         ..
-                    } => {
-                        // Delete concurrency holders for each held queue
-                        for queue in &held_queues {
-                            let holder_key = concurrency_holder_key(tenant, queue, &tid);
-                            txn.delete(&holder_key)?;
-                        }
-                        if !held_queues.is_empty() {
-                            released_holders.push((tid, held_queues));
-                        }
                     }
-                    Task::RequestTicket { .. } => {
-                        // FutureRequestTaskWritten case: deleting the task is sufficient.
+                    | Task::RequestTicket {
+                        // A FutureRequestTaskWritten ticket can carry
+                        // upstream chain grants (see [[task]] schema and
+                        // the matching cancel arm in `cancel.rs`). Deleting
+                        // the task is not enough — the prior holders must
+                        // be cleaned up too, or they leak forever once the
+                        // reimport advances to a new attempt.
+                        task_id: tid,
+                        held_queues,
+                        ..
+                    } => {
+                        for queue in held_queues {
+                            let holder_key = concurrency_holder_key(tenant, &queue, &tid);
+                            txn.delete(&holder_key)?;
+                            released_holders.push((tid.clone(), queue));
+                        }
                     }
                     _ => {}
                 }
@@ -600,17 +609,23 @@ impl JobStoreShard {
                 // in DB queue). For Scheduled jobs we can target deletes precisely using
                 // status-derived attempt/start fields (same approach as cancel).
                 // [SILO-REIMP-CONC-5] Scheduled old-state reimport performs targeted
-                // request-key cleanup for the old scheduled attempt.
-                self.delete_concurrency_requests_for_job(
-                    &txn,
-                    tenant,
-                    job_id,
-                    &stored_limits,
-                    attempt_number,
-                    start_time_ms,
-                    priority,
-                )
-                .await?;
+                // request-key cleanup for the old scheduled attempt. The
+                // returned `(task_id, queue)` pairs are the upstream
+                // holders carried by each deferred request and must also
+                // be released post-commit; dropping them silently leaks
+                // every prior chain grant.
+                let released = self
+                    .delete_concurrency_requests_for_job(
+                        &txn,
+                        tenant,
+                        job_id,
+                        &stored_limits,
+                        attempt_number,
+                        start_time_ms,
+                        priority,
+                    )
+                    .await?;
+                released_holders.extend(released);
             }
         }
 
@@ -717,13 +732,11 @@ impl JobStoreShard {
 
         // Release in-memory holders and immediately request grant scanning.
         // This avoids waiting for periodic reconciliation when slots free up.
-        for (finished_task_id, held_queues) in &released_holders {
-            for queue in held_queues {
-                self.concurrency
-                    .counts()
-                    .atomic_release(tenant, queue, finished_task_id);
-                self.concurrency.request_grant(tenant, queue);
-            }
+        for (finished_task_id, queue) in &released_holders {
+            self.concurrency
+                .counts()
+                .atomic_release(tenant, queue, finished_task_id);
+            self.concurrency.request_grant(tenant, queue);
         }
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
