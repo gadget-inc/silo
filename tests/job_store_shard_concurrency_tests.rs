@@ -2978,6 +2978,312 @@ async fn cancel_future_request_ticket_releases_held_queues() {
     );
 }
 
+/// Cancelling a job parked on a rate-limit step must release any
+/// concurrency holders the chain accumulated upstream.
+///
+/// Setup: enqueue `[Conc-A, RateLimit]`. The chain grants A immediately and
+/// the walker writes a `CheckRateLimit` task carrying `held_queues=[A]`.
+/// Pre-fix the cancel path's catch-all match arm only deleted the task;
+/// A's holder leaked. Post-fix, the new `Task::CheckRateLimit` arm
+/// releases the held queue.
+#[silo::test]
+async fn cancel_check_rate_limit_releases_held_queues() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "cancel-crl-a".to_string();
+
+    let rate_limit = GubernatorRateLimit {
+        name: "api".to_string(),
+        unique_key: "cancel-crl-key".to_string(),
+        limit: 100,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 10,
+            max_backoff_ms: 1000,
+            backoff_multiplier: 2.0,
+            max_retries: 10,
+        },
+    };
+
+    // Future-schedule so the CheckRateLimit task lands in the queue but
+    // is not yet ready to be processed by a dequeue.
+    let future_at = now + 600_000;
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            future_at,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "crl"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(rate_limit),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job");
+
+    // Chain granted A immediately and wrote a CheckRateLimit carrying [A].
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "chain should have granted A at enqueue"
+    );
+
+    let crl_present = {
+        let start = silo::keys::tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        let mut found = false;
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(task) = decode_task(&kv.value)
+                && let Task::CheckRateLimit {
+                    job_id: jid,
+                    ref held_queues,
+                    ..
+                } = task
+                && jid == job_id
+            {
+                assert_eq!(
+                    held_queues.as_slice(),
+                    std::slice::from_ref(&queue_a),
+                    "CheckRateLimit should carry [A] in held_queues"
+                );
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    assert!(crl_present, "expected a CheckRateLimit task for the job");
+
+    shard.cancel_job(tenant, &job_id).await.expect("cancel");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "cancelling a CheckRateLimit must release prior chain holders on A"
+    );
+}
+
+/// Cancelling a job whose chain is parked on a deferred (immediate)
+/// concurrency request must release any holders the chain accumulated
+/// before the gating limit. Mirror of
+/// `cancel_future_request_ticket_releases_held_queues` for the
+/// `start_at_ms <= now_ms` case (TicketRequested, not
+/// FutureRequestTaskWritten).
+#[silo::test]
+async fn cancel_deferred_concurrency_request_releases_held_queues() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "cancel-def-a".to_string();
+    let queue_b = "cancel-def-b".to_string();
+
+    // job1 holds B at capacity 1 so job2 must defer on B.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue_b.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+    assert_eq!(job1_tasks.len(), 1, "job1 should run and hold B");
+
+    // job2: [A free, B full] at now_ms — chain grants A and writes a
+    // concurrency_request_key for B with held_queues=[A].
+    let job2_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "job2 should have grabbed A at enqueue"
+    );
+    assert!(
+        count_concurrency_requests(shard.db()).await >= 1,
+        "expected a deferred concurrency request for B"
+    );
+
+    shard
+        .cancel_job(tenant, &job2_id)
+        .await
+        .expect("cancel job2");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "cancelling a deferred concurrency request must release prior chain holders on A"
+    );
+    // The deferred request itself is also gone.
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "cancel should delete the deferred concurrency request"
+    );
+}
+
+/// If the chain resumer is unavailable when the grant scanner runs (shard
+/// shutting down, or never installed), the scanner must release every
+/// in-memory reservation it made this pass and return without committing.
+/// Otherwise it would leak phantom holders that no future request could
+/// touch.
+///
+/// Setup: job1 holds A (cap=1). job2 enqueues with `[A]` and defers on A.
+/// We drop the chain resumer, then release job1 to expose A's slot and
+/// drive `process_concurrency_grants` synchronously. The scanner enters the
+/// `chain_resumer = None` branch after `try_reserve` succeeds.
+/// Post-call invariants:
+///   - DB holder for A is absent (batch was not committed).
+///   - The deferred request is still in the DB (batch was not committed).
+///   - In-memory holder count for A is 0 (the just-made reservation was
+///     released by the bail-out — no phantom holder).
+#[silo::test]
+async fn grant_scanner_releases_reservations_when_chain_resumer_missing() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue = "no-resumer-a".to_string();
+
+    // job1 takes A.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+    assert_eq!(job1_tasks.len(), 1, "job1 should run and hold A");
+    let job1_task_id = job1_tasks[0].attempt().task_id().to_string();
+
+    // job2 defers on A (capacity 1 is full).
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+    assert!(
+        count_concurrency_requests(shard.db()).await >= 1,
+        "expected a deferred concurrency request"
+    );
+
+    // Drop the chain resumer to force the bailout path. Keep the returned
+    // Arc alive so the inner `ShardChainResumer`'s `Weak<JobStoreShard>` is
+    // not the trigger — we want the chain_resumer field itself to be None.
+    let _stashed = shard
+        .take_chain_resumer_for_test()
+        .expect("resumer should have been installed");
+
+    // Release job1 so A has capacity. Use complete_attempt directly so the
+    // background grant scanner doesn't race ahead — we want to drive
+    // process_concurrency_grants explicitly.
+    shard
+        .report_attempt_outcome(&job1_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report job1 success");
+
+    // Drive a synchronous grant pass. With the resumer missing, the scanner
+    // tries `try_reserve` for job2, succeeds, then enters the resumer-None
+    // branch and releases the reservation before returning. No grant is
+    // produced.
+    let granted = shard.process_concurrency_grants(tenant, &queue, 10).await;
+    assert!(
+        granted.is_empty(),
+        "no grants should be produced when resumer is unavailable"
+    );
+
+    // The batch wasn't committed, so the deferred request is still there
+    // and no DB holder was written for job2 on A.
+    assert!(
+        count_concurrency_requests(shard.db()).await >= 1,
+        "deferred request must survive the aborted pass"
+    );
+    // job1's release dropped its holder; job2's reservation was released
+    // by the bail-out, so the DB shows 0 holders on A.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue).await,
+        0,
+        "no DB holder should be written when the pass aborts before commit"
+    );
+    // Crucially, the in-memory count is also 0 — the just-made reservation
+    // was released. If this leaks, the next request can never run because
+    // try_reserve will see `holders == limit` forever.
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue),
+        0,
+        "in-memory reservation must be released when the resumer is missing"
+    );
+}
+
 /// Multi-limit chain resume — the case the old code was silently
 /// shortcutting on: a job with `[Concurrency-A, Concurrency-B, RateLimit]`.
 /// Conc-A grants immediately at enqueue, Conc-B defers (capacity full), and
