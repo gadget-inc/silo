@@ -498,7 +498,13 @@ impl JobStoreShard {
                     limit_index: (limit_index + 1) as usize,
                     limits: &limits,
                     priority: rt.priority(),
-                    start_at_ms: now_ms,
+                    // Future-scheduled `RequestTicket` was just granted; the
+                    // chain is past its scheduled time. Use `now_ms` for both
+                    // — the task_key needs to dodge any tombstone from the
+                    // ticket we just deleted (matching the precedent this
+                    // method already documented).
+                    scheduled_at_ms: now_ms,
+                    task_key_start_ms: now_ms,
                     now_ms,
                     held_queues: new_held,
                     task_group: &req_task_group,
@@ -622,7 +628,12 @@ impl JobStoreShard {
                             limit_index: (limit_index + 1) as usize,
                             limits: &job_view.limits(),
                             priority,
-                            start_at_ms: now_ms,
+                            // Rate-limit just cleared; chain is past its
+                            // scheduled time. `now_ms` for both dodges any
+                            // tombstone on the CheckRateLimit task_key we
+                            // just deleted.
+                            scheduled_at_ms: now_ms,
+                            task_key_start_ms: now_ms,
                             now_ms,
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,

@@ -269,7 +269,11 @@ impl JobStoreShard {
                         limit_index: 0,
                         limits: &params.limits,
                         priority: params.priority,
-                        start_at_ms: effective_start_at_ms,
+                        // Fresh import → fresh chain. Scheduled and task_key
+                        // time coincide; this attempt_number is unseen so no
+                        // tombstone can collide.
+                        scheduled_at_ms: effective_start_at_ms,
+                        task_key_start_ms: effective_start_at_ms,
                         now_ms,
                         held_queues: Vec::new(),
                         task_group: &params.task_group,
@@ -649,7 +653,11 @@ impl JobStoreShard {
                         limit_index: 0,
                         limits: &stored_limits,
                         priority,
-                        start_at_ms: effective_start_at_ms,
+                        // Reimport advances to a new attempt_number, so the
+                        // task_key is fresh — scheduled and task_key time
+                        // coincide.
+                        scheduled_at_ms: effective_start_at_ms,
+                        task_key_start_ms: effective_start_at_ms,
                         now_ms,
                         held_queues: Vec::new(),
                         task_group: &task_group,
