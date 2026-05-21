@@ -18,7 +18,7 @@ use crate::job_store_shard::helpers::{
 };
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
-    task_key, tenant_status_counter_key,
+    tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -101,12 +101,14 @@ fn record_grant_outcome(
 ) -> GrantResult {
     match outcome {
         None | Some(RequestTicketOutcome::GrantedImmediately { .. }) => {
-            // Slot granted (or no limit existed) - record grant and continue to
-            // the next limit. The interim RunAttempt that handle_enqueue wrote
-            // via append_grant_edits is overwritten at the same task_key when
-            // the outer loop reaches its terminal "no more limits" branch,
-            // which rewrites the RunAttempt with the full accumulated
-            // current_held_queues so ReportOutcome can release every holder.
+            // Slot granted (or no limit existed) — record the grant and
+            // continue. `handle_enqueue`'s `GrantedImmediately` path only
+            // writes the holder DB key; the `RunAttempt` `task_key` is
+            // written exactly once by the outer loop's terminal "no more
+            // limits" branch, carrying the full accumulated `held_queues`.
+            // This guarantees the broker can never observe a `RunAttempt`
+            // with a partial `held_queues`, which would otherwise let a
+            // worker complete a task and under-release holders.
             //
             // Crucially, `current_task_id` is NOT cycled here. The chained
             // cleanup paths (handle_check_rate_limit, handle_run_attempt) all
@@ -595,9 +597,6 @@ impl JobStoreShard {
                         crate::concurrency::ConcurrencyLimitType::Fixed,
                     );
 
-                    let queued_with_request =
-                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
-
                     if matches!(
                         record_grant_outcome(
                             outcome,
@@ -609,15 +608,11 @@ impl JobStoreShard {
                         ),
                         GrantResult::Queued
                     ) {
-                        if queued_with_request && !grants.is_empty() {
-                            writer.delete(task_key(
-                                task_group,
-                                task_key_start_ms,
-                                priority,
-                                job_id,
-                                attempt_number,
-                            ))?;
-                        }
+                        // No interim `task_key` write to clean up here:
+                        // `append_grant_edits` only writes the holder; the
+                        // `RunAttempt` task_key is written exclusively by the
+                        // terminal branch below, which we won't reach on this
+                        // return.
                         return Ok(());
                     }
                 }
@@ -687,9 +682,6 @@ impl JobStoreShard {
                         )?;
                     }
 
-                    let queued_with_request =
-                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
-
                     if matches!(
                         record_grant_outcome(
                             outcome,
@@ -701,15 +693,9 @@ impl JobStoreShard {
                         ),
                         GrantResult::Queued
                     ) {
-                        if queued_with_request && !grants.is_empty() {
-                            writer.delete(task_key(
-                                task_group,
-                                task_key_start_ms,
-                                priority,
-                                job_id,
-                                attempt_number,
-                            ))?;
-                        }
+                        // See the Conc-branch comment: `append_grant_edits`
+                        // doesn't write a `task_key` anymore, so there's
+                        // nothing here to clean up before returning.
                         return Ok(());
                     }
                 }
