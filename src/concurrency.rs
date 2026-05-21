@@ -1367,27 +1367,41 @@ impl ConcurrencyManager {
                     &holder_val,
                 );
 
-                // [SILO-GRANT-4] Emit a ContinueLimits chain-continuation task.
-                // held_queues is the accumulator from earlier in the chain with
-                // this just-granted queue appended; next_limit_index points one
-                // past this limit in the canonical order. Dequeue will
-                // re-enter `enqueue_limit_task_at_index` to evaluate the
-                // remaining limits (or write the terminal RunAttempt).
+                // [SILO-GRANT-4] Emit either a terminal RunAttempt (if this was
+                // the last limit in the canonical chain) or a ContinueLimits
+                // chain-continuation task. Short-circuiting to RunAttempt when
+                // possible avoids a dequeue round-trip — `handle_continue_limits`
+                // would walk into the terminal "no more limits" branch and write
+                // the same RunAttempt anyway, just one cycle later.
                 let mut held_queues = req.held_queues.clone();
                 held_queues.push(queue.to_string());
-                let tval = encode_task(&Task::ContinueLimits {
-                    task_id: req.task_id.clone(),
-                    tenant: tenant.to_string(),
-                    job_id: req.job_id.clone(),
-                    attempt_number: req.attempt_number,
-                    relative_attempt_number: req.relative_attempt_number,
-                    held_queues,
-                    next_limit_index: req.limit_index + 1,
-                    limits: req.limits.clone(),
-                    priority: req.priority,
-                    start_time_ms: req.start_time_ms,
-                    task_group: req.task_group.clone(),
-                });
+                let next_limit_index = req.limit_index + 1;
+                let is_last_limit = (next_limit_index as usize) >= req.limits.len();
+                let tval = if is_last_limit {
+                    encode_task(&Task::RunAttempt {
+                        id: req.task_id.clone(),
+                        tenant: tenant.to_string(),
+                        job_id: req.job_id.clone(),
+                        attempt_number: req.attempt_number,
+                        relative_attempt_number: req.relative_attempt_number,
+                        held_queues,
+                        task_group: req.task_group.clone(),
+                    })
+                } else {
+                    encode_task(&Task::ContinueLimits {
+                        task_id: req.task_id.clone(),
+                        tenant: tenant.to_string(),
+                        job_id: req.job_id.clone(),
+                        attempt_number: req.attempt_number,
+                        relative_attempt_number: req.relative_attempt_number,
+                        held_queues,
+                        next_limit_index,
+                        limits: req.limits.clone(),
+                        priority: req.priority,
+                        start_time_ms: req.start_time_ms,
+                        task_group: req.task_group.clone(),
+                    })
+                };
                 batch.put(
                     task_key(
                         &req.task_group,
