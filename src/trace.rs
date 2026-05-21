@@ -163,7 +163,14 @@ where
         {
             Ok(provider) => {
                 let tracer = provider.tracer("silo");
-                let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+                // Filter spans sent to OTLP independently from console logs.
+                // Without this, the otel layer captures all levels and floods
+                // the batch processor's bounded channel.
+                let otel_filter = EnvFilter::try_from_env("SILO_OTEL_LOG")
+                    .unwrap_or_else(|_| EnvFilter::new("info"));
+                let otel_layer = tracing_opentelemetry::layer()
+                    .with_tracer(tracer)
+                    .with_filter(otel_filter);
                 base.with(otel_layer).init();
             }
             Err(err) => {
