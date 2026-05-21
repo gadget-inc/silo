@@ -449,11 +449,47 @@ impl JobStoreShard {
     /// optimization. If granted, it proceeds to the next limit (iteratively).
     ///
     /// Returns a Vec of all grants made (queue, task_id) for potential rollback if DB write fails.
+    ///
+    /// **Error semantics:** if the walk errors mid-chain (e.g. a db.get for
+    /// floating-limit state fails between an immediate grant and the next
+    /// limit), any in-memory reservations made up to that point are released
+    /// here before the error is returned. Callers therefore see either
+    /// `Ok(grants)` — every entry is a live in-memory reservation paired with
+    /// a pending batch write — or `Err(_)` with no leftover in-memory state to
+    /// clean up. This avoids leaking holders when an interior `?` fires after
+    /// a successful `try_reserve` but before the batch commits.
     pub(crate) async fn enqueue_limit_task_at_index<W: WriteBatcher>(
         &self,
         writer: &mut W,
         params: LimitTaskParams<'_>,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+        // Save the tenant ref so we can roll back grants if walk_limit_chain errors.
+        // (references are Copy, so this doesn't conflict with moving `params`.)
+        let tenant_for_rollback: &str = params.tenant;
+        let mut grants: Vec<(String, String)> = Vec::new();
+        match self.walk_limit_chain(writer, params, &mut grants).await {
+            Ok(()) => Ok(grants),
+            Err(e) => {
+                for (queue, task_id) in &grants {
+                    self.concurrency
+                        .rollback_grant(tenant_for_rollback, queue, task_id);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner loop body for `enqueue_limit_task_at_index`. Pushes successful
+    /// in-memory grants to `grants` as it goes. Returns `Ok(())` on normal
+    /// completion (the caller hands `grants` back to its caller) or `Err(_)`
+    /// with `grants` containing whatever was accumulated up to the failure
+    /// point — the outer wrapper rolls those back before returning the error.
+    async fn walk_limit_chain<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        params: LimitTaskParams<'_>,
+        grants: &mut Vec<(String, String)>,
+    ) -> Result<(), JobStoreShardError> {
         let LimitTaskParams {
             tenant,
             task_id,
@@ -475,7 +511,6 @@ impl JobStoreShard {
         // order function is deterministic on `limits`, so dequeue's
         // `limit_index + 1` continuation lands on the correct next entry.
         let order = limit_processing_order(limits);
-        let mut grants = Vec::new();
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
         let current_task_id = task_id.to_string();
@@ -501,7 +536,7 @@ impl JobStoreShard {
                     attempt_number,
                     &run_task,
                 )?;
-                return Ok(grants);
+                return Ok(());
             }
 
             match &limits[order[current_index]] {
@@ -545,7 +580,7 @@ impl JobStoreShard {
                         record_grant_outcome(
                             outcome,
                             &cl.key,
-                            &mut grants,
+                            grants,
                             &current_task_id,
                             &mut current_held_queues,
                             &mut current_index,
@@ -561,7 +596,7 @@ impl JobStoreShard {
                                 attempt_number,
                             ))?;
                         }
-                        return Ok(grants);
+                        return Ok(());
                     }
                 }
 
@@ -636,7 +671,7 @@ impl JobStoreShard {
                         record_grant_outcome(
                             outcome,
                             &fl.key,
-                            &mut grants,
+                            grants,
                             &current_task_id,
                             &mut current_held_queues,
                             &mut current_index,
@@ -652,7 +687,7 @@ impl JobStoreShard {
                                 attempt_number,
                             ))?;
                         }
-                        return Ok(grants);
+                        return Ok(());
                     }
                 }
 
@@ -681,7 +716,7 @@ impl JobStoreShard {
                         attempt_number,
                         &task,
                     )?;
-                    return Ok(grants);
+                    return Ok(());
                 }
             }
         }
