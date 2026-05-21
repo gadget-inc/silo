@@ -3231,6 +3231,113 @@ async fn two_floating_concurrency_queued_on_fc1_reconciles_with_both() {
     }
 }
 
+/// Regression: when `handle_request_ticket` discovers the job_info is gone
+/// (the `JobMissing` outcome from `process_ticket_request_task`), it must
+/// release any holders the chain accumulated earlier under the ticket's
+/// `task_id`. Otherwise those holders orphan: no lease will ever be written
+/// to reach them, and `report_attempt_outcome` won't run because the job
+/// doesn't exist. Mirrors the symmetric branch in `handle_check_rate_limit`.
+#[silo::test]
+async fn request_ticket_job_missing_releases_prior_chain_holders() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let c_queue = "c-rt-jm2".to_string();
+    let fc_queue = "fc-rt-jm2".to_string();
+
+    // Saturate FC so the FC limit blocks for the target.
+    let _saturator = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "saturator"})),
+            vec![Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: fc_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue saturator");
+    let _sat = shard
+        .dequeue("w-sat", "default", 1)
+        .await
+        .expect("deq sat")
+        .tasks;
+
+    // Use a small future offset so the broker picks up the RequestTicket
+    // after a short delay.
+    let future_start = now + 100;
+    let target_job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            future_start,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"role": "target"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: c_queue.clone(),
+                    max_concurrency: 5,
+                }),
+                Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+                    key: fc_queue.clone(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue target");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &c_queue).await,
+        1,
+        "target's C should be granted at enqueue"
+    );
+
+    // Delete the target's job_info directly to set up the JobMissing
+    // scenario for handle_request_ticket.
+    shard
+        .db()
+        .delete(silo::keys::job_info_key(tenant, &target_job))
+        .await
+        .expect("delete job_info");
+
+    // Poll dequeue until the RequestTicket fires. Once it does,
+    // handle_request_ticket should see job_view = None and hit the JobMissing
+    // branch, which must release the C holder we created at enqueue.
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = shard.dequeue("w-drain", "default", 5).await.expect("deq");
+        if count_holders_for_queue(shard.db(), tenant, &c_queue).await == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &c_queue).await,
+        0,
+        "C holder leaked: handle_request_ticket JobMissing arm did not \
+         release prior chain holders. Without the release loop, the holder \
+         is orphaned because no lease was ever written to reach it via \
+         report_attempt_outcome."
+    );
+}
+
 /// Helper: count concurrency holder keys for a specific (tenant, queue) pair.
 async fn count_holders_for_queue(
     db: &silo::instrumented_db::InstrumentedDb,

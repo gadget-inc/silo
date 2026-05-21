@@ -485,7 +485,20 @@ impl JobStoreShard {
                 state.ack_release(task_key);
             }
             RequestTicketTaskOutcome::JobMissing => {
-                // process_ticket_request_task deleted the task key.
+                // process_ticket_request_task deleted the task key. Also
+                // release any concurrency holders accumulated earlier in the
+                // chain — they're keyed by this ticket's `task_id` and would
+                // otherwise orphan, since no lease will ever be written to
+                // reach them via report_attempt_outcome. Symmetric with the
+                // JobMissing path in handle_check_rate_limit.
+                for q in &prior_held_queues {
+                    state
+                        .batch
+                        .delete(concurrency_holder_key(&tenant, q, task_id));
+                    state
+                        .holder_releases
+                        .push((tenant.clone(), q.clone(), task_id.to_string()));
+                }
                 state.ack_deleted(task_key);
             }
         }
