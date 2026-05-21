@@ -514,6 +514,20 @@ impl JobStoreShard {
         let mut new_held = stored_held_queues;
         new_held.push(queue.clone());
 
+        // task_key is `(task_group, start_time_ms, priority, job_id,
+        // attempt_number)`. The chain continues with the same task_group,
+        // priority, job_id, and attempt_number, so the *only* differentiator
+        // versus the just-tombstoned parent key is start_time_ms. `now_ms`
+        // usually exceeds the parent's start_time_ms, but for a worker that
+        // processes a future-scheduled ticket in the same millisecond it
+        // becomes ready, the two could collide and the follow-up would be
+        // silently suppressed. Bump past the parent to make the dodge
+        // unconditional.
+        let parent_start_time_ms = parse_task_key(task_key)
+            .map(|p| p.start_time_ms as i64)
+            .unwrap_or(now_ms);
+        let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
+
         let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
         let chain_grants = self
             .enqueue_limit_task_at_index(
@@ -528,12 +542,12 @@ impl JobStoreShard {
                     limits: &limits,
                     priority: rt.priority(),
                     // Future-scheduled `RequestTicket` was just granted; the
-                    // chain is past its scheduled time. Use `now_ms` for both
-                    // — the task_key needs to dodge any tombstone from the
-                    // ticket we just deleted (matching the precedent this
-                    // method already documented).
-                    scheduled_at_ms: now_ms,
-                    task_key_start_ms: now_ms,
+                    // chain is past its scheduled time. Use `now_ms` for
+                    // `scheduled_at_ms`; `task_key_start_ms` may need a +1
+                    // bump versus the parent to dodge the broker tombstone
+                    // for the just-deleted ticket.
+                    scheduled_at_ms: new_task_key_start_ms,
+                    task_key_start_ms: new_task_key_start_ms,
                     now_ms,
                     held_queues: new_held,
                     task_group: &req_task_group,
@@ -663,7 +677,15 @@ impl JobStoreShard {
 
         match rate_limit_result {
             Ok(result) if result.under_limit => {
-                // Rate limit passed! Proceed to next limit or RunAttempt
+                // Rate limit passed! Proceed to next limit or RunAttempt.
+                // Same-millisecond tombstone dodge as handle_request_ticket:
+                // bump task_key_start_ms past the parent if necessary so
+                // the follow-up key cannot collide with the just-deleted
+                // CheckRateLimit's task_key.
+                let parent_start_time_ms = parse_task_key(task_key)
+                    .map(|p| p.start_time_ms as i64)
+                    .unwrap_or(now_ms);
+                let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
                 let grants = self
                     .enqueue_limit_task_at_index(
                         &mut DbWriteBatcher::new(&self.db, &mut state.batch),
@@ -676,12 +698,8 @@ impl JobStoreShard {
                             limit_index: (limit_index + 1) as usize,
                             limits: &job_view.limits(),
                             priority,
-                            // Rate-limit just cleared; chain is past its
-                            // scheduled time. `now_ms` for both dodges any
-                            // tombstone on the CheckRateLimit task_key we
-                            // just deleted.
-                            scheduled_at_ms: now_ms,
-                            task_key_start_ms: now_ms,
+                            scheduled_at_ms: new_task_key_start_ms,
+                            task_key_start_ms: new_task_key_start_ms,
                             now_ms,
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,
@@ -733,6 +751,7 @@ impl JobStoreShard {
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     tenant,
+                    check_task_id,
                     job_id,
                     attempt_number,
                     check_relative_attempt_number,
@@ -752,6 +771,7 @@ impl JobStoreShard {
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     tenant,
+                    check_task_id,
                     job_id,
                     attempt_number,
                     check_relative_attempt_number,

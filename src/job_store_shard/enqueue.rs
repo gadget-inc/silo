@@ -537,6 +537,20 @@ impl JobStoreShard {
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
         let current_task_id = task_id.to_string();
+        // `skip_try_reserve` is a retry-only knob (see the lease.rs retry
+        // path): the old holder is still in-memory and the retry must go
+        // through the request queue. It applies to the *first* limit the
+        // walker touches, not every limit in the chain. Today the first
+        // limit's `handle_enqueue` with `skip_try_reserve = true` is
+        // guaranteed to write a TicketRequested and exit the loop, so any
+        // value we leave in here for subsequent iterations is dead. But if
+        // a future ordering ever lets the walker step past that first
+        // limit while `skip_try_reserve` is still true, every downstream
+        // concurrency limit would silently bypass its reservation —
+        // exactly the bug class this PR is trying to close. Consume the
+        // flag after every `handle_enqueue` so the dead-code property
+        // becomes a compile-checked invariant.
+        let mut skip_try_reserve = skip_try_reserve;
 
         loop {
             if current_index >= limits.len() {
@@ -582,7 +596,7 @@ impl JobStoreShard {
                             task_group,
                             attempt_number,
                             relative_attempt_number,
-                            skip_try_reserve,
+                            std::mem::replace(&mut skip_try_reserve, false),
                             current_index as u32,
                             &current_held_queues,
                             limits,
@@ -648,7 +662,7 @@ impl JobStoreShard {
                             task_group,
                             attempt_number,
                             relative_attempt_number,
-                            skip_try_reserve,
+                            std::mem::replace(&mut skip_try_reserve, false),
                             current_index as u32,
                             &current_held_queues,
                             limits,

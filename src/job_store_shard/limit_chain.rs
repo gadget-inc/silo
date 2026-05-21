@@ -64,6 +64,14 @@ impl LimitChainResumer for ShardChainResumer {
         // resumer just granted. Mirrors the precedent in
         // `handle_request_ticket` (dequeue.rs) — see
         // `project_broker_tombstone_chain_continuation`.
+        //
+        // `now_ms` typically exceeds `params.start_at_ms`, but a granted
+        // request that fires within the same millisecond would write
+        // `task_key(now_ms, …) == task_key(start_at_ms, …)` and collide
+        // with the tombstoned interim. Bump past `start_at_ms` to make the
+        // dodge unconditional. The other key components (task_group,
+        // priority, job_id, attempt_number) are constant within a chain.
+        let task_key_start_ms = now_ms.max(params.start_at_ms + 1);
         let mut writer = DbWriteBatcher::new(&shard.db, batch);
         shard
             .enqueue_limit_task_at_index(
@@ -78,7 +86,7 @@ impl LimitChainResumer for ShardChainResumer {
                     limits: &params.limits,
                     priority: params.priority,
                     scheduled_at_ms: params.start_at_ms,
-                    task_key_start_ms: now_ms,
+                    task_key_start_ms,
                     now_ms,
                     held_queues: params.held_queues.clone(),
                     task_group: &params.task_group,
