@@ -734,10 +734,16 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
     while std::time::Instant::now() < deadline {
         let start = tasks_prefix();
         let end = silo::keys::end_bound(&start);
-        let mut iter = shard.db().scan::<Vec<u8>, _>(start..end).await.expect("scan tasks");
+        let mut iter = shard
+            .db()
+            .scan::<Vec<u8>, _>(start..end)
+            .await
+            .expect("scan tasks");
         let mut found = None;
         while let Some(kv) = iter.next().await.expect("iter") {
-            let Some(parsed) = parse_task_key(&kv.key) else { continue };
+            let Some(parsed) = parse_task_key(&kv.key) else {
+                continue;
+            };
             // The leased Job A's task_key has already been ack-deleted, so any
             // surviving task at this point is Job B's resumed RunAttempt.
             found = Some(parsed.start_time_ms);

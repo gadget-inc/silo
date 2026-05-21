@@ -2446,24 +2446,16 @@ impl Scan for TasksScanner {
                     let (task_id_str, held_str) = match decoded.variant_type() {
                         crate::fb::silo::fb::TaskVariant::RunAttempt => {
                             let ra = decoded.as_run_attempt();
-                            let tid = ra
-                                .and_then(|r| r.id())
-                                .unwrap_or_default()
-                                .to_string();
+                            let tid = ra.and_then(|r| r.id()).unwrap_or_default().to_string();
                             let held = ra
                                 .and_then(|r| r.held_queues())
-                                .map(|v| {
-                                    v.iter().collect::<Vec<&str>>().join(",")
-                                })
+                                .map(|v| v.iter().collect::<Vec<&str>>().join(","))
                                 .unwrap_or_default();
                             (tid, held)
                         }
                         crate::fb::silo::fb::TaskVariant::RequestTicket => {
                             let rt = decoded.as_request_ticket();
-                            let tid = rt
-                                .and_then(|r| r.task_id())
-                                .unwrap_or_default()
-                                .to_string();
+                            let tid = rt.and_then(|r| r.task_id()).unwrap_or_default().to_string();
                             let held = rt
                                 .and_then(|r| r.held_queues())
                                 .map(|v| v.iter().collect::<Vec<&str>>().join(","))
@@ -2472,10 +2464,7 @@ impl Scan for TasksScanner {
                         }
                         crate::fb::silo::fb::TaskVariant::CheckRateLimit => {
                             let cr = decoded.as_check_rate_limit();
-                            let tid = cr
-                                .and_then(|r| r.task_id())
-                                .unwrap_or_default()
-                                .to_string();
+                            let tid = cr.and_then(|r| r.task_id()).unwrap_or_default().to_string();
                             let held = cr
                                 .and_then(|r| r.held_queues())
                                 .map(|v| v.iter().collect::<Vec<&str>>().join(","))
