@@ -611,6 +611,13 @@ impl JobStoreShard {
         state.batch.delete(task_key);
         state.ack_deleted(task_key);
 
+        // Parent task_key's start_time_ms — needed by both the success and
+        // retry branches to bump their follow-up task_key past the
+        // tombstone we just installed.
+        let parent_start_time_ms = parse_task_key(task_key)
+            .map(|p| p.start_time_ms as i64)
+            .unwrap_or(now_ms);
+
         // Terminal-status short-circuit. Symmetric with handle_request_ticket:
         // if the job is Succeeded/Failed/Cancelled there's no point calling
         // Gubernator (wastes quota) or advancing the chain (leaks slots until
@@ -682,9 +689,6 @@ impl JobStoreShard {
                 // bump task_key_start_ms past the parent if necessary so
                 // the follow-up key cannot collide with the just-deleted
                 // CheckRateLimit's task_key.
-                let parent_start_time_ms = parse_task_key(task_key)
-                    .map(|p| p.start_time_ms as i64)
-                    .unwrap_or(now_ms);
                 let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
                 let grants = self
                     .enqueue_limit_task_at_index(
@@ -762,6 +766,7 @@ impl JobStoreShard {
                     priority,
                     held_queues,
                     retry_backoff,
+                    parent_start_time_ms,
                     check_task_group,
                 )?;
             }
@@ -782,6 +787,7 @@ impl JobStoreShard {
                     priority,
                     held_queues,
                     retry_backoff,
+                    parent_start_time_ms,
                     check_task_group,
                 )?;
             }
