@@ -1,19 +1,26 @@
 //! Rate limit checking operations via Gubernator.
 
-use uuid::Uuid;
-
 use crate::gubernator::{GubernatorError, RateLimitResult};
 use crate::job_store_shard::helpers::{WriteBatcher, put_task};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::task::{GubernatorRateLimitData, Task};
 
 impl JobStoreShard {
-    /// Schedule a rate limit check retry task
+    /// Schedule a rate limit check retry task.
+    ///
+    /// `task_id` is the chain's continuing task_id (carried from the
+    /// CheckRateLimit being retried). It MUST be reused — not regenerated —
+    /// because every prior holder this chain accumulated is keyed by that
+    /// task_id. Allocating a fresh UUID here orphans those holders: the
+    /// terminal RunAttempt later writes under the new id, the worker's
+    /// completion releases holders under the new id, and the original
+    /// holders are never reachable again.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule_rate_limit_retry<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
+        task_id: &str,
         job_id: &str,
         attempt_number: u32,
         relative_attempt_number: u32,
@@ -27,7 +34,7 @@ impl JobStoreShard {
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let retry_task = Task::CheckRateLimit {
-            task_id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
             tenant: tenant.to_string(),
             job_id: job_id.to_string(),
             attempt_number,
