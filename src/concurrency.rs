@@ -891,21 +891,12 @@ impl ConcurrencyManager {
                 .try_reserve(db, range, tenant, queue, task_id, max_allowed, job_id)
                 .await?
         {
-            // Grant immediately: [SILO-ENQ-CONC-2] [SILO-ENQ-CONC-3] [SILO-IMP-CONC-2] [SILO-REIMP-CONC-2] create holder + task in DB queue
+            // Grant immediately: [SILO-ENQ-CONC-2] [SILO-ENQ-CONC-3] [SILO-IMP-CONC-2] [SILO-REIMP-CONC-2] create holder in DB queue.
+            // The RunAttempt task itself is written exactly once by the chain
+            // walker's terminal branch, carrying the full accumulated
+            // `held_queues`.
             // Note: in-memory slot is already reserved by try_reserve
-            append_grant_edits(
-                writer,
-                now_ms,
-                tenant,
-                queue,
-                task_id,
-                task_key_start_ms,
-                priority,
-                job_id,
-                attempt_number,
-                relative_attempt_number,
-                task_group,
-            )?;
+            append_grant_edits(writer, now_ms, tenant, queue, task_id)?;
             if let Some(ref m) = self.metrics {
                 m.record_concurrency_tickets_granted(
                     &self.shard,
@@ -1560,49 +1551,30 @@ impl ConcurrencyManager {
     }
 }
 
-/// Append DB edits to grant a concurrency slot: creates holder record and RunAttempt task.
-/// Note: In-memory reservation should already be done via try_reserve before calling this.
-#[allow(clippy::too_many_arguments)]
+/// Append DB edits to grant a concurrency slot: creates only the holder
+/// record. The `RunAttempt` `task_key` is written exactly once, by the chain
+/// walker's terminal branch, with the *full* accumulated `held_queues`.
+///
+/// Writing an interim per-queue `RunAttempt` here would be redundant (it gets
+/// overwritten by the terminal write, deleted by the Queued-branch cleanup,
+/// or overwritten by `CheckRateLimit`), and worse, gives the broker scan a
+/// chance to observe a `RunAttempt` whose `held_queues` is missing every
+/// later-granted queue — which would under-release on completion.
+///
+/// Note: In-memory reservation should already be done via `try_reserve`
+/// before calling this.
 fn append_grant_edits<W: WriteBatcher>(
     writer: &mut W,
     now_ms: i64,
     tenant: &str,
     queue: &str,
     task_id: &str,
-    task_key_start_ms: i64,
-    priority: u8,
-    job_id: &str,
-    attempt_number: u32,
-    relative_attempt_number: u32,
-    task_group: &str,
 ) -> Result<(), ConcurrencyError> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
     };
     let holder_val = encode_holder(&holder);
     writer.put(concurrency_holder_key(tenant, queue, task_id), &holder_val)?;
-
-    let task = Task::RunAttempt {
-        id: task_id.to_string(),
-        tenant: tenant.to_string(),
-        job_id: job_id.to_string(),
-        attempt_number,
-        relative_attempt_number,
-        held_queues: vec![queue.to_string()],
-        task_group: task_group.to_string(),
-    };
-    let task_value = encode_task(&task);
-    writer.put(
-        task_key(
-            task_group,
-            task_key_start_ms,
-            priority,
-            job_id,
-            attempt_number,
-        ),
-        &task_value,
-    )?;
-
     Ok(())
 }
 
