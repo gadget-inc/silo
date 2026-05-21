@@ -3,19 +3,21 @@
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 
-use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_lease};
-use crate::concurrency::RequestTicketTaskOutcome;
+use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_holder, encode_lease};
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
-use crate::job::{JobStatus, JobView};
+use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
-use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
+use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, concurrency_holder_key, job_info_key, leased_task_key, parse_task_key,
+    attempt_key, concurrency_holder_key, job_info_key, job_status_key, leased_task_key,
+    parse_task_key,
 };
 use crate::shard_range::ShardRange;
-use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
+use crate::task::{
+    DEFAULT_LEASE_MS, HolderRecord, LeaseRecord, LeasedRefreshTask, LeasedTask, Task,
+};
 use crate::task_broker::BrokerTask;
 
 /// Mutable accumulators for a single dequeue iteration.
@@ -348,130 +350,179 @@ impl JobStoreShard {
         Ok(attempt_val)
     }
 
-    /// Process a RequestTicket task: check cancellation, process concurrency ticket, maybe lease.
+    /// Process a RequestTicket task.
+    ///
+    /// The ticket carries the chain's task_id, the persisted limits list,
+    /// limit_index, and held_queues. Behavior:
+    ///
+    /// 1. Sanity-check that the job still exists (cheap status check; no
+    ///    JobInfo fetch — the limits we need ride on the ticket itself).
+    /// 2. Resolve the gating queue's capacity from the persisted limits.
+    /// 3. `try_reserve` the slot. If at capacity, leave the ticket in place
+    ///    (`ack_release`) so a later scan reattempts.
+    /// 4. On grant: write the holder, delete the ticket, and call
+    ///    `enqueue_limit_task_at_index` with `limit_index + 1` to write the
+    ///    follow-up task. Use `now_ms` for the follow-up's task_key — the
+    ///    broker tombstones the just-deleted task_key, so a chain that
+    ///    re-emits at the same key would be silently suppressed (see the
+    ///    project_broker_tombstone_chain_continuation memory).
+    /// 5. This iteration produces no leasable task. The follow-up (RunAttempt
+    ///    or CheckRateLimit or a new deferred request) is at a fresh task_key
+    ///    and will be picked up by the next broker scan.
     #[allow(clippy::too_many_arguments)]
     async fn handle_request_ticket(
         &self,
         state: &mut DequeueIterationState,
         task_key: &[u8],
         decoded: &DecodedTask,
-        shard_range: &ShardRange,
-        worker_id: &str,
+        _shard_range: &ShardRange,
+        _worker_id: &str,
         now_ms: i64,
-        expiry_ms: i64,
+        _expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
         let rt = decoded.as_request_ticket().ok_or_else(|| {
             JobStoreShardError::Codec("expected RequestTicket variant".to_string())
         })?;
-        let queue = rt.queue().unwrap_or_default();
-        let tenant = rt.tenant().unwrap_or_default();
-        let job_id = rt.job_id().unwrap_or_default();
+        let queue = rt.queue().unwrap_or_default().to_string();
+        let tenant = rt.tenant().unwrap_or_default().to_string();
+        let job_id = rt.job_id().unwrap_or_default().to_string();
         let attempt_number = rt.attempt_number();
         let relative_attempt_number = rt.relative_attempt_number();
-        let request_id = rt.request_id().unwrap_or_default();
-        let req_task_group = rt.task_group().unwrap_or_default();
+        let task_id = rt.task_id().unwrap_or_default().to_string();
+        let req_task_group = rt.task_group().unwrap_or_default().to_string();
+        let limit_index = rt.limit_index();
+        let stored_held_queues: Vec<String> = rt
+            .held_queues()
+            .map(|v| v.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let limits: Vec<Limit> = crate::codec::limit_entries_to_owned(rt.limits());
         state.processed_internal = true;
-        let tenant = tenant.to_string();
 
-        // Note: No cancelled check here. Cancelled jobs' tasks are eagerly removed
-        // by cancel_job. If a stale task appears (e.g., retry after cancel), it will
-        // be processed normally and the worker discovers cancellation via heartbeat.
+        // Cancellation is not checked here — cancel_job eagerly removes tasks;
+        // any stale task that survives will be discovered as cancelled by the
+        // worker via heartbeat.
 
-        // Load job info
-        let job_key = job_info_key(&tenant, job_id);
-        let maybe_job = self.db.get(&job_key).await?;
-        let job_view = maybe_job
-            .as_ref()
-            .and_then(|bytes| JobView::new(bytes.clone()).ok());
+        // Existence check: a missing job_status means the job has been wiped,
+        // so the ticket is orphan. Just delete it. Cheaper than a JobInfo
+        // fetch.
+        match self.db.get(&job_status_key(&tenant, &job_id)).await? {
+            Some(raw) => match decode_job_status_owned(&raw) {
+                Ok(status)
+                    if matches!(
+                        status.kind,
+                        JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled
+                    ) =>
+                {
+                    // Terminal: drop the ticket, nothing to do.
+                    state.batch.delete(task_key);
+                    state.ack_deleted(task_key);
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // Unreadable status — treat as missing.
+                    state.batch.delete(task_key);
+                    state.ack_deleted(task_key);
+                    return Ok(());
+                }
+            },
+            None => {
+                state.batch.delete(task_key);
+                state.ack_deleted(task_key);
+                return Ok(());
+            }
+        }
 
-        // Process ticket via concurrency manager
-        let outcome = self
+        // Capacity comes from the persisted limits (no JobInfo round-trip).
+        let (max_allowed, limit_type) = crate::concurrency::ConcurrencyManager::capacity_for_queue(
+            &self.db, &tenant, &queue, &limits,
+        )
+        .await;
+        self.concurrency
+            .cache_queue_limit(&tenant, &queue, max_allowed as u32, limit_type);
+
+        // Atomically reserve a slot (preserves the original TOCTOU invariant).
+        let reserved = self
             .concurrency
-            .process_ticket_request_task(
+            .counts()
+            .try_reserve(
                 &self.db,
-                shard_range,
-                &mut state.batch,
-                task_key,
+                &self.get_range(),
                 &tenant,
-                queue,
-                request_id,
-                job_id,
-                attempt_number,
-                now_ms,
-                job_view.as_ref(),
+                &queue,
+                &task_id,
+                max_allowed,
+                &job_id,
             )
             .await?;
 
-        match outcome {
-            RequestTicketTaskOutcome::Granted { request_id, queue } => {
-                // Track grant for rollback if DB write fails
-                state
-                    .grants_to_rollback
-                    .push((tenant.clone(), queue.clone(), request_id.clone()));
+        if !reserved {
+            // Out of capacity — leave the ticket in place for a later scan.
+            state.ack_release(task_key);
+            return Ok(());
+        }
 
-                // Create RunAttempt task for the lease (new Task, not a copy)
-                let run = Task::RunAttempt {
-                    id: request_id.clone(),
-                    tenant: tenant.clone(),
-                    job_id: job_id.to_string(),
+        // Track this grant so a batch failure rolls back the reservation.
+        state
+            .grants_to_rollback
+            .push((tenant.clone(), queue.clone(), task_id.clone()));
+
+        // Write the holder for the just-won queue.
+        let holder_val = encode_holder(&HolderRecord {
+            granted_at_ms: now_ms,
+        });
+        state.batch.put(
+            concurrency_holder_key(&tenant, &queue, &task_id),
+            &holder_val,
+        );
+
+        // Delete the original ticket and continue the chain. The follow-up
+        // task is written at a fresh task_key (start_at_ms=now_ms) so the
+        // broker tombstone for `task_key` doesn't suppress its re-pickup.
+        state.batch.delete(task_key);
+        state.ack_deleted(task_key);
+
+        let mut new_held = stored_held_queues;
+        new_held.push(queue.clone());
+
+        let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
+        let chain_grants = self
+            .enqueue_limit_task_at_index(
+                &mut writer,
+                LimitTaskParams {
+                    tenant: &tenant,
+                    task_id: &task_id,
+                    job_id: &job_id,
                     attempt_number,
                     relative_attempt_number,
-                    held_queues: vec![queue],
-                    task_group: req_task_group.to_string(),
-                };
+                    limit_index: (limit_index + 1) as usize,
+                    limits: &limits,
+                    priority: rt.priority(),
+                    start_at_ms: now_ms,
+                    now_ms,
+                    held_queues: new_held,
+                    task_group: &req_task_group,
+                    skip_try_reserve: false,
+                },
+            )
+            .await?;
 
-                let attempt_val = self
-                    .write_lease_and_attempt(
-                        &mut state.batch,
-                        worker_id,
-                        &run,
-                        &request_id,
-                        &tenant,
-                        job_id,
-                        attempt_number,
-                        relative_attempt_number,
-                        now_ms,
-                        expiry_ms,
-                    )
-                    .await?;
+        // Each (queue, task_id) the chain reserved also needs rollback if the
+        // batch write fails.
+        for (q, tid) in chain_grants {
+            state.grants_to_rollback.push((tenant.clone(), q, tid));
+        }
 
-                let view = job_view.ok_or_else(|| {
-                    JobStoreShardError::Codec(format!(
-                        "job view missing for granted ticket, job_id={}",
-                        job_id
-                    ))
-                })?;
-                state
-                    .pending_attempts
-                    .push((tenant.clone(), view, attempt_val));
-                state.ack_deleted(task_key);
-
-                // Track for DST event emission after commit
-                state
-                    .leased_tasks_for_dst
-                    .push((tenant, job_id.to_string(), request_id));
-
-                // Record concurrency ticket metric and ready-to-start latency
-                if let Some(ref m) = self.metrics {
-                    m.record_concurrency_tickets_granted(
-                        self.name(),
-                        crate::metrics::GrantPath::Scanned,
-                        1,
-                    );
-                    if let Some(parsed) = parse_task_key(task_key) {
-                        let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
-                        m.record_ready_to_start_latency_ms(self.name(), req_task_group, latency_ms);
-                    }
-                }
-            }
-            RequestTicketTaskOutcome::Requested => {
-                // Release inflight only; task key remains in DB and must be eligible
-                // for future scans when capacity is available.
-                state.ack_release(task_key);
-            }
-            RequestTicketTaskOutcome::JobMissing => {
-                // process_ticket_request_task deleted the task key.
-                state.ack_deleted(task_key);
+        // Metrics: account the grant as a Scanned-path ticket.
+        if let Some(ref m) = self.metrics {
+            m.record_concurrency_tickets_granted(
+                self.name(),
+                crate::metrics::GrantPath::Scanned,
+                1,
+            );
+            if let Some(parsed) = parse_task_key(task_key) {
+                let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
+                m.record_ready_to_start_latency_ms(self.name(), &req_task_group, latency_ms);
             }
         }
 
