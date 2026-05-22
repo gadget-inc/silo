@@ -129,6 +129,9 @@
       packages.default = silo;
       packages.silo = silo;
       packages.silo-debug = silo-debug;
+      # Exposed so docker.nix can lift the Rust gdb pretty-printers out of the
+      # toolchain without re-importing rust-overlay.
+      packages.rust-toolchain = rustToolchain;
       packages.silo-autoscaler = silo-autoscaler;
       packages.silo-compactor = silo-compactor;
       packages.siloctl = siloctl;

@@ -1,6 +1,23 @@
 { inputs, ... }:
 {
-  perSystem = { config, self', pkgs, lib, system, ... }: {
+  perSystem = { config, self', pkgs, lib, system, ... }:
+    let
+      # Extract just the Rust gdb pretty-printer Python files from the toolchain
+      # so the prod image can ship `rust-gdb` without dragging in the entire
+      # Rust toolchain (~hundreds of MB of rustc + stdlib sources).
+      rust-gdb-printers = pkgs.runCommand "rust-gdb-printers" { } ''
+        mkdir -p $out/share/rust-gdb
+        cp ${self'.packages.rust-toolchain}/lib/rustlib/etc/*.py $out/share/rust-gdb/
+      '';
+      rust-gdb = pkgs.writeShellScriptBin "rust-gdb" ''
+        PYTHONPATH="''${PYTHONPATH:+$PYTHONPATH:}${rust-gdb-printers}/share/rust-gdb" \
+        exec ${pkgs.gdb}/bin/gdb \
+          -d "${rust-gdb-printers}/share/rust-gdb" \
+          -iex "add-auto-load-safe-path ${rust-gdb-printers}/share/rust-gdb" \
+          "$@"
+      '';
+    in
+    {
     packages.silo-docker = pkgs.dockerTools.buildLayeredImage {
       name = "silo";
       tag = "latest";
@@ -9,6 +26,10 @@
         self'.packages.silo
         # Include CA certificates for TLS
         pkgs.cacert
+        # Debugger + Rust pretty-printer wrapper for attaching to silo in prod.
+        # Adds ~50MB for gdb; the rust-gdb wrapper itself is tiny.
+        pkgs.gdb
+        rust-gdb
       ];
 
       # pprof CPU profiler needs /tmp for temporary files during profile collection
