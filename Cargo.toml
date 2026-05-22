@@ -126,8 +126,8 @@ tonic-build = "0.12"
 protoc-bin-vendored = "3.0"
 
 [profile.release]
-debug = 1     # debug info with line tables only for profiling
-strip = false # do not strip symbols for profiling
+debug = "full" # full DWARF — gdb can inspect locals/types, profilers get symbols
+strip = false  # do not strip symbols for profiling
 # NOTE: pprof uses frame-pointer based stack unwinding. The nix build in
 # nix/modules/rust.nix sets RUSTFLAGS="-C force-frame-pointers=yes" to ensure
 # frame pointers are preserved. Without this, production profiles will have
