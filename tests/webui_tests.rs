@@ -1250,12 +1250,16 @@ async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
 
     let shard0_id = shard_map.shards()[0].id;
     let shard0 = state.factory.get(&shard0_id).expect("shard 0");
+    // Present-time enqueues so the chain populates queue_counts:
+    // job 1 grants the only slot (holder), job 2 defers (requester).
+    // Pre-fix this test used future start times — those grabbed holders
+    // too, but future-scheduled jobs no longer do.
     let _ = shard0
         .enqueue(
             "tenant-detail",
             Some("tenant-detail-job-1".to_string()),
             40,
-            test_helpers::now_ms() + 30_000,
+            test_helpers::now_ms(),
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"k":"v"})),
             vec![Limit::Concurrency(ConcurrencyLimit {
@@ -1272,7 +1276,7 @@ async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
             "tenant-detail",
             Some("tenant-detail-job-2".to_string()),
             10,
-            test_helpers::now_ms() + 45_000,
+            test_helpers::now_ms(),
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"k":"v2"})),
             vec![Limit::Concurrency(ConcurrencyLimit {
