@@ -2858,123 +2858,85 @@ async fn two_concurrency_limits_chain_writes_new_request_when_b_full() {
     );
 }
 
-/// Cancelling a future-scheduled multi-concurrency job whose chain has
-/// already won an upstream slot must release that slot.
+/// Future-scheduled jobs must not eat concurrency holders before their
+/// scheduled run time.
 ///
-/// Setup: job1 holds B (capacity 1). job2 is future-scheduled with
-/// `[A (free), B (full)]`. The chain walker grants A immediately at enqueue
-/// time and writes a future `RequestTicket` for B carrying
-/// `held_queues=[A]`. Pre-fix the cancel path saw `Task::RequestTicket {..}`
-/// and only deleted the task — A's holder leaked.
+/// Pre-fix: `handle_enqueue` calls `try_reserve` unconditionally, so a
+/// future-scheduled job whose queue has free capacity is granted a holder
+/// immediately. With enough future-scheduled jobs the queue fills up and
+/// blocks present-time work that should be running now.
+///
+/// Setup: capacity-3 queue. Enqueue 3 future-scheduled jobs (start_at far
+/// in the future). Then enqueue 1 present-time job. Pre-fix the 3 future
+/// jobs grab the 3 holders and the present-time job is parked in the
+/// request queue — `dequeue` returns nothing. Post-fix the future jobs
+/// take no holders, and the present-time job is granted and dequeueable.
 #[silo::test]
-async fn cancel_future_request_ticket_releases_held_queues() {
+async fn future_scheduled_jobs_do_not_starve_immediate_work() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
     let tenant = "-";
-    let queue_a = "cancel-fut-a".to_string();
-    let queue_b = "cancel-fut-b".to_string();
+    let queue = "future-starve-q".to_string();
+    let future_at = now + 600_000; // ten minutes out
 
-    // job1 fills B so job2 cannot grant B at enqueue time.
-    let _job1 = shard
+    // Fill the queue with future-scheduled jobs equal to its capacity.
+    for i in 0..3 {
+        shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                future_at,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"f": i})),
+                vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: 3,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue future job");
+    }
+
+    // No holders should be in place for jobs that won't run for 10 minutes.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue).await,
+        0,
+        "future-scheduled jobs must not grab concurrency holders at enqueue time"
+    );
+
+    // A present-time job on the same queue should be free to run.
+    let immediate_id = shard
         .enqueue(
             tenant,
             None,
             10u8,
             now,
             None,
-            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            test_helpers::msgpack_payload(&serde_json::json!({"f": "now"})),
             vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
-                key: queue_b.clone(),
-                max_concurrency: 1,
+                key: queue.clone(),
+                max_concurrency: 3,
             })],
             None,
             "default",
         )
         .await
-        .expect("enqueue job1");
-    let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
-    assert_eq!(job1_tasks.len(), 1, "job1 should run and hold B");
+        .expect("enqueue immediate job");
 
-    // job2: future-scheduled with [A free, B full]. Chain grants A and
-    // writes a future RequestTicket for B with held_queues=[A].
-    let future_at = now + 600_000;
-    let job2_id = shard
-        .enqueue(
-            tenant,
-            None,
-            10u8,
-            future_at,
-            None,
-            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
-            vec![
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_a.clone(),
-                    max_concurrency: 1,
-                }),
-                Limit::Concurrency(silo::job::ConcurrencyLimit {
-                    key: queue_b.clone(),
-                    max_concurrency: 1,
-                }),
-            ],
-            None,
-            "default",
-        )
+    let tasks = shard
+        .dequeue("w1", "default", 10)
         .await
-        .expect("enqueue job2");
-
-    // Sanity: job2's A holder is in place.
-    assert_eq!(
-        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
-        1,
-        "job2 should have grabbed A at enqueue time"
-    );
-
-    // Sanity: a RequestTicket task exists in the queue for job2.
-    let req_ticket_present = {
-        let start = silo::keys::tasks_prefix();
-        let end = silo::keys::end_bound(&start);
-        let mut iter = shard
-            .db()
-            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
-            .await
-            .expect("scan tasks");
-        let mut found = false;
-        while let Ok(Some(kv)) = iter.next().await {
-            if let Ok(task) = decode_task(&kv.value)
-                && let Task::RequestTicket {
-                    job_id,
-                    ref held_queues,
-                    ..
-                } = task
-                && job_id == job2_id
-            {
-                assert_eq!(
-                    held_queues.as_slice(),
-                    std::slice::from_ref(&queue_a),
-                    "future RequestTicket should carry [A] in held_queues"
-                );
-                found = true;
-                break;
-            }
-        }
-        found
-    };
+        .expect("dequeue")
+        .tasks;
+    let ran_immediate = tasks.iter().any(|t| t.job().id() == immediate_id);
     assert!(
-        req_ticket_present,
-        "expected a future RequestTicket task for job2"
-    );
-
-    // Cancel job2 — the future RequestTicket carries held_queues=[A]; the
-    // cancel path must delete that holder so the slot doesn't leak.
-    shard
-        .cancel_job(tenant, &job2_id)
-        .await
-        .expect("cancel job2");
-
-    assert_eq!(
-        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
-        0,
-        "cancelling a future RequestTicket must release prior chain holders on A"
+        ran_immediate,
+        "present-time job should be granted and dequeueable; \
+         future-scheduled jobs starved its slot. got {} tasks",
+        tasks.len()
     );
 }
 
@@ -3009,15 +2971,17 @@ async fn cancel_check_rate_limit_releases_held_queues() {
         },
     };
 
-    // Future-schedule so the CheckRateLimit task lands in the queue but
-    // is not yet ready to be processed by a dequeue.
-    let future_at = now + 600_000;
+    // Present-time enqueue so the chain immediately grants A and writes a
+    // CheckRateLimit task carrying held_queues=[A]. (We don't dequeue, so
+    // the task sits in the queue until we cancel.) Pre-fix this test used
+    // a future start time, but future-scheduled jobs no longer grab holders
+    // at enqueue time, so the multi-limit chain wouldn't accumulate A.
     let job_id = shard
         .enqueue(
             tenant,
             None,
             10u8,
-            future_at,
+            now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"j": "crl"})),
             vec![

@@ -905,24 +905,38 @@ impl ConcurrencyManager {
                 .try_reserve(db, range, tenant, queue, task_id, max_allowed, job_id)
                 .await?
         {
-            // Grant immediately: [SILO-ENQ-CONC-2] [SILO-ENQ-CONC-3] [SILO-IMP-CONC-2] [SILO-REIMP-CONC-2] create holder in DB queue.
-            // The RunAttempt task itself is written exactly once by the chain
-            // walker's terminal branch, carrying the full accumulated
-            // `held_queues`.
-            // Note: in-memory slot is already reserved by try_reserve
-            append_grant_edits(writer, now_ms, tenant, queue, task_id)?;
-            if let Some(ref m) = self.metrics {
-                m.record_concurrency_tickets_granted(
-                    &self.shard,
-                    crate::metrics::GrantPath::Immediate,
-                    1,
-                );
+            if scheduled_at_ms > now_ms {
+                // Future-scheduled: don't hold the slot until the job runs.
+                // Release the in-memory reservation and fall through to the
+                // FutureRequestTaskWritten branch, which writes a
+                // `Task::RequestTicket` at `scheduled_at_ms`.
+                // `handle_request_ticket` calls `try_reserve` again at
+                // dequeue time, so the slot is taken when it's actually
+                // about to be used. Without this rollback, a burst of
+                // future-scheduled jobs into a free queue grabs every
+                // holder and starves present-time work.
+                self.rollback_grant(tenant, queue, task_id);
+            } else {
+                // Grant immediately: [SILO-ENQ-CONC-2] [SILO-ENQ-CONC-3] [SILO-IMP-CONC-2] [SILO-REIMP-CONC-2] create holder in DB queue.
+                // The RunAttempt task itself is written exactly once by the chain
+                // walker's terminal branch, carrying the full accumulated
+                // `held_queues`.
+                // Note: in-memory slot is already reserved by try_reserve
+                append_grant_edits(writer, now_ms, tenant, queue, task_id)?;
+                if let Some(ref m) = self.metrics {
+                    m.record_concurrency_tickets_granted(
+                        &self.shard,
+                        crate::metrics::GrantPath::Immediate,
+                        1,
+                    );
+                }
+                return Ok(Some(RequestTicketOutcome::GrantedImmediately {
+                    task_id: task_id.to_string(),
+                    queue: queue.clone(),
+                }));
             }
-            Ok(Some(RequestTicketOutcome::GrantedImmediately {
-                task_id: task_id.to_string(),
-                queue: queue.clone(),
-            }))
-        } else if scheduled_at_ms <= now_ms {
+        }
+        if scheduled_at_ms <= now_ms {
             // [SILO-ENQ-CONC-4] [SILO-IMP-CONC-3] [SILO-REIMP-CONC-3] Queue is at capacity
             // [SILO-ENQ-CONC-5] [SILO-IMP-CONC-4] [SILO-REIMP-CONC-4] No task in DB queue, request created
             // [SILO-ENQ-CONC-6] Create request record instead
