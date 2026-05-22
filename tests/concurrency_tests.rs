@@ -143,8 +143,10 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
     let queue = "reconcile-q".to_string();
 
     // Create a real job record that the grant scanner can resolve when
-    // granting. Use a future start time so no ready task exists for this
-    // job yet. Give the job a concurrency limit on `queue` so the injected
+    // granting. Use a present-time start so the chain grants a real
+    // holder we can steal a task_id from. (Pre-fix this test used a future
+    // start, but future-scheduled jobs no longer grab holders at enqueue
+    // time.) Give the job a concurrency limit on `queue` so the injected
     // request is well-formed — post-schema-update the scanner expects
     // requests to persist their limits list and rejects ones with an empty
     // list as corrupt.
@@ -157,7 +159,7 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
             tenant,
             None,
             10u8,
-            now + 60_000,
+            now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"reconcile": true})),
             vec![conc_limit.clone()],
