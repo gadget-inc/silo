@@ -6,7 +6,7 @@
 mod test_helpers;
 
 use silo::codec::{decode_lease, encode_holder, encode_lease, encode_task};
-use silo::job::{FloatingConcurrencyLimit, Limit};
+use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, GubernatorRateLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
 use silo::keys::{concurrency_holder_key, job_info_key, task_key};
@@ -91,6 +91,18 @@ async fn floating_concurrency_holder_released_on_lease_expiry() {
         0,
         "tenant-scoped holder count should also be zero"
     );
+    // In-memory cache must agree with DB; a cache-only leak silently
+    // poisons future try_reserve checks and stalls the grant scanner.
+    assert_eq!(
+        shard.concurrency_holder_count("-", &queue),
+        0,
+        "in-memory holder cache must drop the released holder"
+    );
+    assert_eq!(
+        shard.concurrency_cache_stats().total_holders,
+        0,
+        "no phantom in-memory holders should remain on any queue"
+    );
 }
 
 /// After a lease has been reaped server-side, the worker may still call
@@ -140,6 +152,16 @@ async fn floating_concurrency_holder_released_when_report_outcome_after_reap() {
         count_concurrency_holders(shard.db()).await,
         0,
         "holder must remain released after a late report_attempt_outcome"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count("-", &queue),
+        0,
+        "in-memory holder cache must also be empty after late ack"
+    );
+    assert_eq!(
+        shard.concurrency_cache_stats().total_holders,
+        0,
+        "no phantom in-memory holders across any queue"
     );
 }
 
@@ -203,6 +225,11 @@ async fn holder_leaked_when_run_attempt_finds_missing_job_info() {
         count_concurrency_holders(shard.db()).await,
         0,
         "holder must be released when handle_run_attempt drops a task with held_queues",
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue),
+        0,
+        "in-memory holder cache must release alongside DB delete"
     );
 }
 
@@ -322,6 +349,13 @@ async fn check_rate_limit_max_retries_releases_held_queues() {
         "max-retries early return must release held concurrency holders \
          (regression for dequeue.rs handle_check_rate_limit)"
     );
+    // Cache is the dual of the DB delete; an atomic_release that
+    // accidentally inserts (or skips the lookup) would leak silently.
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        0,
+        "in-memory holder must mirror the DB delete"
+    );
 }
 
 /// Regression test for `handle_check_rate_limit`'s missing-job_info early
@@ -412,6 +446,11 @@ async fn check_rate_limit_missing_job_info_releases_held_queues() {
         "missing-job_info early return must release held concurrency holders \
          (regression for dequeue.rs handle_check_rate_limit)"
     );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        0,
+        "in-memory holder must mirror the DB delete"
+    );
 }
 
 /// Defensive idempotency: a stranded holder (no corresponding lease and no
@@ -476,6 +515,12 @@ async fn purge_orphaned_holders_for_task_removes_stranded_holders() {
         .expect("purge again");
     assert_eq!(purged_again, 0);
     assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+    // Cache parity: the purged holders must also be gone from the
+    // in-memory set, and the unrelated holder must remain unaffected.
+    // Both queues were planted directly into DB (no try_reserve), so
+    // cache started at 0; purge's atomic_release path must not insert.
+    assert_eq!(shard.concurrency_holder_count(tenant, queue_a), 0);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue_b), 0);
 }
 
 /// End-to-end variant: a worker calls `report_attempt_outcome` for a task_id
@@ -544,6 +589,21 @@ async fn late_report_outcome_followed_by_purge_clears_holder() {
         count_concurrency_holders(shard.db()).await,
         0,
         "purge after late ack should remove the planted orphan"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue),
+        0,
+        "in-memory cache for the leased queue must drop the reaped holder"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, stale_queue),
+        0,
+        "in-memory cache for the planted-orphan queue must also be empty after purge"
+    );
+    assert_eq!(
+        shard.concurrency_cache_stats().total_holders,
+        0,
+        "no phantom in-memory holders across the whole shard"
     );
 }
 
@@ -626,6 +686,20 @@ async fn floating_concurrency_steady_state_zero_holders_after_full_cycle() {
         count_concurrency_holders_for_tenant(shard.db(), "-").await,
         0,
         "per-tenant holder count must be zero too"
+    );
+    // Mixed-outcome cycle is exactly the production-like steady state
+    // (some report success, some reap as WORKER_CRASHED). The in-memory
+    // cache MUST equal DB at rest — divergence here is what blocks the
+    // grant scanner in staging.
+    assert_eq!(
+        shard.concurrency_holder_count("-", &queue),
+        0,
+        "in-memory holder cache must be zero for the cycled queue"
+    );
+    assert_eq!(
+        shard.concurrency_cache_stats().total_holders,
+        0,
+        "in-memory holder cache must be zero across the entire shard"
     );
 }
 
@@ -774,5 +848,109 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
          ({}), so any tombstone planted at that key would silently suppress this \
          task — exactly the leak the fix is meant to prevent.",
         original_enqueue_ms,
+    );
+}
+
+/// `lease_task` (the singular gRPC, used by siloctl / admin paths) bypasses the
+/// normal dequeue and replaces the pending task with a fresh
+/// `Task::RunAttempt { held_queues: vec![], task_id: <new uuid> }` regardless
+/// of what the deleted task was.
+///
+/// When the pending task is a `CheckRateLimit` or `RequestTicket` carrying
+/// chain-accumulated `held_queues`, those upstream concurrency holders are
+/// stranded:
+///   - DB still has `concurrency_holder_key(tenant, Q, old_task_id)`.
+///   - In-memory cache still has `Q.holders = {old_task_id}`.
+///   - The new lease records `held_queues = []`, so `report_attempt_outcome`
+///     releases nothing for the old task_id.
+///   - No worker ever reports outcome for the old task_id, so the gRPC
+///     handler's `purge_orphaned_holders_for_task` self-heal never runs.
+///
+/// This test sets up a [Concurrency(Q1, max=1), RateLimit] chain so the
+/// enqueue grants Q1 immediately and parks the chain on a CheckRateLimit task
+/// with `held_queues=[Q1]`. After `lease_task`, both DB and in-memory holders
+/// for Q1 must be zero. The fix should mirror cancel.rs' arm-aware release.
+#[silo::test]
+async fn lease_task_releases_held_queues_when_replacing_check_rate_limit() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue_a = "lease-task-leak-q";
+    let task_group = "default";
+
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"chained": true})),
+            vec![
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: queue_a.to_string(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(GubernatorRateLimit::new(
+                    "api",
+                    format!("u-{}", uuid::Uuid::new_v4()),
+                    100,
+                    60_000,
+                )),
+            ],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue");
+
+    // The walker granted Q1 immediately (max=1) and parked the chain on a
+    // CheckRateLimit task carrying `held_queues=[queue_a]`. Both DB and
+    // in-memory must reflect the holder before we exercise lease_task.
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "Concurrency-A should have one durable holder after the immediate grant"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue_a),
+        1,
+        "in-memory cache should mirror the immediate grant"
+    );
+
+    // Direct-lease the job. This replaces the pending CheckRateLimit task with
+    // a fresh RunAttempt under a new task_id and `held_queues = []`.
+    let leased = shard
+        .lease_task(tenant, &job_id, "test-worker")
+        .await
+        .expect("lease_task");
+    let new_task_id = leased.attempt().task_id().to_string();
+
+    // Worker completes the leased RunAttempt. report_attempt_outcome reads
+    // `held_queues = []` from the lease, so it releases nothing.
+    shard
+        .report_attempt_outcome(&new_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    // Both DB and in-memory must be empty: the stranded holder for the
+    // original chain task_id is exactly the cache-vs-DB drift we're chasing
+    // in staging (in-memory is more vulnerable because the cache-only entries
+    // also poison try_reserve on every subsequent grant attempt).
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "lease_task must release chain-accumulated held_queues from DB; \
+         the deleted CheckRateLimit task's holders are otherwise stranded"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue_a),
+        0,
+        "lease_task must release chain-accumulated held_queues from the \
+         in-memory cache; a stranded cache entry stalls the grant scanner"
+    );
+    assert_eq!(
+        shard.concurrency_cache_stats().total_holders,
+        0,
+        "no phantom in-memory holders should remain across any queue"
     );
 }
