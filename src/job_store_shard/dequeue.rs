@@ -18,7 +18,7 @@ use crate::shard_range::ShardRange;
 use crate::task::{
     DEFAULT_LEASE_MS, HolderRecord, LeaseRecord, LeasedRefreshTask, LeasedTask, Task,
 };
-use crate::task_broker::BrokerTask;
+use crate::task_broker::{BrokerTask, TaskBrokerRegistry};
 
 /// Mutable accumulators for a single dequeue iteration.
 /// Bundles state that each task-type handler needs to read and write,
@@ -58,6 +58,65 @@ impl DequeueIterationState {
     fn ack_deleted(&mut self, key: &[u8]) {
         self.release_keys.push(key.to_vec());
         self.tombstone_keys.push(key.to_vec());
+    }
+}
+
+/// RAII guard over a dequeue iteration's `claimed` batch.
+///
+/// `claim_ready` adds claimed keys to the broker's in-memory `inflight` set,
+/// which is only ever drained by `ack_durable` (commit success) or `requeue`
+/// (explicit error paths). If the `dequeue` future is dropped mid-iteration
+/// (LeaseTasks RPC cancelled / deadline / disconnect) or panics, neither runs
+/// and the whole batch is stranded in `inflight` forever (no TTL), which is the
+/// root cause of `silo_broker_inflight_size` growing and never draining.
+///
+/// This guard closes that gap: every normal exit `disarm`s it (handing the
+/// tasks back to the existing `ack_durable`/`requeue` logic), so its `Drop`
+/// fires *only* on cancellation/panic, where it releases the claimed keys from
+/// `inflight`. It deliberately uses `release_inflight` (release-only) rather
+/// than `requeue` (re-buffer) so an ambiguous commit can't cause double
+/// dispatch — see [`TaskBrokerRegistry::release_inflight`].
+///
+/// Relies on unwinding `Drop` for the panic case (the crate uses the default
+/// `panic = "unwind"`); future cancellation runs `Drop` regardless.
+struct ClaimedInflightGuard<'a> {
+    brokers: &'a TaskBrokerRegistry,
+    tasks: Option<Vec<BrokerTask>>,
+}
+
+impl<'a> ClaimedInflightGuard<'a> {
+    fn new(brokers: &'a TaskBrokerRegistry, tasks: Vec<BrokerTask>) -> Self {
+        Self {
+            brokers,
+            tasks: Some(tasks),
+        }
+    }
+
+    /// The claimed tasks still under guard.
+    fn tasks(&self) -> &[BrokerTask] {
+        self.tasks.as_deref().unwrap_or(&[])
+    }
+
+    /// Take ownership of the claimed batch back, neutralizing the guard so its
+    /// `Drop` is a no-op. Called on every normal exit path.
+    fn disarm(&mut self) -> Vec<BrokerTask> {
+        self.tasks.take().unwrap_or_default()
+    }
+}
+
+impl Drop for ClaimedInflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(tasks) = self.tasks.take() {
+            if tasks.is_empty() {
+                return;
+            }
+            let keys: Vec<Vec<u8>> = tasks.iter().map(|t| t.key.clone()).collect();
+            tracing::warn!(
+                count = keys.len(),
+                "dequeue future dropped/panicked after claim; releasing in-flight tasks"
+            );
+            self.brokers.release_inflight(&keys);
+        }
     }
 }
 
@@ -119,10 +178,16 @@ impl JobStoreShard {
             let expiry_ms = now_ms + DEFAULT_LEASE_MS;
             let mut state = DequeueIterationState::new(claimed.len());
 
+            // Guard the claimed batch: if this dequeue future is cancelled or
+            // panics before a normal disarm below, its Drop releases these keys
+            // from the broker's in-flight set instead of leaking them there.
+            let mut inflight_guard = ClaimedInflightGuard::new(&self.brokers, claimed);
+
             // Get the shard range for split-aware filtering
             let shard_range = self.get_range();
 
-            for entry in &claimed {
+            let mut handler_err: Option<JobStoreShardError> = None;
+            for entry in inflight_guard.tasks() {
                 let decoded = &entry.decoded;
 
                 // Check if task's tenant is within shard range
@@ -192,9 +257,16 @@ impl JobStoreShard {
                     for (tenant, queue, task_id) in state.grants_to_rollback.drain(..) {
                         self.concurrency.rollback_grant(&tenant, &queue, &task_id);
                     }
-                    self.brokers.requeue(claimed);
-                    return Err(e);
+                    // Break so the `inflight_guard` borrow ends before we
+                    // disarm + requeue below.
+                    handler_err = Some(e);
+                    break;
                 }
+            }
+            if let Some(e) = handler_err {
+                // Known not-committed state: re-buffer for immediate re-pickup.
+                self.brokers.requeue(inflight_guard.disarm());
+                return Err(e);
             }
 
             // Merge iteration state into outer accumulators
@@ -247,7 +319,7 @@ impl JobStoreShard {
                     self.concurrency.rollback_grant(tenant, queue, task_id);
                 }
                 // Put back all claimed entries since we didn't lease them durably
-                self.brokers.requeue(claimed);
+                self.brokers.requeue(inflight_guard.disarm());
                 return Err(JobStoreShardError::from(e));
             }
             dst_events::confirm_write(write_op);
@@ -275,6 +347,9 @@ impl JobStoreShard {
             self.brokers
                 .ack_durable(task_group, &state.release_keys, &state.tombstone_keys);
             self.brokers.evict_keys(&state.release_keys);
+            // Commit succeeded: `ack_durable` already released these keys from
+            // in-flight, so neutralize the guard to avoid a redundant release.
+            let _ = inflight_guard.disarm();
             tracing::debug!(
                 release_keys = state.release_keys.len(),
                 tombstone_keys = state.tombstone_keys.len(),
