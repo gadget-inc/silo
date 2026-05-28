@@ -613,26 +613,19 @@ impl JobStoreShard {
     /// `JOB_STATUS` and `IDX_STATUS_TIME` are written with TTL by the caller via
     /// `set_job_status_with_index_opts`, so they are intentionally not handled here.
     ///
-    /// The attempt scan reads from `self.db` directly (committed state,
-    /// pre-batch). For the current attempt this returns its old Running
-    /// value, so the caller MUST put the new terminal ATTEMPT row **after**
-    /// invoking this helper. `WriteBatch` is last-write-wins per key, and
-    /// putting the new row earlier would be silently clobbered when the
-    /// helper re-puts the old Running value with TTL.
+    /// All reads go through `writer` so that when the caller uses a
+    /// `TxnWriter`, the JOB_INFO / ATTEMPT range / JOB_CANCELLED reads are
+    /// tracked in the transaction's SSI read set. A concurrent writer that
+    /// mutates any of those keys between this helper and the caller's commit
+    /// will trip a read-write (or phantom-read) conflict, so the re-put
+    /// cannot silently clobber a concurrent write with stale bytes.
     ///
-    /// Transaction-race caveat: the helper's reads bypass the open
-    /// transaction's optimistic concurrency tracker. A concurrent writer
-    /// that mutates one of these keys between the helper's read and the
-    /// caller's commit would NOT be detected as a conflict by
-    /// `SerializableSnapshot`, and the helper's re-put would silently
-    /// clobber the concurrent write with stale bytes (plus a TTL). Today
-    /// this is safe because every JOB_INFO mutator also writes
-    /// `JOB_STATUS` in the same txn, and the cancel txn reads
-    /// `JOB_STATUS` early — so any JOB_INFO race is closed transitively
-    /// via the status-key read conflict. Callers that introduce new
-    /// JOB_INFO / ATTEMPT / JOB_CANCELLED mutators MUST gate them on a
-    /// `JOB_STATUS` read in the same txn, or this helper needs to be
-    /// reworked to read through the transaction.
+    /// The attempt scan returns the *committed* (pre-batch) attempt rows. For
+    /// the current attempt this means the old Running value, so the caller
+    /// MUST put the new terminal ATTEMPT row **after** invoking this helper.
+    /// `WriteBatch` is last-write-wins per key, and putting the new row
+    /// earlier would be silently clobbered when the helper re-puts the old
+    /// Running value with TTL.
     #[allow(dead_code)] // wired up in follow-up retention PRs (cancel, import, terminal)
     pub(crate) async fn expire_terminal_job_records<W: WriteBatcher>(
         &self,
@@ -642,7 +635,7 @@ impl JobStoreShard {
         expire_ts: i64,
     ) -> Result<(), JobStoreShardError> {
         let info_key = job_info_key(tenant, job_id);
-        let metadata_pairs = if let Some(info_raw) = self.db.get(&info_key).await? {
+        let metadata_pairs = if let Some(info_raw) = writer.get(&info_key).await? {
             let view = JobView::new(info_raw.clone())?;
             let pairs = view.metadata();
             writer.put_with_expire(&info_key, info_raw, expire_ts)?;
@@ -657,17 +650,13 @@ impl JobStoreShard {
         }
 
         let attempt_start = attempt_prefix(tenant, job_id);
-        let attempt_end = end_bound(&attempt_start);
-        let mut iter = self
-            .db
-            .scan::<Vec<u8>, _>(attempt_start..attempt_end)
-            .await?;
+        let mut iter = writer.scan_prefix(&attempt_start).await?;
         while let Some(kv) = iter.next().await? {
             writer.put_with_expire(&kv.key, &kv.value, expire_ts)?;
         }
 
         let cancelled_key = job_cancelled_key(tenant, job_id);
-        if let Some(cancelled_raw) = self.db.get(&cancelled_key).await? {
+        if let Some(cancelled_raw) = writer.get(&cancelled_key).await? {
             writer.put_with_expire(&cancelled_key, cancelled_raw, expire_ts)?;
         }
 
