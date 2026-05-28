@@ -1,6 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 import { SiloWorker, type TaskHandler } from "../src/worker";
-import type { SiloGRPCClient, LeaseTasksResult } from "../src/client";
+import type {
+  SiloGRPCClient,
+  LeaseTasksResult,
+  HeartbeatResult,
+  RefreshTask,
+} from "../src/client";
 import { encodeBytes } from "../src/client";
 import type { Task } from "../src/pb/silo";
 
@@ -765,6 +770,142 @@ describe("SiloWorker", () => {
         ([e]) => e?.name === "LeaseLostError",
       );
       expect(leaseLostErrors.length).toBe(1);
+    });
+
+    it("skips the handler when lease was lost while waiting in the queue", async () => {
+      // Heartbeats start in _enqueueTask before the queued p-queue callback
+      // fires, so a task that waits in the queue can have its lease lost
+      // before _handler is ever invoked. With maxConcurrentTasks=1, the
+      // second task waits behind the first; if heartbeat sets leaseLost on it
+      // during that wait, the handler must not run.
+      const blocker = createTask("task-blocker", "job-blocker");
+      const waiter = createTask("task-waiter", "job-waiter");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([blocker, waiter]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      // Per-task heartbeat: leaseLost only for the waiter; blocker stays owned.
+      const heartbeat = vi.fn(
+        async (_workerId: string, taskId: string): Promise<HeartbeatResult> => {
+          if (taskId === "task-waiter") {
+            return { cancelled: false, leaseLost: true };
+          }
+          return { cancelled: false, leaseLost: false };
+        },
+      );
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let waiterHandlerRan = false;
+      const handler: TaskHandler = async (ctx) => {
+        if (ctx.task.id === "task-waiter") {
+          waiterHandlerRan = true;
+          return { type: "success", result: {} };
+        }
+        // blocker: hold the queue slot long enough for waiter's heartbeat to fire.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return { type: "success", result: {} };
+      };
+
+      const onError = vi.fn();
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 15,
+        maxConcurrentTasks: 1,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await worker.stop();
+
+      // Blocker ran normally; waiter never did.
+      expect(waiterHandlerRan).toBe(false);
+      // Only the blocker reports an outcome — the waiter must not.
+      const waiterOutcomes = reportOutcome.mock.calls.filter(
+        ([opts]) => opts?.taskId === "task-waiter",
+      );
+      expect(waiterOutcomes).toHaveLength(0);
+      // LeaseLostError surfaced exactly for the waiter.
+      const leaseLostForWaiter = onError.mock.calls.filter(
+        ([e]) => e?.name === "LeaseLostError" && e?.taskId === "task-waiter",
+      );
+      expect(leaseLostForWaiter.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("aborts refresh task and skips reportRefreshOutcome on lease_lost", async () => {
+      const refreshTask: RefreshTask = {
+        id: "refresh-1",
+        queueKey: "fl-q",
+        currentMaxConcurrency: 1,
+        lastRefreshedAtMs: 0n,
+        metadata: {},
+        leaseMs: 30000n,
+        shard: "00000000-0000-0000-0000-000000000001",
+        taskGroup: "default",
+      };
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce({ tasks: [], refreshTasks: [refreshTask] })
+        .mockResolvedValue({ tasks: [], refreshTasks: [] });
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const reportRefreshOutcome = vi.fn().mockResolvedValue(undefined);
+      // First heartbeat for the refresh task signals lease_lost.
+      const heartbeat = vi
+        .fn()
+        .mockResolvedValueOnce({ cancelled: false, leaseLost: true })
+        .mockResolvedValue({ cancelled: false, leaseLost: false });
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+      // createMockClient doesn't expose reportRefreshOutcome — patch it on.
+      (client as unknown as { reportRefreshOutcome: typeof reportRefreshOutcome }).reportRefreshOutcome =
+        reportRefreshOutcome;
+
+      let refreshHandlerAborted = false;
+      const refreshHandler = async (ctx: { signal: AbortSignal }) => {
+        await new Promise<void>((resolve) => {
+          if (ctx.signal.aborted) {
+            refreshHandlerAborted = true;
+            resolve();
+            return;
+          }
+          ctx.signal.addEventListener("abort", () => {
+            refreshHandlerAborted = true;
+            resolve();
+          });
+        });
+        return 3;
+      };
+
+      const onError = vi.fn();
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        // Run handler is required even though only refreshes flow through here.
+        handler: async () => ({ type: "success", result: {} }),
+        refreshHandler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 15,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await worker.stop();
+
+      // Refresh handler's abort signal must have fired.
+      expect(refreshHandlerAborted).toBe(true);
+      // Crucially: no refresh outcome reported — the lease is gone.
+      expect(reportRefreshOutcome).not.toHaveBeenCalled();
+      // LeaseLostError surfaced via onError.
+      const leaseLostErrors = onError.mock.calls.filter(
+        ([e]) => e?.name === "LeaseLostError" && e?.taskId === "refresh-1",
+      );
+      expect(leaseLostErrors.length).toBeGreaterThanOrEqual(1);
     });
   });
 
