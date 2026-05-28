@@ -996,6 +996,55 @@ impl JobStoreShard {
         self.concurrency.rollback_grant(tenant, queue, task_id);
     }
 
+    /// Test-only: inject the broker buffer entries for the given task keys,
+    /// reading the persisted task bytes from the DB. Lets tests deterministically
+    /// drive `dequeue` against future-scheduled or pre-cancel-staged tasks
+    /// without waiting for the background broker scanner.
+    pub async fn force_buffer_tasks_for_test(
+        &self,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<usize, JobStoreShardError> {
+        use crate::codec::decode_task_validated;
+        use crate::task_broker::BrokerTask;
+        let mut tasks = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(raw) = self.db.get(&key).await? else {
+                continue;
+            };
+            let decoded = decode_task_validated(raw).map_err(|e| {
+                JobStoreShardError::Codec(format!("force_buffer decode: {e}"))
+            })?;
+            tasks.push(BrokerTask { key, decoded });
+        }
+        let count = tasks.len();
+        self.brokers.requeue(tasks);
+        Ok(count)
+    }
+
+    /// Test-only: reserve an in-memory holder for (tenant, queue, task_id).
+    /// Bypasses DB hydration and capacity checks so tests can fabricate the
+    /// "in-memory and on-disk holder exist for a fake chain" state needed to
+    /// drive cancel/reimport paths through their defensive arms.
+    pub async fn force_reserve_concurrency_for_test(
+        &self,
+        tenant: &str,
+        queue: &str,
+        task_id: &str,
+        limit: usize,
+    ) -> bool {
+        self.concurrency.counts().try_reserve(
+            &self.db,
+            &self.get_range(),
+            tenant,
+            queue,
+            task_id,
+            limit,
+            "force-reserve-test",
+        )
+        .await
+        .unwrap_or(false)
+    }
+
     /// Fetch a job by id as a zero-copy archived view.
     pub async fn get_job(
         &self,

@@ -1073,3 +1073,106 @@ impl JobStoreShard {
         Ok((tasks, keys))
     }
 }
+
+#[cfg(test)]
+mod claimed_inflight_guard_tests {
+    //! Unit tests for [`ClaimedInflightGuard`].
+    //!
+    //! These exercise the RAII contract directly: Drop must release in-flight
+    //! reservations on the broker registry iff the guard was not disarmed.
+    //! Integration coverage (a real `dequeue` future being cancelled) is more
+    //! expensive to stage deterministically; these unit tests pin the same
+    //! invariant at the type level so any future refactor that breaks Drop or
+    //! disarm fails CI before the integration cost catches up to it.
+    use super::*;
+    use crate::codec::{decode_task_validated, encode_task};
+    use crate::instrumented_db::InstrumentedDb;
+    use crate::shard_range::ShardRange;
+    use std::sync::Arc;
+
+    fn sample_broker_task(task_group: &str, job_id: &str) -> BrokerTask {
+        let task = Task::RunAttempt {
+            id: format!("task-{job_id}"),
+            tenant: "-".to_string(),
+            job_id: job_id.to_string(),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            held_queues: vec![],
+            task_group: task_group.to_string(),
+        };
+        let key = crate::keys::task_key(task_group, 1, 0, job_id, 1);
+        let decoded = decode_task_validated(encode_task(&task)).expect("decode task");
+        BrokerTask { key, decoded }
+    }
+
+    async fn build_registry() -> Arc<TaskBrokerRegistry> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::DbBuilder::new("test", store)
+            .build()
+            .await
+            .expect("open in-memory db");
+        let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
+        TaskBrokerRegistry::new(db, "shard".to_string(), None, ShardRange::full())
+    }
+
+    /// Drop without disarm releases in-flight on the broker registry.
+    ///
+    /// This is the leak path commit 1c7f047 closed: if `dequeue` is cancelled
+    /// or panics after `claim_ready`, neither `ack_durable` nor `requeue` runs
+    /// and the claimed keys sit in `inflight` forever (no TTL).
+    #[tokio::test]
+    async fn drop_without_disarm_releases_inflight() {
+        let brokers = build_registry().await;
+        let bt = sample_broker_task("tg-drop", "j1");
+        brokers.seed_inflight_for_test("tg-drop", vec![bt.key.clone()]);
+        assert_eq!(brokers.inflight_len(), 1);
+
+        {
+            let _guard = ClaimedInflightGuard::new(&brokers, vec![bt]);
+            // No disarm — drop fires at end of scope.
+        }
+
+        assert_eq!(
+            brokers.inflight_len(),
+            0,
+            "Drop must release inflight when guard was not disarmed",
+        );
+    }
+
+    /// `disarm()` neutralizes the guard: Drop becomes a no-op so the normal
+    /// ack/requeue path retains control of the in-flight reservation.
+    ///
+    /// Without this contract every normal exit would double-release, racing
+    /// the `ack_durable` / `requeue` calls that follow disarm.
+    #[tokio::test]
+    async fn disarm_neutralizes_guard_drop() {
+        let brokers = build_registry().await;
+        let bt = sample_broker_task("tg-disarm", "j2");
+        brokers.seed_inflight_for_test("tg-disarm", vec![bt.key.clone()]);
+        assert_eq!(brokers.inflight_len(), 1);
+
+        {
+            let mut guard = ClaimedInflightGuard::new(&brokers, vec![bt]);
+            let returned = guard.disarm();
+            assert_eq!(returned.len(), 1, "disarm returns the claimed batch");
+            // Drop now fires on the empty guard — no-op.
+        }
+
+        assert_eq!(
+            brokers.inflight_len(),
+            1,
+            "Disarmed guard's Drop must NOT release inflight",
+        );
+    }
+
+    /// Drop on an empty batch is a no-op (defensive against future callers
+    /// that might construct the guard before claim_ready returns anything).
+    #[tokio::test]
+    async fn drop_on_empty_batch_is_noop() {
+        let brokers = build_registry().await;
+        {
+            let _guard = ClaimedInflightGuard::new(&brokers, vec![]);
+        }
+        assert_eq!(brokers.inflight_len(), 0);
+    }
+}

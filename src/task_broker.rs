@@ -677,6 +677,19 @@ impl TaskBrokerRegistry {
             entry.value().stop();
         }
     }
+
+    /// Test-only: ensure a broker exists for `task_group` and directly inject
+    /// `keys` into its in-flight set. Used to exercise drop-guard / release
+    /// paths without standing up a scanner + DB write round-trip just to drive
+    /// the same state.
+    #[cfg(test)]
+    pub(crate) fn seed_inflight_for_test(&self, task_group: &str, keys: Vec<Vec<u8>>) {
+        let broker = self.get_or_create(task_group);
+        let mut inflight = broker.inflight.lock().unwrap();
+        for k in keys {
+            inflight.insert(k);
+        }
+    }
 }
 
 #[cfg(test)]

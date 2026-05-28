@@ -3774,6 +3774,542 @@ async fn count_check_rate_limit_tasks_for_tenant(
     count
 }
 
+/// `handle_request_ticket`'s terminal-status short-circuit must drop a future
+/// `Task::RequestTicket` (ack-delete the task) and release any `held_queues`
+/// it carries. Today's enqueue path always writes a future RequestTicket with
+/// `held_queues=[]` — but the cleanup is defensive against a hypothetical
+/// future writer producing non-empty held_queues, and the *core* terminal
+/// short-circuit (drop the ticket cleanly rather than process it for a
+/// cancelled job) is exercised on every cancel-races-broker-buffer scenario.
+///
+/// Setup races the broker-eviction step of `cancel_job`: we enqueue a
+/// far-future RequestTicket, manually overwrite job status to `Cancelled`
+/// (bypassing cancel's task-delete + broker-evict), and inject the still-
+/// persisted ticket into the broker buffer via the test hook. Dequeue should
+/// observe the Cancelled status and drop the ticket without producing a
+/// RunAttempt or leaking any holder.
+#[silo::test]
+async fn request_ticket_terminal_short_circuit_drops_ticket() {
+    use silo::codec::encode_job_status;
+    use silo::job::{JobStatus, JobStatusKind};
+    use silo::keys::{end_bound, job_status_key, tasks_prefix};
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue = "rt-terminal-q".to_string();
+    let future_at = now + 600_000;
+
+    // Far-future enqueue ⇒ writes a `Task::RequestTicket` at scheduled_at_ms.
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            future_at,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "rt-term"})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue future");
+
+    // The future-scheduled path holds no slot at enqueue.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue).await,
+        0,
+        "future-scheduled job must not grab a concurrency slot at enqueue",
+    );
+
+    // Locate the persisted RequestTicket task_key. The broker scanner will
+    // skip it (start_time_ms > now_ms), so we'll inject it directly.
+    let ticket_key = {
+        let start = tasks_prefix();
+        let end = end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        let mut found: Option<Vec<u8>> = None;
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(Task::RequestTicket { job_id: jid, .. }) = decode_task(&kv.value)
+                && jid == job_id
+            {
+                found = Some(kv.key.to_vec());
+                break;
+            }
+        }
+        found.expect("expected a RequestTicket task in the DB")
+    };
+
+    // Overwrite job_status to Cancelled directly. We deliberately do NOT call
+    // `cancel_job` here — the production path deletes the task and evicts it
+    // from the broker buffer, which would short-circuit this test. The race
+    // we want to exercise is: status flipped terminal, but the ticket survived
+    // (e.g. cancel raced the broker scan and we missed the evict window).
+    let cancelled = JobStatus::new(JobStatusKind::Cancelled, now, None, None);
+    shard
+        .db()
+        .put(&job_status_key(tenant, &job_id), &encode_job_status(&cancelled))
+        .await
+        .expect("write cancelled status");
+
+    // Inject the future RequestTicket into the broker buffer so dequeue can
+    // claim it without waiting for the scanner (which would skip it as future).
+    let injected = shard
+        .force_buffer_tasks_for_test(vec![ticket_key.clone()])
+        .await
+        .expect("inject ticket");
+    assert_eq!(injected, 1, "ticket should have been injected");
+
+    // Dequeue: handler decodes the RequestTicket, reads cancelled status,
+    // and takes the terminal short-circuit (ack-delete + release held_queues).
+    let result = shard.dequeue("w1", "default", 1).await.expect("dequeue");
+    assert!(
+        result.tasks.is_empty(),
+        "no RunAttempt should be produced for a cancelled job",
+    );
+
+    // Post-conditions: ticket is gone from DB, no orphan holders anywhere.
+    assert!(
+        shard
+            .db()
+            .get(&ticket_key)
+            .await
+            .expect("get ticket key")
+            .is_none(),
+        "terminal short-circuit must ack-delete the ticket",
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue).await,
+        0,
+        "no DB holder should exist post-short-circuit",
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue),
+        0,
+        "no in-memory holder should exist post-short-circuit",
+    );
+}
+
+/// Commit 17d94a8 removed the interim `RunAttempt` write inside
+/// `append_grant_edits`. Before that fix, a multi-limit chain transiently
+/// wrote a `RunAttempt(held=[just_this_queue])` for each granted limit,
+/// then overwrote it at the terminal step with the full `held_queues`. If
+/// slatedb's batch-vs-scan visibility ever exposed an in-flight batch state,
+/// a worker could lease the interim and under-release on completion.
+///
+/// This test pins the post-fix invariant: at any time after a multi-limit
+/// enqueue commits, the ONLY `Task::RunAttempt` persisted for that job is
+/// the terminal one with the full `held_queues`. (A regression that
+/// re-introduces the interim would persist two RunAttempts at different
+/// task_keys — caught by the "exactly one" assertion below.)
+#[silo::test]
+async fn multi_limit_enqueue_persists_only_terminal_run_attempt() {
+    use silo::keys::{end_bound, tasks_prefix};
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "interim-run-attempt-a".to_string();
+    let queue_b = "interim-run-attempt-b".to_string();
+    let queue_c = "interim-run-attempt-c".to_string();
+
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "no-interim"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 10,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 10,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_c.clone(),
+                    max_concurrency: 10,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    // Scan all tasks for this job_id.
+    let start = tasks_prefix();
+    let end = end_bound(&start);
+    let mut iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .expect("scan tasks");
+    let mut run_attempts: Vec<(Vec<u8>, Vec<String>)> = Vec::new();
+    while let Ok(Some(kv)) = iter.next().await {
+        if let Ok(Task::RunAttempt {
+            job_id: ref jid,
+            ref held_queues,
+            ..
+        }) = decode_task(&kv.value)
+            && *jid == job_id
+        {
+            run_attempts.push((kv.key.to_vec(), held_queues.clone()));
+        }
+    }
+
+    assert_eq!(
+        run_attempts.len(),
+        1,
+        "exactly one RunAttempt should be persisted; an interim leak would write multiple at different task_keys. got: {run_attempts:?}",
+    );
+    let (_key, held) = &run_attempts[0];
+    let held_set: HashSet<&String> = held.iter().collect();
+    let expected: HashSet<String> =
+        [queue_a.clone(), queue_b.clone(), queue_c.clone()].into_iter().collect();
+    let expected_refs: HashSet<&String> = expected.iter().collect();
+    assert_eq!(
+        held_set, expected_refs,
+        "the single RunAttempt must carry the full accumulated held_queues",
+    );
+}
+
+/// Rate-limit retry chain must preserve the chain's `task_id` across EVERY
+/// retry — not just the first — and on exhaustion must release every
+/// `held_queues` entry exactly once. The existing
+/// `rate_limit_retry_preserves_chain_task_id` covers one retry → success;
+/// this exercises the multi-retry → exhaustion path that
+/// `handle_check_rate_limit`'s `retry_count >= max_retries` branch handles.
+///
+/// Pre-fix on the task_id path: every retry minted a fresh UUID, so the
+/// terminal exhaustion's holder-key reconstruction (which keys by
+/// `check_task_id`) referred to a different id than the chain's original
+/// holder, leaving A leaked. With N retries that's N leaks per failed
+/// chain — worse than the one-retry case the original regression test
+/// caught.
+#[silo::test]
+async fn rate_limit_retry_chain_preserves_task_id_through_exhaustion() {
+    use silo::codec::decode_task;
+    use silo::gubernator::{GubernatorError, RateLimitClient, RateLimitResult};
+    use silo::pb::gubernator::Algorithm;
+
+    struct AlwaysOverLimit;
+    #[async_trait::async_trait]
+    impl RateLimitClient for AlwaysOverLimit {
+        async fn check_rate_limit(
+            &self,
+            _name: &str,
+            _unique_key: &str,
+            _hits: i64,
+            limit: i64,
+            duration_ms: i64,
+            _algorithm: Algorithm,
+            _behavior: i32,
+        ) -> Result<RateLimitResult, GubernatorError> {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            Ok(RateLimitResult {
+                under_limit: false,
+                limit,
+                remaining: 0,
+                reset_time_ms: now_ms + duration_ms,
+                error: None,
+            })
+        }
+        async fn health_check(&self) -> Result<(String, i32), GubernatorError> {
+            Ok(("ok".to_string(), 1))
+        }
+    }
+
+    let (_tmp, shard) = open_temp_shard_with_rate_limiter(Arc::new(AlwaysOverLimit)).await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "rl-exhaust-a".to_string();
+
+    // Zero backoff so retries fire on the next broker scan with `task_key_start_ms`
+    // bumped only by the +1ms tombstone dodge.
+    let max_retries: u32 = 3;
+    let rate_limit = GubernatorRateLimit {
+        name: "rl-exhaust".to_string(),
+        unique_key: "rl-exhaust-key".to_string(),
+        limit: 1,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            backoff_multiplier: 1.0,
+            max_retries,
+        },
+    };
+
+    let _job = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "rl-exhaust"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(rate_limit),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    // Chain grants A and writes the initial CheckRateLimit. Snapshot its
+    // task_id — every retry must preserve it.
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "chain should have granted A at enqueue"
+    );
+    let initial_task_id = {
+        let start = silo::keys::tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        let mut found = None;
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(Task::CheckRateLimit { task_id, .. }) = decode_task(&kv.value) {
+                found = Some(task_id);
+                break;
+            }
+        }
+        found.expect("initial CheckRateLimit must exist")
+    };
+
+    // Drive dequeue repeatedly. Each iteration consumes the current
+    // CheckRateLimit, calls Gubernator (returns over-limit), and either
+    // schedules a retry or exhausts. We bound at 4*max_retries to avoid an
+    // infinite loop if the chain stalls (which itself would be a bug —
+    // the broker tombstone tests would have caught it first).
+    for _ in 0..(max_retries as usize * 4 + 4) {
+        let _ = shard.dequeue("w1", "default", 10).await.expect("dequeue");
+        // Every CheckRateLimit currently in the DB must carry the original
+        // chain's task_id. If the retry path mints a fresh id, this fires.
+        let start = silo::keys::tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(Task::CheckRateLimit { task_id, .. }) = decode_task(&kv.value) {
+                assert_eq!(
+                    task_id, initial_task_id,
+                    "every CheckRateLimit retry must preserve the chain's task_id",
+                );
+            }
+        }
+
+        // Exhaustion: no more CheckRateLimit tasks in the DB.
+        let remaining = count_check_rate_limit_tasks_for_tenant(shard.db(), tenant).await;
+        if remaining == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Post-exhaustion: holders released both on disk and in-memory.
+    assert_eq!(
+        count_check_rate_limit_tasks_for_tenant(shard.db(), tenant).await,
+        0,
+        "all CheckRateLimit retries must be drained at exhaustion",
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "exhaustion must release the chain's held_queues from the DB",
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue_a),
+        0,
+        "exhaustion must release the chain's held_queues from in-memory",
+    );
+}
+
+/// Symmetric with `cancel_check_rate_limit_releases_held_queues` and
+/// `cancel_deferred_concurrency_request_releases_held_queues`: cancelling a
+/// job parked on a future `Task::RequestTicket` carrying upstream
+/// `held_queues` must release those holders. The natural enqueue path
+/// always writes future tickets with `held_queues=[]` today, so this test
+/// fabricates the multi-limit-future state directly and pins the cancel.rs
+/// `Task::RequestTicket` arm against a future regression that drops the
+/// `for queue in held_queues { ... }` loop.
+#[silo::test]
+async fn cancel_request_ticket_releases_upstream_holders() {
+    use silo::codec::{decode_task, encode_holder, encode_task};
+    use silo::keys::{concurrency_holder_key, end_bound, tasks_prefix};
+    use silo::task::HolderRecord;
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue_a = "cancel-rt-a".to_string();
+    let queue_b = "cancel-rt-b".to_string();
+    let future_at = now + 600_000;
+
+    // Enqueue a far-future job. Real JobInfo + JobStatus + RequestTicket
+    // land in the DB. The chain walker can't naturally produce a future
+    // RequestTicket with `held_queues=[A]` today (future-scheduling stops
+    // the chain on its first limit before any holder is accumulated), so
+    // we'll rewrite the persisted ticket and seed an A holder below.
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            future_at,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "cancel-rt"})),
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue future");
+
+    // Locate the persisted RequestTicket.
+    let (ticket_key, ticket_task) = {
+        let start = tasks_prefix();
+        let end = end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+            .await
+            .expect("scan tasks");
+        let mut found = None;
+        while let Ok(Some(kv)) = iter.next().await {
+            if let Ok(task) = decode_task(&kv.value)
+                && let Task::RequestTicket { job_id: ref jid, .. } = task
+                && *jid == job_id
+            {
+                found = Some((kv.key.to_vec(), task));
+                break;
+            }
+        }
+        found.expect("expected a RequestTicket task")
+    };
+
+    let task_id = match &ticket_task {
+        Task::RequestTicket { task_id, .. } => task_id.clone(),
+        _ => unreachable!(),
+    };
+
+    // Rewrite the ticket to carry `held_queues=[A]` as if an earlier chain
+    // step had granted A. (Today's walker can't produce this, but cancel.rs's
+    // RequestTicket arm has a `for queue in held_queues` loop to handle it.)
+    let morphed = match ticket_task {
+        Task::RequestTicket {
+            queue,
+            start_time_ms,
+            priority,
+            tenant: t,
+            job_id: jid,
+            attempt_number,
+            relative_attempt_number,
+            task_id: tid,
+            task_group,
+            limit_index,
+            held_queues: _,
+            limits,
+        } => Task::RequestTicket {
+            queue,
+            start_time_ms,
+            priority,
+            tenant: t,
+            job_id: jid,
+            attempt_number,
+            relative_attempt_number,
+            task_id: tid,
+            task_group,
+            limit_index,
+            held_queues: vec![queue_a.clone()],
+            limits,
+        },
+        _ => unreachable!(),
+    };
+    shard
+        .db()
+        .put(&ticket_key, &encode_task(&morphed))
+        .await
+        .expect("rewrite ticket with held_queues=[A]");
+
+    // Seed the matching fake A holder (DB + in-memory) under the chain's
+    // task_id. Cancel's post-commit atomic_release keys by task_id; if either
+    // copy isn't seeded, that assertion stays at 0 trivially and would mask a
+    // missed release.
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, &queue_a, &task_id),
+            &encode_holder(&HolderRecord { granted_at_ms: now }),
+        )
+        .await
+        .expect("seed DB holder for A");
+    let reserved = shard
+        .force_reserve_concurrency_for_test(tenant, &queue_a, &task_id, 1)
+        .await;
+    assert!(reserved, "in-memory reservation should succeed");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "fake A holder should be live before cancel",
+    );
+    assert_eq!(shard.concurrency_holder_count(tenant, &queue_a), 1);
+
+    shard.cancel_job(tenant, &job_id).await.expect("cancel");
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "cancelling a future RequestTicket must release its held_queues from the DB",
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue_a),
+        0,
+        "cancelling a future RequestTicket must release its held_queues from the in-memory cache",
+    );
+}
+
 /// Helper: count concurrency holder keys for a specific (tenant, queue) pair.
 async fn count_holders_for_queue(
     db: &silo::instrumented_db::InstrumentedDb,
