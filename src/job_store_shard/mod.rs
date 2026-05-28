@@ -99,6 +99,39 @@ pub struct OpenShardOptions {
     /// Populated from `DatabaseConfig::hydrate_all_at_startup` /
     /// `DatabaseTemplate::hydrate_all_at_startup`; tests set it explicitly.
     pub hydrate_all_at_startup: bool,
+    /// When set, jobs that reach Succeeded have their associated KV records
+    /// re-put with a SlateDB row TTL of this many seconds. `None` disables
+    /// the feature for successful jobs.
+    pub completed_job_expire_s: Option<u64>,
+    /// When set, jobs that reach any non-success terminal status (Failed,
+    /// Cancelled, …) have their associated KV records re-put with a SlateDB
+    /// row TTL of this many seconds. `None` disables the feature for those
+    /// jobs.
+    pub terminal_job_expire_s: Option<u64>,
+}
+
+/// Compute the row TTL (`expire_ts`, epoch ms) for a job that reached the
+/// given terminal status, given the two configured expiration windows.
+/// Returns `None` for non-terminal kinds (`Scheduled`, `Running`) — those
+/// jobs are still alive and must never be tagged for expiry.
+///
+/// `seconds: u64` is operator-supplied; saturating arithmetic keeps the
+/// `u64 → i64` cast meaningful even if someone passes an absurd value
+/// (would otherwise wrap to a negative `expire_ts`, which SlateDB
+/// interprets as already-expired).
+pub(crate) fn compute_terminal_expire_ts(
+    kind: JobStatusKind,
+    now_ms: i64,
+    completed_job_expire_s: Option<u64>,
+    terminal_job_expire_s: Option<u64>,
+) -> Option<i64> {
+    let seconds = match kind {
+        JobStatusKind::Succeeded => completed_job_expire_s?,
+        JobStatusKind::Failed | JobStatusKind::Cancelled => terminal_job_expire_s?,
+        JobStatusKind::Scheduled | JobStatusKind::Running => return None,
+    };
+    let ms_i64 = i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX);
+    Some(now_ms.saturating_add(ms_i64))
 }
 
 fn expand_slatedb_settings_for_shard(
@@ -163,6 +196,12 @@ pub struct JobStoreShard {
     range: ShardRange,
     /// Metrics recorder for SlateDB, passed to DbBuilder and used for stats collection.
     slatedb_metrics_recorder: Arc<DefaultMetricsRecorder>,
+    /// TTL (seconds) applied to Succeeded jobs' associated records. `None`
+    /// disables the feature for successful jobs.
+    pub(crate) completed_job_expire_s: Option<u64>,
+    /// TTL (seconds) applied to non-success terminal jobs' associated records
+    /// (Failed, Cancelled, …). `None` disables the feature for those jobs.
+    pub(crate) terminal_job_expire_s: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -338,6 +377,8 @@ impl JobStoreShard {
                 ),
                 counter_reconciliation_seconds: cfg.counter_reconciliation_seconds,
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
+                completed_job_expire_s: cfg.completed_job_expire_s,
+                terminal_job_expire_s: cfg.terminal_job_expire_s,
             },
             range,
         )
@@ -376,6 +417,8 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
             counter_reconciliation_seconds,
             hydrate_all_at_startup,
+            completed_job_expire_s,
+            terminal_job_expire_s,
         } = options;
 
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -473,6 +516,8 @@ impl JobStoreShard {
             db_path: db_path.to_string(),
             range: range.clone(),
             slatedb_metrics_recorder,
+            completed_job_expire_s,
+            terminal_job_expire_s,
         });
 
         // Periodically reconcile pending concurrency requests to self-heal from
@@ -789,6 +834,18 @@ impl JobStoreShard {
 
     pub fn db(&self) -> &InstrumentedDb {
         &self.db
+    }
+
+    /// Resolve the row TTL (`expire_ts`, epoch ms) for a job that reached the
+    /// given terminal status, or `None` if no TTL is configured.
+    #[allow(dead_code)] // wired up in follow-up retention PRs (cancel, import, terminal)
+    pub(crate) fn terminal_expire_ts(&self, kind: JobStatusKind, now_ms: i64) -> Option<i64> {
+        compute_terminal_expire_ts(
+            kind,
+            now_ms,
+            self.completed_job_expire_s,
+            self.terminal_job_expire_s,
+        )
     }
 
     /// Snapshot the in-memory concurrency limit cache for use by the query system.
@@ -1131,7 +1188,68 @@ impl JobStoreShard {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_slatedb_settings_for_shard;
+    use super::{JobStatusKind, compute_terminal_expire_ts, expand_slatedb_settings_for_shard};
+
+    #[test]
+    fn terminal_expire_ts_succeeded_uses_completed_expire_setting() {
+        let ts = compute_terminal_expire_ts(JobStatusKind::Succeeded, 1_000, Some(60), Some(30));
+        assert_eq!(ts, Some(1_000 + 60_000));
+    }
+
+    #[test]
+    fn terminal_expire_ts_failed_uses_terminal_expire_setting() {
+        let ts = compute_terminal_expire_ts(JobStatusKind::Failed, 1_000, Some(60), Some(30));
+        assert_eq!(ts, Some(1_000 + 30_000));
+    }
+
+    #[test]
+    fn terminal_expire_ts_cancelled_uses_terminal_expire_setting() {
+        let ts = compute_terminal_expire_ts(JobStatusKind::Cancelled, 1_000, Some(60), Some(30));
+        assert_eq!(ts, Some(1_000 + 30_000));
+    }
+
+    #[test]
+    fn terminal_expire_ts_returns_none_for_scheduled_even_when_both_settings_set() {
+        // Live jobs (Scheduled/Running) must never carry a TTL: they're still
+        // reachable and tagging them would let SlateDB drop the row out from
+        // under an active worker.
+        let ts = compute_terminal_expire_ts(JobStatusKind::Scheduled, 1_000, Some(60), Some(30));
+        assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn terminal_expire_ts_returns_none_for_running_even_when_both_settings_set() {
+        let ts = compute_terminal_expire_ts(JobStatusKind::Running, 1_000, Some(60), Some(30));
+        assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn terminal_expire_ts_returns_none_when_succeeded_setting_unset() {
+        let ts = compute_terminal_expire_ts(JobStatusKind::Succeeded, 1_000, None, Some(30));
+        assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn terminal_expire_ts_returns_none_when_terminal_setting_unset() {
+        let ts = compute_terminal_expire_ts(JobStatusKind::Failed, 1_000, Some(60), None);
+        assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn terminal_expire_ts_saturates_on_overflowing_seconds() {
+        let huge = u64::MAX;
+        let ts = compute_terminal_expire_ts(JobStatusKind::Failed, 1_000, None, Some(huge));
+        // `u64::MAX * 1000` overflows; the cast saturates to `i64::MAX`.
+        // Then `1_000 + i64::MAX` saturates again at `i64::MAX`.
+        assert_eq!(ts, Some(i64::MAX));
+    }
+
+    #[test]
+    fn terminal_expire_ts_saturates_when_now_ms_is_near_max() {
+        // Sane seconds; `now_ms` near i64::MAX. Add must saturate, not wrap negative.
+        let ts = compute_terminal_expire_ts(JobStatusKind::Failed, i64::MAX - 5, None, Some(60));
+        assert_eq!(ts, Some(i64::MAX));
+    }
 
     #[test]
     fn expands_shard_placeholder_in_slatedb_cache_root_folder() {

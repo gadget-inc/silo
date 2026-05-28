@@ -11,11 +11,12 @@ use crate::codec::{
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
+use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, concurrency_holder_key, concurrency_holders_tenant_prefix, end_bound,
-    floating_limit_state_key, job_info_key, leased_task_key, parse_concurrency_holder_key,
+    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_tenant_prefix,
+    end_bound, floating_limit_state_key, idx_metadata_key, job_cancelled_key, job_info_key,
+    leased_task_key, parse_concurrency_holder_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
@@ -597,5 +598,79 @@ impl JobStoreShard {
         }
 
         Ok(to_delete.len())
+    }
+
+    /// Re-put all KV records associated with a job that has reached a terminal
+    /// status, applying a SlateDB row TTL of `expire_ts` (epoch ms) so the
+    /// rows are dropped during compaction once they age past `expire_ts`.
+    ///
+    /// Records covered:
+    ///   - `JOB_INFO`            (read existing bytes, re-put with TTL)
+    ///   - `IDX_METADATA`        (one entry per metadata pair on the job)
+    ///   - `ATTEMPT`             (scan all attempt rows for the job, re-put each)
+    ///   - `JOB_CANCELLED`       (re-put with TTL if present)
+    ///
+    /// `JOB_STATUS` and `IDX_STATUS_TIME` are written with TTL by the caller via
+    /// `set_job_status_with_index_opts`, so they are intentionally not handled here.
+    ///
+    /// The attempt scan reads from `self.db` directly (committed state,
+    /// pre-batch). For the current attempt this returns its old Running
+    /// value, so the caller MUST put the new terminal ATTEMPT row **after**
+    /// invoking this helper. `WriteBatch` is last-write-wins per key, and
+    /// putting the new row earlier would be silently clobbered when the
+    /// helper re-puts the old Running value with TTL.
+    ///
+    /// Transaction-race caveat: the helper's reads bypass the open
+    /// transaction's optimistic concurrency tracker. A concurrent writer
+    /// that mutates one of these keys between the helper's read and the
+    /// caller's commit would NOT be detected as a conflict by
+    /// `SerializableSnapshot`, and the helper's re-put would silently
+    /// clobber the concurrent write with stale bytes (plus a TTL). Today
+    /// this is safe because every JOB_INFO mutator also writes
+    /// `JOB_STATUS` in the same txn, and the cancel txn reads
+    /// `JOB_STATUS` early — so any JOB_INFO race is closed transitively
+    /// via the status-key read conflict. Callers that introduce new
+    /// JOB_INFO / ATTEMPT / JOB_CANCELLED mutators MUST gate them on a
+    /// `JOB_STATUS` read in the same txn, or this helper needs to be
+    /// reworked to read through the transaction.
+    #[allow(dead_code)] // wired up in follow-up retention PRs (cancel, import, terminal)
+    pub(crate) async fn expire_terminal_job_records<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        expire_ts: i64,
+    ) -> Result<(), JobStoreShardError> {
+        let info_key = job_info_key(tenant, job_id);
+        let metadata_pairs = if let Some(info_raw) = self.db.get(&info_key).await? {
+            let view = JobView::new(info_raw.clone())?;
+            let pairs = view.metadata();
+            writer.put_with_expire(&info_key, info_raw, expire_ts)?;
+            pairs
+        } else {
+            Vec::new()
+        };
+
+        for (mk, mv) in &metadata_pairs {
+            let mkey = idx_metadata_key(tenant, mk, mv, job_id);
+            writer.put_with_expire(&mkey, [], expire_ts)?;
+        }
+
+        let attempt_start = attempt_prefix(tenant, job_id);
+        let attempt_end = end_bound(&attempt_start);
+        let mut iter = self
+            .db
+            .scan::<Vec<u8>, _>(attempt_start..attempt_end)
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            writer.put_with_expire(&kv.key, &kv.value, expire_ts)?;
+        }
+
+        let cancelled_key = job_cancelled_key(tenant, job_id);
+        if let Some(cancelled_raw) = self.db.get(&cancelled_key).await? {
+            writer.put_with_expire(&cancelled_key, cancelled_raw, expire_ts)?;
+        }
+
+        Ok(())
     }
 }
