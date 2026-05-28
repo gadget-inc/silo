@@ -3,7 +3,7 @@
 //! This module contains the core task types that represent units of work
 //! in the system, along with associated records for leases and concurrency.
 
-use crate::job::{GubernatorRateLimit, JobView};
+use crate::job::{GubernatorRateLimit, JobView, Limit};
 use crate::job_attempt::JobAttemptView;
 
 /// Default lease duration for dequeued tasks (milliseconds)
@@ -149,6 +149,10 @@ pub enum ConcurrencyAction {
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
         task_group: String,
+        task_id: String,
+        held_queues: Vec<String>,
+        next_limit_index: u32,
+        limits: Vec<Limit>,
     },
 }
 

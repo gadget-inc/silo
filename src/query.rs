@@ -1627,7 +1627,16 @@ impl Scan for QueuesScanner {
                         {
                             continue;
                         }
-                        let task_id = parsed.request_id();
+                        let task_id = crate::codec::decode_concurrency_action(kv.value.clone())
+                            .ok()
+                            .and_then(|decoded| {
+                                decoded
+                                    .fb()
+                                    .variant_as_enqueue_task()
+                                    .and_then(|et| et.task_id())
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_else(|| parsed.request_id());
                         let job_id = Some(parsed.job_id.clone());
                         entries.push(QueueEntry {
                             tenant: parsed.tenant,

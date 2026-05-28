@@ -6,13 +6,20 @@
 mod test_helpers;
 
 use silo::codec::{decode_lease, encode_holder, encode_lease, encode_task};
-use silo::job::{FloatingConcurrencyLimit, Limit};
+use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
 use silo::keys::{concurrency_holder_key, job_info_key, task_key};
 use silo::task::{GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 use test_helpers::*;
+
+fn c_limit(queue: &str, max: u32) -> Limit {
+    Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: max,
+    })
+}
 
 fn fc_limit(queue: &str, default_max: u32) -> Limit {
     Limit::FloatingConcurrency(FloatingConcurrencyLimit {
@@ -626,5 +633,116 @@ async fn floating_concurrency_steady_state_zero_holders_after_full_cycle() {
         count_concurrency_holders_for_tenant(shard.db(), "-").await,
         0,
         "per-tenant holder count must be zero too"
+    );
+}
+
+/// A chain can grant an earlier concurrency limit immediately and then pause on
+/// a later limit. When the paused request is granted by the scanner, the
+/// terminal RunAttempt must keep the original task id and all held queues so the
+/// completion path releases every holder.
+#[silo::test]
+async fn scanner_resumes_paused_chain_with_original_task_id_and_all_holders() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let fixed_q = "chain-fixed-q";
+    let floating_q = "chain-floating-q";
+
+    // Job A occupies the floating slot so Job B has to pause after acquiring
+    // the fixed slot.
+    let _job_a = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "a"})),
+            vec![fc_limit(floating_q, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue a");
+
+    let job_b = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "b"})),
+            vec![c_limit(fixed_q, 2), fc_limit(floating_q, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue b");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        2,
+        "A should hold floating_q and B should already hold fixed_q"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "B should be paused on the floating queue"
+    );
+
+    let a = shard.dequeue("w-a", "default", 1).await.expect("dequeue a");
+    assert_eq!(a.tasks.len(), 1);
+    let a_task_id = a.tasks[0].attempt().task_id().to_string();
+    shard
+        .report_attempt_outcome(&a_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete a");
+
+    let b_ready = poll_until(
+        || async {
+            let tasks = shard.peek_tasks("default", 10).await.expect("peek tasks");
+            tasks.into_iter().find_map(|t| match t {
+                Task::RunAttempt {
+                    id,
+                    job_id,
+                    held_queues,
+                    ..
+                } if job_id == job_b => Some((id, held_queues)),
+                _ => None,
+            })
+        },
+        |found| found.is_some(),
+        5_000,
+    )
+    .await
+    .expect("job b should become runnable");
+
+    assert_eq!(
+        b_ready.1,
+        vec![fixed_q.to_string(), floating_q.to_string()],
+        "scanner-written RunAttempt should carry every acquired queue"
+    );
+
+    let b = shard.dequeue("w-b", "default", 1).await.expect("dequeue b");
+    assert_eq!(b.tasks.len(), 1);
+    assert_eq!(b.tasks[0].job().id(), job_b);
+    assert_eq!(
+        b.tasks[0].attempt().task_id(),
+        b_ready.0,
+        "lease should use the same task id as the scanner-written RunAttempt"
+    );
+    shard
+        .report_attempt_outcome(
+            b.tasks[0].attempt().task_id(),
+            AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("complete b");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "completion should release both fixed and floating holders"
     );
 }

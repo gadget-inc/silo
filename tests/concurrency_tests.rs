@@ -175,6 +175,10 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        task_id: "task-1".to_string(),
+        held_queues: Vec::new(),
+        next_limit_index: 0,
+        limits: Vec::new(),
     };
     let request_key = concurrency_request_key(tenant, &queue, now, 10, &job_id, 1, "manual");
     let request_value = encode_concurrency_action(&action);

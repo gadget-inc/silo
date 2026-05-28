@@ -124,6 +124,10 @@ fn test_concurrency_action_roundtrip() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        task_id: "task-1".to_string(),
+        held_queues: Vec::new(),
+        next_limit_index: 1,
+        limits: Vec::new(),
     };
     let encoded = encode_concurrency_action(&action);
     let decoded = decode_concurrency_action(encoded).unwrap();

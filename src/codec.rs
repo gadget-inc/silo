@@ -311,6 +311,146 @@ pub fn encode_attempt(attempt: &JobAttempt) -> Vec<u8> {
     builder.finished_data().to_vec()
 }
 
+fn build_limit_entry_offsets<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    limits: &[Limit],
+) -> Vec<flatbuffers::WIPOffset<fb::LimitEntry<'a>>> {
+    limits
+        .iter()
+        .map(|lim| {
+            let (vtype, voff) = match lim {
+                Limit::Concurrency(cl) => {
+                    let key = builder.create_string(&cl.key);
+                    let entry = fb::ConcurrencyLimitEntry::create(
+                        builder,
+                        &fb::ConcurrencyLimitEntryArgs {
+                            key: Some(key),
+                            max_concurrency: cl.max_concurrency,
+                        },
+                    );
+                    (
+                        fb::LimitVariant::ConcurrencyLimitEntry,
+                        entry.as_union_value(),
+                    )
+                }
+                Limit::RateLimit(rl) => {
+                    let name = builder.create_string(&rl.name);
+                    let unique_key = builder.create_string(&rl.unique_key);
+                    let rp = fb::RateLimitRetryPolicy::create(
+                        builder,
+                        &fb::RateLimitRetryPolicyArgs {
+                            initial_backoff_ms: rl.retry_policy.initial_backoff_ms,
+                            max_backoff_ms: rl.retry_policy.max_backoff_ms,
+                            backoff_multiplier: rl.retry_policy.backoff_multiplier,
+                            max_retries: rl.retry_policy.max_retries,
+                        },
+                    );
+                    let entry = fb::RateLimitEntry::create(
+                        builder,
+                        &fb::RateLimitEntryArgs {
+                            name: Some(name),
+                            unique_key: Some(unique_key),
+                            limit: rl.limit,
+                            duration_ms: rl.duration_ms,
+                            hits: rl.hits,
+                            algorithm: rl.algorithm.as_u8(),
+                            behavior: rl.behavior,
+                            retry_policy: Some(rp),
+                        },
+                    );
+                    (fb::LimitVariant::RateLimitEntry, entry.as_union_value())
+                }
+                Limit::FloatingConcurrency(fl) => {
+                    let key = builder.create_string(&fl.key);
+                    let md = build_kv_pair_offsets(builder, &fl.metadata);
+                    let metadata = builder.create_vector(&md);
+                    let entry = fb::FloatingConcurrencyLimitEntry::create(
+                        builder,
+                        &fb::FloatingConcurrencyLimitEntryArgs {
+                            key: Some(key),
+                            default_max_concurrency: fl.default_max_concurrency,
+                            refresh_interval_ms: fl.refresh_interval_ms,
+                            metadata: Some(metadata),
+                        },
+                    );
+                    (
+                        fb::LimitVariant::FloatingConcurrencyLimitEntry,
+                        entry.as_union_value(),
+                    )
+                }
+            };
+            fb::LimitEntry::create(
+                builder,
+                &fb::LimitEntryArgs {
+                    variant_type: vtype,
+                    variant: Some(voff),
+                },
+            )
+        })
+        .collect()
+}
+
+pub fn fb_limit_entries_to_owned(
+    entries: Option<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<fb::LimitEntry<'_>>>>,
+) -> Vec<Limit> {
+    use crate::job::{
+        ConcurrencyLimit, FloatingConcurrencyLimit, GubernatorAlgorithm, GubernatorRateLimit,
+        RateLimitRetryPolicy,
+    };
+
+    entries
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| match entry.variant_type() {
+                    fb::LimitVariant::ConcurrencyLimitEntry => {
+                        let cl = entry.variant_as_concurrency_limit_entry()?;
+                        Some(Limit::Concurrency(ConcurrencyLimit {
+                            key: cl.key().unwrap_or_default().to_string(),
+                            max_concurrency: cl.max_concurrency(),
+                        }))
+                    }
+                    fb::LimitVariant::RateLimitEntry => {
+                        let rl = entry.variant_as_rate_limit_entry()?;
+                        let rp = rl.retry_policy();
+                        Some(Limit::RateLimit(GubernatorRateLimit {
+                            name: rl.name().unwrap_or_default().to_string(),
+                            unique_key: rl.unique_key().unwrap_or_default().to_string(),
+                            limit: rl.limit(),
+                            duration_ms: rl.duration_ms(),
+                            hits: rl.hits(),
+                            algorithm: if rl.algorithm() == 1 {
+                                GubernatorAlgorithm::LeakyBucket
+                            } else {
+                                GubernatorAlgorithm::TokenBucket
+                            },
+                            behavior: rl.behavior(),
+                            retry_policy: rp
+                                .map(|p| RateLimitRetryPolicy {
+                                    initial_backoff_ms: p.initial_backoff_ms(),
+                                    max_backoff_ms: p.max_backoff_ms(),
+                                    backoff_multiplier: p.backoff_multiplier(),
+                                    max_retries: p.max_retries(),
+                                })
+                                .unwrap_or_default(),
+                        }))
+                    }
+                    fb::LimitVariant::FloatingConcurrencyLimitEntry => {
+                        let fl = entry.variant_as_floating_concurrency_limit_entry()?;
+                        Some(Limit::FloatingConcurrency(FloatingConcurrencyLimit {
+                            key: fl.key().unwrap_or_default().to_string(),
+                            default_max_concurrency: fl.default_max_concurrency(),
+                            refresh_interval_ms: fl.refresh_interval_ms(),
+                            metadata: fb_kv_pairs_to_owned(fl.metadata()),
+                        }))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[inline]
 pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::with_capacity(512);
@@ -334,80 +474,7 @@ pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
     let md = build_kv_pair_offsets(&mut builder, &job.metadata);
     let metadata = builder.create_vector(&md);
 
-    let limits: Vec<_> = job
-        .limits
-        .iter()
-        .map(|lim| {
-            let (vtype, voff) = match lim {
-                Limit::Concurrency(cl) => {
-                    let key = builder.create_string(&cl.key);
-                    let entry = fb::ConcurrencyLimitEntry::create(
-                        &mut builder,
-                        &fb::ConcurrencyLimitEntryArgs {
-                            key: Some(key),
-                            max_concurrency: cl.max_concurrency,
-                        },
-                    );
-                    (
-                        fb::LimitVariant::ConcurrencyLimitEntry,
-                        entry.as_union_value(),
-                    )
-                }
-                Limit::RateLimit(rl) => {
-                    let name = builder.create_string(&rl.name);
-                    let unique_key = builder.create_string(&rl.unique_key);
-                    let rp = fb::RateLimitRetryPolicy::create(
-                        &mut builder,
-                        &fb::RateLimitRetryPolicyArgs {
-                            initial_backoff_ms: rl.retry_policy.initial_backoff_ms,
-                            max_backoff_ms: rl.retry_policy.max_backoff_ms,
-                            backoff_multiplier: rl.retry_policy.backoff_multiplier,
-                            max_retries: rl.retry_policy.max_retries,
-                        },
-                    );
-                    let entry = fb::RateLimitEntry::create(
-                        &mut builder,
-                        &fb::RateLimitEntryArgs {
-                            name: Some(name),
-                            unique_key: Some(unique_key),
-                            limit: rl.limit,
-                            duration_ms: rl.duration_ms,
-                            hits: rl.hits,
-                            algorithm: rl.algorithm.as_u8(),
-                            behavior: rl.behavior,
-                            retry_policy: Some(rp),
-                        },
-                    );
-                    (fb::LimitVariant::RateLimitEntry, entry.as_union_value())
-                }
-                Limit::FloatingConcurrency(fl) => {
-                    let key = builder.create_string(&fl.key);
-                    let md = build_kv_pair_offsets(&mut builder, &fl.metadata);
-                    let metadata = builder.create_vector(&md);
-                    let entry = fb::FloatingConcurrencyLimitEntry::create(
-                        &mut builder,
-                        &fb::FloatingConcurrencyLimitEntryArgs {
-                            key: Some(key),
-                            default_max_concurrency: fl.default_max_concurrency,
-                            refresh_interval_ms: fl.refresh_interval_ms,
-                            metadata: Some(metadata),
-                        },
-                    );
-                    (
-                        fb::LimitVariant::FloatingConcurrencyLimitEntry,
-                        entry.as_union_value(),
-                    )
-                }
-            };
-            fb::LimitEntry::create(
-                &mut builder,
-                &fb::LimitEntryArgs {
-                    variant_type: vtype,
-                    variant: Some(voff),
-                },
-            )
-        })
-        .collect();
+    let limits = build_limit_entry_offsets(&mut builder, &job.limits);
     let limits = builder.create_vector(&limits);
 
     let root = fb::JobInfo::create(
@@ -474,9 +541,21 @@ pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Vec<u8> {
             attempt_number,
             relative_attempt_number,
             task_group,
+            task_id,
+            held_queues,
+            next_limit_index,
+            limits,
         } => {
             let job_id = builder.create_string(job_id);
             let task_group = builder.create_string(task_group);
+            let task_id = builder.create_string(task_id);
+            let hq: Vec<_> = held_queues
+                .iter()
+                .map(|s| builder.create_string(s))
+                .collect();
+            let held_queues = builder.create_vector(&hq);
+            let limits = build_limit_entry_offsets(&mut builder, limits);
+            let limits = builder.create_vector(&limits);
             let et = fb::EnqueueTask::create(
                 &mut builder,
                 &fb::EnqueueTaskArgs {
@@ -486,6 +565,10 @@ pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Vec<u8> {
                     attempt_number: *attempt_number,
                     relative_attempt_number: *relative_attempt_number,
                     task_group: Some(task_group),
+                    task_id: Some(task_id),
+                    held_queues: Some(held_queues),
+                    next_limit_index: *next_limit_index,
+                    limits: Some(limits),
                 },
             );
             let root = fb::ConcurrencyAction::create(

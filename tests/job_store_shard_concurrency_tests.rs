@@ -1638,6 +1638,10 @@ async fn grant_scanner_skips_stale_requests_and_grants_valid_ones() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            task_id: format!("stale-task-{}", i),
+            held_queues: Vec::new(),
+            next_limit_index: 1,
+            limits: Vec::new(),
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
@@ -1699,6 +1703,10 @@ async fn grant_scanner_handles_all_stale_requests() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            task_id: format!("stale-task-{}", i),
+            held_queues: Vec::new(),
+            next_limit_index: 1,
+            limits: Vec::new(),
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
@@ -1994,6 +2002,10 @@ async fn grant_scanner_interleaved_stale_and_valid_requests() {
             attempt_number: 1,
             relative_attempt_number: 1,
             task_group: "tg".to_string(),
+            task_id: format!("stale-task-{}", i),
+            held_queues: Vec::new(),
+            next_limit_index: 1,
+            limits: Vec::new(),
         };
         let key = silo::keys::concurrency_request_key(
             tenant,
