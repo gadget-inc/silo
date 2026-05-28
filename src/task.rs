@@ -213,6 +213,10 @@ pub struct HeartbeatResult {
     pub cancelled: bool,
     /// Timestamp when cancellation was requested, if cancelled
     pub cancelled_at_ms: Option<i64>,
+    /// True if the worker no longer holds this lease (it was reaped or is owned
+    /// by someone else). Workers should abort the in-flight task and NOT report
+    /// a server outcome — the attempt has already been finalized by the reaper.
+    pub lease_lost: bool,
 }
 
 /// A leased refresh task for floating concurrency limits

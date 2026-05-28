@@ -25,29 +25,44 @@ impl JobStoreShard {
     /// Heartbeat a lease to renew it if the worker id matches. Bumps expiry by DEFAULT_LEASE_MS.
     ///
     /// [SILO-HB-3]: Heartbeat ALWAYS renews the lease, even for cancelled jobs.
-    /// Worker discovers cancellation from the heartbeat response
+    /// Worker discovers cancellation from the heartbeat response.
     /// Worker can keep heartbeating during graceful shutdown until they report completion.
+    ///
+    /// Returns `lease_lost: true` (instead of `Err`) when the lease has been
+    /// reaped or is owned by someone else — the worker should abort the
+    /// in-flight task and NOT report a server outcome. Topology / DB errors
+    /// continue to surface as `Err` so the routing client retries.
     pub async fn heartbeat_task(
         &self,
         worker_id: &str,
         task_id: &str,
     ) -> Result<HeartbeatResult, JobStoreShardError> {
-        // [SILO-HB-2] Directly read the lease for this task id
+        // [SILO-HB-2] Directly read the lease for this task id.
+        // The common cause of "you no longer own this lease" is expiry+reap:
+        // the reaper deletes the lease and the retry uses a fresh task_id, so
+        // a zombie worker heartbeating its original task_id finds no lease.
         let key = leased_task_key(task_id);
         let maybe_raw = self.db.get(&key).await?;
         let Some(value_bytes) = maybe_raw else {
-            return Err(JobStoreShardError::LeaseNotFound(task_id.to_string()));
+            return Ok(HeartbeatResult {
+                cancelled: false,
+                cancelled_at_ms: None,
+                lease_lost: true,
+            });
         };
 
         let decoded = decode_lease(value_bytes)?;
 
-        // [SILO-HB-1] Check worker id matches
+        // [SILO-HB-1] Check worker id matches. The same task_id is essentially
+        // never re-leased to a different worker, so this branch is rare — but
+        // semantically identical to the lease-gone case: the worker no longer
+        // owns it. Surface the same lease_lost signal.
         let current_owner = decoded.worker_id();
         if current_owner != worker_id {
-            return Err(JobStoreShardError::LeaseOwnerMismatch {
-                task_id: task_id.to_string(),
-                expected: current_owner.to_string(),
-                got: worker_id.to_string(),
+            return Ok(HeartbeatResult {
+                cancelled: false,
+                cancelled_at_ms: None,
+                lease_lost: true,
             });
         }
 
@@ -85,6 +100,7 @@ impl JobStoreShard {
         Ok(HeartbeatResult {
             cancelled: cancelled_at_ms.is_some(),
             cancelled_at_ms,
+            lease_lost: false,
         })
     }
 
@@ -436,7 +452,7 @@ impl JobStoreShard {
         Ok(())
     }
 
-    /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code, or as Cancelled if the job was cancelled.
+    /// Scan all held leases and mark any expired ones as failed with a LEASE_LOST error code, or as Cancelled if the job was cancelled.
     /// For RefreshFloatingLimit tasks, resets the floating limit state so it can be retried on next periodic refresh.
     /// Skips and deletes leases for tenants outside the shard's range.
     /// Returns the number of expired leases reaped.
@@ -501,7 +517,7 @@ impl JobStoreShard {
             };
             let job_id = decoded.job_id().to_string();
 
-            // Check if job was cancelled - if so, report Cancelled instead of WORKER_CRASHED
+            // Check if job was cancelled - if so, report Cancelled instead of LEASE_LOST
             let was_cancelled = self
                 .is_job_cancelled(tenant, &job_id)
                 .await
@@ -511,13 +527,18 @@ impl JobStoreShard {
                 // Job was cancelled - report as Cancelled (clean termination)
                 AttemptOutcome::Cancelled
             } else {
-                // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
+                // [SILO-REAP-3][SILO-REAP-4] Report as lease lost.
+                // Lease expiry means the worker stopped heartbeating in time —
+                // it either crashed, hung, or was partitioned. The worker will
+                // discover the loss on its next heartbeat (lease_lost: true)
+                // and abort. Record the failure under LEASE_LOST so the
+                // attempt's persisted reason names what actually happened.
                 // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
                 // SILO-REAP-4: Post: Set attempt status to AttemptFailed
                 AttemptOutcome::Error {
-                    error_code: "WORKER_CRASHED".to_string(),
+                    error_code: "LEASE_LOST".to_string(),
                     error: format!(
-                        "lease expired at {} (now {}), worker={}",
+                        "aborted: lease lost (expired at {}, now {}, worker={})",
                         decoded.expiry_ms(),
                         now_ms,
                         decoded.worker_id()

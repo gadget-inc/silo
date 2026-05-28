@@ -98,6 +98,8 @@ export class TaskExecution<
   private readonly _taskAbortController: AbortController;
   /** Whether the task has been cancelled (by server or client) */
   private _cancelled: boolean = false;
+  /** Whether the task was stopped because its lease was lost (reaped / re-owned) */
+  private _leaseLost: boolean = false;
   /** The reason for cancellation if cancelled */
   private _cancellationReason: CancellationReason | undefined;
   /** Promise resolving when cancel RPC completes (if initiated by client) */
@@ -132,9 +134,20 @@ export class TaskExecution<
     return this._cancellationReason;
   }
 
-  /** Whether the task was cancelled and should report Cancelled outcome */
+  /** Whether the task was cancelled and should report Cancelled outcome.
+   *  A lost-lease abort does NOT count — that path reports no outcome. */
   get shouldReportCancelled(): boolean {
-    return this._cancelled;
+    return this._cancelled && !this._leaseLost;
+  }
+
+  /** Whether this task was aborted because its lease was lost. */
+  get leaseLost(): boolean {
+    return this._leaseLost;
+  }
+
+  /** Whether work on this task should stop (cancelled or lease-lost). */
+  get isStopped(): boolean {
+    return this._cancelled || this._leaseLost;
   }
 
   /**
@@ -145,6 +158,18 @@ export class TaskExecution<
     if (this._cancelled) return;
     this._cancelled = true;
     this._cancellationReason = "server";
+    this._taskAbortController.abort();
+  }
+
+  /**
+   * Called when a heartbeat reveals the lease has been lost (reaped after
+   * expiry, or owned by another worker). Aborts the in-flight handler. Unlike
+   * cancellation, no outcome is reported to the server — the attempt has
+   * already been finalized server-side as LEASE_LOST.
+   */
+  public markLostLease(): void {
+    if (this._leaseLost) return;
+    this._leaseLost = true;
     this._taskAbortController.abort();
   }
 
