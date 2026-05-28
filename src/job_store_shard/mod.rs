@@ -84,11 +84,12 @@ pub struct OpenShardOptions {
     pub metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     pub concurrency_reconcile_interval: Duration,
-    /// When true, spawns the per-shard counter reconciliation background
-    /// task. The reconciler exists to correct counter drift caused by the
-    /// standalone compactor dropping terminal job rows; deployments that run
-    /// the standalone compactor enable it. Defaults to off.
-    pub enable_counter_reconciliation: bool,
+    /// Interval in seconds for the per-shard counter reconciliation
+    /// background task. The reconciler exists to correct counter drift caused
+    /// by the standalone compactor dropping terminal job rows; deployments
+    /// that run the standalone compactor set this to enable it. `None`
+    /// (the default) disables the task entirely.
+    pub counter_reconciliation_seconds: Option<u64>,
     /// When true, scan every concurrency holder into the in-memory cache
     /// before opening the shard for ticket granting, and treat
     /// `ensure_hydrated` misses thereafter as empty queues. When false, no
@@ -335,7 +336,7 @@ impl JobStoreShard {
                 concurrency_reconcile_interval: Duration::from_millis(
                     crate::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS.max(1),
                 ),
-                enable_counter_reconciliation: cfg.enable_counter_reconciliation,
+                counter_reconciliation_seconds: cfg.counter_reconciliation_seconds,
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
             },
             range,
@@ -373,7 +374,7 @@ impl JobStoreShard {
             rate_limiter,
             metrics,
             concurrency_reconcile_interval,
-            enable_counter_reconciliation,
+            counter_reconciliation_seconds,
             hydrate_all_at_startup,
         } = options;
 
@@ -487,8 +488,8 @@ impl JobStoreShard {
         // Only enabled when the deployment runs the standalone compactor, which
         // drops terminal job rows without a writable Db handle and therefore
         // cannot decrement counters at drop time.
-        if enable_counter_reconciliation {
-            shard.spawn_counter_reconcile_task(range);
+        if let Some(interval_seconds) = counter_reconciliation_seconds {
+            shard.spawn_counter_reconcile_task(range, interval_seconds);
         }
 
         // Set the shard creation timestamp if this is the first time opening
@@ -710,21 +711,17 @@ impl JobStoreShard {
     ///
     /// Unlike the concurrency reconciler (small scan, fast cadence), this task
     /// scans all `JOB_INFO` + `JOB_STATUS` rows in the shard and so runs at
-    /// hourly cadence by default. To avoid all shards spiking object-store
-    /// reads at the same wall-clock minute on process boot, we sleep a
-    /// shard-deterministic jitter `[0, interval)` before the first tick. The
-    /// jitter is derived from the shard name's hash so that deterministic
-    /// simulation tests remain reproducible.
-    fn spawn_counter_reconcile_task(self: &Arc<Self>, range: ShardRange) {
+    /// the deployment-configured cadence (typically hourly). To avoid all
+    /// shards spiking object-store reads at the same wall-clock minute on
+    /// process boot, we sleep a shard-deterministic jitter `[0, interval)`
+    /// before the first tick. The jitter is derived from the shard name's
+    /// hash so that deterministic simulation tests remain reproducible.
+    fn spawn_counter_reconcile_task(self: &Arc<Self>, range: ShardRange, interval_seconds: u64) {
         let shard = Arc::clone(self);
         let cancellation = self.cancellation.clone();
         let shard_name = self.name.clone();
-        // Hardcoded: this counter is eventually-consistent observability with
-        // no operational SLA, so there's no reason to tune it per-shard or
-        // per-deployment. Plumbing a knob here would force every test/bench
-        // that constructs OpenShardOptions/DatabaseTemplate to set a value.
         let reconcile_interval =
-            Duration::from_millis(crate::settings::DEFAULT_COUNTER_RECONCILE_INTERVAL_MS.max(1));
+            Duration::from_millis(interval_seconds.saturating_mul(1000).max(1));
 
         tokio::spawn(async move {
             // Deterministic jitter based on shard name so we don't stampede

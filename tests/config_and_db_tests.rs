@@ -571,7 +571,7 @@ concurrency_reconcile_interval_ms = 25
 }
 
 #[silo::test]
-fn parse_toml_enable_counter_reconciliation_defaults_off() {
+fn parse_toml_counter_reconciliation_seconds_defaults_off() {
     let toml_str = r#"
 [database]
 backend = "fs"
@@ -579,21 +579,21 @@ path = "/tmp/silo-%shard%"
 "#;
     let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
     assert!(
-        !cfg.database.enable_counter_reconciliation,
+        cfg.database.counter_reconciliation_seconds.is_none(),
         "counter reconciliation should be off by default"
     );
 }
 
 #[silo::test]
-fn parse_toml_enable_counter_reconciliation_opt_in() {
+fn parse_toml_counter_reconciliation_seconds_opt_in() {
     let toml_str = r#"
 [database]
 backend = "fs"
 path = "/tmp/silo-%shard%"
-enable_counter_reconciliation = true
+counter_reconciliation_seconds = 3600
 "#;
     let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
-    assert!(cfg.database.enable_counter_reconciliation);
+    assert_eq!(cfg.database.counter_reconciliation_seconds, Some(3600));
 }
 
 /// Guards against the manual `Default` impl on `DatabaseTemplate` drifting away
@@ -619,8 +619,8 @@ path = "/tmp/silo-%shard%"
         from_toml.database.concurrency_reconcile_interval_ms
     );
     assert_eq!(
-        from_default.enable_counter_reconciliation,
-        from_toml.database.enable_counter_reconciliation
+        from_default.counter_reconciliation_seconds,
+        from_toml.database.counter_reconciliation_seconds
     );
     assert!(from_default.wal.is_none() && from_toml.database.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.database.slatedb.is_none());
@@ -647,8 +647,8 @@ path = "/tmp/silo-shard"
         from_toml.apply_wal_on_close
     );
     assert_eq!(
-        from_default.enable_counter_reconciliation,
-        from_toml.enable_counter_reconciliation
+        from_default.counter_reconciliation_seconds,
+        from_toml.counter_reconciliation_seconds
     );
     assert!(from_default.wal.is_none() && from_toml.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.slatedb.is_none());
