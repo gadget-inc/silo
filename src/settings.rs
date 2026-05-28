@@ -182,17 +182,6 @@ fn default_concurrency_reconcile_interval_ms() -> u64 {
     DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS
 }
 
-/// Hardcoded interval for the per-shard counter reconciliation background
-/// task. The reconciler corrects counter drift caused by the standalone
-/// compactor dropping terminal job rows without a writable `Db` handle. There
-/// is no operational reason to tune it per-shard or per-deployment, so it is
-/// not exposed as a config field.
-pub const DEFAULT_COUNTER_RECONCILE_INTERVAL_MS: u64 = 60 * 60 * 1000;
-
-fn default_enable_counter_reconciliation() -> bool {
-    false
-}
-
 fn default_hydrate_all_at_startup() -> bool {
     false
 }
@@ -221,13 +210,14 @@ pub struct DatabaseTemplate {
     /// to self-heal from missed in-memory notifications.
     #[serde(default = "default_concurrency_reconcile_interval_ms")]
     pub concurrency_reconcile_interval_ms: u64,
-    /// When true, enables the periodic counter reconciliation background task
-    /// that re-derives counter truth from JOB_INFO/JOB_STATUS to correct drift
-    /// caused by the standalone compactor dropping terminal job rows. Other
-    /// counter writes (in transactions, in `reconcile_pending_requests`, etc.)
-    /// are unaffected. Defaults to false (reconciliation disabled).
-    #[serde(default = "default_enable_counter_reconciliation")]
-    pub enable_counter_reconciliation: bool,
+    /// Interval in seconds for the periodic counter reconciliation background
+    /// task that re-derives counter truth from JOB_INFO/JOB_STATUS to correct
+    /// drift caused by the standalone compactor dropping terminal job rows.
+    /// `None` (the default) disables the task entirely. `Some(n)` runs it
+    /// every `n` seconds. Other counter writes (in transactions, in
+    /// `reconcile_pending_requests`, etc.) are unaffected.
+    #[serde(default)]
+    pub counter_reconciliation_seconds: Option<u64>,
     /// When true, scan every concurrency holder into the in-memory cache before
     /// the shard accepts traffic, and treat later `ensure_hydrated` misses as
     /// empty queues. When false, no startup scan runs and the singleflighted
@@ -257,7 +247,7 @@ impl Default for DatabaseTemplate {
             wal: None,
             apply_wal_on_close: default_apply_wal_on_close(),
             concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
-            enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            counter_reconciliation_seconds: None,
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
             slatedb: None,
             memory_cache: None,
@@ -508,10 +498,11 @@ pub struct DatabaseConfig {
     /// Defaults to true when WAL is configured.
     #[serde(default = "default_apply_wal_on_close")]
     pub apply_wal_on_close: bool,
-    /// When true, enables the periodic counter reconciliation background task.
-    /// See `DatabaseTemplate::enable_counter_reconciliation` for details.
-    #[serde(default = "default_enable_counter_reconciliation")]
-    pub enable_counter_reconciliation: bool,
+    /// Interval in seconds for the counter reconciliation background task.
+    /// `None` disables the task; `Some(n)` runs it every `n` seconds. See
+    /// `DatabaseTemplate::counter_reconciliation_seconds` for details.
+    #[serde(default)]
+    pub counter_reconciliation_seconds: Option<u64>,
     /// When true, eagerly scan every concurrency holder into the in-memory
     /// cache at startup. See `DatabaseTemplate::hydrate_all_at_startup` for
     /// details. Defaults to false.
@@ -539,7 +530,7 @@ impl Default for DatabaseConfig {
             path: "/tmp/silo-shard".to_string(),
             wal: None,
             apply_wal_on_close: default_apply_wal_on_close(),
-            enable_counter_reconciliation: default_enable_counter_reconciliation(),
+            counter_reconciliation_seconds: None,
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
             slatedb: None,
             memory_cache: None,
