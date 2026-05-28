@@ -104,6 +104,16 @@ impl InstrumentedDb {
         self.inner.get(key).instrument(self.span.clone()).await
     }
 
+    pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+    ) -> Result<Option<KeyValue>, slatedb::Error> {
+        self.inner
+            .get_key_value(key)
+            .instrument(self.span.clone())
+            .await
+    }
+
     pub async fn scan<K, T>(&self, range: T) -> Result<InstrumentedDbIterator, slatedb::Error>
     where
         K: AsRef<[u8]> + Send,

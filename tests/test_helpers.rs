@@ -82,6 +82,30 @@ pub async fn open_temp_shard_with_metrics() -> (
     (tmp, shard, metrics)
 }
 
+/// Open a temp shard with both `completed_job_expire_s` and
+/// `terminal_job_expire_s` set to the same value (in seconds). Lets cancel /
+/// import / completion tests assert that terminal-job records carry the
+/// expected row TTL without caring which terminal status each test produces.
+pub async fn open_temp_shard_with_terminal_expire_s(
+    expire_s: u64,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        completed_job_expire_s: Some(expire_s),
+        terminal_job_expire_s: Some(expire_s),
+        ..Default::default()
+    };
+    let shard = JobStoreShard::open(&cfg, rate_limiter, None, ShardRange::full())
+        .await
+        .expect("open shard");
+    (tmp, shard)
+}
+
 /// Open a temp shard with a custom periodic concurrency reconciliation interval.
 pub async fn open_temp_shard_with_reconcile_interval_ms(
     interval_ms: u64,
