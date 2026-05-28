@@ -5,7 +5,7 @@
 
 mod test_helpers;
 
-use silo::codec::{decode_lease, encode_holder, encode_lease, encode_task};
+use silo::codec::{decode_lease, decode_task, encode_holder, encode_lease, encode_task};
 use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, JobStatusKind, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
@@ -23,6 +23,32 @@ fn fc_limit(queue: &str, default_max: u32) -> Limit {
         refresh_interval_ms: 60_000,
         metadata: vec![],
     })
+}
+
+async fn find_task_for_job(
+    db: &silo::instrumented_db::InstrumentedDb,
+    job_id: &str,
+) -> Option<Task> {
+    let start = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&start);
+    let mut iter = db.scan::<Vec<u8>, _>(start..end).await.ok()?;
+    while let Ok(Some(kv)) = iter.next().await {
+        if let Ok(task) = decode_task(&kv.value)
+            && task_job_id(&task) == Some(job_id)
+        {
+            return Some(task);
+        }
+    }
+    None
+}
+
+fn task_job_id(task: &Task) -> Option<&str> {
+    match task {
+        Task::RunAttempt { job_id, .. }
+        | Task::RequestTicket { job_id, .. }
+        | Task::CheckRateLimit { job_id, .. } => Some(job_id),
+        Task::RefreshFloatingLimit { .. } => None,
+    }
 }
 
 /// Force the worker's lease for `task_id` to be already expired by rewriting the
@@ -716,7 +742,7 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
     // Job B has no slot to take — it queues as a concurrency request and the
     // chain walker drops its interim RunAttempt at `task_key(original_enqueue_ms, …)`
     // in the same batch as the request write.
-    let _job_b = shard
+    let job_b = shard
         .enqueue(
             tenant,
             None,
@@ -805,6 +831,32 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
          ({}), so any tombstone planted at that key would silently suppress this \
          task — exactly the leak the fix is meant to prevent.",
         original_enqueue_ms,
+    );
+
+    let b_status = shard
+        .get_job_status(tenant, &job_b)
+        .await
+        .expect("load job B status")
+        .expect("job B status exists");
+    assert_eq!(b_status.kind, JobStatusKind::Scheduled);
+    assert_eq!(
+        b_status.next_attempt_starts_after_ms,
+        Some(b_start as i64),
+        "Scheduled status must point at the retargeted resumed RunAttempt key"
+    );
+
+    shard
+        .cancel_job(tenant, &job_b)
+        .await
+        .expect("cancel retargeted job B");
+    assert!(
+        find_task_for_job(shard.db(), &job_b).await.is_none(),
+        "cancel must find and delete the resumed RunAttempt via status-derived task key"
+    );
+    assert_eq!(
+        count_concurrency_holders_for_tenant(shard.db(), tenant).await,
+        0,
+        "cancel must release the holder created by the grant scanner"
     );
 }
 

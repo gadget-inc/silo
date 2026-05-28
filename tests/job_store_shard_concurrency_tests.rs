@@ -1,7 +1,9 @@
 mod test_helpers;
 
 use silo::codec::{decode_task, encode_concurrency_action};
-use silo::job::{GubernatorAlgorithm, GubernatorRateLimit, Limit, RateLimitRetryPolicy};
+use silo::job::{
+    GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, Limit, RateLimitRetryPolicy,
+};
 use silo::job_attempt::AttemptOutcome;
 use silo::keys::concurrency_holder_key;
 use silo::retry::RetryPolicy;
@@ -3625,7 +3627,7 @@ async fn deferred_concurrency_resumes_into_rate_limit() {
     // Job 2: [A(cap=2), B(cap=1), RateLimit]. Conc-A still has a slot, so the
     // chain grants A immediately; B is full so it defers via a
     // concurrency_request_key. The chain does NOT reach RateLimit yet.
-    let _job2 = shard
+    let job2 = shard
         .enqueue(
             tenant,
             None,
@@ -3679,19 +3681,30 @@ async fn deferred_concurrency_resumes_into_rate_limit() {
     // Poll for the CheckRateLimit task. Pre-fix the scanner would have
     // written a RunAttempt and bypassed the rate limit — that assertion
     // below would fail with `RunAttempt` instead.
-    let mut check_rl: Option<Task> = None;
+    let mut check_rl: Option<(silo::keys::ParsedTaskKey, Task)> = None;
     for _ in 0..50 {
-        if let Some(t) = find_task_for_tenant(shard.db(), tenant).await
+        if let Some((key, t)) = find_task_key_and_task_for_tenant(shard.db(), tenant).await
             && matches!(t, Task::CheckRateLimit { .. })
         {
-            check_rl = Some(t);
+            check_rl = Some((key, t));
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let check_rl = check_rl.expect(
+    let (check_rl_key, check_rl) = check_rl.expect(
         "expected a CheckRateLimit task for job 2 after Conc-B was promoted by the grant scanner; \
          if a RunAttempt was written instead, the chain shortcut bypassed RateLimit",
+    );
+    let job2_status = shard
+        .get_job_status(tenant, &job2)
+        .await
+        .expect("load job2 status")
+        .expect("job2 status exists");
+    assert_eq!(job2_status.kind, JobStatusKind::Scheduled);
+    assert_eq!(
+        job2_status.next_attempt_starts_after_ms,
+        Some(check_rl_key.start_time_ms as i64),
+        "Scheduled status must point at the retargeted CheckRateLimit key"
     );
 
     // Verify held_queues = [A, B] — Conc-A's prior grant survived into the
@@ -3726,15 +3739,132 @@ async fn deferred_concurrency_resumes_into_rate_limit() {
         count_holders_for_queue(shard.db(), tenant, &queue_b).await,
         1
     );
+
+    shard
+        .cancel_job(tenant, &job2)
+        .await
+        .expect("cancel job2 after grant scanner wrote CheckRateLimit");
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "cancel must find retargeted CheckRateLimit and release Conc-A"
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_b).await,
+        0,
+        "cancel must find retargeted CheckRateLimit and release Conc-B"
+    );
+    assert_eq!(
+        count_check_rate_limit_tasks_for_tenant(shard.db(), tenant).await,
+        0,
+        "cancel must delete the retargeted CheckRateLimit task"
+    );
     let _ = end_bound(&tasks_prefix());
 }
 
-/// Helper: scan the tasks prefix and return the first task for the given
-/// tenant (used by `deferred_concurrency_resumes_into_rate_limit`).
-async fn find_task_for_tenant(
+#[silo::test]
+async fn grant_scanner_hydrates_legacy_request_without_task_id_or_limits() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue = "legacy-request-q".to_string();
+
+    let job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue holder job");
+    let job2 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue queued job");
+
+    let (request_key, _) = first_concurrency_request_kv(shard.db())
+        .await
+        .expect("queued job should have a request");
+    let parsed =
+        silo::keys::parse_concurrency_request_key(&request_key).expect("request key should parse");
+    assert_eq!(parsed.job_id, job2);
+
+    // Simulate a request value written by the pre-upgrade schema: the durable
+    // key still carries the request id, but the value has no task_id, limits,
+    // held_queues, or limit_index fields.
+    let legacy_value = encode_legacy_enqueue_task_value(&parsed, "default");
+    shard
+        .db()
+        .put(&request_key, &legacy_value)
+        .await
+        .expect("overwrite request with legacy value");
+
+    let leased_a = shard
+        .dequeue("w1", "default", 1)
+        .await
+        .expect("dequeue job1")
+        .tasks;
+    assert_eq!(leased_a.len(), 1);
+    assert_eq!(leased_a[0].job().id(), job1);
+    let task1 = leased_a[0].attempt().task_id().to_string();
+
+    shard
+        .report_attempt_outcome(&task1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete job1");
+
+    let mut leased_b = Vec::new();
+    for _ in 0..50 {
+        leased_b = shard
+            .dequeue("w2", "default", 1)
+            .await
+            .expect("dequeue job2")
+            .tasks;
+        if !leased_b.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        leased_b.len(),
+        1,
+        "legacy request should be granted, not deleted as corrupt"
+    );
+    assert_eq!(leased_b[0].job().id(), job2);
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "granted legacy request should be consumed"
+    );
+}
+
+async fn find_task_key_and_task_for_tenant(
     db: &silo::instrumented_db::InstrumentedDb,
     tenant: &str,
-) -> Option<Task> {
+) -> Option<(silo::keys::ParsedTaskKey, Task)> {
     let start = silo::keys::tasks_prefix();
     let end = silo::keys::end_bound(&start);
     let mut iter = db
@@ -3742,13 +3872,49 @@ async fn find_task_for_tenant(
         .await
         .ok()?;
     while let Ok(Some(kv)) = iter.next().await {
+        let Some(parsed) = silo::keys::parse_task_key(&kv.key) else {
+            continue;
+        };
         if let Ok(task) = decode_task(&kv.value)
             && task.tenant() == tenant
         {
-            return Some(task);
+            return Some((parsed, task));
         }
     }
     None
+}
+
+fn encode_legacy_enqueue_task_value(
+    parsed: &silo::keys::ParsedConcurrencyRequestKey,
+    task_group: &str,
+) -> Vec<u8> {
+    let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(128);
+    let job_id = builder.create_string(&parsed.job_id);
+    let task_group = builder.create_string(task_group);
+    let et = silo::fb::silo::fb::EnqueueTask::create(
+        &mut builder,
+        &silo::fb::silo::fb::EnqueueTaskArgs {
+            start_time_ms: parsed.start_time_ms as i64,
+            priority: parsed.priority,
+            job_id: Some(job_id),
+            attempt_number: parsed.attempt_number,
+            relative_attempt_number: parsed.attempt_number,
+            task_group: Some(task_group),
+            limit_index: 0,
+            held_queues: None,
+            task_id: None,
+            limits: None,
+        },
+    );
+    let root = silo::fb::silo::fb::ConcurrencyAction::create(
+        &mut builder,
+        &silo::fb::silo::fb::ConcurrencyActionArgs {
+            variant_type: silo::fb::silo::fb::ConcurrencyActionVariant::EnqueueTask,
+            variant: Some(et.as_union_value()),
+        },
+    );
+    builder.finish(root, None);
+    builder.finished_data().to_vec()
 }
 
 /// Helper: count `CheckRateLimit` tasks for a tenant.

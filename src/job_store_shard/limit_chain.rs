@@ -18,7 +18,9 @@ use slatedb::WriteBatch;
 
 use crate::concurrency::{ConcurrencyError, LimitChainResumer, ResumeChainParams};
 use crate::job_store_shard::helpers::DbWriteBatcher;
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
+use crate::job_store_shard::{
+    JobStoreShard, JobStoreShardError, LimitTaskParams, LimitTaskWriteResult,
+};
 
 pub(crate) struct ShardChainResumer {
     shard: Weak<JobStoreShard>,
@@ -73,7 +75,7 @@ impl LimitChainResumer for ShardChainResumer {
         // priority, job_id, attempt_number) are constant within a chain.
         let task_key_start_ms = now_ms.max(params.start_at_ms + 1);
         let mut writer = DbWriteBatcher::new(&shard.db, batch);
-        shard
+        let result = shard
             .enqueue_limit_task_at_index(
                 &mut writer,
                 LimitTaskParams {
@@ -94,8 +96,42 @@ impl LimitChainResumer for ShardChainResumer {
                 },
             )
             .await
-            .map_err(into_concurrency_error)
+            .map_err(into_concurrency_error)?;
+
+        if let Err(e) = retarget_if_concrete_task(&shard, &mut writer, &params, &result).await {
+            for (queue, task_id) in &result.grants {
+                shard
+                    .concurrency
+                    .rollback_grant(&params.tenant, queue, task_id);
+            }
+            return Err(into_concurrency_error(e));
+        }
+
+        Ok(result.grants)
     }
+}
+
+async fn retarget_if_concrete_task(
+    shard: &JobStoreShard,
+    writer: &mut DbWriteBatcher<'_>,
+    params: &ResumeChainParams,
+    result: &LimitTaskWriteResult,
+) -> Result<(), JobStoreShardError> {
+    let Some(task_key_start_ms) = result.pending_task_key_start_ms else {
+        return Ok(());
+    };
+    if task_key_start_ms == params.start_at_ms {
+        return Ok(());
+    }
+    shard
+        .retarget_scheduled_task_key(
+            writer,
+            &params.tenant,
+            &params.job_id,
+            params.attempt_number,
+            task_key_start_ms,
+        )
+        .await
 }
 
 fn into_concurrency_error(e: JobStoreShardError) -> ConcurrencyError {
