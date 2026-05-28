@@ -838,7 +838,6 @@ impl JobStoreShard {
 
     /// Resolve the row TTL (`expire_ts`, epoch ms) for a job that reached the
     /// given terminal status, or `None` if no TTL is configured.
-    #[allow(dead_code)] // wired up in follow-up retention PRs (cancel, import, terminal)
     pub(crate) fn terminal_expire_ts(&self, kind: JobStatusKind, now_ms: i64) -> Option<i64> {
         compute_terminal_expire_ts(
             kind,

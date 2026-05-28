@@ -118,6 +118,11 @@ impl JobStoreShard {
         }
 
         let now_ms = now_epoch_ms();
+        // The row-TTL deadline for terminal records depends on which terminal
+        // status the job reaches — `completed_job_expire_s` for Succeeded,
+        // `terminal_job_expire_s` for Failed/Cancelled. We resolve it inside
+        // each terminal branch below via `self.terminal_expire_ts(kind, now_ms)`.
+        let mut terminal_expire_ts: Option<i64> = None;
         let attempt_status = match &outcome {
             AttemptOutcome::Success { result } => AttemptStatus::Succeeded {
                 finished_at_ms: now_ms,
@@ -147,10 +152,11 @@ impl JobStoreShard {
         };
         let attempt_val = encode_attempt(&attempt);
 
-        // Atomically update attempt and remove lease
+        // Atomically update attempt and remove lease.
+        // Note: the attempt put is deferred until after we determine whether the
+        // job reached a terminal status, so that we can apply the row TTL only
+        // to attempts of terminal jobs.
         let mut batch = WriteBatch::new();
-        // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status
-        batch.put(&attempt_key, &attempt_val);
         // [SILO-SUCC-2][SILO-FAIL-2][SILO-RETRY-2] Release lease
         batch.delete(&leased_task_key);
 
@@ -160,16 +166,23 @@ impl JobStoreShard {
         let mut retry_grants: Vec<(String, String)> = Vec::new();
         // Track the new job status for DST event emission
         let mut new_job_status_for_dst: Option<String> = None;
+        // Whether the job reached a terminal status during this call. Drives
+        // both the `expire_terminal_job_records` invocation and the TTL on the
+        // new attempt row written below.
+        let mut reached_terminal = false;
 
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
             AttemptOutcome::Success { .. } => {
                 let job_status = JobStatus::succeeded(now_ms);
-                self.set_job_status_with_index(
+                terminal_expire_ts =
+                    self.terminal_expire_ts(crate::job::JobStatusKind::Succeeded, now_ms);
+                self.set_job_status_with_index_opts(
                     &mut DbWriteBatcher::new(&self.db, &mut batch),
                     &tenant,
                     &job_id,
                     job_status,
+                    terminal_expire_ts,
                 )
                 .await?;
                 // Job reached terminal state - include counter in batch
@@ -177,15 +190,19 @@ impl JobStoreShard {
                     &self.db, &mut batch,
                 ))?;
                 new_job_status_for_dst = Some("Succeeded".to_string());
+                reached_terminal = true;
             }
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
                 let job_status = JobStatus::cancelled(now_ms);
-                self.set_job_status_with_index(
+                terminal_expire_ts =
+                    self.terminal_expire_ts(crate::job::JobStatusKind::Cancelled, now_ms);
+                self.set_job_status_with_index_opts(
                     &mut DbWriteBatcher::new(&self.db, &mut batch),
                     &tenant,
                     &job_id,
                     job_status,
+                    terminal_expire_ts,
                 )
                 .await?;
                 // Job reached terminal state - include counter in batch
@@ -193,6 +210,7 @@ impl JobStoreShard {
                     &self.db, &mut batch,
                 ))?;
                 new_job_status_for_dst = Some("Cancelled".to_string());
+                reached_terminal = true;
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
             AttemptOutcome::Error { .. } => {
@@ -263,11 +281,14 @@ impl JobStoreShard {
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
                         let job_status = JobStatus::failed(now_ms);
-                        self.set_job_status_with_index(
+                        terminal_expire_ts =
+                            self.terminal_expire_ts(crate::job::JobStatusKind::Failed, now_ms);
+                        self.set_job_status_with_index_opts(
                             &mut DbWriteBatcher::new(&self.db, &mut batch),
                             &tenant,
                             &job_id,
                             job_status,
+                            terminal_expire_ts,
                         )
                         .await?;
                         // Job reached terminal state (failed permanently) - include counter in batch
@@ -275,11 +296,57 @@ impl JobStoreShard {
                             &self.db, &mut batch,
                         ))?;
                         new_job_status_for_dst = Some("Failed".to_string());
+                        reached_terminal = true;
                     }
                 } else {
                     job_missing_error = Some(JobStoreShardError::JobNotFound(job_id.clone()));
                 }
             }
+        }
+
+        // Re-put all of the job's *prior* associated records (JOB_INFO,
+        // IDX_METADATA, earlier ATTEMPT rows, JOB_CANCELLED) with the TTL.
+        //
+        // Ordering note: this MUST happen before we write the new ATTEMPT row
+        // for the current attempt. The helper scans `attempt_prefix` from
+        // `self.db` (which reflects committed state, pre-batch) — so the row
+        // for the current attempt comes back with its old Running status, and
+        // would clobber a freshly-batched terminal put on the same key
+        // because WriteBatch is last-write-wins per key. Writing the new
+        // attempt afterwards lets it win.
+        //
+        // Concurrency note: another writer cannot mutate this job's
+        // attempt rows in parallel — the lease for the running attempt was
+        // just deleted earlier in this batch, no other attempt for this
+        // job_id can be Running, and the job's terminal status will block
+        // dequeue / restart / reimport, so the scan sees a stable view.
+        if reached_terminal && let Some(ts) = terminal_expire_ts {
+            self.expire_terminal_job_records(
+                &mut DbWriteBatcher::new(&self.db, &mut batch),
+                &tenant,
+                &job_id,
+                ts,
+            )
+            .await?;
+        }
+
+        // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status.
+        // Apply TTL to terminal-job attempts so they expire alongside the rest of
+        // the job's records. The retry-scheduling branch leaves the attempt
+        // without a TTL — it'll be picked up by the helper's scan when the job
+        // ultimately hits a terminal status.
+        match (reached_terminal, terminal_expire_ts) {
+            (true, Some(ts)) => {
+                use slatedb::config::{PutOptions, Ttl};
+                batch.put_with_options(
+                    &attempt_key,
+                    &attempt_val,
+                    &PutOptions {
+                        ttl: Ttl::ExpireAt(ts),
+                    },
+                );
+            }
+            _ => batch.put(&attempt_key, &attempt_val),
         }
 
         // [SILO-REL-1][SILO-RETRY-REL] Delete concurrency holders in the batch.
