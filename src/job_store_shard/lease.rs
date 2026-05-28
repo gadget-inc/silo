@@ -270,7 +270,8 @@ impl JobStoreShard {
                                     skip_try_reserve: true,
                                 },
                             )
-                            .await?;
+                            .await?
+                            .grants;
 
                         // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                         let job_status =

@@ -298,7 +298,8 @@ impl JobStoreShard {
                         skip_try_reserve: false,
                     },
                 )
-                .await?;
+                .await?
+                .grants;
         }
 
         // Include counters in the transaction (unmark_write excludes them from conflict detection)
@@ -724,7 +725,8 @@ impl JobStoreShard {
                         skip_try_reserve: false,
                     },
                 )
-                .await?;
+                .await?
+                .grants;
         }
         // [SILO-REIMP-7] If terminal: status is terminal, no new tasks
 

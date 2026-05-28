@@ -604,7 +604,7 @@ impl JobStoreShard {
         let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
 
         let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
-        let chain_grants = self
+        let chain_result = self
             .enqueue_limit_task_at_index(
                 &mut writer,
                 LimitTaskParams {
@@ -633,8 +633,18 @@ impl JobStoreShard {
 
         // Each (queue, task_id) the chain reserved also needs rollback if the
         // batch write fails.
-        for (q, tid) in chain_grants {
+        for (q, tid) in chain_result.grants {
             state.grants_to_rollback.push((tenant.clone(), q, tid));
+        }
+        if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms {
+            self.retarget_scheduled_task_key(
+                &mut writer,
+                &tenant,
+                &job_id,
+                attempt_number,
+                task_key_start_ms,
+            )
+            .await?;
         }
 
         // Metrics: account the grant as a Scanned-path ticket.
@@ -765,7 +775,7 @@ impl JobStoreShard {
                 // the follow-up key cannot collide with the just-deleted
                 // CheckRateLimit's task_key.
                 let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
-                let grants = self
+                let chain_result = self
                     .enqueue_limit_task_at_index(
                         &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                         LimitTaskParams {
@@ -787,10 +797,20 @@ impl JobStoreShard {
                     )
                     .await?;
                 // Track any immediate grants for rollback if DB write fails
-                for (queue, task_id) in grants {
+                for (queue, task_id) in chain_result.grants {
                     state
                         .grants_to_rollback
                         .push((tenant.clone(), queue, task_id));
+                }
+                if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms {
+                    self.retarget_scheduled_task_key(
+                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                        tenant,
+                        job_id,
+                        attempt_number,
+                        task_key_start_ms,
+                    )
+                    .await?;
                 }
             }
             Ok(result) => {
