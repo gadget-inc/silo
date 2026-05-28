@@ -15,6 +15,7 @@ import type {
   RefreshOutcome,
   HeartbeatResult,
 } from "./client";
+import { LeaseLostError } from "./client";
 import { Task, TaskExecution, transformTask } from "./TaskExecution";
 import { WorkerMetrics, getWorkerMeter } from "./metrics";
 
@@ -653,6 +654,21 @@ export class SiloWorker<
       };
     }
 
+    // If the heartbeat told us the lease is gone, the attempt has already been
+    // finalized server-side as LEASE_LOST and the lease is deleted — any
+    // reportOutcome would be rejected (LeaseNotFound) and would also be unsafe
+    // in the rare owner-mismatch edge. Surface the loss locally and stop.
+    if (execution.leaseLost) {
+      const err = new LeaseLostError(execution.task.id, execution.task.jobId);
+      const span = trace.getActiveSpan();
+      if (span) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: "lease_lost" });
+        span.recordException(err);
+      }
+      this._onError(err, { taskId: execution.task.id });
+      return;
+    }
+
     // If the task was cancelled (by server or client), report Cancelled outcome instead
     if (execution.shouldReportCancelled) {
       await this._client.reportOutcome({
@@ -712,11 +728,13 @@ export class SiloWorker<
   }
 
   /**
-   * Send a heartbeat for a task execution and handle cancellation if detected.
+   * Send a heartbeat for a task execution and handle cancellation or
+   * lease-loss if detected.
    */
   private async _sendHeartbeatForTask(execution: TaskExecution): Promise<void> {
-    // Don't send heartbeats for already-cancelled tasks
-    if (execution.isCancelled) {
+    // Don't send heartbeats once the execution has stopped — already cancelled,
+    // or already aborted due to lease loss.
+    if (execution.isStopped) {
       return;
     }
 
@@ -730,6 +748,12 @@ export class SiloWorker<
     // If the server reports cancellation, mark the execution as cancelled
     if (result.cancelled) {
       execution.markCancelledByServer();
+    }
+    // If the server reports the lease has been lost (reaped after expiry, or
+    // re-owned), abort the in-flight handler. The attempt has already been
+    // finalized server-side as LEASE_LOST, so no outcome will be reported.
+    if (result.leaseLost) {
+      execution.markLostLease();
     }
   }
 

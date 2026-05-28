@@ -349,6 +349,7 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   bool cancelled = 1;               // True if job was cancelled. Worker should stop and report Cancelled.
   optional int64 cancelled_at_ms = 2; // Unix timestamp (ms) when cancellation was requested, if cancelled.
+  bool lease_lost = 3;              // True if the worker no longer holds this lease (expired/reaped or owned by someone else). Worker should abort the task immediately and NOT report an outcome. Defaults to false for backward compatibility.
 }
 
 message QueryNull {}

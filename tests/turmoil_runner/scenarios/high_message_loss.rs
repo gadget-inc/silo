@@ -49,7 +49,7 @@ pub fn run() {
                 let retry_policy = Some(RetryPolicy {
                     retry_count: 10,
                     // Low delays so that when every lease_tasks response is lost and
-                    // the reaper handles all attempts as WORKER_CRASHED, the retry
+                    // the reaper handles all attempts as LEASE_LOST, the retry
                     // backoff doesn't add significant time to each ~10s lease cycle.
                     // 10 retries × ~10s lease ≈ 100s, well within the verifier timeout.
                     initial_interval_ms: 10,

@@ -3,7 +3,6 @@ mod test_helpers;
 use silo::codec::{decode_lease, encode_task};
 use silo::job::JobStatusKind;
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
-use silo::job_store_shard::JobStoreShardError;
 use silo::task::Task;
 use slatedb::WriteBatch;
 
@@ -174,28 +173,20 @@ async fn heartbeat_rejects_mismatched_worker() {
         assert_eq!(tasks.len(), 1);
         let task_id = tasks[0].attempt().task_id().to_string();
 
-        let err = shard
+        let result = shard
             .heartbeat_task("worker-2", &task_id)
             .await
-            .expect_err("heartbeat should fail");
-
-        match err {
-            JobStoreShardError::LeaseOwnerMismatch {
-                task_id: tid,
-                expected,
-                got,
-            } => {
-                assert_eq!(tid, task_id);
-                assert_eq!(expected, "worker-1".to_string());
-                assert_eq!(got, "worker-2".to_string());
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+            .expect("heartbeat returns lease_lost rather than erroring");
+        assert!(
+            result.lease_lost,
+            "mismatched worker should see lease_lost: true"
+        );
+        assert!(!result.cancelled);
     });
 }
 
 #[silo::test]
-async fn heartbeat_after_outcome_returns_lease_not_found() {
+async fn heartbeat_after_outcome_returns_lease_lost() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
         let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
@@ -230,14 +221,15 @@ async fn heartbeat_after_outcome_returns_lease_not_found() {
             )
             .await
             .expect("report ok");
-        let err = shard
+        let result = shard
             .heartbeat_task("worker-1", &task_id)
             .await
-            .expect_err("hb should fail");
-        match err {
-            JobStoreShardError::LeaseNotFound(t) => assert_eq!(t, task_id),
-            other => panic!("unexpected error: {other:?}"),
-        }
+            .expect("heartbeat returns lease_lost rather than erroring");
+        assert!(
+            result.lease_lost,
+            "heartbeat after outcome should see lease_lost: true"
+        );
+        assert!(!result.cancelled);
     });
 }
 

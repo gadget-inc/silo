@@ -251,7 +251,7 @@ pub fn run() {
                 .iter()
                 .filter(|attempt| {
                     attempt.status() == AttemptStatus::Failed
-                        && attempt.error_code.as_deref() == Some("WORKER_CRASHED")
+                        && attempt.error_code.as_deref() == Some("LEASE_LOST")
                 })
                 .count();
 
@@ -271,7 +271,7 @@ pub fn run() {
             );
             assert!(
                 crashed_attempts >= 1,
-                "Expected a failed attempt due to lease expiry (WORKER_CRASHED)"
+                "Expected a failed attempt due to lease expiry (LEASE_LOST)"
             );
             assert!(
                 job_resp.attempts.len() >= 2,

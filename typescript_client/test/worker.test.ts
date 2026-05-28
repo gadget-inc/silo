@@ -666,6 +666,108 @@ describe("SiloWorker", () => {
     });
   });
 
+  describe("lease-lost abort", () => {
+    it("aborts the handler and skips reportOutcome when heartbeat returns leaseLost", async () => {
+      const task = createTask("task-ll", "job-ll");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      // First heartbeat: server signals lease_lost. Subsequent calls return
+      // a normal owned response — the worker should early-return on isStopped.
+      const heartbeat = vi
+        .fn()
+        .mockResolvedValueOnce({ cancelled: false, leaseLost: true })
+        .mockResolvedValue({ cancelled: false, leaseLost: false });
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let abortObserved = false;
+      const handler: TaskHandler = async (ctx) => {
+        await new Promise<void>((resolve) => {
+          if (ctx.cancellationSignal.aborted) {
+            abortObserved = true;
+            resolve();
+            return;
+          }
+          ctx.cancellationSignal.addEventListener("abort", () => {
+            abortObserved = true;
+            resolve();
+          });
+        });
+        return { type: "success", result: {} };
+      };
+
+      const onError = vi.fn();
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 20,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await worker.stop();
+
+      expect(abortObserved).toBe(true);
+      // Critical: no outcome should be reported when the lease was lost.
+      expect(reportOutcome).not.toHaveBeenCalled();
+      // onError should have been invoked with a LeaseLostError carrying the task id.
+      expect(onError).toHaveBeenCalled();
+      const [err] = onError.mock.calls[0]!;
+      expect(err.name).toBe("LeaseLostError");
+      expect(err.taskId).toBe("task-ll");
+    });
+
+    it("does not double-abort on repeated leaseLost responses", async () => {
+      const task = createTask("task-ll2", "job-ll2");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi
+        .fn()
+        .mockResolvedValue({ cancelled: false, leaseLost: true });
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      const handler: TaskHandler = async (ctx) => {
+        await new Promise<void>((resolve) => {
+          if (ctx.cancellationSignal.aborted) resolve();
+          else ctx.cancellationSignal.addEventListener("abort", () => resolve());
+        });
+        return { type: "success", result: {} };
+      };
+
+      const onError = vi.fn();
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 20,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await worker.stop();
+
+      expect(reportOutcome).not.toHaveBeenCalled();
+      // Even with repeated leaseLost responses, the local LeaseLostError is
+      // surfaced exactly once for this task.
+      const leaseLostErrors = onError.mock.calls.filter(
+        ([e]) => e?.name === "LeaseLostError",
+      );
+      expect(leaseLostErrors.length).toBe(1);
+    });
+  });
+
   describe("error handling", () => {
     it("calls onError when polling fails", async () => {
       const leaseTasks = vi.fn().mockRejectedValue(new Error("Connection failed"));
