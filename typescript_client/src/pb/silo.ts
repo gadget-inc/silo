@@ -944,6 +944,10 @@ export interface HeartbeatResponse {
      * @generated from protobuf field: optional int64 cancelled_at_ms = 2
      */
     cancelledAtMs?: bigint; // Unix timestamp (ms) when cancellation was requested, if cancelled.
+    /**
+     * @generated from protobuf field: bool lease_lost = 3
+     */
+    leaseLost: boolean; // True if the worker no longer holds this lease (expired/reaped or owned by someone else). Worker should abort the task immediately and NOT report an outcome. Defaults to false for backward compatibility.
 }
 /**
  * @generated from protobuf message silo.v1.QueryNull
@@ -4578,12 +4582,14 @@ class HeartbeatResponse$Type extends MessageType<HeartbeatResponse> {
     constructor() {
         super("silo.v1.HeartbeatResponse", [
             { no: 1, name: "cancelled", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
-            { no: 2, name: "cancelled_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ }
+            { no: 2, name: "cancelled_at_ms", kind: "scalar", opt: true, T: 3 /*ScalarType.INT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 3, name: "lease_lost", kind: "scalar", T: 8 /*ScalarType.BOOL*/ }
         ]);
     }
     create(value?: PartialMessage<HeartbeatResponse>): HeartbeatResponse {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.cancelled = false;
+        message.leaseLost = false;
         if (value !== undefined)
             reflectionMergePartial<HeartbeatResponse>(this, message, value);
         return message;
@@ -4598,6 +4604,9 @@ class HeartbeatResponse$Type extends MessageType<HeartbeatResponse> {
                     break;
                 case /* optional int64 cancelled_at_ms */ 2:
                     message.cancelledAtMs = reader.int64().toBigInt();
+                    break;
+                case /* bool lease_lost */ 3:
+                    message.leaseLost = reader.bool();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -4617,6 +4626,9 @@ class HeartbeatResponse$Type extends MessageType<HeartbeatResponse> {
         /* optional int64 cancelled_at_ms = 2; */
         if (message.cancelledAtMs !== undefined)
             writer.tag(2, WireType.Varint).int64(message.cancelledAtMs);
+        /* bool lease_lost = 3; */
+        if (message.leaseLost !== false)
+            writer.tag(3, WireType.Varint).bool(message.leaseLost);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

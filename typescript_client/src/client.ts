@@ -93,6 +93,28 @@ export class TaskNotFoundError extends Error {
 }
 
 /**
+ * Surfaced to the worker's onError when a heartbeat reveals the lease has been
+ * lost (reaped after expiry, or owned by another worker). The worker aborts
+ * the in-flight task and does NOT report a server outcome — the attempt has
+ * already been finalized server-side as LEASE_LOST.
+ */
+export class LeaseLostError extends Error {
+  code = "SILO_LEASE_LOST";
+
+  /** The task ID whose lease was lost */
+  public readonly taskId: string;
+  /** The job ID the task belonged to */
+  public readonly jobId?: string;
+
+  constructor(taskId: string, jobId?: string) {
+    super(`Lease lost for task "${taskId}" — aborting`);
+    this.name = "LeaseLostError";
+    this.taskId = taskId;
+    this.jobId = jobId;
+  }
+}
+
+/**
  * Base class for errors translated from gRPC status codes.
  */
 export class SiloGrpcError extends Error {
@@ -981,6 +1003,9 @@ export interface HeartbeatResult {
   cancelled: boolean;
   /** Timestamp (epoch ms) when cancellation was requested, if cancelled. */
   cancelledAtMs?: bigint;
+  /** True if the worker no longer holds this lease (reaped or owned by someone else).
+   *  Worker should abort the in-flight task and NOT report a server outcome. */
+  leaseLost: boolean;
 }
 
 /** Result from leasing tasks - includes both job tasks and refresh tasks */
@@ -2476,6 +2501,9 @@ export class SiloGRPCClient {
         return {
           cancelled: response.cancelled,
           cancelledAtMs: response.cancelledAtMs,
+          // `leaseLost` is sent by newer servers as a response field instead
+          // of a gRPC error. Defaults to false against older servers.
+          leaseLost: response.leaseLost ?? false,
         };
       });
     } catch (error) {

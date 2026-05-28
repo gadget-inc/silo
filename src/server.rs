@@ -1365,6 +1365,7 @@ impl Silo for SiloService {
         Ok(Response::new(HeartbeatResponse {
             cancelled: result.cancelled,
             cancelled_at_ms: result.cancelled_at_ms,
+            lease_lost: result.lease_lost,
         }))
     }
 

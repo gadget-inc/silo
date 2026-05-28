@@ -1029,7 +1029,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("get lease after reap");
     assert!(lease.is_none(), "lease should be removed by reaper");
 
-    // Attempt 1 marked failed with WORKER_CRASHED
+    // Attempt 1 marked failed with LEASE_LOST
     let a1 = shard
         .get_job_attempt("-", &job_id, 1)
         .await
@@ -1037,7 +1037,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("a1 exists");
     match a1.state() {
         AttemptStatus::Failed { error_code, .. } => {
-            assert_eq!(error_code, "WORKER_CRASHED")
+            assert_eq!(error_code, "LEASE_LOST")
         }
         _ => panic!("expected Failed"),
     }

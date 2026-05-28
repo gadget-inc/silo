@@ -6,6 +6,7 @@ export {
   JobAlreadyExistsError,
   JobNotTerminalError,
   TaskNotFoundError,
+  LeaseLostError,
   SiloGrpcError,
   SiloNotFoundError,
   SiloAlreadyExistsError,

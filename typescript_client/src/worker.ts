@@ -1,6 +1,7 @@
 import {
   context as otelContext,
   type Meter,
+  type Span,
   SpanStatusCode,
   trace,
   type Tracer,
@@ -15,6 +16,7 @@ import type {
   RefreshOutcome,
   HeartbeatResult,
 } from "./client";
+import { LeaseLostError } from "./client";
 import { Task, TaskExecution, transformTask } from "./TaskExecution";
 import { WorkerMetrics, getWorkerMeter } from "./metrics";
 
@@ -260,6 +262,13 @@ export class SiloWorker<
   private _taskQueue: PQueue;
   /** Active task executions, keyed by task ID */
   private _activeExecutions: Map<string, TaskExecution> = new Map();
+  /** Per-refresh-task abort + lease-lost state, keyed by task ID. Refresh tasks
+   *  don't carry a full TaskExecution; this is the minimal bookkeeping the
+   *  heartbeat needs to stop a refresh whose lease has been reaped. */
+  private _refreshTaskStates: Map<
+    string,
+    { abortController: AbortController; leaseLost: boolean }
+  > = new Map();
   /** Heartbeat intervals for active tasks (regular tasks and refresh tasks) */
   private _heartbeatIntervals: Map<string, ReturnType<typeof setInterval>> = new Map();
   /** Counter for per-worker round-robin server selection */
@@ -599,7 +608,28 @@ export class SiloWorker<
   private _enqueueRefreshTask(task: RefreshTask): void {
     const shard = task.shard;
 
-    // Start heartbeat for this refresh task (no TaskExecution needed, refresh tasks can't be cancelled)
+    // Per-refresh-task bookkeeping so the heartbeat can abort the handler if
+    // the lease is lost. Propagate the worker-wide shutdown signal into the
+    // per-task controller so refresh handlers still abort on worker.stop().
+    const refreshAbort = new AbortController();
+    const workerSignal = this._abortController?.signal;
+    if (workerSignal) {
+      if (workerSignal.aborted) {
+        refreshAbort.abort();
+      } else {
+        workerSignal.addEventListener("abort", () => refreshAbort.abort(), {
+          once: true,
+        });
+      }
+    }
+    const state = { abortController: refreshAbort, leaseLost: false };
+    this._refreshTaskStates.set(task.id, state);
+
+    // Start heartbeat for this refresh task. Unlike RunAttempt heartbeats this
+    // path discards `cancelled` (refresh tasks aren't cancellable), but it
+    // does honor `leaseLost`: a refresh lease that expired and was reaped
+    // should not have its outcome reported back (the report would be rejected
+    // and the refresh state has already been reset by the reaper).
     const heartbeatInterval = setInterval(() => {
       this._sendHeartbeat(task.id, shard, task.tenant).catch((error) => {
         this._onError(error instanceof Error ? error : new Error(String(error)), {
@@ -626,7 +656,23 @@ export class SiloWorker<
           clearInterval(interval);
           this._heartbeatIntervals.delete(task.id);
         }
+        this._refreshTaskStates.delete(task.id);
       });
+  }
+
+  /**
+   * Surface a lost-lease abort locally: mark the active span as errored,
+   * record the exception, and notify via the worker's onError callback. No
+   * server outcome is reported — the attempt is already finalized server-side
+   * as LEASE_LOST and the lease is gone.
+   */
+  private _surfaceLeaseLost(taskId: string, jobId: string | undefined, span: Span | undefined): void {
+    const err = new LeaseLostError(taskId, jobId);
+    if (span) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: "lease_lost" });
+      span.recordException(err);
+    }
+    this._onError(err, { taskId });
   }
 
   /**
@@ -635,6 +681,16 @@ export class SiloWorker<
   private async _executeTaskWithExecution(
     execution: TaskExecution<Payload, Metadata>,
   ): Promise<void> {
+    // Heartbeats start in `_enqueueTask` before this queued callback runs, so
+    // the lease can already be lost by the time we get here (e.g. the task
+    // waited in the p-queue past its lease while a heartbeat fired). Skip the
+    // handler entirely so we don't duplicate side-effecting work after the
+    // server has finalized/retried the attempt.
+    if (execution.leaseLost) {
+      this._surfaceLeaseLost(execution.task.id, execution.task.jobId, trace.getActiveSpan());
+      return;
+    }
+
     const context: TaskContext<Payload, Metadata> = {
       task: execution.task,
       cancellationSignal: execution.signal,
@@ -651,6 +707,15 @@ export class SiloWorker<
         code: "HANDLER_ERROR",
         data: serializeError(error),
       };
+    }
+
+    // If the heartbeat told us the lease is gone (during the handler), the
+    // attempt has already been finalized server-side as LEASE_LOST and the
+    // lease is deleted — any reportOutcome would be rejected (LeaseNotFound)
+    // and unsafe in the rare owner-mismatch edge. Surface and stop.
+    if (execution.leaseLost) {
+      this._surfaceLeaseLost(execution.task.id, execution.task.jobId, trace.getActiveSpan());
+      return;
     }
 
     // If the task was cancelled (by server or client), report Cancelled outcome instead
@@ -677,11 +742,21 @@ export class SiloWorker<
    * Execute a refresh task and report its outcome.
    */
   private async _executeRefreshTask(task: RefreshTask, shard: string): Promise<void> {
+    const state = this._refreshTaskStates.get(task.id);
+
+    // Lease could have been lost while this refresh was waiting in the queue;
+    // skip the handler entirely so we don't perform redundant refresh work
+    // after the reaper has already reset the floating-limit state.
+    if (state?.leaseLost) {
+      this._surfaceLeaseLost(task.id, undefined, trace.getActiveSpan());
+      return;
+    }
+
     const context: RefreshTaskContext = {
       task,
       shard,
       workerId: this._workerId,
-      signal: this._abortController?.signal ?? new AbortController().signal,
+      signal: state?.abortController.signal ?? this._abortController?.signal ?? new AbortController().signal,
     };
 
     let outcome: RefreshOutcome;
@@ -702,6 +777,14 @@ export class SiloWorker<
       };
     }
 
+    // If the heartbeat told us the refresh lease was lost during execution,
+    // do NOT call reportRefreshOutcome — the lease is gone and the call would
+    // be rejected. Surface locally so the loss is visible in telemetry.
+    if (state?.leaseLost) {
+      this._surfaceLeaseLost(task.id, undefined, trace.getActiveSpan());
+      return;
+    }
+
     // Report the refresh outcome
     await this._client.reportRefreshOutcome({
       taskId: task.id,
@@ -712,11 +795,13 @@ export class SiloWorker<
   }
 
   /**
-   * Send a heartbeat for a task execution and handle cancellation if detected.
+   * Send a heartbeat for a task execution and handle cancellation or
+   * lease-loss if detected.
    */
   private async _sendHeartbeatForTask(execution: TaskExecution): Promise<void> {
-    // Don't send heartbeats for already-cancelled tasks
-    if (execution.isCancelled) {
+    // Don't send heartbeats once the execution has stopped — already cancelled,
+    // or already aborted due to lease loss.
+    if (execution.isStopped) {
       return;
     }
 
@@ -731,13 +816,36 @@ export class SiloWorker<
     if (result.cancelled) {
       execution.markCancelledByServer();
     }
+    // If the server reports the lease has been lost (reaped after expiry, or
+    // re-owned), abort the in-flight handler. The attempt has already been
+    // finalized server-side as LEASE_LOST, so no outcome will be reported.
+    if (result.leaseLost) {
+      execution.markLostLease();
+    }
   }
 
   /**
-   * Send a heartbeat for a task (for refresh tasks that don't need TaskExecution).
+   * Send a heartbeat for a refresh task. Refresh tasks aren't cancellable, but
+   * we still honor `leaseLost`: if the server says the refresh lease is gone,
+   * abort the in-flight refresh handler and mark state so `_executeRefreshTask`
+   * skips `reportRefreshOutcome`.
    */
   private async _sendHeartbeat(taskId: string, shard: string, tenant?: string): Promise<void> {
-    await this._client.heartbeat(this._workerId, taskId, shard, tenant);
+    const state = this._refreshTaskStates.get(taskId);
+    if (state?.leaseLost) {
+      // Already stopped — don't keep heartbeating a lease we've abandoned.
+      return;
+    }
+    const result: HeartbeatResult = await this._client.heartbeat(
+      this._workerId,
+      taskId,
+      shard,
+      tenant,
+    );
+    if (result.leaseLost && state && !state.leaseLost) {
+      state.leaseLost = true;
+      state.abortController.abort();
+    }
   }
 
   /**
