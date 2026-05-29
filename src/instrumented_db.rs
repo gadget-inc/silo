@@ -20,7 +20,7 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
-use slatedb::config::{FlushOptions, ScanOptions, WriteOptions};
+use slatedb::config::{FlushOptions, PutOptions, ScanOptions, WriteOptions};
 use slatedb::{Db, DbIterator, DbTransaction, IsolationLevel, KeyValue, WriteBatch, WriteHandle};
 use tracing::{Instrument, Span};
 
@@ -199,6 +199,20 @@ impl InstrumentedDbTransaction {
     {
         let _g = self.span.enter();
         self.inner.put(key, value)
+    }
+
+    pub fn put_with_options<K, V>(
+        &self,
+        key: K,
+        value: V,
+        options: &PutOptions,
+    ) -> Result<(), slatedb::Error>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let _g = self.span.enter();
+        self.inner.put_with_options(key, value, options)
     }
 
     pub fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<(), slatedb::Error> {

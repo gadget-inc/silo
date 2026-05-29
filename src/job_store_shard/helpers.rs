@@ -1,13 +1,14 @@
 //! Helper functions shared across job_store_shard submodules.
 use slatedb::WriteBatch;
 use slatedb::bytes::Bytes;
+use slatedb::config::{PutOptions, Ttl};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::encode_task;
-use crate::instrumented_db::{InstrumentedDb, InstrumentedDbTransaction};
+use crate::instrumented_db::{InstrumentedDb, InstrumentedDbIterator, InstrumentedDbTransaction};
 use crate::job::JobStatus;
 use crate::job_store_shard::JobStoreShardError;
-use crate::keys::task_key;
+use crate::keys::{end_bound, task_key};
 use crate::task::Task;
 
 /// A trait that abstracts over SlateDB's two ways of writing in groups: `WriteBatch` and `DbTransaction`.
@@ -27,6 +28,21 @@ pub(crate) trait WriteBatcher {
         value: V,
     ) -> Result<(), slatedb::Error>;
 
+    /// Put a key-value pair with a SlateDB row TTL set to `expire_ts`
+    /// (epoch milliseconds). Used by the terminal-job expiration path so the
+    /// row is dropped during compaction once it ages past `expire_ts`.
+    ///
+    /// No default impl — every implementor must thread the TTL through to
+    /// the underlying writer. A silent fallback that drops the TTL would
+    /// produce data that never expires without any compile-time signal, so
+    /// the trait forces every writer to decide explicitly.
+    fn put_with_expire<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+        expire_ts: i64,
+    ) -> Result<(), slatedb::Error>;
+
     /// Delete a key.
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error>;
 
@@ -44,12 +60,25 @@ pub(crate) trait WriteBatcher {
 
     /// Get a value by key.
     ///
-    /// For transactions, this reads from the transaction snapshot.
+    /// For transactions, this reads from the transaction snapshot and tracks
+    /// the read key in the SSI read set (so a concurrent writer to the same
+    /// key trips a read-write conflict at commit).
     /// For batches, this reads from the underlying database.
     fn get(
         &self,
         key: &[u8],
     ) -> impl std::future::Future<Output = Result<Option<Bytes>, slatedb::Error>> + Send;
+
+    /// Scan all keys with the given prefix.
+    ///
+    /// For transactions, this reads from the transaction snapshot and tracks
+    /// the scanned range in the SSI read set (so a concurrent writer that
+    /// inserts a key into the range trips a phantom-read conflict at commit).
+    /// For batches, this reads from the underlying database.
+    fn scan_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> impl std::future::Future<Output = Result<InstrumentedDbIterator, slatedb::Error>> + Send;
 }
 
 /// Wrapper around `&mut WriteBatch` that implements `WriteBatcher`
@@ -76,6 +105,22 @@ impl WriteBatcher for DbWriteBatcher<'_> {
         Ok(())
     }
 
+    fn put_with_expire<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+        expire_ts: i64,
+    ) -> Result<(), slatedb::Error> {
+        self.batch.put_with_options(
+            key,
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAt(expire_ts),
+            },
+        );
+        Ok(())
+    }
+
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error> {
         self.batch.delete(key);
         Ok(())
@@ -92,6 +137,11 @@ impl WriteBatcher for DbWriteBatcher<'_> {
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
         self.db.get(key).await
+    }
+
+    async fn scan_prefix(&self, prefix: &[u8]) -> Result<InstrumentedDbIterator, slatedb::Error> {
+        let end = end_bound(prefix);
+        self.db.scan::<Vec<u8>, _>(prefix.to_vec()..end).await
     }
 }
 
@@ -111,6 +161,21 @@ impl WriteBatcher for TxnWriter<'_> {
         self.0.put(key, value)
     }
 
+    fn put_with_expire<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        key: K,
+        value: V,
+        expire_ts: i64,
+    ) -> Result<(), slatedb::Error> {
+        self.0.put_with_options(
+            key,
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAt(expire_ts),
+            },
+        )
+    }
+
     fn delete<K: AsRef<[u8]>>(&mut self, key: K) -> Result<(), slatedb::Error> {
         self.0.delete(key)
     }
@@ -128,6 +193,11 @@ impl WriteBatcher for TxnWriter<'_> {
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
         self.0.get(key).await
+    }
+
+    async fn scan_prefix(&self, prefix: &[u8]) -> Result<InstrumentedDbIterator, slatedb::Error> {
+        let end = end_bound(prefix);
+        self.0.scan::<Vec<u8>, _>(prefix.to_vec()..end).await
     }
 }
 

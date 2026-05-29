@@ -11,11 +11,12 @@ use crate::codec::{
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
-use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
+use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, concurrency_holder_key, concurrency_holders_tenant_prefix, end_bound,
-    floating_limit_state_key, job_info_key, leased_task_key, parse_concurrency_holder_key,
+    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_tenant_prefix,
+    end_bound, floating_limit_state_key, idx_metadata_key, job_cancelled_key, job_info_key,
+    leased_task_key, parse_concurrency_holder_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
@@ -597,5 +598,68 @@ impl JobStoreShard {
         }
 
         Ok(to_delete.len())
+    }
+
+    /// Re-put all KV records associated with a job that has reached a terminal
+    /// status, applying a SlateDB row TTL of `expire_ts` (epoch ms) so the
+    /// rows are dropped during compaction once they age past `expire_ts`.
+    ///
+    /// Records covered:
+    ///   - `JOB_INFO`            (read existing bytes, re-put with TTL)
+    ///   - `IDX_METADATA`        (one entry per metadata pair on the job)
+    ///   - `ATTEMPT`             (scan all attempt rows for the job, re-put each)
+    ///   - `JOB_CANCELLED`       (re-put with TTL if present)
+    ///
+    /// `JOB_STATUS` and `IDX_STATUS_TIME` are written with TTL by the caller via
+    /// `set_job_status_with_index_opts`, so they are intentionally not handled here.
+    ///
+    /// All reads go through `writer` so that when the caller uses a
+    /// `TxnWriter`, the JOB_INFO / ATTEMPT range / JOB_CANCELLED reads are
+    /// tracked in the transaction's SSI read set. A concurrent writer that
+    /// mutates any of those keys between this helper and the caller's commit
+    /// will trip a read-write (or phantom-read) conflict, so the re-put
+    /// cannot silently clobber a concurrent write with stale bytes.
+    ///
+    /// The attempt scan returns the *committed* (pre-batch) attempt rows. For
+    /// the current attempt this means the old Running value, so the caller
+    /// MUST put the new terminal ATTEMPT row **after** invoking this helper.
+    /// `WriteBatch` is last-write-wins per key, and putting the new row
+    /// earlier would be silently clobbered when the helper re-puts the old
+    /// Running value with TTL.
+    #[allow(dead_code)] // wired up in follow-up retention PRs (cancel, import, terminal)
+    pub(crate) async fn expire_terminal_job_records<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        expire_ts: i64,
+    ) -> Result<(), JobStoreShardError> {
+        let info_key = job_info_key(tenant, job_id);
+        let metadata_pairs = if let Some(info_raw) = writer.get(&info_key).await? {
+            let view = JobView::new(info_raw.clone())?;
+            let pairs = view.metadata();
+            writer.put_with_expire(&info_key, info_raw, expire_ts)?;
+            pairs
+        } else {
+            Vec::new()
+        };
+
+        for (mk, mv) in &metadata_pairs {
+            let mkey = idx_metadata_key(tenant, mk, mv, job_id);
+            writer.put_with_expire(&mkey, [], expire_ts)?;
+        }
+
+        let attempt_start = attempt_prefix(tenant, job_id);
+        let mut iter = writer.scan_prefix(&attempt_start).await?;
+        while let Some(kv) = iter.next().await? {
+            writer.put_with_expire(&kv.key, &kv.value, expire_ts)?;
+        }
+
+        let cancelled_key = job_cancelled_key(tenant, job_id);
+        if let Some(cancelled_raw) = writer.get(&cancelled_key).await? {
+            writer.put_with_expire(&cancelled_key, cancelled_raw, expire_ts)?;
+        }
+
+        Ok(())
     }
 }

@@ -614,6 +614,8 @@ pub async fn clone_golden_shard(
             ),
             counter_reconciliation_seconds: None,
             hydrate_all_at_startup: false,
+            completed_job_expire_s: None,
+            terminal_job_expire_s: None,
         },
         ShardRange::full(),
     )
