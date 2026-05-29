@@ -201,6 +201,31 @@ impl WriteBatcher for TxnWriter<'_> {
     }
 }
 
+/// Put `value` at `key` through the transaction, applying a SlateDB row TTL
+/// expiring at `expire_ts` (epoch ms) when `expire_ts` is `Some`, and a plain
+/// put otherwise.
+///
+/// Centralizes the terminal-vs-non-terminal put branch used across the import
+/// and cancel paths, where every record written in the txn must pick up the
+/// row TTL iff the job lands in a terminal status.
+pub(crate) fn put_with_optional_expire(
+    txn: &InstrumentedDbTransaction,
+    key: impl AsRef<[u8]>,
+    value: impl AsRef<[u8]>,
+    expire_ts: Option<i64>,
+) -> Result<(), slatedb::Error> {
+    match expire_ts {
+        Some(ts) => txn.put_with_options(
+            key,
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAt(ts),
+            },
+        ),
+        None => txn.put(key, value),
+    }
+}
+
 /// Get current epoch time in milliseconds.
 ///
 /// Uses `std::time::SystemTime::now()` which returns real wall-clock time in production.

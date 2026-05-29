@@ -4,7 +4,7 @@
 //! Unlike enqueue, import accepts completed attempts and lets Silo take ownership going forward.
 
 use slatedb::IsolationLevel;
-use slatedb::config::{PutOptions, Ttl, WriteOptions};
+use slatedb::config::WriteOptions;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -14,7 +14,8 @@ use crate::fb::silo::fb;
 use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, now_epoch_ms, put_with_optional_expire,
+    retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
@@ -209,30 +210,12 @@ impl JobStoreShard {
             task_group: params.task_group.clone(),
         };
         let job_value = encode_job_info(&job);
-        match terminal_expire_ts {
-            Some(ts) => txn.put_with_options(
-                &info_key,
-                &job_value,
-                &PutOptions {
-                    ttl: Ttl::ExpireAt(ts),
-                },
-            )?,
-            None => txn.put(&info_key, &job_value)?,
-        }
+        put_with_optional_expire(&txn, &info_key, &job_value, terminal_expire_ts)?;
 
         // Write metadata secondary index
         for (mk, mv) in &job.metadata {
             let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-            match terminal_expire_ts {
-                Some(ts) => txn.put_with_options(
-                    &mkey,
-                    [],
-                    &PutOptions {
-                        ttl: Ttl::ExpireAt(ts),
-                    },
-                )?,
-                None => txn.put(&mkey, [])?,
-            }
+            put_with_optional_expire(&txn, &mkey, [], terminal_expire_ts)?;
         }
 
         // [SILO-IMP-2] Write imported attempt records (existing statuses unchanged - vacuously true for new import)
@@ -266,16 +249,7 @@ impl JobStoreShard {
             };
             let attempt_value = encode_attempt(&attempt_record);
             let akey = attempt_key(tenant, job_id, attempt_number);
-            match terminal_expire_ts {
-                Some(ts) => txn.put_with_options(
-                    &akey,
-                    &attempt_value,
-                    &PutOptions {
-                        ttl: Ttl::ExpireAt(ts),
-                    },
-                )?,
-                None => txn.put(&akey, &attempt_value)?,
-            }
+            put_with_optional_expire(&txn, &akey, &attempt_value, terminal_expire_ts)?;
         }
 
         // Write status + index (TTL applied when the import lands terminal)
@@ -578,16 +552,7 @@ impl JobStoreShard {
             };
             let attempt_value = encode_attempt(&attempt_record);
             let akey = attempt_key(tenant, job_id, attempt_number);
-            match terminal_expire_ts {
-                Some(ts) => txn.put_with_options(
-                    &akey,
-                    &attempt_value,
-                    &PutOptions {
-                        ttl: Ttl::ExpireAt(ts),
-                    },
-                )?,
-                None => txn.put(&akey, &attempt_value)?,
-            }
+            put_with_optional_expire(&txn, &akey, &attempt_value, terminal_expire_ts)?;
         }
 
         // Persist the updated retry policy so future retry decisions (e.g. in
@@ -604,16 +569,7 @@ impl JobStoreShard {
         };
         let updated_job_value = encode_job_info(&updated_job);
         let info_key = job_info_key(tenant, job_id);
-        match terminal_expire_ts {
-            Some(ts) => txn.put_with_options(
-                &info_key,
-                &updated_job_value,
-                &PutOptions {
-                    ttl: Ttl::ExpireAt(ts),
-                },
-            )?,
-            None => txn.put(&info_key, &updated_job_value)?,
-        }
+        put_with_optional_expire(&txn, &info_key, &updated_job_value, terminal_expire_ts)?;
 
         // === Clean up old scheduling state ===
 

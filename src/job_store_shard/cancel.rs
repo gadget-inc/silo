@@ -6,7 +6,8 @@ use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellati
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, now_epoch_ms, put_with_optional_expire,
+    retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
@@ -102,19 +103,12 @@ impl JobStoreShard {
             cancelled_at_ms: now_ms,
         };
         let cancellation_value = encode_job_cancellation(&cancellation);
-        match terminal_expire_ts {
-            Some(ts) => {
-                use slatedb::config::{PutOptions, Ttl};
-                txn.put_with_options(
-                    &cancelled_key,
-                    &cancellation_value,
-                    &PutOptions {
-                        ttl: Ttl::ExpireAt(ts),
-                    },
-                )?;
-            }
-            None => txn.put(&cancelled_key, &cancellation_value)?,
-        }
+        put_with_optional_expire(
+            &txn,
+            &cancelled_key,
+            &cancellation_value,
+            terminal_expire_ts,
+        )?;
 
         // Track concurrency state for post-commit cleanup
         let mut held_queues_to_release: Vec<String> = Vec::new();
