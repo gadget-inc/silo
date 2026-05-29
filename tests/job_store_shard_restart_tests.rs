@@ -1396,3 +1396,116 @@ async fn terminal_reimport_tags_existing_and_new_records_with_expire_ts() {
         }
     });
 }
+
+/// A terminal import must source its row TTL from the status-specific setting:
+/// Succeeded → `completed_job_expire_s`, Failed → `terminal_job_expire_s`.
+/// Configures the two settings to widely disjoint values so a swap of the two
+/// sources (which `open_temp_shard_with_terminal_expire_s` can't catch, since it
+/// sets both equal) lands the `expire_ts` in the wrong window and fails.
+#[silo::test]
+async fn terminal_import_uses_status_specific_ttl_source() {
+    with_timeout!(20000, {
+        use silo::keys::job_status_key;
+
+        let completed_s: u64 = 100 * 24 * 60 * 60; // 100 days
+        let terminal_s: u64 = 24 * 60 * 60; // 1 day
+        let completed_ms: i64 = completed_s as i64 * 1000;
+        let terminal_ms: i64 = terminal_s as i64 * 1000;
+        let (_tmp, shard) = open_temp_shard_with_split_expire_s(completed_s, terminal_s).await;
+
+        let before_ms = now_ms();
+
+        // Succeeded import → completed_job_expire_s.
+        let mut ok = import_base("import-succeeded");
+        ok.attempts = vec![import_succeeded_attempt(before_ms - 1_000)];
+
+        // Failed import (no retry policy → retries exhausted → terminal Failed)
+        // → terminal_job_expire_s.
+        let mut failed = import_base("import-failed");
+        failed.attempts = vec![import_failed_attempt(before_ms - 1_000)];
+
+        let results = shard
+            .import_jobs("-", vec![ok, failed])
+            .await
+            .expect("import_jobs");
+        assert_eq!(results[0].status, JobStatusKind::Succeeded);
+        assert_eq!(results[1].status, JobStatusKind::Failed);
+        let after_ms = now_ms();
+
+        let raw_db = shard.db();
+        for (id, ttl_ms) in [
+            ("import-succeeded", completed_ms),
+            ("import-failed", terminal_ms),
+        ] {
+            let kv = raw_db
+                .get_key_value(&job_status_key("-", id))
+                .await
+                .expect("get_key_value")
+                .expect("row present");
+            let expire_ts = kv.expire_ts.expect("terminal import must carry expire_ts");
+            let lower = before_ms + ttl_ms - 5_000;
+            let upper = after_ms + ttl_ms + 5_000;
+            assert!(
+                expire_ts >= lower && expire_ts <= upper,
+                "expire_ts {expire_ts} for {id} outside expected window [{lower}, {upper}] \
+                 — wrong TTL source?"
+            );
+        }
+    });
+}
+
+/// Reimporting a Scheduled job to another non-terminal (Scheduled) status must
+/// NOT tag any record with `expire_ts`. Complements
+/// `non_terminal_import_does_not_tag_records` (new import) and the terminal
+/// reimport coverage by exercising the reimport branch when it stays
+/// non-terminal.
+#[silo::test]
+async fn non_terminal_reimport_does_not_tag_records() {
+    with_timeout!(20000, {
+        use silo::keys::{attempt_key, job_info_key, job_status_key};
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
+
+        // First import: Scheduled (no attempts).
+        let initial = import_base("reimport-scheduled");
+        shard
+            .import_jobs("-", vec![initial])
+            .await
+            .expect("initial import");
+
+        // Reimport with one Failed attempt but a retry policy that still allows
+        // retries → job stays Scheduled (non-terminal).
+        let mut step = import_base("reimport-scheduled");
+        step.retry_policy = Some(RetryPolicy {
+            retry_count: 5,
+            initial_interval_ms: 100,
+            max_interval_ms: 10_000,
+            randomize_interval: false,
+            backoff_factor: 2.0,
+        });
+        step.attempts = vec![import_failed_attempt(now_ms() - 1_000)];
+        let results = shard
+            .import_jobs("-", vec![step])
+            .await
+            .expect("reimport step");
+        assert!(results[0].success);
+        assert_eq!(results[0].status, JobStatusKind::Scheduled);
+
+        let raw_db = shard.db();
+        for key in [
+            job_status_key("-", "reimport-scheduled"),
+            job_info_key("-", "reimport-scheduled"),
+            attempt_key("-", "reimport-scheduled", 1),
+        ] {
+            let kv = raw_db
+                .get_key_value(&key)
+                .await
+                .expect("get_key_value")
+                .expect("row present");
+            assert!(
+                kv.expire_ts.is_none(),
+                "non-terminal reimport must not tag record: key={key:?}"
+            );
+        }
+    });
+}
