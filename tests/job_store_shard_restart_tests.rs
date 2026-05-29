@@ -1509,3 +1509,389 @@ async fn non_terminal_reimport_does_not_tag_records() {
         }
     });
 }
+
+#[silo::test]
+async fn terminal_records_are_tagged_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::{job_info_key, job_status_key};
+        let ttl_s: u64 = 7 * 24 * 60 * 60; // 7 days
+        let ttl_ms: i64 = ttl_s as i64 * 1000;
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(ttl_s).await;
+
+        let before_ms = now_ms();
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Drive the job to Failed (no retry policy → first error is permanent).
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: b"boom".to_vec(),
+                },
+            )
+            .await
+            .expect("report failure");
+        let after_ms = now_ms();
+
+        // JOB_STATUS and JOB_INFO must both carry an `expire_ts` set to roughly
+        // `now + ttl_ms`. Allow a generous window around the wall-clock bounds
+        // (clocks can skew under load and the implementation samples `now_ms`
+        // once per termination call).
+        let raw_db = shard.db();
+        for key in [job_status_key("-", &job_id), job_info_key("-", &job_id)] {
+            let kv = raw_db
+                .get_key_value(&key)
+                .await
+                .expect("get_key_value")
+                .expect("row present");
+            let expire_ts = kv
+                .expire_ts
+                .expect("terminal record should carry expire_ts");
+            let lower = before_ms + ttl_ms - 5_000;
+            let upper = after_ms + ttl_ms + 5_000;
+            assert!(
+                expire_ts >= lower && expire_ts <= upper,
+                "expire_ts {expire_ts} outside expected window [{lower}, {upper}] for key {key:?}"
+            );
+        }
+    });
+}
+
+/// Regression: when terminal_job_expire_s is set, the ATTEMPT row for the
+/// job's current attempt must reflect the **terminal** outcome status (e.g.
+/// Succeeded), not the prior Running status that was on disk before
+/// `report_attempt_outcome` ran. An earlier implementation re-scanned
+/// ATTEMPT rows after writing the new terminal attempt and clobbered the
+/// new value with the old Running value because WriteBatch is last-write-wins
+/// per key. This test reads the ATTEMPT row directly and asserts both the
+/// terminal status and the TTL are present.
+#[silo::test]
+async fn terminal_attempt_row_keeps_terminal_status_under_ttl() {
+    with_timeout!(20000, {
+        use silo::job_attempt::{AttemptStatus, JobAttemptView};
+        use silo::keys::attempt_key;
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: Vec::new() })
+            .await
+            .expect("report success");
+
+        // The committed attempt row for attempt 1 must be Succeeded with a TTL.
+        let kv = shard
+            .db()
+            .get_key_value(&attempt_key("-", &job_id, 1))
+            .await
+            .expect("get_key_value")
+            .expect("attempt row present");
+        assert!(
+            kv.expire_ts.is_some(),
+            "terminal attempt row should carry expire_ts"
+        );
+        let view = JobAttemptView::new(kv.value).expect("decode attempt");
+        match view.state() {
+            AttemptStatus::Succeeded { .. } => {}
+            other => panic!("expected AttemptStatus::Succeeded, got {:?}", other),
+        }
+    });
+}
+
+/// IDX_METADATA rows are the reason `expire_terminal_job_records` reads
+/// JOB_INFO back: we extract the metadata pairs from JOB_INFO so we know
+/// which IDX_METADATA keys to TTL. This test pins down that every
+/// IDX_METADATA row for a terminal job carries the row TTL.
+#[silo::test]
+async fn terminal_idx_metadata_rows_are_tagged_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::idx_metadata_key;
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
+
+        let metadata = vec![
+            ("env".to_string(), "prod".to_string()),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("kind".to_string(), "ingest".to_string()),
+        ];
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                Some(metadata.clone()),
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: Vec::new() })
+            .await
+            .expect("report success");
+
+        for (k, v) in &metadata {
+            let kv = shard
+                .db()
+                .get_key_value(&idx_metadata_key("-", k, v, &job_id))
+                .await
+                .expect("get_key_value")
+                .unwrap_or_else(|| panic!("IDX_METADATA row missing for {k}={v}"));
+            assert!(
+                kv.expire_ts.is_some(),
+                "IDX_METADATA row for {k}={v} must carry expire_ts"
+            );
+        }
+    });
+}
+
+/// IDX_STATUS_TIME row written for the new terminal status must carry the
+/// row TTL. This is written inside `write_job_status_with_index_opts` rather
+/// than the helper, so it's a separate code path from the JOB_INFO/ATTEMPT
+/// re-puts and worth its own assertion.
+#[silo::test]
+async fn terminal_idx_status_time_row_is_tagged_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::job::JobStatusKind;
+        use silo::keys::{idx_status_time_key, status_index_timestamp};
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: Vec::new() })
+            .await
+            .expect("report success");
+
+        // Re-derive the IDX_STATUS_TIME key for the new (Succeeded) status from
+        // the recorded JobStatus so this test stays in lockstep with however
+        // `set_job_status_with_index_opts` constructs the key.
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get_job_status")
+            .expect("status present");
+        assert_eq!(status.kind, JobStatusKind::Succeeded);
+        let ts = status_index_timestamp(&status);
+        let idx_key = idx_status_time_key("-", status.kind.as_str(), ts, &job_id);
+        let kv = shard
+            .db()
+            .get_key_value(&idx_key)
+            .await
+            .expect("get_key_value")
+            .expect("IDX_STATUS_TIME row present");
+        assert!(
+            kv.expire_ts.is_some(),
+            "IDX_STATUS_TIME row for terminal status must carry expire_ts"
+        );
+    });
+}
+
+/// JOB_CANCELLED rows are written on the cancellation path and must also
+/// be TTL'd when the cancellation results in a terminal outcome. Exercises
+/// the Cancelled-acknowledgement branch which neither of the other new
+/// tests touches.
+#[silo::test]
+async fn cancelled_terminal_job_cancellation_row_is_tagged_with_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::job_cancelled_key;
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Dequeue so the job is Running; only then does worker-acknowledged
+        // cancellation flow through report_attempt_outcome(Cancelled).
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+
+        // Cancel from the API side first (writes JOB_CANCELLED), then have the
+        // worker acknowledge with AttemptOutcome::Cancelled.
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Cancelled)
+            .await
+            .expect("report cancelled");
+
+        let kv = shard
+            .db()
+            .get_key_value(&job_cancelled_key("-", &job_id))
+            .await
+            .expect("get_key_value")
+            .expect("JOB_CANCELLED row present");
+        assert!(
+            kv.expire_ts.is_some(),
+            "JOB_CANCELLED row for terminal Cancelled job must carry expire_ts"
+        );
+    });
+}
+
+/// When `report_attempt_outcome(Error)` schedules a retry (job goes back to
+/// Scheduled, not terminal), the just-finalized attempt row must NOT carry
+/// a TTL. Otherwise retried jobs that never reach terminal status would
+/// silently lose their attempt history once the next compaction runs.
+/// This is the inverse of `terminal_attempt_row_keeps_terminal_status_under_ttl`
+/// and pins down the doc-comment claim in lease.rs.
+#[silo::test]
+async fn retry_branch_attempt_row_has_no_expire_ts() {
+    with_timeout!(20000, {
+        use silo::keys::attempt_key;
+
+        let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
+
+        // Retry policy so the first error leads to retry-scheduling, not Failed.
+        let retry_policy = RetryPolicy {
+            retry_count: 3,
+            initial_interval_ms: 1_000,
+            max_interval_ms: 60_000,
+            randomize_interval: false,
+            backoff_factor: 2.0,
+        };
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                Some(retry_policy),
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: b"boom".to_vec(),
+                },
+            )
+            .await
+            .expect("report error");
+
+        // Job should be back to Scheduled (retry scheduled), not terminal.
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("status")
+            .expect("present");
+        assert_eq!(status.kind, JobStatusKind::Scheduled);
+
+        let kv = shard
+            .db()
+            .get_key_value(&attempt_key("-", &job_id, 1))
+            .await
+            .expect("get_key_value")
+            .expect("attempt row present");
+        assert!(
+            kv.expire_ts.is_none(),
+            "attempt row written under the retry-scheduling branch must NOT carry expire_ts \
+             (job is still alive and could be retried for hours); got {:?}",
+            kv.expire_ts
+        );
+    });
+}
