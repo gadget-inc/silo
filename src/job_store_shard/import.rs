@@ -14,7 +14,8 @@ use crate::fb::silo::fb;
 use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, now_epoch_ms, put_with_optional_expire,
+    retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
@@ -182,6 +183,21 @@ impl JobStoreShard {
             return Err(JobStoreShardError::InvalidArgument(msg));
         }
 
+        // Determine the resulting status up-front so we can tag every record
+        // written in this txn with a row TTL when the job lands in a terminal
+        // status. A brand-new import has no pre-existing committed records for
+        // `expire_terminal_job_records` to re-put — every record is created
+        // here — so we apply the TTL inline at each put site instead of calling
+        // the helper.
+        let num_attempts = params.attempts.len() as u32;
+        let (job_status, status_kind, is_terminal) =
+            determine_import_status(params, num_attempts, now_ms, effective_start_at_ms);
+        let terminal_expire_ts: Option<i64> = if is_terminal {
+            self.terminal_expire_ts(status_kind, now_ms)
+        } else {
+            None
+        };
+
         // Write JobInfo
         let job = JobInfo {
             id: job_id.to_string(),
@@ -194,17 +210,16 @@ impl JobStoreShard {
             task_group: params.task_group.clone(),
         };
         let job_value = encode_job_info(&job);
-        txn.put(&info_key, &job_value)?;
+        put_with_optional_expire(&txn, &info_key, &job_value, terminal_expire_ts)?;
 
         // Write metadata secondary index
         for (mk, mv) in &job.metadata {
             let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-            txn.put(&mkey, [])?;
+            put_with_optional_expire(&txn, &mkey, [], terminal_expire_ts)?;
         }
 
         // [SILO-IMP-2] Write imported attempt records (existing statuses unchanged - vacuously true for new import)
         // [SILO-IMP-3] All new attempts are terminal (validated by validate_import_attempts)
-        let num_attempts = params.attempts.len() as u32;
         for (i, imported) in params.attempts.iter().enumerate() {
             let attempt_number = (i as u32) + 1;
             let task_id = Uuid::new_v4().to_string();
@@ -234,15 +249,18 @@ impl JobStoreShard {
             };
             let attempt_value = encode_attempt(&attempt_record);
             let akey = attempt_key(tenant, job_id, attempt_number);
-            txn.put(&akey, &attempt_value)?;
+            put_with_optional_expire(&txn, &akey, &attempt_value, terminal_expire_ts)?;
         }
 
-        let (job_status, status_kind, is_terminal) =
-            determine_import_status(params, num_attempts, now_ms, effective_start_at_ms);
-
-        // Write status + index
+        // Write status + index (TTL applied when the import lands terminal)
         let mut writer = TxnWriter(&txn);
-        Self::write_job_status_with_index(&mut writer, tenant, job_id, job_status)?;
+        Self::write_job_status_with_index_opts(
+            &mut writer,
+            tenant,
+            job_id,
+            job_status,
+            terminal_expire_ts,
+        )?;
 
         // [SILO-IMP-5] Terminal status set by determine_import_status (Succeeded/Failed/Cancelled)
         // [SILO-IMP-6] Scheduled status set by determine_import_status when retries remain
@@ -478,10 +496,34 @@ impl JobStoreShard {
             return Err(JobStoreShardError::InvalidArgument(msg));
         }
 
+        // === Determine new status (resolved before any writes so we can apply
+        // the terminal-row TTL inline to everything we write in this txn) ===
+        let total_attempts = params.attempts.len() as u32;
+        let (new_job_status, status_kind, is_terminal) =
+            determine_import_status(params, total_attempts, now_ms, effective_start_at_ms);
+        let terminal_expire_ts: Option<i64> = if is_terminal {
+            self.terminal_expire_ts(status_kind, now_ms)
+        } else {
+            None
+        };
+
+        // If this reimport lands the job in a terminal status, retroactively
+        // tag the records that already exist in committed state (old JOB_INFO,
+        // IDX_METADATA rows for unchanged metadata pairs, prior ATTEMPT rows,
+        // any JOB_CANCELLED marker) with the row TTL. The helper reads and
+        // re-puts through the `TxnWriter`, and the txn's WriteBatch is
+        // last-write-wins per key, so it must run *before* the in-txn writes
+        // that override the same keys (updated JOB_INFO below, JOB_CANCELLED
+        // delete further down) — otherwise the helper's re-put of the old value
+        // would clobber the new one.
+        if let Some(ts) = terminal_expire_ts {
+            self.expire_terminal_job_records(&mut TxnWriter(&txn), tenant, job_id, ts)
+                .await?;
+        }
+
         // === Write only new attempt records ===
         // [SILO-IMP-2] existing attempt statuses unchanged (we don't touch them)
         // [SILO-IMP-3] new attempts are terminal (validated above)
-        let total_attempts = params.attempts.len() as u32;
         for i in existing_count..params.attempts.len() {
             let imported = &params.attempts[i];
             let attempt_number = (i as u32) + 1;
@@ -512,12 +554,8 @@ impl JobStoreShard {
             };
             let attempt_value = encode_attempt(&attempt_record);
             let akey = attempt_key(tenant, job_id, attempt_number);
-            txn.put(&akey, &attempt_value)?;
+            put_with_optional_expire(&txn, &akey, &attempt_value, terminal_expire_ts)?;
         }
-
-        // === Determine new status ===
-        let (new_job_status, status_kind, is_terminal) =
-            determine_import_status(params, total_attempts, now_ms, effective_start_at_ms);
 
         // Persist the updated retry policy so future retry decisions (e.g. in
         // report_attempt_outcome) stay consistent with this reimport.
@@ -532,7 +570,8 @@ impl JobStoreShard {
             task_group: existing_job.task_group().to_string(),
         };
         let updated_job_value = encode_job_info(&updated_job);
-        txn.put(job_info_key(tenant, job_id), &updated_job_value)?;
+        let info_key = job_info_key(tenant, job_id);
+        put_with_optional_expire(&txn, &info_key, &updated_job_value, terminal_expire_ts)?;
 
         // === Clean up old scheduling state ===
 
@@ -619,8 +658,14 @@ impl JobStoreShard {
         // === Update status, scheduling state, and counters ===
         let mut writer = TxnWriter(&txn);
 
-        self.set_job_status_with_index(&mut writer, tenant, job_id, new_job_status)
-            .await?;
+        self.set_job_status_with_index_opts(
+            &mut writer,
+            tenant,
+            job_id,
+            new_job_status,
+            terminal_expire_ts,
+        )
+        .await?;
 
         // Clean up cancelled key: cancel_job writes a separate cancelled key that blocks
         // lease creation. The marker can outlive Cancelled status (for example when a

@@ -626,7 +626,6 @@ impl JobStoreShard {
     /// `WriteBatch` is last-write-wins per key, and putting the new row
     /// earlier would be silently clobbered when the helper re-puts the old
     /// Running value with TTL.
-    #[allow(dead_code)] // wired up in follow-up retention PRs (cancel, import, terminal)
     pub(crate) async fn expire_terminal_job_records<W: WriteBatcher>(
         &self,
         writer: &mut W,
