@@ -96,9 +96,11 @@ impl JobStoreShard {
         // [SILO-CXL-2] Post: Mark job as cancelled (write cancellation record).
         // If this cancellation transitions the job to terminal, tag the new
         // JOB_CANCELLED row with the row TTL directly. `expire_terminal_job_records`
-        // re-puts an existing JOB_CANCELLED row by reading from committed state
-        // via `self.db.get`, but the row we just wrote lives in the open
-        // transaction, so the helper wouldn't see it.
+        // reads through the `TxnWriter` (so reads see this txn's own writes and
+        // join the SSI read set), so it would also re-put this row with the same
+        // TTL — tagging it here keeps the TTL co-located with the only put site
+        // and makes the JOB_CANCELLED row's TTL correct independent of helper
+        // ordering.
         let cancellation = JobCancellation {
             cancelled_at_ms: now_ms,
         };
@@ -221,10 +223,13 @@ impl JobStoreShard {
         // tagged at its put site, so the helper only needs to handle the
         // remaining records.
         //
-        // The helper reads existing values via `self.db.get` (committed
-        // state). For JOB_INFO and any prior ATTEMPT rows that is correct
-        // (those were written by earlier transactions). It re-puts via the
-        // TxnWriter, which goes through the open transaction.
+        // The helper reads and re-puts through the `TxnWriter`: reads go via
+        // `txn.get` / `txn.scan`, which see this transaction's own buffered
+        // writes and join the SSI read set so a concurrent mutation of any of
+        // these keys trips a conflict rather than being silently clobbered with
+        // stale bytes (see `expire_terminal_job_records`). JOB_INFO and any
+        // prior ATTEMPT rows were written by earlier transactions; re-putting
+        // them here tags them with the row TTL.
         if let Some(ts) = terminal_expire_ts {
             self.expire_terminal_job_records(&mut TxnWriter(&txn), tenant, id, ts)
                 .await?;

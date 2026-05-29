@@ -185,10 +185,10 @@ impl JobStoreShard {
 
         // Determine the resulting status up-front so we can tag every record
         // written in this txn with a row TTL when the job lands in a terminal
-        // status. `expire_terminal_job_records` reads from committed state
-        // (pre-txn), so it can't see anything written here — for a brand-new
-        // import we apply the TTL inline at each put site instead of calling
-        // the helper post-write.
+        // status. A brand-new import has no pre-existing committed records for
+        // `expire_terminal_job_records` to re-put — every record is created
+        // here — so we apply the TTL inline at each put site instead of calling
+        // the helper.
         let num_attempts = params.attempts.len() as u32;
         let (job_status, status_kind, is_terminal) =
             determine_import_status(params, num_attempts, now_ms, effective_start_at_ms);
@@ -510,10 +510,12 @@ impl JobStoreShard {
         // If this reimport lands the job in a terminal status, retroactively
         // tag the records that already exist in committed state (old JOB_INFO,
         // IDX_METADATA rows for unchanged metadata pairs, prior ATTEMPT rows,
-        // any JOB_CANCELLED marker) with the row TTL. The helper reads from
-        // `self.db` (pre-txn), so it must run *before* the in-txn writes that
-        // override the same keys (updated JOB_INFO below, JOB_CANCELLED delete
-        // further down) — the txn's WriteBatch is last-write-wins per key.
+        // any JOB_CANCELLED marker) with the row TTL. The helper reads and
+        // re-puts through the `TxnWriter`, and the txn's WriteBatch is
+        // last-write-wins per key, so it must run *before* the in-txn writes
+        // that override the same keys (updated JOB_INFO below, JOB_CANCELLED
+        // delete further down) — otherwise the helper's re-put of the old value
+        // would clobber the new one.
         if let Some(ts) = terminal_expire_ts {
             self.expire_terminal_job_records(&mut TxnWriter(&txn), tenant, job_id, ts)
                 .await?;
