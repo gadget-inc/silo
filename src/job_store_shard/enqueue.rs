@@ -524,6 +524,9 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                             skip_try_reserve,
+                            current_held_queues.clone(),
+                            (current_index + 1) as u32,
+                            limits.to_vec(),
                         )
                         .await?;
 
@@ -593,6 +596,9 @@ impl JobStoreShard {
                             attempt_number,
                             relative_attempt_number,
                             skip_try_reserve,
+                            current_held_queues.clone(),
+                            (current_index + 1) as u32,
+                            limits.to_vec(),
                         )
                         .await?;
 

@@ -69,7 +69,7 @@ use crate::keys::{
 };
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
-use crate::task::{ConcurrencyAction, HolderRecord, Task};
+use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, Task};
 use crate::task_broker::TaskBrokerRegistry;
 
 /// Error type for concurrency operations that can fail due to storage or encoding errors.
@@ -759,6 +759,9 @@ impl ConcurrencyManager {
         attempt_number: u32,
         relative_attempt_number: u32,
         skip_try_reserve: bool,
+        held_queues: Vec<String>,
+        next_limit_index: u32,
+        all_limits: Vec<Limit>,
     ) -> Result<Option<RequestTicketOutcome>, ConcurrencyError> {
         // Only gate on the first limit (if any)
         let Some(limit) = limits.first() else {
@@ -781,19 +784,7 @@ impl ConcurrencyManager {
         {
             // Grant immediately: [SILO-ENQ-CONC-2] [SILO-ENQ-CONC-3] [SILO-IMP-CONC-2] [SILO-REIMP-CONC-2] create holder + task in DB queue
             // Note: in-memory slot is already reserved by try_reserve
-            append_grant_edits(
-                writer,
-                now_ms,
-                tenant,
-                queue,
-                task_id,
-                start_at_ms,
-                priority,
-                job_id,
-                attempt_number,
-                relative_attempt_number,
-                task_group,
-            )?;
+            append_grant_edits(writer, now_ms, tenant, queue, task_id)?;
             if let Some(ref m) = self.metrics {
                 m.record_concurrency_tickets_granted(
                     &self.shard,
@@ -819,14 +810,17 @@ impl ConcurrencyManager {
                 attempt_number,
                 relative_attempt_number,
                 task_group,
+                task_id,
+                held_queues,
+                next_limit_index,
+                all_limits,
             )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
                 queue: queue.clone(),
             }))
         } else {
             // Job scheduled for future: queue as RequestTicket task
-            let suffix = format!("{:08x}", rand::random::<u32>());
-            let request_id = format!("{job_id}:{attempt_number}:{suffix}");
+            let request_id = task_id.to_string();
             let ticket = Task::RequestTicket {
                 queue: queue.clone(),
                 start_time_ms: start_at_ms,
@@ -1084,13 +1078,16 @@ impl ConcurrencyManager {
 
         struct ScannedRequest {
             request_key: Vec<u8>,
-            request_id: String,
+            task_id: String,
             job_id: String,
             attempt_number: u32,
             relative_attempt_number: u32,
             start_time_ms: i64,
             priority: u8,
             task_group: String,
+            held_queues: Vec<String>,
+            next_limit_index: u32,
+            limits: Vec<Limit>,
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
@@ -1112,6 +1109,8 @@ impl ConcurrencyManager {
 
             let mut batch = WriteBatch::new();
             let mut grants: Vec<(String, String)> = Vec::new();
+            let mut reserved_slots: Vec<(String, String)> = Vec::new();
+            let mut request_counter_delta: i64 = 0;
             let mut stale_and_corrupt_count: usize = 0;
 
             // --- Scan batch of candidates ---
@@ -1137,6 +1136,7 @@ impl ConcurrencyManager {
                     Err(_) => {
                         tracing::warn!(queue = %queue, "grant scanner: failed to decode request, deleting");
                         batch.delete(&kv.key);
+                        request_counter_delta -= 1;
                         stale_and_corrupt_count += 1;
                         continue;
                     }
@@ -1145,6 +1145,7 @@ impl ConcurrencyManager {
                 let Some(et) = a.variant_as_enqueue_task() else {
                     tracing::warn!(queue = %queue, "grant scanner: unknown concurrency action variant, deleting");
                     batch.delete(&kv.key);
+                    request_counter_delta -= 1;
                     stale_and_corrupt_count += 1;
                     continue;
                 };
@@ -1157,11 +1158,33 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                let Some(parsed_req) = parsed_req else {
+                if parsed_req.is_none() {
+                    batch.delete(&kv.key);
+                    request_counter_delta -= 1;
+                    stale_and_corrupt_count += 1;
                     continue;
-                };
-                let request_id = parsed_req.request_id();
-
+                }
+                let task_id = et.task_id().unwrap_or_default().to_string();
+                if task_id.is_empty() {
+                    tracing::warn!(queue = %queue, "grant scanner: request missing task_id, deleting");
+                    batch.delete(&kv.key);
+                    request_counter_delta -= 1;
+                    stale_and_corrupt_count += 1;
+                    continue;
+                }
+                let held_queues = et
+                    .held_queues()
+                    .map(|v| v.iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
+                let limits = crate::codec::fb_limit_entries_to_owned(et.limits());
+                let next_limit_index = et.next_limit_index();
+                if next_limit_index as usize > limits.len() {
+                    tracing::warn!(queue = %queue, "grant scanner: request next_limit_index out of bounds, deleting");
+                    batch.delete(&kv.key);
+                    request_counter_delta -= 1;
+                    stale_and_corrupt_count += 1;
+                    continue;
+                }
                 // Resolve max_concurrency from the first request whose job info is readable.
                 // Don't cache failures — a stale request's missing job shouldn't lock
                 // the limit to 1 for the rest of the scan.
@@ -1203,13 +1226,16 @@ impl ConcurrencyManager {
 
                 scanned.push(ScannedRequest {
                     request_key: kv.key.to_vec(),
-                    request_id,
+                    task_id,
                     job_id: job_id_str.to_string(),
                     attempt_number: et.attempt_number(),
                     relative_attempt_number: et.relative_attempt_number(),
                     start_time_ms,
                     priority: et.priority(),
                     task_group: et.task_group().unwrap_or_default().to_string(),
+                    held_queues,
+                    next_limit_index,
+                    limits,
                 });
             }
 
@@ -1293,11 +1319,12 @@ impl ConcurrencyManager {
                     valid_requests.push(req);
                 } else {
                     batch.delete(&req.request_key);
+                    request_counter_delta -= 1;
                     stale_and_corrupt_count += 1;
                 }
             }
 
-            // --- Reserve in-memory slots and accumulate grant edits ---
+            // --- Reserve in-memory slots and resume each admitted limit chain ---
             let limit = max_concurrency.map(|(l, _)| l).unwrap_or(1);
             for req in &valid_requests {
                 if total_granted + grants.len() >= count as usize {
@@ -1308,7 +1335,7 @@ impl ConcurrencyManager {
                 if !self.counts.try_reserve_internal(
                     tenant,
                     queue,
-                    &req.request_id,
+                    &req.task_id,
                     limit,
                     &req.job_id,
                 ) {
@@ -1316,47 +1343,172 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                // [SILO-GRANT-3] Create holder
+                reserved_slots.push((queue.to_string(), req.task_id.clone()));
+
+                let mut held_queues = req.held_queues.clone();
+                if !held_queues.iter().any(|q| q == queue) {
+                    held_queues.push(queue.to_string());
+                }
+
+                // The request itself is resolved by this reservation. Further walker
+                // pauses write their own request records below.
+                batch.delete(&req.request_key);
+                request_counter_delta -= 1;
                 let holder_val = encode_holder(&HolderRecord {
                     granted_at_ms: now_ms,
                 });
                 batch.put(
-                    concurrency_holder_key(tenant, queue, &req.request_id),
+                    concurrency_holder_key(tenant, queue, &req.task_id),
                     &holder_val,
                 );
 
-                // [SILO-GRANT-4] Create RunAttempt task
-                let tval = encode_task(&Task::RunAttempt {
-                    id: req.request_id.clone(),
-                    tenant: tenant.to_string(),
-                    job_id: req.job_id.clone(),
-                    attempt_number: req.attempt_number,
-                    relative_attempt_number: req.relative_attempt_number,
-                    held_queues: vec![queue.to_string()],
-                    task_group: req.task_group.clone(),
-                });
-                batch.put(
-                    task_key(
-                        &req.task_group,
-                        req.start_time_ms,
-                        req.priority,
-                        &req.job_id,
-                        req.attempt_number,
-                    ),
-                    &tval,
-                );
-                batch.delete(&req.request_key);
+                let mut current_index = req.next_limit_index as usize;
+                let order = crate::job_store_shard::limit_processing_order(&req.limits);
+                let mut paused = false;
+                while current_index < req.limits.len() {
+                    match &req.limits[order[current_index]] {
+                        Limit::Concurrency(cl) => {
+                            if !self.counts.try_reserve_internal(
+                                tenant,
+                                &cl.key,
+                                &req.task_id,
+                                cl.max_concurrency as usize,
+                                &req.job_id,
+                            ) {
+                                append_request_batch_edits(
+                                    &mut batch,
+                                    tenant,
+                                    &cl.key,
+                                    req.start_time_ms,
+                                    req.priority,
+                                    &req.job_id,
+                                    req.attempt_number,
+                                    req.relative_attempt_number,
+                                    &req.task_group,
+                                    &req.task_id,
+                                    held_queues.clone(),
+                                    (current_index + 1) as u32,
+                                    req.limits.clone(),
+                                );
+                                paused = true;
+                                break;
+                            }
+                            reserved_slots.push((cl.key.clone(), req.task_id.clone()));
+                            let holder_val = encode_holder(&HolderRecord {
+                                granted_at_ms: now_ms,
+                            });
+                            batch.put(
+                                concurrency_holder_key(tenant, &cl.key, &req.task_id),
+                                &holder_val,
+                            );
+                            held_queues.push(cl.key.clone());
+                            current_index += 1;
+                        }
+                        Limit::FloatingConcurrency(fl) => {
+                            // Scanner resumption preserves the existing fast path by using
+                            // the durable/default floating capacity. Refresh-driven capacity
+                            // updates continue to be handled by the refresh task path.
+                            let max = fl.default_max_concurrency as usize;
+                            if !self.counts.try_reserve_internal(
+                                tenant,
+                                &fl.key,
+                                &req.task_id,
+                                max,
+                                &req.job_id,
+                            ) {
+                                append_request_batch_edits(
+                                    &mut batch,
+                                    tenant,
+                                    &fl.key,
+                                    req.start_time_ms,
+                                    req.priority,
+                                    &req.job_id,
+                                    req.attempt_number,
+                                    req.relative_attempt_number,
+                                    &req.task_group,
+                                    &req.task_id,
+                                    held_queues.clone(),
+                                    (current_index + 1) as u32,
+                                    req.limits.clone(),
+                                );
+                                paused = true;
+                                break;
+                            }
+                            reserved_slots.push((fl.key.clone(), req.task_id.clone()));
+                            let holder_val = encode_holder(&HolderRecord {
+                                granted_at_ms: now_ms,
+                            });
+                            batch.put(
+                                concurrency_holder_key(tenant, &fl.key, &req.task_id),
+                                &holder_val,
+                            );
+                            held_queues.push(fl.key.clone());
+                            current_index += 1;
+                        }
+                        Limit::RateLimit(rl) => {
+                            let task = Task::CheckRateLimit {
+                                task_id: req.task_id.clone(),
+                                tenant: tenant.to_string(),
+                                job_id: req.job_id.clone(),
+                                attempt_number: req.attempt_number,
+                                relative_attempt_number: req.relative_attempt_number,
+                                limit_index: current_index as u32,
+                                rate_limit: GubernatorRateLimitData::from(rl),
+                                retry_count: 0,
+                                started_at_ms: now_ms,
+                                priority: req.priority,
+                                held_queues: held_queues.clone(),
+                                task_group: req.task_group.clone(),
+                            };
+                            let tval = encode_task(&task);
+                            batch.put(
+                                task_key(
+                                    &req.task_group,
+                                    req.start_time_ms,
+                                    req.priority,
+                                    &req.job_id,
+                                    req.attempt_number,
+                                ),
+                                &tval,
+                            );
+                            paused = true;
+                            break;
+                        }
+                    }
+                }
 
-                grants.push((req.request_id.clone(), req.task_group.clone()));
+                if !paused {
+                    let tval = encode_task(&Task::RunAttempt {
+                        id: req.task_id.clone(),
+                        tenant: tenant.to_string(),
+                        job_id: req.job_id.clone(),
+                        attempt_number: req.attempt_number,
+                        relative_attempt_number: req.relative_attempt_number,
+                        held_queues,
+                        task_group: req.task_group.clone(),
+                    });
+                    batch.put(
+                        task_key(
+                            &req.task_group,
+                            req.start_time_ms,
+                            req.priority,
+                            &req.job_id,
+                            req.attempt_number,
+                        ),
+                        &tval,
+                    );
+                }
+
+                if !paused {
+                    grants.push((req.task_id.clone(), req.task_group.clone()));
+                }
             }
 
             // --- Per-pass commit ---
-            // Combined counter decrement for this pass's grants + stale/corrupt deletions.
-            let pass_decrement = grants.len() + stale_and_corrupt_count;
-            if pass_decrement > 0 {
+            if request_counter_delta != 0 {
                 batch.merge(
                     concurrency_requester_counter_key(tenant, queue),
-                    encode_counter(-(pass_decrement as i64)),
+                    encode_counter(request_counter_delta),
                 );
             }
 
@@ -1378,8 +1530,8 @@ impl ConcurrencyManager {
                 .await
             {
                 // Roll back only this pass's reservations; prior committed passes stand.
-                for (request_id, _) in &grants {
-                    self.counts.release_reservation(tenant, queue, request_id);
+                for (queue, task_id) in &reserved_slots {
+                    self.counts.release_reservation(tenant, queue, task_id);
                 }
                 tracing::warn!(
                     error = %e,
@@ -1415,21 +1567,14 @@ impl ConcurrencyManager {
     }
 }
 
-/// Append DB edits to grant a concurrency slot: creates holder record and RunAttempt task.
-/// Note: In-memory reservation should already be done via try_reserve before calling this.
-#[allow(clippy::too_many_arguments)]
+/// Append DB edits to grant a concurrency slot by creating only the holder record.
+/// The limit walker writes the runnable task once the full chain has resolved.
 fn append_grant_edits<W: WriteBatcher>(
     writer: &mut W,
     now_ms: i64,
     tenant: &str,
     queue: &str,
     task_id: &str,
-    start_time_ms: i64,
-    priority: u8,
-    job_id: &str,
-    attempt_number: u32,
-    relative_attempt_number: u32,
-    task_group: &str,
 ) -> Result<(), ConcurrencyError> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
@@ -1437,22 +1582,53 @@ fn append_grant_edits<W: WriteBatcher>(
     let holder_val = encode_holder(&holder);
     writer.put(concurrency_holder_key(tenant, queue, task_id), &holder_val)?;
 
-    let task = Task::RunAttempt {
-        id: task_id.to_string(),
-        tenant: tenant.to_string(),
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_request_batch_edits(
+    batch: &mut WriteBatch,
+    tenant: &str,
+    queue: &str,
+    start_time_ms: i64,
+    priority: u8,
+    job_id: &str,
+    attempt_number: u32,
+    relative_attempt_number: u32,
+    task_group: &str,
+    task_id: &str,
+    held_queues: Vec<String>,
+    next_limit_index: u32,
+    limits: Vec<Limit>,
+) {
+    let action = ConcurrencyAction::EnqueueTask {
+        start_time_ms,
+        priority,
         job_id: job_id.to_string(),
         attempt_number,
         relative_attempt_number,
-        held_queues: vec![queue.to_string()],
         task_group: task_group.to_string(),
+        task_id: task_id.to_string(),
+        held_queues,
+        next_limit_index,
+        limits,
     };
-    let task_value = encode_task(&task);
-    writer.put(
-        task_key(task_group, start_time_ms, priority, job_id, attempt_number),
-        &task_value,
-    )?;
-
-    Ok(())
+    let action_val = encode_concurrency_action(&action);
+    let suffix = format!("{:08x}", rand::random::<u32>());
+    let req_key = concurrency_request_key(
+        tenant,
+        queue,
+        start_time_ms,
+        priority,
+        job_id,
+        attempt_number,
+        &suffix,
+    );
+    batch.put(&req_key, &action_val);
+    batch.merge(
+        concurrency_requester_counter_key(tenant, queue),
+        encode_counter(1),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,6 +1642,10 @@ fn append_request_edits<W: WriteBatcher>(
     attempt_number: u32,
     relative_attempt_number: u32,
     task_group: &str,
+    task_id: &str,
+    held_queues: Vec<String>,
+    next_limit_index: u32,
+    limits: Vec<Limit>,
 ) -> Result<(), ConcurrencyError> {
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms,
@@ -1474,6 +1654,10 @@ fn append_request_edits<W: WriteBatcher>(
         attempt_number,
         relative_attempt_number,
         task_group: task_group.to_string(),
+        task_id: task_id.to_string(),
+        held_queues,
+        next_limit_index,
+        limits,
     };
     let action_val = encode_concurrency_action(&action);
     let suffix = format!("{:08x}", rand::random::<u32>());

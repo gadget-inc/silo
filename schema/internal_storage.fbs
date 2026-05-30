@@ -237,6 +237,10 @@ table EnqueueTask {
   attempt_number: uint32;
   relative_attempt_number: uint32;
   task_group: string;
+  task_id: string;
+  held_queues: [string];
+  next_limit_index: uint32;
+  limits: [LimitEntry];
 }
 
 union ConcurrencyActionVariant {
