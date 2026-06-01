@@ -710,9 +710,14 @@ impl JobStoreShard {
     ) -> Result<usize, JobStoreShardError> {
         let start = concurrency_holders_prefix();
         let end = end_bound(&start);
+        // Uncached scan: this is a full-prefix sweep over every holder, run once
+        // per second. Holder blocks are not re-read from the block cache in
+        // steady state (the in-memory ConcurrencyCounts serves concurrency reads
+        // after lazy hydration), so caching them here would only evict hot
+        // blocks used by the enqueue/dequeue path.
         let mut iter = self
             .db
-            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options_uncached())
             .await?;
 
         let now_ms = now_epoch_ms();
