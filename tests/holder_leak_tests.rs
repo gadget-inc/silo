@@ -6,13 +6,20 @@
 mod test_helpers;
 
 use silo::codec::{decode_lease, encode_holder, encode_lease, encode_task};
-use silo::job::{FloatingConcurrencyLimit, Limit};
+use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
 use silo::keys::{concurrency_holder_key, job_info_key, task_key};
 use silo::task::{GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 use test_helpers::*;
+
+fn conc_limit(queue: &str, max: u32) -> Limit {
+    Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: max,
+    })
+}
 
 fn fc_limit(queue: &str, default_max: u32) -> Limit {
     Limit::FloatingConcurrency(FloatingConcurrencyLimit {
@@ -774,5 +781,329 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
          ({}), so any tombstone planted at that key would silently suppress this \
          task — exactly the leak the fix is meant to prevent.",
         original_enqueue_ms,
+    );
+}
+
+/// Regression for the "stranded inflight task → orphaned holder" defect that
+/// `e6660cd` ("Clear up stranded inflight tasks with drop guard") targets.
+///
+/// Failure shape this reproduces:
+///   1. A concurrency-limited job is enqueued. `handle_enqueue` grants the slot
+///      immediately: `append_grant_edits` writes the durable holder in the SAME
+///      batch as the terminal `RunAttempt` task. Holder committed, task durable.
+///   2. A worker dequeues the `RunAttempt`. `claim_ready` moves the task into the
+///      broker's in-memory `inflight` set. Then, under worker overload, the
+///      `LeaseTasks` RPC future is *cancelled* (deadline / disconnect / drop)
+///      before the lease is durably written.
+///   3. Without the drop guard the task is stranded in `inflight` forever (no
+///      TTL): the scanner skips inflight keys, so the `RunAttempt` is never
+///      re-leased — yet the holder from step 1 keeps consuming the slot. That's
+///      the leak: holder committed, task consumed, no lease ever appears.
+///
+/// The guard closes this by releasing the claimed key from `inflight` on drop
+/// (without re-buffering), so the DB scanner — which still sees the un-deleted
+/// task key — re-adds it and a later dequeue leases it exactly once. This test
+/// drives the *real* `dequeue` future, cancels it mid-flight right after the
+/// claim, and asserts the task recovers and the holder never leaks.
+///
+/// If the guard regresses, the recovery loop below never re-leases the task and
+/// the `expect` fires with "never re-leased — holder orphaned".
+#[silo::test]
+async fn dropped_dequeue_future_does_not_orphan_holder() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "drop-guard-q";
+
+    // (1) Enqueue a Concurrency(max=1) job. The slot is free, so the grant is
+    // immediate: holder + RunAttempt land together in the enqueue batch.
+    let _job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![conc_limit(queue, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "concurrency grant should write a holder at enqueue time"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        1,
+        "in-memory holder reservation should exist after the immediate grant"
+    );
+
+    // Wait for the background scanner to buffer the RunAttempt so the dequeue's
+    // first `claim_ready` is synchronous — guaranteeing the single poll below
+    // claims the task (moves it into `inflight`) before parking on an await.
+    let buffered = poll_until(|| async { shard.broker_buffer_len() }, |n| *n >= 1, 2_000).await;
+    assert!(buffered >= 1, "scanner should buffer the RunAttempt task");
+
+    // (2) Drive the real dequeue future, poll it exactly once, then drop it.
+    // The first poll claims the task synchronously — `claim_ready` moves the key
+    // into the broker's `inflight` set — then parks awaiting durability. The
+    // future is then dropped (cancelled RPC), which must run
+    // `ClaimedInflightGuard::drop`.
+    {
+        let mut fut = Box::pin(shard.dequeue("w-overloaded", "default", 1));
+        let polled = futures::poll!(fut.as_mut());
+        assert!(
+            polled.is_pending(),
+            "single poll must leave the dequeue mid-flight (claimed, not yet acked); \
+             got a ready result instead, so the cancellation window was not exercised"
+        );
+        // While the future is alive and parked, the claimed key is in-flight.
+        assert_eq!(
+            shard.broker_inflight_len("default"),
+            1,
+            "the claimed RunAttempt must be in-flight while the dequeue is mid-flight"
+        );
+        drop(fut); // ClaimedInflightGuard::drop → release_inflight(key)
+    }
+
+    // PRIMARY REGRESSION ASSERTION (deterministic): dropping the dequeue future
+    // must have released the claimed key from the in-flight set. Without the
+    // drop guard (e6660cd) the key is stranded here forever — the scanner skips
+    // in-flight keys, so the RunAttempt is never re-leased and its holder leaks.
+    assert_eq!(
+        shard.broker_inflight_len("default"),
+        0,
+        "cancelled dequeue left the claimed task stranded in-flight — drop guard regression; \
+         the holder it backs can never be re-leased and is orphaned"
+    );
+
+    // Holder is still committed from enqueue and must NOT have been doubled or
+    // dropped by the cancellation.
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "holder count must stay at exactly 1 across the cancellation"
+    );
+
+    // (3) Recovery: a subsequent dequeue must re-lease the stranded task. With a
+    // broken/absent guard the task is stuck in `inflight`, the scanner never
+    // re-adds it, and this loop never finds a lease.
+    let mut recovered_task_id: Option<String> = None;
+    for _ in 0..50 {
+        let res = shard
+            .dequeue("w-healthy", "default", 1)
+            .await
+            .expect("recovery dequeue");
+        if let Some(t) = res.tasks.first() {
+            recovered_task_id = Some(t.attempt().task_id().to_string());
+            break;
+        }
+        // Tolerate the ambiguous case where the cancelled write actually landed:
+        // a lease may already exist even though the future was dropped.
+        if let Some((_, lease_val)) = first_lease_kv(shard.db()).await {
+            if let Ok(Task::RunAttempt { id, .. }) =
+                decode_lease(lease_val).expect("decode lease").to_task()
+            {
+                recovered_task_id = Some(id);
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    let task_id = recovered_task_id.expect(
+        "dropped RunAttempt was never re-leased — the holder is orphaned (no task, no lease, \
+         yet the concurrency slot stays consumed). This is the stranded-inflight holder leak \
+         the e6660cd drop guard must prevent.",
+    );
+
+    // Exactly one holder backs the (now re-leased) task — no phantom duplicate.
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "re-lease must reuse the original holder, not mint a second one"
+    );
+
+    // (4) Completing the job releases the holder — proving it was never orphaned
+    // and the slot is reclaimable.
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "durable holder must be released once the recovered job completes"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        0,
+        "in-memory holder reservation must also drain to zero — no slot leak"
+    );
+}
+
+/// PRODUCTION WEDGE REPRODUCTION — an in-memory concurrency holder that the
+/// dequeue drop guard does NOT release, permanently consuming a queue's cap.
+///
+/// A concurrency holder has two halves: a durable KV row (prefix 0x09) AND an
+/// in-memory reservation (`ConcurrencyCounts`, a per-(tenant,queue) set of
+/// task_ids). `try_reserve`/`process_grants` gate admission on the IN-MEMORY
+/// count, so an in-memory reservation with no durable backing silently steals a
+/// slot forever (nothing durable for cancel/reap/expiry to key a release off,
+/// and hydration only ever *inserts*). Accumulate enough — prod hit 300/300 for
+/// env-10000215255 — and the queue wedges while ~1M requesters starve.
+///
+/// The drop guard `ClaimedInflightGuard` (e6660cd) only rolls back the broker's
+/// `inflight` set; it has no reference to `self.concurrency`. So any in-memory
+/// holder bookkeeping that lives in `dequeue`'s post-commit tail is lost when
+/// the future is cancelled. This test pins the cleanest, deterministic instance:
+///
+///   `handle_run_attempt` for a RunAttempt whose `job_info` is gone deletes the
+///   held concurrency holder *in the committed batch* but performs the matching
+///   in-memory `atomic_release` only afterwards, in `dequeue`'s post-commit loop
+///   (dequeue.rs ~334-339). `write_with_options` applies the batch to the WAL on
+///   its first poll, so the durable delete lands even if the future is then
+///   dropped — but the post-commit `atomic_release` never runs. Net: durable
+///   holder gone, in-memory reservation retained = a ghost that wedges the queue.
+///
+/// The sibling on the *grant* side (handle_request_ticket's `try_reserve` not
+/// rolled back on drop) produces the same ghost when the commit doesn't land;
+/// it needs a genuinely-pending pre-commit await (a cold hydration scan over a
+/// large queue in prod) to hit, so it isn't deterministic in the warm test DB.
+/// Both share one root cause and one fix: roll back in-memory concurrency state
+/// on the dequeue future-drop path, exactly as the error/commit-failure paths do.
+///
+/// This test cancels the real `dequeue` future at the commit and asserts the
+/// queue is NOT wedged. It FAILS on current code (durable=0 but in-memory=1),
+/// reproducing the leak; it passes once the drop path releases in-memory holders.
+///
+/// Currently `#[ignore]`d because it reproduces an UNFIXED bug (a failing test
+/// would redden CI). Run it explicitly with:
+///   cargo test --test holder_leak_tests \
+///     dropped_dequeue_future_skips_inmemory_holder_release_and_wedges_queue \
+///     -- --ignored --nocapture
+/// Remove the `#[ignore]` once the drop path releases in-memory holders; it then
+/// becomes the regression guard. (Uses `#[tokio::test]` rather than
+/// `#[silo::test]` because the latter's proc-macro drops outer attributes like
+/// `#[ignore]`.)
+#[ignore = "reproduces an unfixed in-memory holder leak / queue wedge; un-ignore after the fix"]
+#[tokio::test]
+async fn dropped_dequeue_future_skips_inmemory_holder_release_and_wedges_queue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "wedge-q";
+    let task_group = "default";
+
+    // Enqueue a Concurrency(max=1) job: holder granted at enqueue (in-memory +
+    // durable), and a RunAttempt carrying held_queues=[queue] is written.
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![conc_limit(queue, 1)],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue");
+
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1, "durable holder at enqueue");
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1, "in-memory holder at enqueue");
+
+    // The job_info row disappears before the worker dequeues (migration / cleanup
+    // race / partial restore). `handle_run_attempt` will take the missing-job
+    // branch: delete the task AND the held concurrency holder in the batch, then
+    // (post-commit) `atomic_release` the in-memory slot.
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.delete(&job_info_key(tenant, &job_id));
+        shard.db().write(batch).await.expect("delete job_info");
+        shard.db().flush().await.expect("flush");
+    }
+
+    // Wait for the scanner to buffer the RunAttempt.
+    let buffered = poll_until(|| async { shard.broker_buffer_len() }, |n| *n >= 1, 5_000).await;
+    assert!(buffered >= 1, "scanner should buffer the RunAttempt");
+
+    // Drive the real dequeue future to the commit, then cancel it there.
+    //
+    // We poll with `yield_now` (which does NOT advance the paused clock), so the
+    // 10ms flush timer never fires and the `write_with_options` await stays
+    // pending — the future parks exactly at the commit with the batch already
+    // applied to the WAL. Dropping there is the overloaded-worker RPC cancel.
+    {
+        let mut fut = Box::pin(shard.dequeue("w-overloaded", task_group, 1));
+        for _ in 0..500 {
+            let polled = futures::poll!(fut.as_mut());
+            assert!(
+                polled.is_pending(),
+                "dequeue completed before we could cancel it at the commit"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(fut); // cancel at the commit await; the post-commit atomic_release never runs
+    }
+
+    // Let the flush land the buffered batch (durable holder delete).
+    let durable = poll_until(
+        || async { count_concurrency_holders(shard.db()).await },
+        |n| *n == 0,
+        5_000,
+    )
+    .await;
+
+    // Smoking gun: the durable holder was deleted by the committed batch, but the
+    // in-memory reservation was NOT released (post-commit loop skipped on drop).
+    let ghost = shard.concurrency_holder_count(tenant, queue);
+    assert_eq!(durable, 0, "durable holder should be deleted by the committed batch");
+    assert_eq!(
+        ghost, 1,
+        "LEAK: in-memory holder reservation survives (durable={durable}, in_mem={ghost}). \
+         `atomic_release` only runs in dequeue's post-commit loop, which the cancelled \
+         future skipped — the drop guard does not touch concurrency state."
+    );
+
+    // The slot is now wedged in memory: a fresh Concurrency(max=1) job on the
+    // same queue can never be granted, because `try_reserve` sees the ghost.
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![conc_limit(queue, 1)],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue job2");
+
+    let mut job2_leased = false;
+    for _ in 0..50 {
+        let res = shard.dequeue("w2", task_group, 1).await.expect("dequeue job2");
+        if !res.tasks.is_empty() {
+            job2_leased = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        job2_leased,
+        "QUEUE WEDGED: with the ghost in-memory holder (durable={durable}, in_mem={ghost}) \
+         occupying the only slot, a brand-new job can never acquire concurrency and never \
+         leases — the permanent orphaned-holder wedge seen in production. Nothing durable \
+         exists for reap/cancel/expiry to release, so it survives until process restart."
     );
 }

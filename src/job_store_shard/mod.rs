@@ -875,6 +875,14 @@ impl JobStoreShard {
         self.brokers.buffer_len()
     }
 
+    /// Number of tasks currently held in the broker's in-flight set for a task
+    /// group (claimed by a worker but not yet durably acked). Exposed for
+    /// observability and for tests that assert the dequeue drop-guard releases
+    /// claimed keys when its future is cancelled.
+    pub fn broker_inflight_len(&self, task_group: &str) -> usize {
+        self.brokers.group_inflight_len(task_group)
+    }
+
     /// Snapshot the sizes of the in-memory concurrency holders cache.
     pub fn concurrency_cache_stats(&self) -> crate::concurrency::ConcurrencyCacheStats {
         self.concurrency.cache_stats()
