@@ -48,9 +48,6 @@ addr = "0.0.0.0:7460"
 backend = "gcs"
 # NOTE: %shard% must be at a path boundary (after /) for split/clone to work correctly
 path = "gs://my-bucket/silo/%shard%"
-# Submit a full-compaction spec for each shard every N seconds (consumed by the
-# standalone silo-compactor). Omit to disable periodic compaction.
-# periodic_full_compaction_s = 3600
 
 # Optional: Use local filesystem for WAL for lower write latency
 # If omitted, WAL uses the same backend as the main store
