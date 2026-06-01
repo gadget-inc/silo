@@ -2219,6 +2219,35 @@ where
         }
     });
 
+    // Optional per-pod periodic full-compaction ticker. Disabled when the
+    // `periodic_full_compaction_s` database setting is absent.
+    let compaction_ticker: Option<JoinHandle<()>> =
+        cfg.database.periodic_full_compaction_s.map(|secs| {
+            let compaction_factory = factory.clone();
+            let mut compaction_tick_rx = tick_tx.subscribe();
+            let period = std::time::Duration::from_secs(secs);
+            tokio::spawn(async move {
+                // interval_at => skip the immediate first tick; first run at t=secs.
+                let mut interval =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = interval.tick() => {
+                            for (shard_id, shard) in compaction_factory.instances().iter() {
+                                let shard_label = shard_id.to_string();
+                                match shard.submit_full_compaction().await {
+                                    Ok(()) => info!(shard = %shard_label, "periodic full compaction submitted"),
+                                    Err(e) => warn!(shard = %shard_label, error = %e, "periodic full compaction failed"),
+                                }
+                            }
+                        }
+                        _ = compaction_tick_rx.recv() => { break; }
+                    }
+                }
+            })
+        });
+
     // Create reflection service for grpcurl/debugging
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
@@ -2259,5 +2288,8 @@ where
     // permanent leases. factory.close_all() in main.rs serves as a safety net.
     reaper.await.ok();
     metrics_scrape.await.ok();
+    if let Some(h) = compaction_ticker {
+        h.await.ok();
+    }
     Ok(())
 }

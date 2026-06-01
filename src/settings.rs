@@ -254,6 +254,13 @@ pub struct DatabaseTemplate {
     /// counter values from the surviving job rows.
     #[serde(default)]
     pub terminal_job_expire_s: Option<u64>,
+    /// When set, every pod runs a background ticker that submits a full-compaction
+    /// spec for each shard it owns, every this-many seconds. `None` (the default)
+    /// disables periodic compaction entirely (no ticker is spawned). The spec is
+    /// consumed and executed by the standalone silo-compactor deployment, not by
+    /// the silo pod itself.
+    #[serde(default)]
+    pub periodic_full_compaction_s: Option<u64>,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -280,6 +287,7 @@ impl Default for DatabaseTemplate {
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
+            periodic_full_compaction_s: None,
             slatedb: None,
             memory_cache: None,
         }
@@ -736,4 +744,34 @@ impl GubernatorSettings {
 #[doc(hidden)]
 pub fn expand_env_vars_for_test(input: &str) -> String {
     expand_env_vars(input).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_full_compaction_s_defaults_to_none() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            "#,
+        )
+        .expect("config without periodic_full_compaction_s should parse");
+        assert_eq!(db.periodic_full_compaction_s, None);
+    }
+
+    #[test]
+    fn periodic_full_compaction_s_parses_when_present() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            periodic_full_compaction_s = 5
+            "#,
+        )
+        .expect("config with periodic_full_compaction_s should parse");
+        assert_eq!(db.periodic_full_compaction_s, Some(5));
+    }
 }
