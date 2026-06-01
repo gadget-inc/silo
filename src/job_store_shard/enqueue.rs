@@ -60,26 +60,6 @@ pub(crate) struct LimitTaskParams<'a> {
     pub skip_try_reserve: bool,
 }
 
-/// Canonical processing order for a job's limits: Concurrency first, then
-/// FloatingConcurrency, then RateLimit, stable within each kind. Returns
-/// indices into the caller-provided `limits` slice. A `Limit::Concurrency`
-/// must always be processed before any `Limit::FloatingConcurrency` so a
-/// strictly-tighter Concurrency limit blocks the job *before* it acquires a
-/// FloatingConcurrency slot — otherwise the FC grant produces a leasable
-/// `RunAttempt[FC]` that bypasses the still-full Concurrency limit.
-pub(crate) fn limit_processing_order(limits: &[Limit]) -> Vec<usize> {
-    let kind_rank = |i: usize| -> u8 {
-        match &limits[i] {
-            Limit::Concurrency(_) => 0,
-            Limit::FloatingConcurrency(_) => 1,
-            Limit::RateLimit(_) => 2,
-        }
-    };
-    let mut order: Vec<usize> = (0..limits.len()).collect();
-    order.sort_by_key(|&i| kind_rank(i));
-    order
-}
-
 /// Whether a concurrency grant was obtained or the job was queued for later.
 enum GrantResult {
     /// Slot granted immediately; caller should advance to the next limit.
@@ -528,12 +508,13 @@ impl JobStoreShard {
             task_group,
             skip_try_reserve,
         } = params;
-        // Walk limits in the canonical processing order (see
-        // `limit_processing_order`). `current_index` and the `limit_index`
-        // stored in `CheckRateLimit` tasks are positions in this order — the
-        // order function is deterministic on `limits`, so dequeue's
-        // `limit_index + 1` continuation lands on the correct next entry.
-        let order = limit_processing_order(limits);
+        // Walk limits in the order the client provided them — silo no longer
+        // reorders. `current_index` and the `limit_index` stored in
+        // `CheckRateLimit` tasks are direct indices into `limits`, so
+        // dequeue's `limit_index + 1` continuation lands on the next entry.
+        // Clients are responsible for ordering their limits such that a
+        // tighter `Concurrency` limit precedes any `FloatingConcurrency` that
+        // would otherwise grant a leasable slot bypassing it.
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
         let current_task_id = task_id.to_string();
@@ -576,7 +557,7 @@ impl JobStoreShard {
                 return Ok(());
             }
 
-            match &limits[order[current_index]] {
+            match &limits[current_index] {
                 Limit::Concurrency(cl) => {
                     // Try immediate grant for concurrency limits
                     let outcome = self
