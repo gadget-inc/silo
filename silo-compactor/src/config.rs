@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 
-use crate::compaction_filter::DEFAULT_RETENTION_SECS;
 use crate::storage::Backend;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -17,8 +16,6 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     #[serde(default, deserialize_with = "deserialize_compactor_options")]
     pub compactor_options: Option<slatedb::config::CompactorOptions>,
-    #[serde(default)]
-    pub compaction_filter: CompactionFilterConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
 }
@@ -49,58 +46,10 @@ fn default_metrics_addr() -> String {
     "0.0.0.0:9090".into()
 }
 
-/// Compaction filter selection. Defaults to [`CompactionFilterConfig::None`]
-/// so existing deployments keep current behavior after the upgrade.
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CompactionFilterConfig {
-    #[default]
-    None,
-    /// Delete terminal (Succeeded/Failed/Cancelled) job data older than
-    /// `retention_secs`. Defaults to 7 days.
-    CompletedJobs {
-        #[serde(default = "default_completed_jobs_retention_secs")]
-        retention_secs: u64,
-        /// Soft cap on the in-memory `(tenant, job_id)` set built by
-        /// pre-scanning IDX_STATUS_TIME. When unset, falls back to
-        /// `compaction_filter::DEFAULT_EXPIRED_SET_MAX_ENTRIES`. Set to
-        /// `0` to disable the pre-scan and use per-row point reads
-        /// exclusively.
-        #[serde(default)]
-        expired_set_max_entries: Option<usize>,
-    },
-}
-
-fn default_completed_jobs_retention_secs() -> u64 {
-    DEFAULT_RETENTION_SECS
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct StorageConfig {
     pub backend: Backend,
     /// Path with `%shard%` placeholder, replaced by the shard UUID at runtime.
-    pub path: String,
-    /// Optional separate WAL object store, mirroring silo's `[database.wal]`.
-    /// Required whenever silo opens the same shards with split WAL configured:
-    /// the per-job `DbReader` opened by the `completed_jobs` compaction filter
-    /// otherwise fails with "wal store reconfiguration unsupported" because
-    /// slatedb's V1 manifest records that the DB was created with a separate
-    /// WAL store.
-    ///
-    /// The compactor never reads or writes WAL contents — only SSTs in the
-    /// main store — so the path here only needs to satisfy slatedb's
-    /// flag-level check. When silo's WAL lives on a per-pod local disk the
-    /// compactor pod can't reach (e.g. `fs:///var/silo/wal-%shard%`), point
-    /// this at any reachable backend (`backend = "memory"` is fine).
-    #[serde(default)]
-    pub wal: Option<WalStorageConfig>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct WalStorageConfig {
-    pub backend: Backend,
-    /// Path with `%shard%` placeholder, replaced by the shard UUID at runtime.
-    /// Same shape as `[storage].path`.
     pub path: String,
 }
 
@@ -341,47 +290,8 @@ mod tests {
         assert_eq!(cfg.coordinator.rebalance_interval, Duration::from_secs(30));
         assert_eq!(cfg.coordinator.mode, CoordinatorMode::K8sDeployment);
         assert!(cfg.compactor_options.is_none());
-        assert_eq!(cfg.compaction_filter, CompactionFilterConfig::None);
         assert!(cfg.metrics.enabled);
         assert_eq!(cfg.metrics.addr, "0.0.0.0:9090");
-    }
-
-    #[test]
-    fn parses_storage_wal_block() {
-        let toml_str = r#"
-            [storage]
-            backend = "gcs"
-            path = "gs://bucket/silo/%shard%"
-
-            [storage.wal]
-            backend = "memory"
-            path = "memory://wal/%shard%"
-
-            [shard_discovery]
-            backend = "etcd"
-            cluster_prefix = "silo-dev"
-            etcd_endpoints = ["http://127.0.0.1:2379"]
-        "#;
-        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
-        let wal = cfg.storage.wal.expect("wal block parsed");
-        assert_eq!(wal.backend, Backend::Memory);
-        assert_eq!(wal.path, "memory://wal/%shard%");
-    }
-
-    #[test]
-    fn storage_wal_defaults_to_none() {
-        let toml_str = r#"
-            [storage]
-            backend = "fs"
-            path = "/tmp/silo/%shard%"
-
-            [shard_discovery]
-            backend = "etcd"
-            cluster_prefix = "silo-dev"
-            etcd_endpoints = ["http://127.0.0.1:2379"]
-        "#;
-        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
-        assert!(cfg.storage.wal.is_none());
     }
 
     #[test]
@@ -403,81 +313,6 @@ mod tests {
         let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
         assert!(!cfg.metrics.enabled);
         assert_eq!(cfg.metrics.addr, "127.0.0.1:9091");
-    }
-
-    #[test]
-    fn parses_completed_jobs_filter_with_retention() {
-        let toml_str = r#"
-            [storage]
-            backend = "memory"
-            path = "memory://x/%shard%"
-
-            [shard_discovery]
-            backend = "etcd"
-            cluster_prefix = "silo-dev"
-
-            [compaction_filter]
-            kind = "completed_jobs"
-            retention_secs = 900
-        "#;
-        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(
-            cfg.compaction_filter,
-            CompactionFilterConfig::CompletedJobs {
-                retention_secs: 900,
-                expired_set_max_entries: None,
-            }
-        );
-    }
-
-    #[test]
-    fn completed_jobs_filter_defaults_to_seven_days() {
-        let toml_str = r#"
-            [storage]
-            backend = "memory"
-            path = "memory://x/%shard%"
-
-            [shard_discovery]
-            backend = "etcd"
-            cluster_prefix = "silo-dev"
-
-            [compaction_filter]
-            kind = "completed_jobs"
-        "#;
-        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(
-            cfg.compaction_filter,
-            CompactionFilterConfig::CompletedJobs {
-                retention_secs: DEFAULT_RETENTION_SECS,
-                expired_set_max_entries: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_completed_jobs_filter_with_expired_set_cap() {
-        let toml_str = r#"
-            [storage]
-            backend = "memory"
-            path = "memory://x/%shard%"
-
-            [shard_discovery]
-            backend = "etcd"
-            cluster_prefix = "silo-dev"
-
-            [compaction_filter]
-            kind = "completed_jobs"
-            retention_secs = 900
-            expired_set_max_entries = 500_000
-        "#;
-        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(
-            cfg.compaction_filter,
-            CompactionFilterConfig::CompletedJobs {
-                retention_secs: 900,
-                expired_set_max_entries: Some(500_000),
-            }
-        );
     }
 
     #[test]
