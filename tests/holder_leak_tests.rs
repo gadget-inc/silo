@@ -1590,8 +1590,16 @@ async fn dropped_dequeue_future_skips_inmemory_holder_release_and_wedges_queue()
         .await
         .expect("enqueue");
 
-    assert_eq!(count_concurrency_holders(shard.db()).await, 1, "durable holder at enqueue");
-    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1, "in-memory holder at enqueue");
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "durable holder at enqueue"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        1,
+        "in-memory holder at enqueue"
+    );
 
     // The job_info row disappears before the worker dequeues (migration / cleanup
     // race / partial restore). `handle_run_attempt` will take the missing-job
@@ -1649,7 +1657,10 @@ async fn dropped_dequeue_future_skips_inmemory_holder_release_and_wedges_queue()
     // read here may be 0 (reconciler already ran) or 1 (still queued).
     // Either is correct as long as the queue un-wedges before the
     // recovery dequeue loop below times out.
-    assert_eq!(durable, 0, "durable holder should be deleted by the committed batch");
+    assert_eq!(
+        durable, 0,
+        "durable holder should be deleted by the committed batch"
+    );
 
     // The slot must not stay wedged: a fresh Concurrency(max=1) job on the
     // same queue must be grantable once the reconciler has released the
@@ -1671,7 +1682,10 @@ async fn dropped_dequeue_future_skips_inmemory_holder_release_and_wedges_queue()
 
     let mut job2_leased = false;
     for _ in 0..50 {
-        let res = shard.dequeue("w2", task_group, 1).await.expect("dequeue job2");
+        let res = shard
+            .dequeue("w2", task_group, 1)
+            .await
+            .expect("dequeue job2");
         if !res.tasks.is_empty() {
             job2_leased = true;
             break;
@@ -1751,7 +1765,12 @@ async fn reconcile_pending_holders_four_quadrants() {
     shard.concurrency_insert_holder(tenant, queue, "task-ghost");
 
     // Enqueue all four for reconciliation.
-    for tid in ["task-both", "task-neither", "task-durable-only", "task-ghost"] {
+    for tid in [
+        "task-both",
+        "task-neither",
+        "task-durable-only",
+        "task-ghost",
+    ] {
         shard.request_concurrency_reconciliation(
             tenant.to_string(),
             queue.to_string(),

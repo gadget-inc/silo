@@ -1167,11 +1167,7 @@ impl ConcurrencyManager {
     ///
     /// On a transient DB error, the failing tuple is re-queued so the next
     /// tick (or sub-tick wake) retries it.
-    pub async fn reconcile_pending_holders(
-        &self,
-        db: &Arc<InstrumentedDb>,
-        range: &ShardRange,
-    ) {
+    pub async fn reconcile_pending_holders(&self, db: &Arc<InstrumentedDb>, range: &ShardRange) {
         let pending = self.counts.drain_pending_reconciliations();
         if pending.is_empty() {
             return;
@@ -1181,10 +1177,7 @@ impl ConcurrencyManager {
         // per pass.
         let mut by_queue: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
         for (tenant, queue, task_id) in pending {
-            by_queue
-                .entry((tenant, queue))
-                .or_default()
-                .push(task_id);
+            by_queue.entry((tenant, queue)).or_default().push(task_id);
         }
 
         for ((tenant, queue), task_ids) in by_queue {
@@ -1225,11 +1218,8 @@ impl ConcurrencyManager {
                             task_id = %task_id,
                             "reconciler: durable lookup failed; re-queueing"
                         );
-                        self.counts.enqueue_reconciliation(
-                            tenant.clone(),
-                            queue.clone(),
-                            task_id,
-                        );
+                        self.counts
+                            .enqueue_reconciliation(tenant.clone(), queue.clone(), task_id);
                         continue;
                     }
                 };

@@ -4,6 +4,7 @@ use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 
 use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_holder, encode_lease};
+use crate::concurrency::ConcurrencyManager;
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
@@ -14,7 +15,6 @@ use crate::keys::{
     attempt_key, concurrency_holder_key, job_info_key, job_status_key, leased_task_key,
     parse_task_key,
 };
-use crate::concurrency::ConcurrencyManager;
 use crate::shard_range::ShardRange;
 use crate::task::{
     DEFAULT_LEASE_MS, HolderRecord, LeaseRecord, LeasedRefreshTask, LeasedTask, Task,
@@ -245,7 +245,10 @@ impl<'a> PendingHolderReleaseGuard<'a> {
     /// commit-success path so the dequeue body runs the existing
     /// `atomic_release` + `request_grant` loop itself.
     fn take_all(&mut self) -> Vec<(String, String, String)> {
-        self.pending.as_mut().map(std::mem::take).unwrap_or_default()
+        self.pending
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Neutralize the guard. Used at terminal exit paths (commit-failure /
