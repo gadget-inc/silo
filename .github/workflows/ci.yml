@@ -332,7 +332,7 @@ jobs:
             runner: blacksmith-8vcpu-ubuntu-2404
             nix_system: x86_64-linux
           - platform: arm64
-            runner: blacksmith-16vcpu-ubuntu-2404-arm
+            runner: blacksmith-32vcpu-ubuntu-2404-arm
             nix_system: aarch64-linux
     runs-on: ${{ matrix.runner }}
     permissions:
