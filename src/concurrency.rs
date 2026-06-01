@@ -1167,11 +1167,21 @@ impl ConcurrencyManager {
     ///
     /// On a transient DB error, the failing tuple is re-queued so the next
     /// tick (or sub-tick wake) retries it.
-    pub async fn reconcile_pending_holders(&self, db: &Arc<InstrumentedDb>, range: &ShardRange) {
+    /// Reconcile each pending `(tenant, queue, task_id)` against its durable
+    /// holder row. Returns `true` if any tuple had to be re-queued (hydrate
+    /// or per-task `db.get` returned an error), so the caller knows to
+    /// schedule a retry — see `spawn_holder_reconcile_task` for the
+    /// backoff-and-renotify loop that consumes this signal.
+    pub async fn reconcile_pending_holders(
+        &self,
+        db: &Arc<InstrumentedDb>,
+        range: &ShardRange,
+    ) -> bool {
         let pending = self.counts.drain_pending_reconciliations();
         if pending.is_empty() {
-            return;
+            return false;
         }
+        let mut requeued = false;
 
         // Group by (tenant, queue) so each queue is hydrated at most once
         // per pass.
@@ -1202,6 +1212,7 @@ impl ConcurrencyManager {
                     self.counts
                         .enqueue_reconciliation(tenant.clone(), queue.clone(), tid);
                 }
+                requeued = true;
                 continue;
             }
 
@@ -1220,6 +1231,7 @@ impl ConcurrencyManager {
                         );
                         self.counts
                             .enqueue_reconciliation(tenant.clone(), queue.clone(), task_id);
+                        requeued = true;
                         continue;
                     }
                 };
@@ -1272,6 +1284,8 @@ impl ConcurrencyManager {
                 "reconciler: pending_reconciliations growing — backlog suggests stuck reconciler"
             );
         }
+
+        requeued
     }
 
     /// Walk every hydrated (tenant, queue) in this shard, compare the

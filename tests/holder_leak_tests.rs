@@ -16,6 +16,13 @@ use silo::task::{GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 use test_helpers::*;
 
+fn conc_limit(queue: &str, max: u32) -> Limit {
+    Limit::Concurrency(ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: max,
+    })
+}
+
 fn fc_limit(queue: &str, default_max: u32) -> Limit {
     Limit::FloatingConcurrency(FloatingConcurrencyLimit {
         key: queue.to_string(),
