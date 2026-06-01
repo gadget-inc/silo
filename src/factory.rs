@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use futures::TryStreamExt;
 use slatedb::object_store::ObjectStore;
+use slatedb::object_store::ObjectStoreExt;
 use slatedb::object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 use std::sync::Arc;

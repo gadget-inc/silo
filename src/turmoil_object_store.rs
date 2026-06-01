@@ -18,9 +18,9 @@ use futures::stream::BoxStream;
 use rand::Rng;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
-    Attributes, Error as ObjectStoreError, GetOptions, GetRange, GetResult, GetResultPayload,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as ObjectStoreResult, UploadPart,
+    Attributes, CopyMode, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange, GetResult,
+    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, UploadPart,
 };
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -225,25 +225,39 @@ impl ObjectStore for TurmoilObjectStore {
         })
     }
 
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        // Simulate network latency for delete operations (1-3ms)
-        simulate_latency(1, 3).await;
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        let root = self.root.clone();
+        locations
+            .map(move |location| {
+                let root = root.clone();
+                async move {
+                    let location = location?;
 
-        let full_path = self.full_path(location);
+                    // Simulate network latency for delete operations (1-3ms)
+                    simulate_latency(1, 3).await;
 
-        let removed = get_shared_storage().lock().unwrap().remove(&full_path);
+                    let full_path = root.join(location.as_ref());
 
-        if removed.is_none() {
-            return Err(ObjectStoreError::NotFound {
-                path: location.to_string(),
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "file not found",
-                )),
-            });
-        }
+                    let removed = get_shared_storage().lock().unwrap().remove(&full_path);
 
-        Ok(())
+                    if removed.is_none() {
+                        return Err(ObjectStoreError::NotFound {
+                            path: location.to_string(),
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "file not found",
+                            )),
+                        });
+                    }
+
+                    Ok(location)
+                }
+            })
+            .buffered(10)
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -365,26 +379,43 @@ impl ObjectStore for TurmoilObjectStore {
         })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
         // Simulate network latency for copy operations (1-5ms)
         simulate_latency(1, 5).await;
 
         let from_path = self.full_path(from);
         let to_path = self.full_path(to);
 
-        let entry = {
-            let storage = get_shared_storage().lock().unwrap();
-            storage
-                .get(&from_path)
-                .cloned()
-                .ok_or_else(|| ObjectStoreError::NotFound {
-                    path: from.to_string(),
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "source file not found",
-                    )),
-                })?
-        };
+        // Hold the lock across the whole operation so the precondition check and
+        // the write are atomic (matches real object stores' copy semantics).
+        let mut storage = get_shared_storage().lock().unwrap();
+
+        // CopyMode::Create requires that the destination does not already exist.
+        if options.mode == CopyMode::Create && storage.contains_key(&to_path) {
+            return Err(ObjectStoreError::AlreadyExists {
+                path: to.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination already exists",
+                )),
+            });
+        }
+
+        let entry = storage
+            .get(&from_path)
+            .cloned()
+            .ok_or_else(|| ObjectStoreError::NotFound {
+                path: from.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "source file not found",
+                )),
+            })?;
 
         // Update timestamp for the copy
         let new_entry = StorageEntry {
@@ -392,32 +423,9 @@ impl ObjectStore for TurmoilObjectStore {
             last_modified: current_time(),
         };
 
-        get_shared_storage()
-            .lock()
-            .unwrap()
-            .insert(to_path, new_entry);
+        storage.insert(to_path, new_entry);
 
         Ok(())
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        let to_path = self.full_path(to);
-
-        // Check if destination exists
-        {
-            let storage = get_shared_storage().lock().unwrap();
-            if storage.contains_key(&to_path) {
-                return Err(ObjectStoreError::AlreadyExists {
-                    path: to.to_string(),
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "destination already exists",
-                    )),
-                });
-            }
-        }
-
-        self.copy(from, to).await
     }
 }
 
@@ -475,6 +483,7 @@ impl MultipartUpload for TurmoilMultipartUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slatedb::object_store::ObjectStoreExt;
 
     #[tokio::test]
     async fn test_basic_put_get() {
