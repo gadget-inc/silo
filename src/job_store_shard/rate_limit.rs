@@ -1,19 +1,26 @@
 //! Rate limit checking operations via Gubernator.
 
-use uuid::Uuid;
-
 use crate::gubernator::{GubernatorError, RateLimitResult};
 use crate::job_store_shard::helpers::{WriteBatcher, put_task};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::task::{GubernatorRateLimitData, Task};
 
 impl JobStoreShard {
-    /// Schedule a rate limit check retry task
+    /// Schedule a rate limit check retry task.
+    ///
+    /// `task_id` is the chain's continuing task_id (carried from the
+    /// CheckRateLimit being retried). It MUST be reused — not regenerated —
+    /// because every prior holder this chain accumulated is keyed by that
+    /// task_id. Allocating a fresh UUID here orphans those holders: the
+    /// terminal RunAttempt later writes under the new id, the worker's
+    /// completion releases holders under the new id, and the original
+    /// holders are never reachable again.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule_rate_limit_retry<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
+        task_id: &str,
         job_id: &str,
         attempt_number: u32,
         relative_attempt_number: u32,
@@ -24,10 +31,13 @@ impl JobStoreShard {
         priority: u8,
         held_queues: &[String],
         retry_at_ms: i64,
+        parent_start_time_ms: i64,
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
+        let task_key_start_ms =
+            rate_limit_retry_task_key_start_ms(retry_at_ms, parent_start_time_ms);
         let retry_task = Task::CheckRateLimit {
-            task_id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
             tenant: tenant.to_string(),
             job_id: job_id.to_string(),
             attempt_number,
@@ -43,7 +53,7 @@ impl JobStoreShard {
         put_task(
             writer,
             task_group,
-            retry_at_ms,
+            task_key_start_ms,
             priority,
             job_id,
             attempt_number,
@@ -96,5 +106,64 @@ impl JobStoreShard {
         let capped = backoff.min(rate_limit.retry_max_backoff_ms);
 
         now_ms + capped
+    }
+}
+
+/// Compute the `task_key_start_ms` for a rate-limit retry given the
+/// caller's requested `retry_at_ms` and the parent CheckRateLimit's
+/// `start_time_ms` (the value baked into the just-tombstoned task_key).
+///
+/// `handle_check_rate_limit` ack-deletes the parent CheckRateLimit's
+/// task_key, which installs a broker tombstone keyed by
+/// `(task_group, parent_start_time_ms, priority, job_id, attempt_number)`.
+/// All other components of the retry's task_key are identical to the
+/// parent's; the only differentiator is `start_time_ms`. If
+/// `retry_at_ms == parent_start_time_ms` — possible with zero/near-zero
+/// backoff, or with `reset_time_ms == parent.start_time_ms` — the retry
+/// write would land on the tombstoned key and be silently suppressed,
+/// stalling the chain and stranding every `held_queues` entry. Bumping
+/// past the parent by one millisecond costs nothing on the broker's
+/// dispatch ordering and makes the dodge unconditional.
+///
+/// Extracted as a free function so the invariant can be unit-tested
+/// without spinning up a `JobStoreShard`.
+pub(crate) fn rate_limit_retry_task_key_start_ms(
+    retry_at_ms: i64,
+    parent_start_time_ms: i64,
+) -> i64 {
+    retry_at_ms.max(parent_start_time_ms + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rate_limit_retry_task_key_start_ms;
+
+    #[test]
+    fn equal_retry_and_parent_bumps_by_one() {
+        // The exact collision case: zero backoff with the dequeue happening
+        // in the same millisecond as the parent's start_time_ms.
+        assert_eq!(rate_limit_retry_task_key_start_ms(100, 100), 101);
+    }
+
+    #[test]
+    fn retry_before_parent_jumps_to_parent_plus_one() {
+        // Clock skew or a Gubernator reset_time pointing at an earlier
+        // millisecond than the parent's start. Still must dodge the
+        // tombstone.
+        assert_eq!(rate_limit_retry_task_key_start_ms(50, 100), 101);
+    }
+
+    #[test]
+    fn retry_strictly_after_parent_is_unchanged() {
+        // The common case: backoff > 0 carries retry_at_ms past the parent.
+        // No bump needed.
+        assert_eq!(rate_limit_retry_task_key_start_ms(200, 100), 200);
+    }
+
+    #[test]
+    fn retry_one_past_parent_is_unchanged() {
+        // Boundary: retry_at_ms is exactly parent + 1. The `max` returns
+        // retry_at_ms unchanged; no double-bump.
+        assert_eq!(rate_limit_retry_task_key_start_ms(101, 100), 101);
     }
 }

@@ -346,57 +346,6 @@ impl JobView {
 
     /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)
     pub fn limits(&self) -> Vec<Limit> {
-        self.fb()
-            .limits()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| match entry.variant_type() {
-                        fb::LimitVariant::ConcurrencyLimitEntry => {
-                            let cl = entry.variant_as_concurrency_limit_entry()?;
-                            Some(Limit::Concurrency(ConcurrencyLimit {
-                                key: cl.key().unwrap_or_default().to_string(),
-                                max_concurrency: cl.max_concurrency(),
-                            }))
-                        }
-                        fb::LimitVariant::RateLimitEntry => {
-                            let rl = entry.variant_as_rate_limit_entry()?;
-                            let rp = rl.retry_policy();
-                            Some(Limit::RateLimit(GubernatorRateLimit {
-                                name: rl.name().unwrap_or_default().to_string(),
-                                unique_key: rl.unique_key().unwrap_or_default().to_string(),
-                                limit: rl.limit(),
-                                duration_ms: rl.duration_ms(),
-                                hits: rl.hits(),
-                                algorithm: if rl.algorithm() == 1 {
-                                    GubernatorAlgorithm::LeakyBucket
-                                } else {
-                                    GubernatorAlgorithm::TokenBucket
-                                },
-                                behavior: rl.behavior(),
-                                retry_policy: rp
-                                    .map(|p| RateLimitRetryPolicy {
-                                        initial_backoff_ms: p.initial_backoff_ms(),
-                                        max_backoff_ms: p.max_backoff_ms(),
-                                        backoff_multiplier: p.backoff_multiplier(),
-                                        max_retries: p.max_retries(),
-                                    })
-                                    .unwrap_or_default(),
-                            }))
-                        }
-                        fb::LimitVariant::FloatingConcurrencyLimitEntry => {
-                            let fl = entry.variant_as_floating_concurrency_limit_entry()?;
-                            Some(Limit::FloatingConcurrency(FloatingConcurrencyLimit {
-                                key: fl.key().unwrap_or_default().to_string(),
-                                default_max_concurrency: fl.default_max_concurrency(),
-                                refresh_interval_ms: fl.refresh_interval_ms(),
-                                metadata: fb_kv_pairs_to_owned(fl.metadata()),
-                            }))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        crate::codec::limit_entries_to_owned(self.fb().limits())
     }
 }

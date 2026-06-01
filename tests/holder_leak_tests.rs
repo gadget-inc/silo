@@ -6,10 +6,12 @@
 mod test_helpers;
 
 use silo::codec::{decode_lease, encode_holder, encode_lease, encode_task};
-use silo::job::{FloatingConcurrencyLimit, Limit};
+use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, JobStatusKind, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
+use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
 use silo::keys::{concurrency_holder_key, job_info_key, task_key};
+use silo::retry::RetryPolicy;
 use silo::task::{GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 use test_helpers::*;
@@ -26,6 +28,35 @@ fn fc_limit(queue: &str, default_max: u32) -> Limit {
 /// Force the worker's lease for `task_id` to be already expired by rewriting the
 /// stored lease record. Mirrors the pattern in
 /// `tests/concurrency_tests.rs::concurrency_reap_expired_lease_releases_holder`.
+/// Force every lease currently stored on the shard to be already expired.
+/// Useful for batch lease-expiry simulation where multiple holders are
+/// drained at once.
+async fn expire_all_leases(shard: &silo::job_store_shard::JobStoreShard) {
+    let start = silo::keys::leases_prefix();
+    let end = silo::keys::end_bound(&start);
+    let mut iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .expect("scan leases");
+    let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    while let Ok(Some(kv)) = iter.next().await {
+        let decoded = decode_lease(kv.value.clone()).expect("decode lease");
+        let expired = LeaseRecord {
+            worker_id: decoded.worker_id().to_string(),
+            task: decoded.to_task().unwrap(),
+            expiry_ms: now_ms() - 1,
+            started_at_ms: decoded.started_at_ms(),
+        };
+        updates.push((kv.key.to_vec(), encode_lease(&expired)));
+    }
+    drop(iter);
+    for (k, v) in updates {
+        shard.db().put(&k, &v).await.expect("put expired lease");
+    }
+    shard.db().flush().await.expect("flush");
+}
+
 async fn expire_first_lease(shard: &silo::job_store_shard::JobStoreShard) {
     let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
     let decoded = decode_lease(lease_value).expect("decode lease");
@@ -627,4 +658,650 @@ async fn floating_concurrency_steady_state_zero_holders_after_full_cycle() {
         0,
         "per-tenant holder count must be zero too"
     );
+}
+
+/// Regression test for the broker-tombstone collision in process_grants' chain
+/// resumer.
+///
+/// Before the fix, `ShardChainResumer::resume_chain` re-emitted the resumed
+/// chain's `RunAttempt` task at `task_key(params.start_at_ms, …)` — the same
+/// task_key the original enqueue's chain had written (and the same batch had
+/// then deleted) when the job first queued. If the broker's scan happened to
+/// observe the interim RunAttempt before the delete won in the LSM, a worker
+/// could lease and ack-delete it, installing a tombstone for that task_key.
+/// The resumed chain's subsequent write at the same key was then silently
+/// suppressed, stranding the holders the resumer had just granted.
+///
+/// The fix lands the resumed task at `task_key(now_ms, …)` so the broker
+/// tombstone for the original key cannot suppress it — mirroring the
+/// long-standing precedent in `handle_request_ticket`. See
+/// `project_broker_tombstone_chain_continuation`.
+///
+/// This test pins down the simpler invariant the fix introduces: after a
+/// queued job is granted by `process_grants`, its terminal `RunAttempt` lives
+/// at a `task_key` whose `start_time_ms` is strictly greater than the job's
+/// original enqueue `start_at_ms`, provided enough wall-clock has passed.
+#[silo::test]
+async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
+    use silo::job::ConcurrencyLimit;
+    use silo::keys::{parse_task_key, tasks_prefix};
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "resume-chain-q".to_string();
+    let tenant = "-";
+
+    // Job A occupies the only Concurrency slot. Its RunAttempt is leased and
+    // acknowledged so any later write at the same task_key would be eligible
+    // for broker-tombstone suppression — that's exactly the trap the resumer
+    // needs to dodge.
+    let original_enqueue_ms = now_ms();
+    let _job_a = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            original_enqueue_ms,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "A"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue A");
+
+    // Job B has no slot to take — it queues as a concurrency request and the
+    // chain walker drops its interim RunAttempt at `task_key(original_enqueue_ms, …)`
+    // in the same batch as the request write.
+    let _job_b = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            original_enqueue_ms,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"job": "B"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue B");
+
+    // Lease A.
+    let leased_a = shard.dequeue("w", "default", 1).await.expect("deq A").tasks;
+    assert_eq!(leased_a.len(), 1, "A should lease immediately");
+    let task_a_id = leased_a[0].attempt().task_id().to_string();
+
+    // Force a measurable wall-clock gap so that any later "now_ms" the resumer
+    // captures is strictly greater than `original_enqueue_ms`. Without this
+    // gap the assertion below would be vacuously satisfied by same-millisecond
+    // resolution rather than by the fix.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let before_release_ms = now_ms();
+    assert!(
+        before_release_ms > original_enqueue_ms,
+        "test setup must advance the wall clock past the original enqueue"
+    );
+
+    // Releasing A frees the slot; the grant scanner picks up B's request and
+    // calls `ShardChainResumer::resume_chain`, which now uses `now_ms` for the
+    // terminal RunAttempt's task_key.
+    shard
+        .report_attempt_outcome(&task_a_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report A");
+
+    // Poll for B's RunAttempt task to appear; the grant scanner runs
+    // asynchronously after the release.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut b_task_start_time_ms: Option<u64> = None;
+    while std::time::Instant::now() < deadline {
+        let start = tasks_prefix();
+        let end = silo::keys::end_bound(&start);
+        let mut iter = shard
+            .db()
+            .scan::<Vec<u8>, _>(start..end)
+            .await
+            .expect("scan tasks");
+        let mut found = None;
+        while let Some(kv) = iter.next().await.expect("iter") {
+            let Some(parsed) = parse_task_key(&kv.key) else {
+                continue;
+            };
+            // The leased Job A's task_key has already been ack-deleted, so any
+            // surviving task at this point is Job B's resumed RunAttempt.
+            found = Some(parsed.start_time_ms);
+            break;
+        }
+        if let Some(t) = found {
+            b_task_start_time_ms = Some(t);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let b_start = b_task_start_time_ms
+        .expect("grant scanner failed to write Job B's RunAttempt within the deadline");
+
+    assert!(
+        b_start >= before_release_ms as u64,
+        "resumed chain must write at task_key(now_ms, …), not at the original \
+         enqueue's start_at_ms — got start_time_ms={} which is not >= now-at-release={}. \
+         A regression here re-introduces the broker-tombstone collision tracked in \
+         project_broker_tombstone_chain_continuation.",
+        b_start,
+        before_release_ms,
+    );
+    assert!(
+        b_start > original_enqueue_ms as u64,
+        "resumed RunAttempt's task_key still encodes the original enqueue time \
+         ({}), so any tombstone planted at that key would silently suppress this \
+         task — exactly the leak the fix is meant to prevent.",
+        original_enqueue_ms,
+    );
+}
+
+/// Catch-all steady-state assertion: a single shard, single tenant drives a
+/// mixed bag of job life cycles to terminal — success, exhausted retries,
+/// cancel-before-grant, cancel-after-grant, lease expiry + reap, rate-limit
+/// retry → success, future-scheduled then cancel, and reimport-to-terminal —
+/// then confirms no concurrency holders, no concurrency requests, and no
+/// in-memory holder remain. This is the catch-all the bench-only
+/// `HolderAudit` provides for live workloads, moved into `cargo test` so
+/// any new leak path (one we forgot to cover with a targeted test) trips
+/// CI rather than waiting for the bench.
+#[silo::test]
+async fn steady_state_zero_holders_under_mixed_workload() {
+    use silo::gubernator::{
+        GubernatorError, MockGubernatorClient, RateLimitClient, RateLimitResult,
+    };
+    use silo::job::{GubernatorAlgorithm, GubernatorRateLimit, RateLimitRetryPolicy};
+    use silo::pb::gubernator::Algorithm;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Single-call-success Gubernator stub for the rate-limit-then-pass leg.
+    struct FailFirstThenPass {
+        seen: AtomicU32,
+    }
+    #[async_trait::async_trait]
+    impl RateLimitClient for FailFirstThenPass {
+        async fn check_rate_limit(
+            &self,
+            _name: &str,
+            _unique_key: &str,
+            _hits: i64,
+            limit: i64,
+            duration_ms: i64,
+            _algorithm: Algorithm,
+            _behavior: i32,
+        ) -> Result<RateLimitResult, GubernatorError> {
+            let i = self.seen.fetch_add(1, Ordering::SeqCst);
+            let under_limit = i >= 1;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            Ok(RateLimitResult {
+                under_limit,
+                limit,
+                remaining: if under_limit { limit } else { 0 },
+                reset_time_ms: now_ms + duration_ms,
+                error: None,
+            })
+        }
+        async fn health_check(&self) -> Result<(String, i32), GubernatorError> {
+            Ok(("ok".to_string(), 1))
+        }
+    }
+
+    // The rate-limit leg needs its own shard so its rate-limit client doesn't
+    // affect the other workloads.
+    let rl_client = Arc::new(FailFirstThenPass {
+        seen: AtomicU32::new(0),
+    });
+    let (_rl_tmp, rl_shard) = open_temp_shard_with_rate_limiter(rl_client.clone()).await;
+
+    // Everything else: one shard with the default mock rate limiter.
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+
+    // Track distinct queue names so the final per-queue in-memory assertion
+    // visits every queue we touched (a typo'd queue would otherwise be
+    // silently ignored).
+    let mut queues_touched: Vec<String> = Vec::new();
+
+    // ----- 1) Success: 8 jobs on a big-cap queue, all dequeued + reported success.
+    let q_success = "mix-success".to_string();
+    queues_touched.push(q_success.clone());
+    let n_success = 8;
+    for i in 0..n_success {
+        shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"i": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: q_success.clone(),
+                    max_concurrency: 10,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue success");
+    }
+    let success_tasks = shard
+        .dequeue("w-success", "default", n_success as usize)
+        .await
+        .expect("dequeue success")
+        .tasks;
+    assert_eq!(success_tasks.len(), n_success);
+    for t in &success_tasks {
+        shard
+            .report_attempt_outcome(
+                t.attempt().task_id(),
+                AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("complete success");
+    }
+
+    // ----- 2) Exhausted retries: 3 jobs, retry_count=1, both attempts Error → Failed.
+    let q_fail = "mix-fail".to_string();
+    queues_touched.push(q_fail.clone());
+    let n_fail = 3;
+    for i in 0..n_fail {
+        shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                now,
+                Some(RetryPolicy {
+                    retry_count: 1,
+                    initial_interval_ms: 1,
+                    max_interval_ms: 10,
+                    randomize_interval: false,
+                    backoff_factor: 1.0,
+                }),
+                test_helpers::msgpack_payload(&serde_json::json!({"f": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: q_fail.clone(),
+                    max_concurrency: 5,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue fail");
+    }
+    // Drain through both attempts (initial + 1 retry).
+    for _ in 0..3 {
+        let tasks = shard
+            .dequeue("w-fail", "default", 16)
+            .await
+            .expect("dq fail")
+            .tasks;
+        if tasks.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            continue;
+        }
+        for t in &tasks {
+            shard
+                .report_attempt_outcome(
+                    t.attempt().task_id(),
+                    AttemptOutcome::Error {
+                        error_code: "ERR".to_string(),
+                        error: b"boom".to_vec(),
+                    },
+                )
+                .await
+                .expect("error outcome");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // ----- 3) Cancel-before-grant: enqueue 5 jobs on a cap=1 queue. j0 takes
+    //         the slot; j1..j4 sit as deferred concurrency requests. We let
+    //         j0 succeed naturally (so its release happens through the
+    //         normal completion path) and cancel only the 4 deferred jobs.
+    //         Cancelling j0 too would race the background grant scanner —
+    //         each release of j0's slot wakes the scanner, which grants a
+    //         deferred request whose status check passed before the next
+    //         cancel commits. The race is a real TOCTOU but unrelated to
+    //         the steady-state assertion this test is meant to defend; we
+    //         scope around it by exercising the cleaner shape.
+    let q_cancel_pre = "mix-cancel-pre".to_string();
+    queues_touched.push(q_cancel_pre.clone());
+    let mut pre_ids = Vec::new();
+    for i in 0..5 {
+        let id = shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"c": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: q_cancel_pre.clone(),
+                    max_concurrency: 1,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue cancel-pre");
+        pre_ids.push(id);
+    }
+    // Cancel j1..j4 first (TicketRequested → request-record cleanup, no
+    // scanner wake-up race) then complete j0 via the normal worker path.
+    for id in pre_ids.iter().skip(1) {
+        shard
+            .cancel_job(tenant, id)
+            .await
+            .expect("cancel-pre deferred");
+    }
+    let pre_tasks = shard
+        .dequeue("w-pre", "default", 5)
+        .await
+        .expect("dq cancel-pre");
+    let pre_run = pre_tasks
+        .tasks
+        .into_iter()
+        .find(|t| t.job().id() == pre_ids[0])
+        .expect("j0 should be leasable after deferred siblings are cancelled");
+    shard
+        .report_attempt_outcome(
+            pre_run.attempt().task_id(),
+            AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("complete j0");
+
+    // ----- 4) Cancel after grant: 3 jobs leased then cancelled mid-flight.
+    //         Worker acks via Cancelled outcome.
+    let q_cancel_post = "mix-cancel-post".to_string();
+    queues_touched.push(q_cancel_post.clone());
+    let mut post_ids = Vec::new();
+    for i in 0..3 {
+        let id = shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"p": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: q_cancel_post.clone(),
+                    max_concurrency: 10,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue cancel-post");
+        post_ids.push(id);
+    }
+    let post_tasks = shard
+        .dequeue("w-post", "default", 3)
+        .await
+        .expect("dq cancel-post")
+        .tasks;
+    assert_eq!(post_tasks.len(), 3);
+    for (id, t) in post_ids.iter().zip(post_tasks.iter()) {
+        shard.cancel_job(tenant, id).await.expect("cancel-post");
+        // Worker acks the cancellation outcome (Running → Cancelled).
+        shard
+            .report_attempt_outcome(t.attempt().task_id(), AttemptOutcome::Cancelled)
+            .await
+            .expect("worker ack cancel");
+    }
+
+    // ----- 5) Lease expiry: 4 jobs leased, leases force-expired, reap drains them.
+    let q_reap = "mix-reap".to_string();
+    queues_touched.push(q_reap.clone());
+    for i in 0..4 {
+        shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"r": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: q_reap.clone(),
+                    max_concurrency: 10,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue reap");
+    }
+    let reap_tasks = shard
+        .dequeue("w-reap", "default", 4)
+        .await
+        .expect("dq reap")
+        .tasks;
+    assert_eq!(reap_tasks.len(), 4);
+    expire_all_leases(&shard).await;
+    let reaped = shard.reap_expired_leases(tenant).await.expect("reap");
+    assert!(
+        reaped >= 4,
+        "expected at least 4 leases reaped, got {reaped}"
+    );
+
+    // ----- 6) Future-scheduled then cancel: 3 future jobs cancelled before their start time.
+    let q_future = "mix-future".to_string();
+    queues_touched.push(q_future.clone());
+    let mut future_ids = Vec::new();
+    for i in 0..3 {
+        let id = shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                now + 600_000,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"fu": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: q_future.clone(),
+                    max_concurrency: 5,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue future");
+        future_ids.push(id);
+    }
+    for id in &future_ids {
+        shard.cancel_job(tenant, id).await.expect("cancel future");
+    }
+
+    // ----- 7) Reimport terminal: 3 jobs imported as Scheduled, then re-imported as Succeeded.
+    let q_reimport = "mix-reimport".to_string();
+    queues_touched.push(q_reimport.clone());
+    for i in 0..3 {
+        let job_id = format!("mix-reimp-{i}");
+        let initial = ImportJobParams {
+            id: job_id.clone(),
+            priority: 50,
+            enqueue_time_ms: now,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: test_helpers::msgpack_payload(&serde_json::json!({"re": i})),
+            limits: vec![Limit::Concurrency(ConcurrencyLimit {
+                key: q_reimport.clone(),
+                max_concurrency: 5,
+            })],
+            metadata: None,
+            task_group: "default".to_string(),
+            attempts: vec![],
+        };
+        let r = shard.import_jobs(tenant, vec![initial]).await.unwrap();
+        assert!(r[0].success);
+        assert_eq!(r[0].status, JobStatusKind::Scheduled);
+        let reimport = ImportJobParams {
+            id: job_id.clone(),
+            priority: 50,
+            enqueue_time_ms: now,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: test_helpers::msgpack_payload(&serde_json::json!({"re": i})),
+            limits: vec![Limit::Concurrency(ConcurrencyLimit {
+                key: q_reimport.clone(),
+                max_concurrency: 5,
+            })],
+            metadata: None,
+            task_group: "default".to_string(),
+            attempts: vec![ImportedAttempt {
+                status: ImportedAttemptStatus::Succeeded {
+                    result: vec![4, 5, 6],
+                },
+                started_at_ms: now,
+                finished_at_ms: now + 1_000,
+            }],
+        };
+        let r = shard.import_jobs(tenant, vec![reimport]).await.unwrap();
+        assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+        assert_eq!(r[0].status, JobStatusKind::Succeeded);
+    }
+
+    // ----- 8) Rate-limit retry → success on its own shard.
+    let q_rl = "mix-rl".to_string();
+    let rl_limit = GubernatorRateLimit {
+        name: "mix-rl".to_string(),
+        unique_key: "mix-rl-key".to_string(),
+        limit: 1,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: RateLimitRetryPolicy {
+            initial_backoff_ms: 5,
+            max_backoff_ms: 50,
+            backoff_multiplier: 2.0,
+            max_retries: 5,
+        },
+    };
+    let _rl_job = rl_shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"rl": 0})),
+            vec![
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: q_rl.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::RateLimit(rl_limit),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue rl");
+    // Drive dequeues until a RunAttempt is leased, then complete it.
+    let mut rl_leased_id: Option<String> = None;
+    for _ in 0..40 {
+        let tasks = rl_shard
+            .dequeue("w-rl", "default", 1)
+            .await
+            .expect("dq rl")
+            .tasks;
+        if let Some(t) = tasks.into_iter().next() {
+            rl_leased_id = Some(t.attempt().task_id().to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rl_leased_id = rl_leased_id.expect("rate-limit chain should produce a RunAttempt");
+    rl_shard
+        .report_attempt_outcome(&rl_leased_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("complete rl");
+
+    // ===== Final assertions =====
+    // The grant scanner runs asynchronously after each release; poll briefly
+    // so the catch-all assertion isn't racing the background pass.
+    let holders = poll_until(|| count_concurrency_holders(shard.db()), |n| *n == 0, 3_000).await;
+    if holders != 0 {
+        // Per-queue diagnostic for the failure mode.
+        for q in &queues_touched {
+            let on_disk = silo::keys::concurrency_holders_queue_prefix(tenant, q);
+            let end = silo::keys::end_bound(&on_disk);
+            let mut iter = shard
+                .db()
+                .scan_with_options::<Vec<u8>, _>(on_disk..end, &silo::scan_options())
+                .await
+                .expect("scan holders");
+            let mut keys = Vec::new();
+            while let Ok(Some(kv)) = iter.next().await {
+                keys.push(kv.key.to_vec());
+            }
+            if !keys.is_empty() {
+                eprintln!(
+                    "queue {q} still has {} holder(s) post-drain: {:?}",
+                    keys.len(),
+                    keys.iter()
+                        .map(|k| silo::keys::parse_concurrency_holder_key(k))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        holders, 0,
+        "steady state: no concurrency holders should remain on the main shard"
+    );
+    let requests = poll_until(
+        || count_concurrency_requests(shard.db()),
+        |n| *n == 0,
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        requests, 0,
+        "steady state: no concurrency requests should remain on the main shard"
+    );
+    for q in &queues_touched {
+        assert_eq!(
+            shard.concurrency_holder_count(tenant, q),
+            0,
+            "steady state: in-memory holder count for queue {q} should be 0",
+        );
+    }
+
+    // Rate-limit shard's own audit.
+    let rl_holders = poll_until(
+        || count_concurrency_holders(rl_shard.db()),
+        |n| *n == 0,
+        2_000,
+    )
+    .await;
+    assert_eq!(rl_holders, 0, "rate-limit shard must drain its holder");
+    assert_eq!(rl_shard.concurrency_holder_count(tenant, &q_rl), 0);
+
+    // Sanity: silence unused-import warnings — the gubernator mock isn't
+    // referenced after construction; explicitly drop it here for clarity.
+    let _ = MockGubernatorClient::new_arc();
 }

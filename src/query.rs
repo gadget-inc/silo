@@ -2150,7 +2150,7 @@ impl Scan for QueueCountsScanner {
 /// filter by `task_group` and optionally a `start_time_ms` range, which mirrors the
 /// access pattern used by the task broker.
 ///
-/// Schema: shard_id, tenant, task_group, start_time_ms, priority, job_id, attempt, variant_type
+/// Schema: shard_id, tenant, task_group, start_time_ms, priority, job_id, attempt, variant_type, task_id, held_queues
 pub struct TasksScanner {
     pub(crate) shard: Arc<JobStoreShard>,
 }
@@ -2170,6 +2170,8 @@ impl TasksScanner {
             Field::new("job_id", DataType::Utf8, false),
             Field::new("attempt", DataType::UInt32, false),
             Field::new("variant_type", DataType::Utf8, false),
+            Field::new("task_id", DataType::Utf8, false),
+            Field::new("held_queues", DataType::Utf8, false),
         ]))
     }
 }
@@ -2391,6 +2393,8 @@ impl Scan for TasksScanner {
                 let mut job_ids = Vec::with_capacity(target);
                 let mut attempts = Vec::with_capacity(target);
                 let mut variant_types = Vec::with_capacity(target);
+                let mut task_ids = Vec::with_capacity(target);
+                let mut held_queues_strs = Vec::with_capacity(target);
 
                 let mut batch_count: usize = 0;
 
@@ -2438,6 +2442,40 @@ impl Scan for TasksScanner {
                     attempts.push(parsed.attempt);
                     variant_types.push(variant_type_name(decoded.variant_type()).to_string());
 
+                    // Per-variant: pull task_id and (for RunAttempt) the held_queues list.
+                    let (task_id_str, held_str) = match decoded.variant_type() {
+                        crate::fb::silo::fb::TaskVariant::RunAttempt => {
+                            let ra = decoded.as_run_attempt();
+                            let tid = ra.and_then(|r| r.id()).unwrap_or_default().to_string();
+                            let held = ra
+                                .and_then(|r| r.held_queues())
+                                .map(|v| v.iter().collect::<Vec<&str>>().join(","))
+                                .unwrap_or_default();
+                            (tid, held)
+                        }
+                        crate::fb::silo::fb::TaskVariant::RequestTicket => {
+                            let rt = decoded.as_request_ticket();
+                            let tid = rt.and_then(|r| r.task_id()).unwrap_or_default().to_string();
+                            let held = rt
+                                .and_then(|r| r.held_queues())
+                                .map(|v| v.iter().collect::<Vec<&str>>().join(","))
+                                .unwrap_or_default();
+                            (tid, held)
+                        }
+                        crate::fb::silo::fb::TaskVariant::CheckRateLimit => {
+                            let cr = decoded.as_check_rate_limit();
+                            let tid = cr.and_then(|r| r.task_id()).unwrap_or_default().to_string();
+                            let held = cr
+                                .and_then(|r| r.held_queues())
+                                .map(|v| v.iter().collect::<Vec<&str>>().join(","))
+                                .unwrap_or_default();
+                            (tid, held)
+                        }
+                        _ => (String::new(), String::new()),
+                    };
+                    task_ids.push(task_id_str);
+                    held_queues_strs.push(held_str);
+
                     batch_count += 1;
                 }
 
@@ -2473,6 +2511,8 @@ impl Scan for TasksScanner {
                         "job_id" => Arc::new(StringArray::from(job_ids.clone())),
                         "attempt" => Arc::new(UInt32Array::from(attempts.clone())),
                         "variant_type" => Arc::new(StringArray::from(variant_types.clone())),
+                        "task_id" => Arc::new(StringArray::from(task_ids.clone())),
+                        "held_queues" => Arc::new(StringArray::from(held_queues_strs.clone())),
                         other => {
                             let _ = tx
                                 .send(Err(DataFusionError::Execution(format!(

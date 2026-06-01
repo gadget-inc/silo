@@ -1,0 +1,107 @@
+//! Bridge from the grant scanner to the shard's limit-chain walker.
+//!
+//! The grant scanner lives inside `ConcurrencyManager` and cannot directly
+//! reference `JobStoreShard` (the shard owns the manager). This module defines
+//! `ShardChainResumer`, an implementation of [`LimitChainResumer`] that holds a
+//! `Weak<JobStoreShard>` and forwards `resume_chain` calls into
+//! `JobStoreShard::enqueue_limit_task_at_index`, the single canonical chain
+//! walker.
+//!
+//! Installed via `ConcurrencyManager::set_chain_resumer` once during shard
+//! startup; the weak reference is upgraded per call, returning
+//! `ConcurrencyError::ShardShuttingDown` if the shard has been dropped.
+
+use std::sync::{Arc, Weak};
+
+use async_trait::async_trait;
+use slatedb::WriteBatch;
+
+use crate::concurrency::{ConcurrencyError, LimitChainResumer, ResumeChainParams};
+use crate::job_store_shard::helpers::DbWriteBatcher;
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
+
+pub(crate) struct ShardChainResumer {
+    shard: Weak<JobStoreShard>,
+}
+
+impl ShardChainResumer {
+    pub(crate) fn install(shard: &Arc<JobStoreShard>) -> Arc<dyn LimitChainResumer> {
+        Arc::new(Self {
+            shard: Arc::downgrade(shard),
+        })
+    }
+}
+
+#[async_trait]
+impl LimitChainResumer for ShardChainResumer {
+    async fn resume_chain(
+        &self,
+        batch: &mut WriteBatch,
+        params: ResumeChainParams,
+    ) -> Result<Vec<(String, String)>, ConcurrencyError> {
+        let shard = self
+            .shard
+            .upgrade()
+            .ok_or(ConcurrencyError::ShardShuttingDown)?;
+
+        // The full limits list rides on the deferred request/ticket value, so
+        // we never have to round-trip JobInfo here. `now_ms` is threaded
+        // through from the scanner so the `task_key(now_ms, …)` we write
+        // here can't disagree with the `granted_at_ms` the scanner already
+        // baked into this batch.
+        let now_ms = params.now_ms;
+
+        // `scheduled_at_ms` stays honest — the chain's original user-requested
+        // start time — so the future-scheduling check and any persisted
+        // `start_time_ms` on a follow-up request keep their semantics. But
+        // every `task_key` this walk writes lands at `now_ms`: the broker
+        // tombstones any task_key it has ack-deleted, and an LSM scan can
+        // momentarily observe the interim RunAttempt earlier chain steps
+        // wrote at `task_key(scheduled_at_ms, …)` even though that interim is
+        // deleted in the same batch. Once a worker claims and ack-deletes
+        // that key, every later write at the same task_key is silently
+        // suppressed by the tombstone, which strands the holders this
+        // resumer just granted. Mirrors the precedent in
+        // `handle_request_ticket` (dequeue.rs) — see
+        // `project_broker_tombstone_chain_continuation`.
+        //
+        // `now_ms` typically exceeds `params.start_at_ms`, but a granted
+        // request that fires within the same millisecond would write
+        // `task_key(now_ms, …) == task_key(start_at_ms, …)` and collide
+        // with the tombstoned interim. Bump past `start_at_ms` to make the
+        // dodge unconditional. The other key components (task_group,
+        // priority, job_id, attempt_number) are constant within a chain.
+        let task_key_start_ms = now_ms.max(params.start_at_ms + 1);
+        let mut writer = DbWriteBatcher::new(&shard.db, batch);
+        shard
+            .enqueue_limit_task_at_index(
+                &mut writer,
+                LimitTaskParams {
+                    tenant: &params.tenant,
+                    task_id: &params.task_id,
+                    job_id: &params.job_id,
+                    attempt_number: params.attempt_number,
+                    relative_attempt_number: params.relative_attempt_number,
+                    limit_index: params.limit_index as usize,
+                    limits: &params.limits,
+                    priority: params.priority,
+                    scheduled_at_ms: params.start_at_ms,
+                    task_key_start_ms,
+                    now_ms,
+                    held_queues: params.held_queues.clone(),
+                    task_group: &params.task_group,
+                    skip_try_reserve: false,
+                },
+            )
+            .await
+            .map_err(into_concurrency_error)
+    }
+}
+
+fn into_concurrency_error(e: JobStoreShardError) -> ConcurrencyError {
+    match e {
+        JobStoreShardError::Slate(arc) => ConcurrencyError::Slate(arc),
+        JobStoreShardError::Codec(s) => ConcurrencyError::Encoding(s),
+        other => ConcurrencyError::ChainResume(other.to_string()),
+    }
+}

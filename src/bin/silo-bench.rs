@@ -13,8 +13,9 @@ use rand::Rng;
 use silo::cluster_client::ClientConfig;
 use silo::pb::report_outcome_request::Outcome;
 use silo::pb::{
-    ConcurrencyLimit, EnqueueRequest, LeaseTasksRequest, Limit, ReportOutcomeRequest,
-    SerializedBytes, serialized_bytes,
+    ConcurrencyLimit, EnqueueRequest, FloatingConcurrencyLimit, LeaseTasksRequest, Limit,
+    QueryRequest, RefreshSuccess, ReportOutcomeRequest, ReportRefreshOutcomeRequest,
+    SerializedBytes, report_refresh_outcome_request, serialized_bytes,
 };
 use silo::routing_client::RoutingClient;
 use silo::settings::LogFormat;
@@ -53,6 +54,29 @@ struct Args {
     /// Max concurrency for enqueued tasks
     #[arg(long, default_value = "100")]
     max_concurrency: u32,
+
+    /// Number of FloatingConcurrency limits to attach to each enqueued job, in
+    /// addition to the static Concurrency limit. Each enqueue randomly picks
+    /// between 1 and this max (inclusive). Set to 0 to disable floating limits.
+    #[arg(long, default_value = "2")]
+    max_floating_limits: u32,
+
+    /// Default max_concurrency for each FloatingConcurrency limit (used until
+    /// the first worker refresh updates it).
+    #[arg(long, default_value = "50")]
+    floating_default_max: u32,
+
+    /// Refresh interval (ms) for FloatingConcurrency limits. Workers receive
+    /// refresh tasks at most this often. Lower values exercise the
+    /// refresh/grant interaction more aggressively.
+    #[arg(long, default_value = "2000")]
+    floating_refresh_interval_ms: i64,
+
+    /// Probability (0.0-1.0) that a refresh worker reports a Failure instead
+    /// of Success. Failures exercise the backoff/retry path that previously
+    /// leaked holders.
+    #[arg(long, default_value = "0.1")]
+    floating_failure_rate: f64,
 
     /// Report interval in seconds
     #[arg(long, default_value = "1")]
@@ -205,6 +229,7 @@ fn make_success_outcome_request(
 /// Worker task that polls for tasks from random shards and reports success outcomes.
 /// Workers lease tasks from all tenants and report outcomes without specifying a tenant
 /// (the server determines the tenant from the task_id).
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     client: Arc<RoutingClient>,
     worker_id: String,
@@ -213,6 +238,9 @@ async fn worker_loop(
     completed_count: Arc<AtomicU64>,
     poll_count: Arc<AtomicU64>,
     empty_poll_count: Arc<AtomicU64>,
+    refresh_count: Arc<AtomicU64>,
+    floating_failure_rate: f64,
+    floating_default_max: u32,
 ) {
     while running.load(Ordering::Relaxed) {
         let (mut silo_client, shard) = match client.client_for_random_shard() {
@@ -236,7 +264,63 @@ async fn worker_loop(
         let result = silo_client.lease_tasks(request).await;
         match result {
             Ok(response) => {
-                let tasks = response.into_inner().tasks;
+                let response = response.into_inner();
+                let tasks = response.tasks;
+                let refresh_tasks = response.refresh_tasks;
+
+                // Handle floating-limit refresh tasks first so the new
+                // max_concurrency lands before subsequent enqueues see the
+                // limit. The chosen value oscillates around the configured
+                // default so the in-flight max changes constantly — this
+                // stresses the chain code that has to reconcile in-flight
+                // grants against changing capacity.
+                for rt in refresh_tasks {
+                    let report_shard = rt.shard.clone();
+                    let mut refresh_client = match client.client_for_shard(&report_shard) {
+                        Ok(c) => c,
+                        Err(_) => silo_client.clone(),
+                    };
+
+                    let outcome: report_refresh_outcome_request::Outcome = {
+                        let mut rng = rand::rng();
+                        let roll: f64 = rng.random();
+                        if roll < floating_failure_rate {
+                            report_refresh_outcome_request::Outcome::Failure(
+                                silo::pb::RefreshFailure {
+                                    code: "bench_simulated".to_string(),
+                                    message: "bench-injected refresh failure".to_string(),
+                                },
+                            )
+                        } else {
+                            // Vary max_concurrency widely: half to 2x the
+                            // default. Includes 1 occasionally so we exercise
+                            // tight-capacity scenarios.
+                            let half = (floating_default_max / 2).max(1);
+                            let high = (floating_default_max * 2).max(half + 1);
+                            let new_max = rng.random_range(half..=high);
+                            report_refresh_outcome_request::Outcome::Success(RefreshSuccess {
+                                new_max_concurrency: new_max,
+                            })
+                        }
+                    };
+
+                    let req = ReportRefreshOutcomeRequest {
+                        shard: report_shard.clone(),
+                        task_id: rt.id.clone(),
+                        outcome: Some(outcome),
+                        tenant_id: rt.tenant_id.clone(),
+                    };
+
+                    match refresh_client.report_refresh_outcome(req).await {
+                        Ok(_) => {
+                            refresh_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            warn!(worker_id = %worker_id, error = %e, "report_refresh_outcome failed");
+                        }
+                    }
+                }
+
                 if tasks.is_empty() {
                     empty_poll_count.fetch_add(1, Ordering::Relaxed);
                     // Small sleep when no tasks to avoid tight polling
@@ -305,11 +389,15 @@ async fn worker_loop(
 }
 
 /// Enqueuer task that continuously enqueues tasks to the correct shards.
+#[allow(clippy::too_many_arguments)]
 async fn enqueuer_loop(
     client: Arc<RoutingClient>,
     enqueuer_id: String,
     concurrency_key_override: Option<String>,
     max_concurrency: u32,
+    max_floating_limits: u32,
+    floating_default_max: u32,
+    floating_refresh_interval_ms: i64,
     running: Arc<AtomicBool>,
     enqueued_count: Arc<AtomicU64>,
     tenant_selector: Arc<TenantSelector>,
@@ -333,6 +421,37 @@ async fn enqueuer_loop(
         let priority = (job_counter % 100) as u32;
         let start_at_ms = now_ms();
 
+        // Build the limit list: one static Concurrency + 1..=N floating
+        // limits chosen per-tenant. We sample the floating count fresh per
+        // enqueue so the workload exercises 0/1/2-limit chains within the
+        // same run. Floating queue keys are tenant-scoped, so distinct
+        // tenants don't share a floating limit.
+        let mut limits: Vec<Limit> = Vec::new();
+        limits.push(Limit {
+            limit: Some(silo::pb::limit::Limit::Concurrency(ConcurrencyLimit {
+                key: concurrency_key.clone(),
+                max_concurrency,
+            })),
+        });
+        if max_floating_limits > 0 {
+            let n_floating = {
+                let mut rng = rand::rng();
+                rng.random_range(1..=max_floating_limits)
+            };
+            for i in 0..n_floating {
+                limits.push(Limit {
+                    limit: Some(silo::pb::limit::Limit::FloatingConcurrency(
+                        FloatingConcurrencyLimit {
+                            key: format!("{}-float-{}", tenant, i),
+                            default_max_concurrency: floating_default_max,
+                            refresh_interval_ms: floating_refresh_interval_ms,
+                            metadata: Default::default(),
+                        },
+                    )),
+                });
+            }
+        }
+
         let mut retries = 0u32;
         loop {
             let (mut silo_client, shard) = match client.client_for_tenant(&tenant) {
@@ -353,12 +472,7 @@ async fn enqueuer_loop(
                 payload: Some(SerializedBytes {
                     encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes.clone())),
                 }),
-                limits: vec![Limit {
-                    limit: Some(silo::pb::limit::Limit::Concurrency(ConcurrencyLimit {
-                        key: concurrency_key.clone(),
-                        max_concurrency,
-                    })),
-                }],
+                limits: limits.clone(),
                 tenant: Some(tenant.clone()),
                 metadata: Default::default(),
                 task_group: "default".to_string(),
@@ -402,10 +516,12 @@ async fn run_throughput_bench(
 ) -> anyhow::Result<()> {
     // Shared counters
     let running = Arc::new(AtomicBool::new(true));
+    let enqueuers_running = Arc::new(AtomicBool::new(true));
     let completed_count = Arc::new(AtomicU64::new(0));
     let poll_count = Arc::new(AtomicU64::new(0));
     let empty_poll_count = Arc::new(AtomicU64::new(0));
     let enqueued_count = Arc::new(AtomicU64::new(0));
+    let refresh_count = Arc::new(AtomicU64::new(0));
 
     // Spawn worker tasks
     let mut handles = Vec::new();
@@ -416,6 +532,9 @@ async fn run_throughput_bench(
         let completed = completed_count.clone();
         let polls = poll_count.clone();
         let empty_polls = empty_poll_count.clone();
+        let refreshes = refresh_count.clone();
+        let failure_rate = args.floating_failure_rate;
+        let floating_default = args.floating_default_max;
 
         handles.push(tokio::spawn(worker_loop(
             client,
@@ -425,24 +544,36 @@ async fn run_throughput_bench(
             completed,
             polls,
             empty_polls,
+            refreshes,
+            failure_rate,
+            floating_default,
         )));
     }
 
-    // Spawn enqueuer tasks
+    // Spawn enqueuer tasks. Enqueuers share their own `running` flag so we
+    // can stop them before workers — letting workers drain in-flight jobs
+    // before the post-bench holder audit.
+    let mut enqueuer_handles = Vec::new();
     for i in 0..args.enqueuers {
         let client = client.clone();
         let enqueuer_id = format!("bench-enqueuer-{}", i);
-        let running = running.clone();
+        let running = enqueuers_running.clone();
         let enqueued = enqueued_count.clone();
         let concurrency_key = args.concurrency_key.clone();
         let max_concurrency = args.max_concurrency;
+        let max_floating = args.max_floating_limits;
+        let floating_default = args.floating_default_max;
+        let floating_refresh = args.floating_refresh_interval_ms;
         let selector = tenant_selector.clone();
 
-        handles.push(tokio::spawn(enqueuer_loop(
+        enqueuer_handles.push(tokio::spawn(enqueuer_loop(
             client,
             enqueuer_id,
             concurrency_key,
             max_concurrency,
+            max_floating,
+            floating_default,
+            floating_refresh,
             running,
             enqueued,
             selector,
@@ -459,10 +590,10 @@ async fn run_throughput_bench(
     info!("Starting benchmark");
     if !args.structured_logging {
         println!(
-            "{:>8} {:>12} {:>12} {:>12} {:>12} {:>12}",
-            "Elapsed", "Completed", "Rate/s", "Enqueued", "Enq Rate/s", "Empty Polls"
+            "{:>8} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "Elapsed", "Completed", "Rate/s", "Enqueued", "Enq Rate/s", "Empty Polls", "Refreshes"
         );
-        println!("{}", "-".repeat(72));
+        println!("{}", "-".repeat(85));
     }
 
     while start.elapsed() < Duration::from_secs(args.duration_secs) {
@@ -472,6 +603,7 @@ async fn run_throughput_bench(
         let current_completed = completed_count.load(Ordering::Relaxed);
         let current_enqueued = enqueued_count.load(Ordering::Relaxed);
         let current_empty_polls = empty_poll_count.load(Ordering::Relaxed);
+        let current_refreshes = refresh_count.load(Ordering::Relaxed);
 
         let interval_secs = last_report.elapsed().as_secs_f64();
         let completed_delta = current_completed - last_completed;
@@ -486,18 +618,20 @@ async fn run_throughput_bench(
             enqueued = current_enqueued,
             enqueue_rate_per_sec = enqueue_rate,
             empty_polls = current_empty_polls,
+            refreshes = current_refreshes,
             "Benchmark progress"
         );
 
         if !args.structured_logging {
             println!(
-                "{:>7.1}s {:>12} {:>12.1} {:>12} {:>12.1} {:>12}",
+                "{:>7.1}s {:>12} {:>12.1} {:>12} {:>12.1} {:>12} {:>12}",
                 elapsed.as_secs_f64(),
                 current_completed,
                 rate,
                 current_enqueued,
                 enqueue_rate,
-                current_empty_polls
+                current_empty_polls,
+                current_refreshes
             );
         }
 
@@ -506,11 +640,50 @@ async fn run_throughput_bench(
         last_report = Instant::now();
     }
 
+    // Drain phase: stop enqueueing, let workers continue processing the
+    // in-flight backlog. Without this, the post-bench holder count would
+    // legitimately be non-zero (jobs are still leased), masking real leaks.
+    info!("Stopping enqueuers; draining in-flight work...");
+    enqueuers_running.store(false, Ordering::Relaxed);
+    for handle in enqueuer_handles {
+        let _ = handle.await;
+    }
+
+    // Wait until the in-flight backlog is fully drained or we hit a timeout.
+    // Termination condition: no completions OR no empty-poll delta over a
+    // window. Holder leaks make `completed` plateau even though jobs are
+    // pending — drain bails after ~60 s in that case, leaving the audit to
+    // flag the leak.
+    let drain_started = Instant::now();
+    let drain_deadline = Duration::from_secs(120);
+    let mut prev_completed = completed_count.load(Ordering::Relaxed);
+    let mut stable_ticks = 0u32;
+    while drain_started.elapsed() < drain_deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let now_completed = completed_count.load(Ordering::Relaxed);
+        let now_enqueued = enqueued_count.load(Ordering::Relaxed);
+        if now_completed == prev_completed {
+            stable_ticks += 1;
+            // Three stable ticks (~6 s with no completions) means either
+            // we're done or stuck. Either way move on to the audit.
+            if stable_ticks >= 3 {
+                let backlog = now_enqueued.saturating_sub(now_completed);
+                info!(
+                    drain_elapsed_secs = drain_started.elapsed().as_secs_f64(),
+                    backlog = backlog,
+                    "Drain stopped (no completions for ~6s)"
+                );
+                break;
+            }
+        } else {
+            stable_ticks = 0;
+        }
+        prev_completed = now_completed;
+    }
+
     // Stop workers
     info!("Stopping workers...");
     running.store(false, Ordering::Relaxed);
-
-    // Wait for all workers to finish
     for handle in handles {
         let _ = handle.await;
     }
@@ -521,6 +694,7 @@ async fn run_throughput_bench(
     let total_polls = poll_count.load(Ordering::Relaxed);
     let total_empty_polls = empty_poll_count.load(Ordering::Relaxed);
     let total_enqueued = enqueued_count.load(Ordering::Relaxed);
+    let total_refreshes = refresh_count.load(Ordering::Relaxed);
 
     let avg_rate = total_completed as f64 / total_elapsed.as_secs_f64();
     let empty_poll_pct = if total_polls > 0 {
@@ -539,6 +713,7 @@ async fn run_throughput_bench(
         empty_poll_percentage = empty_poll_pct,
         total_enqueued = total_enqueued,
         average_enqueue_rate_per_sec = avg_enqueue_rate,
+        total_refreshes = total_refreshes,
         "Final benchmark results"
     );
 
@@ -556,9 +731,147 @@ async fn run_throughput_bench(
         );
         println!("Total enqueued: {}", total_enqueued);
         println!("Average enqueue rate: {:.1} tasks/sec", avg_enqueue_rate);
+        println!("Total refresh outcomes: {}", total_refreshes);
+        let backlog = total_enqueued.saturating_sub(total_completed);
+        println!("Backlog (enqueued - completed): {}", backlog);
+    }
+
+    // Post-bench holder audit. Workers have stopped and the in-flight queue
+    // has drained, so any remaining concurrency holders are leaks. Sum
+    // across every shard.
+    info!("Auditing holder counts across all shards...");
+    let audit = audit_holder_leaks(&client).await;
+    match audit {
+        Ok(report) => {
+            report.log();
+            if report.is_leak() {
+                anyhow::bail!(
+                    "HOLDER LEAK DETECTED: {} concurrency holders remain after drain (backlog={})",
+                    report.total_holders,
+                    total_enqueued.saturating_sub(total_completed)
+                );
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "holder audit failed (treating as inconclusive, not a leak)");
+        }
     }
 
     Ok(())
+}
+
+/// Result of scanning every shard for outstanding concurrency holders +
+/// concurrency requests after the bench has drained.
+#[derive(Debug, Default)]
+struct HolderAudit {
+    total_holders: u64,
+    total_requests: u64,
+    /// Per-shard (holders, requests) counts for diagnostics.
+    per_shard: Vec<(String, u64, u64)>,
+}
+
+impl HolderAudit {
+    fn log(&self) {
+        for (shard, h, r) in &self.per_shard {
+            info!(shard = %shard, holders = h, requests = r, "shard audit");
+        }
+        info!(
+            total_holders = self.total_holders,
+            total_requests = self.total_requests,
+            "Post-bench holder audit"
+        );
+        println!("\n===================");
+        println!("Post-bench Holder Audit");
+        println!("===================");
+        for (shard, h, r) in &self.per_shard {
+            println!("  shard {} : holders={} requests={}", shard, h, r);
+        }
+        println!(
+            "TOTAL: holders={} requests={}",
+            self.total_holders, self.total_requests
+        );
+        if self.is_leak() {
+            println!("*** HOLDER LEAK ***");
+        } else {
+            println!("(clean — no outstanding holders)");
+        }
+    }
+
+    fn is_leak(&self) -> bool {
+        self.total_holders > 0
+    }
+}
+
+/// Query each shard for the count of outstanding concurrency holders +
+/// requests. Uses the SQL Query RPC against the `queues` table.
+async fn audit_holder_leaks(client: &RoutingClient) -> anyhow::Result<HolderAudit> {
+    let topo = client.topology();
+    let mut audit = HolderAudit::default();
+    for owner in &topo.shard_owners {
+        let mut silo_client = match client.client_for_shard(&owner.shard_id) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(shard = %owner.shard_id, error = %e, "audit: could not get client");
+                continue;
+            }
+        };
+        let holders = query_count(
+            &mut silo_client,
+            &owner.shard_id,
+            "SELECT count(*) AS n FROM queues WHERE entry_type = 'holder'",
+        )
+        .await
+        .unwrap_or(0);
+        let requests = query_count(
+            &mut silo_client,
+            &owner.shard_id,
+            "SELECT count(*) AS n FROM queues WHERE entry_type = 'requester'",
+        )
+        .await
+        .unwrap_or(0);
+        audit.total_holders += holders;
+        audit.total_requests += requests;
+        audit
+            .per_shard
+            .push((owner.shard_id.clone(), holders, requests));
+    }
+    Ok(audit)
+}
+
+/// Run a `SELECT count(*) AS n FROM ...` query and return the scalar count.
+/// The Query RPC returns rows as MessagePack-encoded `SerializedBytes`; we
+/// decode them as a `serde_json::Value` and pull out the `n` field.
+async fn query_count(
+    client: &mut silo::cluster_client::InterceptedSiloClient,
+    shard: &str,
+    sql: &str,
+) -> anyhow::Result<u64> {
+    let resp = client
+        .query(QueryRequest {
+            shard: shard.to_string(),
+            sql: sql.to_string(),
+            tenant: None,
+            parameters: vec![],
+        })
+        .await?
+        .into_inner();
+    for row in resp.rows {
+        let bytes = match row.encoding {
+            Some(serialized_bytes::Encoding::Msgpack(b)) => b,
+            None => continue,
+        };
+        let v: serde_json::Value = rmp_serde::from_slice(&bytes)?;
+        // The aggregate column is named `n` in our SQL; tolerate the
+        // datafusion default `count(*)` alias as well.
+        for key in ["n", "count(*)", "COUNT(*)"] {
+            if let Some(val) = v.get(key)
+                && let Some(n) = val.as_u64()
+            {
+                return Ok(n);
+            }
+        }
+    }
+    Ok(0)
 }
 
 #[tokio::main(flavor = "multi_thread")]

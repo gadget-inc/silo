@@ -3,20 +3,22 @@
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 
-use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_lease};
-use crate::concurrency::RequestTicketTaskOutcome;
+use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_holder, encode_lease};
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
-use crate::job::{JobStatus, JobView};
+use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
-use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
+use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, concurrency_holder_key, job_info_key, leased_task_key, parse_task_key,
+    attempt_key, concurrency_holder_key, job_info_key, job_status_key, leased_task_key,
+    parse_task_key,
 };
 use crate::shard_range::ShardRange;
-use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, LeasedTask, Task};
-use crate::task_broker::BrokerTask;
+use crate::task::{
+    DEFAULT_LEASE_MS, HolderRecord, LeaseRecord, LeasedRefreshTask, LeasedTask, Task,
+};
+use crate::task_broker::{BrokerTask, TaskBrokerRegistry};
 
 /// Mutable accumulators for a single dequeue iteration.
 /// Bundles state that each task-type handler needs to read and write,
@@ -56,6 +58,65 @@ impl DequeueIterationState {
     fn ack_deleted(&mut self, key: &[u8]) {
         self.release_keys.push(key.to_vec());
         self.tombstone_keys.push(key.to_vec());
+    }
+}
+
+/// RAII guard over a dequeue iteration's `claimed` batch.
+///
+/// `claim_ready` adds claimed keys to the broker's in-memory `inflight` set,
+/// which is only ever drained by `ack_durable` (commit success) or `requeue`
+/// (explicit error paths). If the `dequeue` future is dropped mid-iteration
+/// (LeaseTasks RPC cancelled / deadline / disconnect) or panics, neither runs
+/// and the whole batch is stranded in `inflight` forever (no TTL), which is the
+/// root cause of `silo_broker_inflight_size` growing and never draining.
+///
+/// This guard closes that gap: every normal exit `disarm`s it (handing the
+/// tasks back to the existing `ack_durable`/`requeue` logic), so its `Drop`
+/// fires *only* on cancellation/panic, where it releases the claimed keys from
+/// `inflight`. It deliberately uses `release_inflight` (release-only) rather
+/// than `requeue` (re-buffer) so an ambiguous commit can't cause double
+/// dispatch — see [`TaskBrokerRegistry::release_inflight`].
+///
+/// Relies on unwinding `Drop` for the panic case (the crate uses the default
+/// `panic = "unwind"`); future cancellation runs `Drop` regardless.
+struct ClaimedInflightGuard<'a> {
+    brokers: &'a TaskBrokerRegistry,
+    tasks: Option<Vec<BrokerTask>>,
+}
+
+impl<'a> ClaimedInflightGuard<'a> {
+    fn new(brokers: &'a TaskBrokerRegistry, tasks: Vec<BrokerTask>) -> Self {
+        Self {
+            brokers,
+            tasks: Some(tasks),
+        }
+    }
+
+    /// The claimed tasks still under guard.
+    fn tasks(&self) -> &[BrokerTask] {
+        self.tasks.as_deref().unwrap_or(&[])
+    }
+
+    /// Take ownership of the claimed batch back, neutralizing the guard so its
+    /// `Drop` is a no-op. Called on every normal exit path.
+    fn disarm(&mut self) -> Vec<BrokerTask> {
+        self.tasks.take().unwrap_or_default()
+    }
+}
+
+impl Drop for ClaimedInflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(tasks) = self.tasks.take() {
+            if tasks.is_empty() {
+                return;
+            }
+            let keys: Vec<Vec<u8>> = tasks.iter().map(|t| t.key.clone()).collect();
+            tracing::warn!(
+                count = keys.len(),
+                "dequeue future dropped/panicked after claim; releasing in-flight tasks"
+            );
+            self.brokers.release_inflight(&keys);
+        }
     }
 }
 
@@ -117,10 +178,16 @@ impl JobStoreShard {
             let expiry_ms = now_ms + DEFAULT_LEASE_MS;
             let mut state = DequeueIterationState::new(claimed.len());
 
+            // Guard the claimed batch: if this dequeue future is cancelled or
+            // panics before a normal disarm below, its Drop releases these keys
+            // from the broker's in-flight set instead of leaking them there.
+            let mut inflight_guard = ClaimedInflightGuard::new(&self.brokers, claimed);
+
             // Get the shard range for split-aware filtering
             let shard_range = self.get_range();
 
-            for entry in &claimed {
+            let mut handler_err: Option<JobStoreShardError> = None;
+            for entry in inflight_guard.tasks() {
                 let decoded = &entry.decoded;
 
                 // Check if task's tenant is within shard range
@@ -139,7 +206,7 @@ impl JobStoreShard {
                     continue;
                 }
 
-                match decoded.variant_type() {
+                let handler_result: Result<(), JobStoreShardError> = match decoded.variant_type() {
                     fb::TaskVariant::RequestTicket => {
                         self.handle_request_ticket(
                             &mut state,
@@ -150,35 +217,56 @@ impl JobStoreShard {
                             now_ms,
                             expiry_ms,
                         )
-                        .await?;
+                        .await
                     }
                     fb::TaskVariant::CheckRateLimit => {
                         self.handle_check_rate_limit(&mut state, &entry.key, decoded, now_ms)
-                            .await?;
+                            .await
                     }
-                    fb::TaskVariant::RefreshFloatingLimit => {
-                        self.handle_refresh_floating_limit(
-                            &mut state,
-                            &mut refresh_out,
-                            &entry.key,
-                            decoded,
-                            worker_id,
-                            expiry_ms,
-                        )?;
-                    }
+                    fb::TaskVariant::RefreshFloatingLimit => self.handle_refresh_floating_limit(
+                        &mut state,
+                        &mut refresh_out,
+                        &entry.key,
+                        decoded,
+                        worker_id,
+                        expiry_ms,
+                    ),
                     fb::TaskVariant::RunAttempt => {
                         self.handle_run_attempt(
                             &mut state, &entry.key, decoded, worker_id, now_ms, expiry_ms,
                         )
-                        .await?;
+                        .await
                     }
-                    other => {
-                        return Err(JobStoreShardError::Codec(format!(
-                            "unexpected task variant {:?}",
-                            other
-                        )));
+                    other => Err(JobStoreShardError::Codec(format!(
+                        "unexpected task variant {:?}",
+                        other
+                    ))),
+                };
+
+                if let Err(e) = handler_result {
+                    // Handler bailed mid-iteration. The batch will not be
+                    // committed, but any in-memory `try_reserve` reservations
+                    // that handlers (or the chain walker beneath them) pushed
+                    // into `state.grants_to_rollback` are real — release them
+                    // here or they leak as phantom holders. The outer
+                    // `grants_to_rollback` accumulator is always empty at this
+                    // point (cleared at the end of the prior iteration, not
+                    // yet merged for this one), so draining `state` is
+                    // sufficient. `holder_releases` is paired with batched
+                    // deletes that will not happen, so it must NOT be drained.
+                    for (tenant, queue, task_id) in state.grants_to_rollback.drain(..) {
+                        self.concurrency.rollback_grant(&tenant, &queue, &task_id);
                     }
+                    // Break so the `inflight_guard` borrow ends before we
+                    // disarm + requeue below.
+                    handler_err = Some(e);
+                    break;
                 }
+            }
+            if let Some(e) = handler_err {
+                // Known not-committed state: re-buffer for immediate re-pickup.
+                self.brokers.requeue(inflight_guard.disarm());
+                return Err(e);
             }
 
             // Merge iteration state into outer accumulators
@@ -231,7 +319,7 @@ impl JobStoreShard {
                     self.concurrency.rollback_grant(tenant, queue, task_id);
                 }
                 // Put back all claimed entries since we didn't lease them durably
-                self.brokers.requeue(claimed);
+                self.brokers.requeue(inflight_guard.disarm());
                 return Err(JobStoreShardError::from(e));
             }
             dst_events::confirm_write(write_op);
@@ -259,6 +347,9 @@ impl JobStoreShard {
             self.brokers
                 .ack_durable(task_group, &state.release_keys, &state.tombstone_keys);
             self.brokers.evict_keys(&state.release_keys);
+            // Commit succeeded: `ack_durable` already released these keys from
+            // in-flight, so neutralize the guard to avoid a redundant release.
+            let _ = inflight_guard.disarm();
             tracing::debug!(
                 release_keys = state.release_keys.len(),
                 tombstone_keys = state.tombstone_keys.len(),
@@ -348,130 +439,214 @@ impl JobStoreShard {
         Ok(attempt_val)
     }
 
-    /// Process a RequestTicket task: check cancellation, process concurrency ticket, maybe lease.
+    /// Process a RequestTicket task.
+    ///
+    /// The ticket carries the chain's task_id, the persisted limits list,
+    /// limit_index, and held_queues. Behavior:
+    ///
+    /// 1. Sanity-check that the job still exists (cheap status check; no
+    ///    JobInfo fetch — the limits we need ride on the ticket itself).
+    /// 2. Resolve the gating queue's capacity from the persisted limits.
+    /// 3. `try_reserve` the slot. If at capacity, leave the ticket in place
+    ///    (`ack_release`) so a later scan reattempts.
+    /// 4. On grant: write the holder, delete the ticket, and call
+    ///    `enqueue_limit_task_at_index` with `limit_index + 1` to write the
+    ///    follow-up task. Use `now_ms` for the follow-up's task_key — the
+    ///    broker tombstones the just-deleted task_key, so a chain that
+    ///    re-emits at the same key would be silently suppressed (see the
+    ///    project_broker_tombstone_chain_continuation memory).
+    /// 5. This iteration produces no leasable task. The follow-up (RunAttempt
+    ///    or CheckRateLimit or a new deferred request) is at a fresh task_key
+    ///    and will be picked up by the next broker scan.
     #[allow(clippy::too_many_arguments)]
     async fn handle_request_ticket(
         &self,
         state: &mut DequeueIterationState,
         task_key: &[u8],
         decoded: &DecodedTask,
-        shard_range: &ShardRange,
-        worker_id: &str,
+        _shard_range: &ShardRange,
+        _worker_id: &str,
         now_ms: i64,
-        expiry_ms: i64,
+        _expiry_ms: i64,
     ) -> Result<(), JobStoreShardError> {
         let rt = decoded.as_request_ticket().ok_or_else(|| {
             JobStoreShardError::Codec("expected RequestTicket variant".to_string())
         })?;
-        let queue = rt.queue().unwrap_or_default();
-        let tenant = rt.tenant().unwrap_or_default();
-        let job_id = rt.job_id().unwrap_or_default();
+        let queue = rt.queue().unwrap_or_default().to_string();
+        let tenant = rt.tenant().unwrap_or_default().to_string();
+        let job_id = rt.job_id().unwrap_or_default().to_string();
         let attempt_number = rt.attempt_number();
         let relative_attempt_number = rt.relative_attempt_number();
-        let request_id = rt.request_id().unwrap_or_default();
-        let req_task_group = rt.task_group().unwrap_or_default();
+        let task_id = rt.task_id().unwrap_or_default().to_string();
+        let req_task_group = rt.task_group().unwrap_or_default().to_string();
+        let limit_index = rt.limit_index();
+        let stored_held_queues: Vec<String> = rt
+            .held_queues()
+            .map(|v| v.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let limits: Vec<Limit> = crate::codec::limit_entries_to_owned(rt.limits());
         state.processed_internal = true;
-        let tenant = tenant.to_string();
 
-        // Note: No cancelled check here. Cancelled jobs' tasks are eagerly removed
-        // by cancel_job. If a stale task appears (e.g., retry after cancel), it will
-        // be processed normally and the worker discovers cancellation via heartbeat.
+        // Cancellation is not checked here — cancel_job eagerly removes tasks;
+        // any stale task that survives will be discovered as cancelled by the
+        // worker via heartbeat.
 
-        // Load job info
-        let job_key = job_info_key(&tenant, job_id);
-        let maybe_job = self.db.get(&job_key).await?;
-        let job_view = maybe_job
-            .as_ref()
-            .and_then(|bytes| JobView::new(bytes.clone()).ok());
+        // Existence check: a missing job_status means the job has been wiped,
+        // so the ticket is orphan. Just delete it. Cheaper than a JobInfo
+        // fetch.
+        //
+        // If the ticket is dropped (terminal/missing/unreadable status), any
+        // concurrency holders the chain already accumulated (carried in
+        // `stored_held_queues`) must be released — otherwise those slots are
+        // permanently leaked. Mirrors the missing-job_info branches in
+        // handle_check_rate_limit and handle_run_attempt.
+        let drop_ticket_and_release = |state: &mut DequeueIterationState| {
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
+            for q in stored_held_queues.iter() {
+                state
+                    .batch
+                    .delete(concurrency_holder_key(&tenant, q, &task_id));
+                state
+                    .holder_releases
+                    .push((tenant.clone(), q.clone(), task_id.clone()));
+            }
+        };
+        match self.db.get(&job_status_key(&tenant, &job_id)).await? {
+            Some(raw) => match decode_job_status_owned(&raw) {
+                Ok(status)
+                    if matches!(
+                        status.kind,
+                        JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled
+                    ) =>
+                {
+                    // Terminal: drop the ticket and release upstream holders.
+                    drop_ticket_and_release(state);
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // Unreadable status — treat as missing.
+                    drop_ticket_and_release(state);
+                    return Ok(());
+                }
+            },
+            None => {
+                drop_ticket_and_release(state);
+                return Ok(());
+            }
+        }
 
-        // Process ticket via concurrency manager
-        let outcome = self
+        // Capacity comes from the persisted limits (no JobInfo round-trip).
+        let (max_allowed, limit_type) = crate::concurrency::ConcurrencyManager::capacity_for_queue(
+            &self.db, &tenant, &queue, &limits,
+        )
+        .await;
+        self.concurrency
+            .cache_queue_limit(&tenant, &queue, max_allowed as u32, limit_type);
+
+        // Atomically reserve a slot (preserves the original TOCTOU invariant).
+        let reserved = self
             .concurrency
-            .process_ticket_request_task(
+            .counts()
+            .try_reserve(
                 &self.db,
-                shard_range,
-                &mut state.batch,
-                task_key,
+                &self.get_range(),
                 &tenant,
-                queue,
-                request_id,
-                job_id,
-                attempt_number,
-                now_ms,
-                job_view.as_ref(),
+                &queue,
+                &task_id,
+                max_allowed,
+                &job_id,
             )
             .await?;
 
-        match outcome {
-            RequestTicketTaskOutcome::Granted { request_id, queue } => {
-                // Track grant for rollback if DB write fails
-                state
-                    .grants_to_rollback
-                    .push((tenant.clone(), queue.clone(), request_id.clone()));
+        if !reserved {
+            // Out of capacity — leave the ticket in place for a later scan.
+            state.ack_release(task_key);
+            return Ok(());
+        }
 
-                // Create RunAttempt task for the lease (new Task, not a copy)
-                let run = Task::RunAttempt {
-                    id: request_id.clone(),
-                    tenant: tenant.clone(),
-                    job_id: job_id.to_string(),
+        // Track this grant so a batch failure rolls back the reservation.
+        state
+            .grants_to_rollback
+            .push((tenant.clone(), queue.clone(), task_id.clone()));
+
+        // Write the holder for the just-won queue.
+        let holder_val = encode_holder(&HolderRecord {
+            granted_at_ms: now_ms,
+        });
+        state.batch.put(
+            concurrency_holder_key(&tenant, &queue, &task_id),
+            &holder_val,
+        );
+
+        // Delete the original ticket and continue the chain. The follow-up
+        // task is written at a fresh task_key (start_at_ms=now_ms) so the
+        // broker tombstone for `task_key` doesn't suppress its re-pickup.
+        state.batch.delete(task_key);
+        state.ack_deleted(task_key);
+
+        let mut new_held = stored_held_queues;
+        new_held.push(queue.clone());
+
+        // task_key is `(task_group, start_time_ms, priority, job_id,
+        // attempt_number)`. The chain continues with the same task_group,
+        // priority, job_id, and attempt_number, so the *only* differentiator
+        // versus the just-tombstoned parent key is start_time_ms. `now_ms`
+        // usually exceeds the parent's start_time_ms, but for a worker that
+        // processes a future-scheduled ticket in the same millisecond it
+        // becomes ready, the two could collide and the follow-up would be
+        // silently suppressed. Bump past the parent to make the dodge
+        // unconditional.
+        let parent_start_time_ms = parse_task_key(task_key)
+            .map(|p| p.start_time_ms as i64)
+            .unwrap_or(now_ms);
+        let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
+
+        let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
+        let chain_grants = self
+            .enqueue_limit_task_at_index(
+                &mut writer,
+                LimitTaskParams {
+                    tenant: &tenant,
+                    task_id: &task_id,
+                    job_id: &job_id,
                     attempt_number,
                     relative_attempt_number,
-                    held_queues: vec![queue],
-                    task_group: req_task_group.to_string(),
-                };
+                    limit_index: (limit_index + 1) as usize,
+                    limits: &limits,
+                    priority: rt.priority(),
+                    // Future-scheduled `RequestTicket` was just granted; the
+                    // chain is past its scheduled time. Use `now_ms` for
+                    // `scheduled_at_ms`; `task_key_start_ms` may need a +1
+                    // bump versus the parent to dodge the broker tombstone
+                    // for the just-deleted ticket.
+                    scheduled_at_ms: new_task_key_start_ms,
+                    task_key_start_ms: new_task_key_start_ms,
+                    now_ms,
+                    held_queues: new_held,
+                    task_group: &req_task_group,
+                    skip_try_reserve: false,
+                },
+            )
+            .await?;
 
-                let attempt_val = self
-                    .write_lease_and_attempt(
-                        &mut state.batch,
-                        worker_id,
-                        &run,
-                        &request_id,
-                        &tenant,
-                        job_id,
-                        attempt_number,
-                        relative_attempt_number,
-                        now_ms,
-                        expiry_ms,
-                    )
-                    .await?;
+        // Each (queue, task_id) the chain reserved also needs rollback if the
+        // batch write fails.
+        for (q, tid) in chain_grants {
+            state.grants_to_rollback.push((tenant.clone(), q, tid));
+        }
 
-                let view = job_view.ok_or_else(|| {
-                    JobStoreShardError::Codec(format!(
-                        "job view missing for granted ticket, job_id={}",
-                        job_id
-                    ))
-                })?;
-                state
-                    .pending_attempts
-                    .push((tenant.clone(), view, attempt_val));
-                state.ack_deleted(task_key);
-
-                // Track for DST event emission after commit
-                state
-                    .leased_tasks_for_dst
-                    .push((tenant, job_id.to_string(), request_id));
-
-                // Record concurrency ticket metric and ready-to-start latency
-                if let Some(ref m) = self.metrics {
-                    m.record_concurrency_tickets_granted(
-                        self.name(),
-                        crate::metrics::GrantPath::Scanned,
-                        1,
-                    );
-                    if let Some(parsed) = parse_task_key(task_key) {
-                        let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
-                        m.record_ready_to_start_latency_ms(self.name(), req_task_group, latency_ms);
-                    }
-                }
-            }
-            RequestTicketTaskOutcome::Requested => {
-                // Release inflight only; task key remains in DB and must be eligible
-                // for future scans when capacity is available.
-                state.ack_release(task_key);
-            }
-            RequestTicketTaskOutcome::JobMissing => {
-                // process_ticket_request_task deleted the task key.
-                state.ack_deleted(task_key);
+        // Metrics: account the grant as a Scanned-path ticket.
+        if let Some(ref m) = self.metrics {
+            m.record_concurrency_tickets_granted(
+                self.name(),
+                crate::metrics::GrantPath::Scanned,
+                1,
+            );
+            if let Some(parsed) = parse_task_key(task_key) {
+                let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
+                m.record_ready_to_start_latency_ms(self.name(), &req_task_group, latency_ms);
             }
         }
 
@@ -511,6 +686,52 @@ impl JobStoreShard {
         state.batch.delete(task_key);
         state.ack_deleted(task_key);
 
+        // Parent task_key's start_time_ms — needed by both the success and
+        // retry branches to bump their follow-up task_key past the
+        // tombstone we just installed.
+        let parent_start_time_ms = parse_task_key(task_key)
+            .map(|p| p.start_time_ms as i64)
+            .unwrap_or(now_ms);
+
+        // Terminal-status short-circuit. Symmetric with handle_request_ticket:
+        // if the job is Succeeded/Failed/Cancelled there's no point calling
+        // Gubernator (wastes quota) or advancing the chain (leaks slots until
+        // a worker happens to discover cancellation on heartbeat). Drop the
+        // task and release any upstream holders the chain accumulated.
+        let drop_and_release = |state: &mut DequeueIterationState| {
+            for q in held_queues.iter() {
+                let queue = q.clone();
+                state
+                    .batch
+                    .delete(concurrency_holder_key(tenant, &queue, check_task_id));
+                state
+                    .holder_releases
+                    .push((tenant.to_string(), queue, check_task_id.to_string()));
+            }
+        };
+        match self.db.get(&job_status_key(tenant, job_id)).await? {
+            Some(raw) => match decode_job_status_owned(&raw) {
+                Ok(status)
+                    if matches!(
+                        status.kind,
+                        JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled
+                    ) =>
+                {
+                    drop_and_release(state);
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    drop_and_release(state);
+                    return Ok(());
+                }
+            },
+            None => {
+                drop_and_release(state);
+                return Ok(());
+            }
+        }
+
         // Load job info to get the full limits list
         let job_key = job_info_key(tenant, job_id);
         let maybe_job = self.db.get(&job_key).await?;
@@ -521,34 +742,14 @@ impl JobStoreShard {
                     // Drop the task and release any concurrency holders it
                     // carries from earlier chained limits. Symmetric with the
                     // missing-job_info path below and with handle_run_attempt.
-                    for q in held_queues.iter() {
-                        let queue = q.clone();
-                        state
-                            .batch
-                            .delete(concurrency_holder_key(tenant, &queue, check_task_id));
-                        state.holder_releases.push((
-                            tenant.to_string(),
-                            queue,
-                            check_task_id.to_string(),
-                        ));
-                    }
+                    drop_and_release(state);
                     return Ok(());
                 }
             },
             None => {
                 // Job missing — drop the task and release any concurrency
                 // holders it carries from earlier chained limits.
-                for q in held_queues.iter() {
-                    let queue = q.clone();
-                    state
-                        .batch
-                        .delete(concurrency_holder_key(tenant, &queue, check_task_id));
-                    state.holder_releases.push((
-                        tenant.to_string(),
-                        queue,
-                        check_task_id.to_string(),
-                    ));
-                }
+                drop_and_release(state);
                 return Ok(());
             }
         };
@@ -558,7 +759,12 @@ impl JobStoreShard {
 
         match rate_limit_result {
             Ok(result) if result.under_limit => {
-                // Rate limit passed! Proceed to next limit or RunAttempt
+                // Rate limit passed! Proceed to next limit or RunAttempt.
+                // Same-millisecond tombstone dodge as handle_request_ticket:
+                // bump task_key_start_ms past the parent if necessary so
+                // the follow-up key cannot collide with the just-deleted
+                // CheckRateLimit's task_key.
+                let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
                 let grants = self
                     .enqueue_limit_task_at_index(
                         &mut DbWriteBatcher::new(&self.db, &mut state.batch),
@@ -571,7 +777,8 @@ impl JobStoreShard {
                             limit_index: (limit_index + 1) as usize,
                             limits: &job_view.limits(),
                             priority,
-                            start_at_ms: now_ms,
+                            scheduled_at_ms: new_task_key_start_ms,
+                            task_key_start_ms: new_task_key_start_ms,
                             now_ms,
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,
@@ -623,6 +830,7 @@ impl JobStoreShard {
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     tenant,
+                    check_task_id,
                     job_id,
                     attempt_number,
                     check_relative_attempt_number,
@@ -633,6 +841,7 @@ impl JobStoreShard {
                     priority,
                     held_queues,
                     retry_backoff,
+                    parent_start_time_ms,
                     check_task_group,
                 )?;
             }
@@ -642,6 +851,7 @@ impl JobStoreShard {
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     tenant,
+                    check_task_id,
                     job_id,
                     attempt_number,
                     check_relative_attempt_number,
@@ -652,6 +862,7 @@ impl JobStoreShard {
                     priority,
                     held_queues,
                     retry_backoff,
+                    parent_start_time_ms,
                     check_task_group,
                 )?;
             }
@@ -860,5 +1071,108 @@ impl JobStoreShard {
         }
 
         Ok((tasks, keys))
+    }
+}
+
+#[cfg(test)]
+mod claimed_inflight_guard_tests {
+    //! Unit tests for [`ClaimedInflightGuard`].
+    //!
+    //! These exercise the RAII contract directly: Drop must release in-flight
+    //! reservations on the broker registry iff the guard was not disarmed.
+    //! Integration coverage (a real `dequeue` future being cancelled) is more
+    //! expensive to stage deterministically; these unit tests pin the same
+    //! invariant at the type level so any future refactor that breaks Drop or
+    //! disarm fails CI before the integration cost catches up to it.
+    use super::*;
+    use crate::codec::{decode_task_validated, encode_task};
+    use crate::instrumented_db::InstrumentedDb;
+    use crate::shard_range::ShardRange;
+    use std::sync::Arc;
+
+    fn sample_broker_task(task_group: &str, job_id: &str) -> BrokerTask {
+        let task = Task::RunAttempt {
+            id: format!("task-{job_id}"),
+            tenant: "-".to_string(),
+            job_id: job_id.to_string(),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            held_queues: vec![],
+            task_group: task_group.to_string(),
+        };
+        let key = crate::keys::task_key(task_group, 1, 0, job_id, 1);
+        let decoded = decode_task_validated(encode_task(&task)).expect("decode task");
+        BrokerTask { key, decoded }
+    }
+
+    async fn build_registry() -> Arc<TaskBrokerRegistry> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::DbBuilder::new("test", store)
+            .build()
+            .await
+            .expect("open in-memory db");
+        let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
+        TaskBrokerRegistry::new(db, "shard".to_string(), None, ShardRange::full())
+    }
+
+    /// Drop without disarm releases in-flight on the broker registry.
+    ///
+    /// This is the leak path commit 1c7f047 closed: if `dequeue` is cancelled
+    /// or panics after `claim_ready`, neither `ack_durable` nor `requeue` runs
+    /// and the claimed keys sit in `inflight` forever (no TTL).
+    #[tokio::test]
+    async fn drop_without_disarm_releases_inflight() {
+        let brokers = build_registry().await;
+        let bt = sample_broker_task("tg-drop", "j1");
+        brokers.seed_inflight_for_test("tg-drop", vec![bt.key.clone()]);
+        assert_eq!(brokers.inflight_len(), 1);
+
+        {
+            let _guard = ClaimedInflightGuard::new(&brokers, vec![bt]);
+            // No disarm — drop fires at end of scope.
+        }
+
+        assert_eq!(
+            brokers.inflight_len(),
+            0,
+            "Drop must release inflight when guard was not disarmed",
+        );
+    }
+
+    /// `disarm()` neutralizes the guard: Drop becomes a no-op so the normal
+    /// ack/requeue path retains control of the in-flight reservation.
+    ///
+    /// Without this contract every normal exit would double-release, racing
+    /// the `ack_durable` / `requeue` calls that follow disarm.
+    #[tokio::test]
+    async fn disarm_neutralizes_guard_drop() {
+        let brokers = build_registry().await;
+        let bt = sample_broker_task("tg-disarm", "j2");
+        brokers.seed_inflight_for_test("tg-disarm", vec![bt.key.clone()]);
+        assert_eq!(brokers.inflight_len(), 1);
+
+        {
+            let mut guard = ClaimedInflightGuard::new(&brokers, vec![bt]);
+            let returned = guard.disarm();
+            assert_eq!(returned.len(), 1, "disarm returns the claimed batch");
+            // Drop now fires on the empty guard — no-op.
+        }
+
+        assert_eq!(
+            brokers.inflight_len(),
+            1,
+            "Disarmed guard's Drop must NOT release inflight",
+        );
+    }
+
+    /// Drop on an empty batch is a no-op (defensive against future callers
+    /// that might construct the guard before claim_ready returns anything).
+    #[tokio::test]
+    async fn drop_on_empty_batch_is_noop() {
+        let brokers = build_registry().await;
+        {
+            let _guard = ClaimedInflightGuard::new(&brokers, vec![]);
+        }
+        assert_eq!(brokers.inflight_len(), 0);
     }
 }

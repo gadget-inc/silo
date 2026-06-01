@@ -3109,6 +3109,10 @@ async fn reimport_failed_to_scheduled_ignores_stale_concurrency_requests() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "reimp-stale-req-target:1:stale".to_string(),
+        limits: Vec::new(),
     };
     let stale_request_key = silo::keys::concurrency_request_key(
         "-",
@@ -3191,5 +3195,261 @@ async fn reimport_failed_to_scheduled_ignores_stale_concurrency_requests() {
         dequeued.tasks[0].attempt().attempt_number(),
         3,
         "grant scanner must not grant stale request attempts after reimport"
+    );
+}
+
+/// Extension of `reimport_terminal_releases_holders_for_check_rate_limit_task`
+/// to the multi-limit case: a job parked on a `Task::CheckRateLimit` whose
+/// `held_queues` carries TWO concurrency queues from upstream chain steps
+/// must release BOTH holders on a terminal reimport.
+///
+/// The reimport cleanup loop iterates `held_queues` and calls
+/// `concurrency_holder_key(tenant, queue, task_id)` for each entry. If a
+/// future regression accidentally `break`s on the first entry, only A is
+/// released and B leaks — this test pins that loop against that mistake.
+#[silo::test]
+async fn reimport_releases_multi_limit_held_queues_on_check_rate_limit() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let job_id = "reimp-check-rate-limit-multi";
+    let queue_a = "reimp-multi-a";
+    let queue_b = "reimp-multi-b";
+
+    // Initial import with two concurrency limits. cap=10 on both so the
+    // chain walker grants A and B immediately and writes a RunAttempt
+    // carrying held_queues=[A, B].
+    let mut initial = base_import_params(job_id);
+    initial.retry_policy = Some(default_retry_policy());
+    initial.limits = vec![
+        Limit::Concurrency(ConcurrencyLimit {
+            key: queue_a.to_string(),
+            max_concurrency: 10,
+        }),
+        Limit::Concurrency(ConcurrencyLimit {
+            key: queue_b.to_string(),
+            max_concurrency: 10,
+        }),
+    ];
+    let r = shard.import_jobs("-", vec![initial]).await.unwrap();
+    assert!(r[0].success);
+    assert_eq!(r[0].status, JobStatusKind::Scheduled);
+
+    // Sanity: both holders exist after import.
+    assert_eq!(
+        test_helpers::count_concurrency_holders(shard.db()).await,
+        2,
+        "multi-limit import should hold both queues before cleanup"
+    );
+
+    // Locate the RunAttempt and morph it into a CheckRateLimit carrying the
+    // same held_queues=[A, B]. Mirrors the single-limit test's pattern.
+    let (task_key, task_raw) = test_helpers::first_task_kv(shard.db())
+        .await
+        .expect("expected scheduled task");
+    let task = decode_task(&task_raw).expect("decode task");
+    let held_queues = match task {
+        Task::RunAttempt {
+            id,
+            tenant,
+            job_id: task_job_id,
+            attempt_number,
+            relative_attempt_number,
+            held_queues,
+            task_group,
+        } => {
+            assert_eq!(
+                held_queues.len(),
+                2,
+                "chain walker should produce held_queues=[A, B]",
+            );
+            let synthetic = Task::CheckRateLimit {
+                task_id: id,
+                tenant,
+                job_id: task_job_id,
+                attempt_number,
+                relative_attempt_number,
+                limit_index: 2,
+                rate_limit: GubernatorRateLimitData {
+                    name: "api-limit-multi".to_string(),
+                    unique_key: format!("reimport-multi-{}", uuid::Uuid::new_v4()),
+                    limit: 100,
+                    duration_ms: 60_000,
+                    hits: 1,
+                    algorithm: GubernatorAlgorithm::TokenBucket.as_u8(),
+                    behavior: 0,
+                    retry_initial_backoff_ms: 10,
+                    retry_max_backoff_ms: 1000,
+                    retry_backoff_multiplier: 2.0,
+                    retry_max_retries: 10,
+                },
+                retry_count: 0,
+                started_at_ms: test_helpers::now_ms(),
+                priority: 50,
+                held_queues: held_queues.clone(),
+                task_group,
+            };
+            let mut batch = WriteBatch::new();
+            batch.put(&task_key, &encode_task(&synthetic));
+            shard
+                .db()
+                .write(batch)
+                .await
+                .expect("replace RunAttempt with CheckRateLimit");
+            held_queues
+        }
+        other => panic!("expected RunAttempt task before replacement, got {other:?}"),
+    };
+    assert_eq!(
+        held_queues.len(),
+        2,
+        "synthetic CheckRateLimit must carry held_queues=[A, B]",
+    );
+
+    // Reimport terminal — the reimport cleanup must walk both entries in
+    // `held_queues` and delete the matching holders.
+    let mut reimport = base_import_params(job_id);
+    reimport.retry_policy = Some(default_retry_policy());
+    reimport.limits = vec![
+        Limit::Concurrency(ConcurrencyLimit {
+            key: queue_a.to_string(),
+            max_concurrency: 10,
+        }),
+        Limit::Concurrency(ConcurrencyLimit {
+            key: queue_b.to_string(),
+            max_concurrency: 10,
+        }),
+    ];
+    reimport.attempts = vec![succeeded_attempt(1_700_000_001_000)];
+    let r = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Succeeded);
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), "-", queue_a).await,
+        0,
+        "reimport must release A holder from multi-limit CheckRateLimit",
+    );
+    assert_eq!(
+        count_holders_for_queue(shard.db(), "-", queue_b).await,
+        0,
+        "reimport must release B holder from multi-limit CheckRateLimit",
+    );
+    assert_eq!(
+        test_helpers::count_concurrency_holders(shard.db()).await,
+        0,
+        "terminal reimport should release ALL holders from CheckRateLimit task"
+    );
+}
+
+/// Helper: count concurrency holders for (tenant, queue) via DB scan.
+async fn count_holders_for_queue(
+    db: &silo::instrumented_db::InstrumentedDb,
+    tenant: &str,
+    queue: &str,
+) -> usize {
+    let start = silo::keys::concurrency_holders_queue_prefix(tenant, queue);
+    let end = silo::keys::end_bound(&start);
+    let mut iter = db
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .expect("scan holders");
+    let mut count = 0;
+    while let Ok(Some(_)) = iter.next().await {
+        count += 1;
+    }
+    count
+}
+
+/// Reimporting a Scheduled job parked on an immediate deferred
+/// concurrency request (the `TicketRequested` outcome — no task in the
+/// DB queue, just a request key) must release every upstream chain grant
+/// the request value carries on its `held_queues`. The reimport path
+/// previously dropped the holders returned by
+/// `delete_concurrency_requests_for_job`.
+#[silo::test]
+async fn reimport_releases_held_queues_on_deferred_request() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    let tenant = "-";
+    let queue_a = "reimp-def-a".to_string();
+    let queue_b = "reimp-def-b".to_string();
+    let now = test_helpers::now_ms();
+
+    // job1 holds B.
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue_b.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let _j1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+
+    // job2: immediate [A free, B full] with an explicit id.
+    let job2_id = "reimp-def-job".to_string();
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            Some(job2_id.clone()),
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    // Chain grants A and writes a deferred B-request with held=[A].
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        1,
+        "chain should have granted A at enqueue"
+    );
+    assert!(
+        test_helpers::count_concurrency_requests(shard.db()).await >= 1,
+        "expected a deferred concurrency request"
+    );
+
+    // Reimport job2 — replaces the old scheduling state; the deferred
+    // request's held holders must be released.
+    let mut reimport = base_import_params(&job2_id);
+    reimport.limits = vec![Limit::Concurrency(ConcurrencyLimit {
+        key: queue_a.clone(),
+        max_concurrency: 1,
+    })];
+    reimport.attempts = vec![succeeded_attempt(now + 1_000)];
+    let r = shard.import_jobs(tenant, vec![reimport]).await.unwrap();
+    assert!(r[0].success, "reimport failed: {:?}", r[0].error);
+    assert_eq!(r[0].status, JobStatusKind::Succeeded);
+
+    assert_eq!(
+        count_holders_for_queue(shard.db(), tenant, &queue_a).await,
+        0,
+        "reimport must release held_queues from the deferred concurrency request"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue_a),
+        0,
+        "in-memory holder count for A must also drop to zero"
     );
 }

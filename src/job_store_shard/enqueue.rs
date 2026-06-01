@@ -18,7 +18,7 @@ use crate::job_store_shard::helpers::{
 };
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
-    task_key, tenant_status_counter_key,
+    tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -34,7 +34,22 @@ pub(crate) struct LimitTaskParams<'a> {
     pub limit_index: usize,
     pub limits: &'a [Limit],
     pub priority: u8,
-    pub start_at_ms: i64,
+    /// The job's user-requested start time. Used purely as the "is this
+    /// future-scheduled?" predicate (`scheduled_at_ms > now_ms` ⇒ write a
+    /// `Task::RequestTicket` instead of an in-queue request record) and as
+    /// the `start_time_ms` we persist on `EnqueueTask` so `process_grants`
+    /// can skip future-dated requests on resume.
+    pub scheduled_at_ms: i64,
+    /// The time component baked into every `task_key` / `concurrency_request_key`
+    /// this chain step writes. For a fresh enqueue this equals
+    /// `scheduled_at_ms` so a future-scheduled `RequestTicket` lands at the
+    /// future time. For a chain *resume* — `ShardChainResumer::resume_chain`
+    /// — this is `now_ms`, so the resumed task cannot collide with a broker
+    /// tombstone pinned by an earlier ack-delete at the original
+    /// `task_key(scheduled_at_ms, …)`. See
+    /// `project_broker_tombstone_chain_continuation` and the precedent in
+    /// `handle_request_ticket` (dequeue.rs).
+    pub task_key_start_ms: i64,
     pub now_ms: i64,
     pub held_queues: Vec<String>,
     pub task_group: &'a str,
@@ -86,12 +101,14 @@ fn record_grant_outcome(
 ) -> GrantResult {
     match outcome {
         None | Some(RequestTicketOutcome::GrantedImmediately { .. }) => {
-            // Slot granted (or no limit existed) - record grant and continue to
-            // the next limit. The interim RunAttempt that handle_enqueue wrote
-            // via append_grant_edits is overwritten at the same task_key when
-            // the outer loop reaches its terminal "no more limits" branch,
-            // which rewrites the RunAttempt with the full accumulated
-            // current_held_queues so ReportOutcome can release every holder.
+            // Slot granted (or no limit existed) — record the grant and
+            // continue. `handle_enqueue`'s `GrantedImmediately` path only
+            // writes the holder DB key; the `RunAttempt` `task_key` is
+            // written exactly once by the outer loop's terminal "no more
+            // limits" branch, carrying the full accumulated `held_queues`.
+            // This guarantees the broker can never observe a `RunAttempt`
+            // with a partial `held_queues`, which would otherwise let a
+            // worker complete a task and under-release holders.
             //
             // Crucially, `current_task_id` is NOT cycled here. The chained
             // cleanup paths (handle_check_rate_limit, handle_run_attempt) all
@@ -399,7 +416,12 @@ impl JobStoreShard {
                 limit_index: 0,
                 limits: &job.limits,
                 priority,
-                start_at_ms,
+                // Fresh enqueue: scheduled and task_key time coincide. If the
+                // job is future-scheduled (`start_at_ms > now_ms`) the
+                // resulting `RequestTicket` lands at the future time so the
+                // broker picks it up exactly then.
+                scheduled_at_ms: start_at_ms,
+                task_key_start_ms: start_at_ms,
                 now_ms,
                 held_queues: Vec::new(),
                 task_group,
@@ -449,11 +471,47 @@ impl JobStoreShard {
     /// optimization. If granted, it proceeds to the next limit (iteratively).
     ///
     /// Returns a Vec of all grants made (queue, task_id) for potential rollback if DB write fails.
+    ///
+    /// **Error semantics:** if the walk errors mid-chain (e.g. a db.get for
+    /// floating-limit state fails between an immediate grant and the next
+    /// limit), any in-memory reservations made up to that point are released
+    /// here before the error is returned. Callers therefore see either
+    /// `Ok(grants)` — every entry is a live in-memory reservation paired with
+    /// a pending batch write — or `Err(_)` with no leftover in-memory state to
+    /// clean up. This avoids leaking holders when an interior `?` fires after
+    /// a successful `try_reserve` but before the batch commits.
     pub(crate) async fn enqueue_limit_task_at_index<W: WriteBatcher>(
         &self,
         writer: &mut W,
         params: LimitTaskParams<'_>,
     ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+        // Save the tenant ref so we can roll back grants if walk_limit_chain errors.
+        // (references are Copy, so this doesn't conflict with moving `params`.)
+        let tenant_for_rollback: &str = params.tenant;
+        let mut grants: Vec<(String, String)> = Vec::new();
+        match self.walk_limit_chain(writer, params, &mut grants).await {
+            Ok(()) => Ok(grants),
+            Err(e) => {
+                for (queue, task_id) in &grants {
+                    self.concurrency
+                        .rollback_grant(tenant_for_rollback, queue, task_id);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner loop body for `enqueue_limit_task_at_index`. Pushes successful
+    /// in-memory grants to `grants` as it goes. Returns `Ok(())` on normal
+    /// completion (the caller hands `grants` back to its caller) or `Err(_)`
+    /// with `grants` containing whatever was accumulated up to the failure
+    /// point — the outer wrapper rolls those back before returning the error.
+    async fn walk_limit_chain<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        params: LimitTaskParams<'_>,
+        grants: &mut Vec<(String, String)>,
+    ) -> Result<(), JobStoreShardError> {
         let LimitTaskParams {
             tenant,
             task_id,
@@ -463,7 +521,8 @@ impl JobStoreShard {
             limit_index,
             limits,
             priority,
-            start_at_ms,
+            scheduled_at_ms,
+            task_key_start_ms,
             now_ms,
             held_queues,
             task_group,
@@ -475,10 +534,23 @@ impl JobStoreShard {
         // order function is deterministic on `limits`, so dequeue's
         // `limit_index + 1` continuation lands on the correct next entry.
         let order = limit_processing_order(limits);
-        let mut grants = Vec::new();
         let mut current_index = limit_index;
         let mut current_held_queues = held_queues;
         let current_task_id = task_id.to_string();
+        // `skip_try_reserve` is a retry-only knob (see the lease.rs retry
+        // path): the old holder is still in-memory and the retry must go
+        // through the request queue. It applies to the *first* limit the
+        // walker touches, not every limit in the chain. Today the first
+        // limit's `handle_enqueue` with `skip_try_reserve = true` is
+        // guaranteed to write a TicketRequested and exit the loop, so any
+        // value we leave in here for subsequent iterations is dead. But if
+        // a future ordering ever lets the walker step past that first
+        // limit while `skip_try_reserve` is still true, every downstream
+        // concurrency limit would silently bypass its reservation —
+        // exactly the bug class this PR is trying to close. Consume the
+        // flag after every `handle_enqueue` so the dead-code property
+        // becomes a compile-checked invariant.
+        let mut skip_try_reserve = skip_try_reserve;
 
         loop {
             if current_index >= limits.len() {
@@ -495,13 +567,13 @@ impl JobStoreShard {
                 put_task(
                     writer,
                     task_group,
-                    start_at_ms,
+                    task_key_start_ms,
                     priority,
                     job_id,
                     attempt_number,
                     &run_task,
                 )?;
-                return Ok(grants);
+                return Ok(());
             }
 
             match &limits[order[current_index]] {
@@ -517,13 +589,17 @@ impl JobStoreShard {
                             &current_task_id,
                             job_id,
                             priority,
-                            start_at_ms,
+                            scheduled_at_ms,
+                            task_key_start_ms,
                             now_ms,
                             std::slice::from_ref(cl),
                             task_group,
                             attempt_number,
                             relative_attempt_number,
-                            skip_try_reserve,
+                            std::mem::replace(&mut skip_try_reserve, false),
+                            current_index as u32,
+                            &current_held_queues,
+                            limits,
                         )
                         .await?;
 
@@ -535,30 +611,23 @@ impl JobStoreShard {
                         crate::concurrency::ConcurrencyLimitType::Fixed,
                     );
 
-                    let queued_with_request =
-                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
-
                     if matches!(
                         record_grant_outcome(
                             outcome,
                             &cl.key,
-                            &mut grants,
+                            grants,
                             &current_task_id,
                             &mut current_held_queues,
                             &mut current_index,
                         ),
                         GrantResult::Queued
                     ) {
-                        if queued_with_request && !grants.is_empty() {
-                            writer.delete(task_key(
-                                task_group,
-                                start_at_ms,
-                                priority,
-                                job_id,
-                                attempt_number,
-                            ))?;
-                        }
-                        return Ok(grants);
+                        // No interim `task_key` write to clean up here:
+                        // `append_grant_edits` only writes the holder; the
+                        // `RunAttempt` task_key is written exclusively by the
+                        // terminal branch below, which we won't reach on this
+                        // return.
+                        return Ok(());
                     }
                 }
 
@@ -586,13 +655,17 @@ impl JobStoreShard {
                             &current_task_id,
                             job_id,
                             priority,
-                            start_at_ms,
+                            scheduled_at_ms,
+                            task_key_start_ms,
                             now_ms,
                             std::slice::from_ref(&temp_cl),
                             task_group,
                             attempt_number,
                             relative_attempt_number,
-                            skip_try_reserve,
+                            std::mem::replace(&mut skip_try_reserve, false),
+                            current_index as u32,
+                            &current_held_queues,
+                            limits,
                         )
                         .await?;
 
@@ -623,30 +696,21 @@ impl JobStoreShard {
                         )?;
                     }
 
-                    let queued_with_request =
-                        matches!(&outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
-
                     if matches!(
                         record_grant_outcome(
                             outcome,
                             &fl.key,
-                            &mut grants,
+                            grants,
                             &current_task_id,
                             &mut current_held_queues,
                             &mut current_index,
                         ),
                         GrantResult::Queued
                     ) {
-                        if queued_with_request && !grants.is_empty() {
-                            writer.delete(task_key(
-                                task_group,
-                                start_at_ms,
-                                priority,
-                                job_id,
-                                attempt_number,
-                            ))?;
-                        }
-                        return Ok(grants);
+                        // See the Conc-branch comment: `append_grant_edits`
+                        // doesn't write a `task_key` anymore, so there's
+                        // nothing here to clean up before returning.
+                        return Ok(());
                     }
                 }
 
@@ -669,13 +733,13 @@ impl JobStoreShard {
                     put_task(
                         writer,
                         task_group,
-                        start_at_ms,
+                        task_key_start_ms,
                         priority,
                         job_id,
                         attempt_number,
                         &task,
                     )?;
-                    return Ok(grants);
+                    return Ok(());
                 }
             }
         }

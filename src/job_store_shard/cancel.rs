@@ -112,9 +112,10 @@ impl JobStoreShard {
             terminal_expire_ts,
         )?;
 
-        // Track concurrency state for post-commit cleanup
-        let mut held_queues_to_release: Vec<String> = Vec::new();
-        let mut task_id_for_release: Option<String> = None;
+        // Track concurrency holders to release post-commit. Each entry is a
+        // (task_id, queue) pair — `atomic_release` keys the in-memory slot
+        // by task_id, and the grant scanner is woken per queue.
+        let mut holders_to_release: Vec<(String, String)> = Vec::new();
         let mut deleted_task_key: Option<Vec<u8>> = None;
 
         // [SILO-CXL-3] For Scheduled jobs, eagerly delete task and concurrency state
@@ -174,36 +175,66 @@ impl JobStoreShard {
                             ..
                         } => {
                             // Delete concurrency holders for each held queue
-                            for queue in &held_queues {
-                                txn.delete(concurrency_holder_key(tenant, queue, &tid))?;
-                            }
-                            if !held_queues.is_empty() {
-                                task_id_for_release = Some(tid);
-                                held_queues_to_release = held_queues;
+                            for queue in held_queues {
+                                txn.delete(concurrency_holder_key(tenant, &queue, &tid))?;
+                                holders_to_release.push((tid.clone(), queue));
                             }
                         }
-                        Task::RequestTicket { .. } => {
-                            // FutureRequestTaskWritten case: the RequestTicket task IS the
-                            // pending request mechanism. Deleting the task is sufficient.
+                        Task::RequestTicket {
+                            task_id: tid,
+                            held_queues,
+                            ..
+                        } => {
+                            // FutureRequestTaskWritten case: the RequestTicket
+                            // task is the pending request mechanism. Deleting
+                            // it stops the request. But a multi-limit chain
+                            // can reach this state with prior holders already
+                            // granted (carried on the ticket's `held_queues`);
+                            // those must be released or the slots leak.
+                            for queue in held_queues {
+                                txn.delete(concurrency_holder_key(tenant, &queue, &tid))?;
+                                holders_to_release.push((tid.clone(), queue));
+                            }
+                        }
+                        Task::CheckRateLimit {
+                            task_id: tid,
+                            held_queues,
+                            ..
+                        } => {
+                            // A chain parked on a rate-limit step can carry
+                            // upstream concurrency grants on its
+                            // `held_queues`. Deleting the task stops the
+                            // chain, but the holders must be released too or
+                            // those slots leak.
+                            for queue in held_queues {
+                                txn.delete(concurrency_holder_key(tenant, &queue, &tid))?;
+                                holders_to_release.push((tid.clone(), queue));
+                            }
                         }
                         _ => {
-                            // Other task types (CheckRateLimit, RefreshFloatingLimit, etc.)
-                            // Just delete the task key above.
+                            // Other task types (RefreshFloatingLimit, etc.)
+                            // carry no chain-accumulated holders; deleting
+                            // the task key above is sufficient.
                         }
                     }
                 } else {
                     // No task found - check for TicketRequested case (request record
                     // exists but no task in DB queue). Scan for requests for this job.
-                    self.delete_concurrency_requests_for_job(
-                        &txn,
-                        tenant,
-                        id,
-                        &limits,
-                        attempt_number,
-                        start_time_ms,
-                        priority,
-                    )
-                    .await?;
+                    // A deferred concurrency request can carry `held_queues` from
+                    // upstream chain steps; those holders must be released too,
+                    // mirroring the future-RequestTicket path above.
+                    let released = self
+                        .delete_concurrency_requests_for_job(
+                            &txn,
+                            tenant,
+                            id,
+                            &limits,
+                            attempt_number,
+                            start_time_ms,
+                            priority,
+                        )
+                        .await?;
+                    holders_to_release.extend(released);
                 }
             }
         }
@@ -246,14 +277,11 @@ impl JobStoreShard {
         }
 
         // Release concurrency holders from in-memory counts and signal grant scanner
-        if !held_queues_to_release.is_empty() {
-            let finished_task_id = task_id_for_release.as_deref().unwrap_or_default();
-            for queue in &held_queues_to_release {
-                self.concurrency
-                    .counts()
-                    .atomic_release(tenant, queue, finished_task_id);
-                self.concurrency.request_grant(tenant, queue);
-            }
+        for (task_id, queue) in &holders_to_release {
+            self.concurrency
+                .counts()
+                .atomic_release(tenant, queue, task_id);
+            self.concurrency.request_grant(tenant, queue);
         }
 
         Ok(())
@@ -265,6 +293,11 @@ impl JobStoreShard {
     /// Uses a narrow prefix scan targeting exactly this job's requests, rather than scanning
     /// all requests for the queue. Falls back to start_time_ms=0 if no requests found
     /// (same pattern as task key reconstruction fallback).
+    ///
+    /// Returns the `(task_id, queue)` pairs of concurrency holders that the
+    /// caller must release post-commit — a deferred request can carry
+    /// `held_queues` from upstream chain steps whose holders are still
+    /// reserved.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn delete_concurrency_requests_for_job(
         &self,
@@ -275,7 +308,8 @@ impl JobStoreShard {
         attempt_number: u32,
         start_time_ms: i64,
         priority: u8,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+        let mut holders_to_release: Vec<(String, String)> = Vec::new();
         for limit in limits {
             let queue_key = match limit {
                 Limit::Concurrency(cl) => &cl.key,
@@ -292,6 +326,7 @@ impl JobStoreShard {
                     attempt_number,
                     start_time_ms,
                     priority,
+                    &mut holders_to_release,
                 )
                 .await?;
 
@@ -305,15 +340,26 @@ impl JobStoreShard {
                     attempt_number,
                     0,
                     priority,
+                    &mut holders_to_release,
                 )
                 .await?;
             }
         }
-        Ok(())
+        Ok(holders_to_release)
     }
 
     /// Scan a narrow prefix for this job's concurrency requests and delete them.
     /// Returns true if any requests were deleted.
+    ///
+    /// For each request value found, decodes the persisted `task_id` and
+    /// `held_queues` and:
+    /// - batches a delete of every `concurrency_holder_key(tenant, q, task_id)`
+    ///   so upstream chain holders are dropped together with the request;
+    /// - appends `(task_id, queue)` pairs to `holders_to_release` so the caller
+    ///   can route them through the post-commit `atomic_release` path.
+    ///
+    /// A malformed value is logged and its key is still deleted (the entry is
+    /// dead either way); the holders for that entry simply can't be recovered.
     #[expect(clippy::too_many_arguments)]
     async fn delete_concurrency_requests_with_prefix(
         &self,
@@ -324,6 +370,7 @@ impl JobStoreShard {
         attempt_number: u32,
         start_time_ms: i64,
         priority: u8,
+        holders_to_release: &mut Vec<(String, String)>,
     ) -> Result<bool, JobStoreShardError> {
         let prefix = concurrency_request_job_prefix(
             tenant,
@@ -338,6 +385,40 @@ impl JobStoreShard {
 
         let mut deleted_count: i64 = 0;
         while let Some(kv) = iter.next().await? {
+            // Decode the request to recover any upstream `held_queues` the
+            // chain accumulated before this gate. Missing/corrupt values are
+            // logged — we still delete the request key but cannot recover the
+            // holders (they will leak in-memory until process restart).
+            match crate::codec::decode_concurrency_action(kv.value.clone()) {
+                Ok(decoded) => {
+                    let a = decoded.fb();
+                    if let Some(et) = a.variant_as_enqueue_task() {
+                        let task_id = et.task_id().unwrap_or_default();
+                        if !task_id.is_empty()
+                            && let Some(held) = et.held_queues()
+                        {
+                            for q in held.iter() {
+                                txn.delete(concurrency_holder_key(tenant, q, task_id))?;
+                                holders_to_release.push((task_id.to_string(), q.to_string()));
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            queue = %queue_key,
+                            "cancel: concurrency request has unknown variant; holders (if any) cannot be recovered"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        queue = %queue_key,
+                        error = %e,
+                        "cancel: failed to decode concurrency request; holders (if any) cannot be recovered"
+                    );
+                }
+            }
             txn.delete(&kv.key)?;
             deleted_count += 1;
             tracing::debug!(

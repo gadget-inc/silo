@@ -456,6 +456,32 @@ impl TaskBroker {
         }
     }
 
+    /// Release claimed keys from in-flight tracking *without* re-buffering them.
+    ///
+    /// Used by the dequeue drop-guard when the dequeue future is cancelled or
+    /// panics after claiming but before it could `ack_durable`/`requeue`. At
+    /// that point we cannot know whether the durable commit landed.
+    ///
+    /// Unlike `requeue`, this does not re-insert into the buffer and installs no
+    /// tombstone — re-pickup is driven by the DB scanner, which only re-adds
+    /// keys still present in the DB. This matters because the claimed batch can
+    /// include internal chain tasks (`RequestTicket`/`CheckRateLimit`) whose
+    /// processing has non-idempotent side effects (reserving a concurrency
+    /// holder, charging a Gubernator rate limit, writing the next chain task).
+    /// Blindly re-buffering one whose commit *did* land would re-run those
+    /// effects (double-reserved holders, double-charged limits, duplicate
+    /// follow-ups; for a RunAttempt, a second lease on the same task_id).
+    /// Routing through the scanner avoids that: a committed task had its key
+    /// deleted in the same batch (not re-added → no double-processing), while an
+    /// uncommitted task still has its key (re-scanned → processed exactly once,
+    /// un-stranded).
+    fn release_inflight(&self, keys: &[Vec<u8>]) {
+        let mut inflight = self.inflight.lock().unwrap();
+        for k in keys {
+            inflight.remove(k);
+        }
+    }
+
     /// Acknowledge durable dequeue outcomes.
     /// - `release_keys`: keys to release from in-flight tracking.
     /// - `tombstone_keys`: subset of keys that were durably deleted and should be
@@ -606,6 +632,19 @@ impl TaskBrokerRegistry {
         }
     }
 
+    /// Release claimed keys from in-flight tracking without re-buffering them.
+    /// Keys may belong to different task groups; only touches brokers that
+    /// already exist. See [`TaskBroker::release_inflight`].
+    pub fn release_inflight(&self, keys: &[Vec<u8>]) {
+        for k in keys {
+            if let Some(parsed) = parse_task_key(k)
+                && let Some(broker) = self.brokers.get(&parsed.task_group)
+            {
+                broker.release_inflight(std::slice::from_ref(k));
+            }
+        }
+    }
+
     /// Get the total buffer length across all brokers.
     pub fn buffer_len(&self) -> usize {
         self.brokers.iter().map(|e| e.value().buffer_len()).sum()
@@ -637,5 +676,107 @@ impl TaskBrokerRegistry {
         for entry in self.brokers.iter() {
             entry.value().stop();
         }
+    }
+
+    /// Test-only: ensure a broker exists for `task_group` and directly inject
+    /// `keys` into its in-flight set. Used to exercise drop-guard / release
+    /// paths without standing up a scanner + DB write round-trip just to drive
+    /// the same state.
+    #[cfg(test)]
+    pub(crate) fn seed_inflight_for_test(&self, task_group: &str, keys: Vec<Vec<u8>>) {
+        let broker = self.get_or_create(task_group);
+        let mut inflight = broker.inflight.lock().unwrap();
+        for k in keys {
+            inflight.insert(k);
+        }
+    }
+}
+
+#[cfg(test)]
+mod inflight_release_tests {
+    use super::*;
+    use crate::codec::encode_task;
+    use crate::instrumented_db::InstrumentedDb;
+    use crate::shard_range::ShardRange;
+    use crate::task::Task;
+
+    async fn empty_broker() -> Arc<TaskBroker> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::DbBuilder::new("test", store)
+            .build()
+            .await
+            .expect("open in-memory db");
+        let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
+        TaskBroker::new(
+            "tg".to_string(),
+            db,
+            "shard".to_string(),
+            None,
+            ShardRange::full(),
+        )
+    }
+
+    fn sample_broker_task(job_id: &str) -> BrokerTask {
+        let task = Task::RunAttempt {
+            id: format!("task-{job_id}"),
+            tenant: "-".to_string(),
+            job_id: job_id.to_string(),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            held_queues: vec![],
+            task_group: "tg".to_string(),
+        };
+        let key = crate::keys::task_key("tg", 1, 0, job_id, 1);
+        let decoded = decode_task_validated(encode_task(&task)).expect("decode task");
+        BrokerTask { key, decoded }
+    }
+
+    /// The drop-guard uses `release_inflight`: it must free the in-flight
+    /// reservation WITHOUT re-buffering, so re-pickup is driven by the DB
+    /// scanner (which won't re-add a key whose commit deleted it → no double
+    /// dispatch).
+    #[tokio::test]
+    async fn release_inflight_frees_without_rebuffering() {
+        let broker = empty_broker().await;
+        let task = sample_broker_task("j1");
+        let key = task.key.clone();
+        broker.buffer.insert(key.clone(), task);
+
+        // Claim moves it from the buffer into in-flight.
+        let claimed = broker.claim_ready(10);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(broker.buffer_len(), 0);
+        assert_eq!(broker.inflight_len(), 1);
+
+        broker.release_inflight(&[key]);
+        assert_eq!(broker.inflight_len(), 0, "inflight should be drained");
+        assert_eq!(
+            broker.buffer_len(),
+            0,
+            "release_inflight must not re-buffer"
+        );
+    }
+
+    /// Contrast: the explicit error paths use `requeue`, which frees in-flight
+    /// AND re-buffers for immediate re-pickup. Guards the distinction the fix
+    /// relies on.
+    #[tokio::test]
+    async fn requeue_frees_and_rebuffers() {
+        let broker = empty_broker().await;
+        let task = sample_broker_task("j2");
+        let key = task.key.clone();
+        broker.buffer.insert(key, task);
+
+        let claimed = broker.claim_ready(10);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(broker.inflight_len(), 1);
+
+        broker.requeue(claimed);
+        assert_eq!(broker.inflight_len(), 0);
+        assert_eq!(
+            broker.buffer_len(),
+            1,
+            "requeue should re-buffer for immediate re-pickup"
+        );
     }
 }

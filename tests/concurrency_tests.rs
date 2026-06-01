@@ -142,22 +142,66 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
     let tenant = "-";
     let queue = "reconcile-q".to_string();
 
-    // Create a real job record that the grant scanner can resolve when granting.
-    // Use a future start time so no ready task exists for this job yet.
+    // Create a real job record that the grant scanner can resolve when
+    // granting. Use a present-time start so the chain grants a real
+    // holder we can steal a task_id from. (Pre-fix this test used a future
+    // start, but future-scheduled jobs no longer grab holders at enqueue
+    // time.) Give the job a concurrency limit on `queue` so the injected
+    // request is well-formed — post-schema-update the scanner expects
+    // requests to persist their limits list and rejects ones with an empty
+    // list as corrupt.
+    let conc_limit = silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.clone(),
+        max_concurrency: 1,
+    });
     let job_id = shard
         .enqueue(
             tenant,
             None,
             10u8,
-            now + 60_000,
+            now,
             None,
             test_helpers::msgpack_payload(&serde_json::json!({"reconcile": true})),
-            vec![],
+            vec![conc_limit.clone()],
             None,
             "default",
         )
         .await
         .expect("enqueue");
+
+    // The enqueue above grants the queue's only slot to this job and writes
+    // a holder under a freshly-generated task_id. Look that task_id up and
+    // clear it (DB + in-memory) so we can simulate an "orphan request"
+    // (durable request exists but the in-memory scanner notification was
+    // missed). The manual request below reuses the same task_id so the
+    // chain resumer's holder lookups stay coherent.
+    let holders_prefix = silo::keys::concurrency_holders_queue_prefix(tenant, &queue);
+    let mut iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(
+            holders_prefix.clone()..silo::keys::end_bound(&holders_prefix),
+            &silo::scan_options(),
+        )
+        .await
+        .expect("scan holders");
+    let kv = iter
+        .next()
+        .await
+        .expect("iter")
+        .expect("a holder must exist from the natural enqueue");
+    let holder_key = kv.key.to_vec();
+    let parsed = silo::keys::parse_concurrency_holder_key(&holder_key).expect("parse holder key");
+    let manual_task_id = parsed.task_id;
+    drop(iter);
+
+    let mut clear_batch = WriteBatch::new();
+    clear_batch.delete(&holder_key);
+    shard
+        .db()
+        .write(clear_batch)
+        .await
+        .expect("clear pre-existing holder");
+    shard.rollback_concurrency_grant_for_test(tenant, &queue, &manual_task_id);
 
     assert_eq!(
         count_concurrency_holders(shard.db()).await,
@@ -175,6 +219,10 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
         attempt_number: 1,
         relative_attempt_number: 1,
         task_group: "default".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: manual_task_id.clone(),
+        limits: vec![conc_limit.clone()],
     };
     let request_key = concurrency_request_key(tenant, &queue, now, 10, &job_id, 1, "manual");
     let request_value = encode_concurrency_action(&action);
@@ -1830,4 +1878,313 @@ async fn concurrency_no_overgrant_with_lazy_hydration() {
     );
 
     shard2.close().await.expect("close shard2");
+}
+
+/// The grant scanner must defensively delete corrupt request entries it
+/// encounters during a pass and continue processing the rest. Three shapes
+/// are exercised here:
+///
+/// 1. Truncated flatbuffer (decode fails outright).
+/// 2. Empty `limits` (post-schema, every request must carry its limits — an
+///    empty list would let the chain resumer fall through to a terminal
+///    `RunAttempt` that bypasses every gate).
+/// 3. Empty `task_id` (the chain identity is what keys every holder; an
+///    empty id would make rollback / release unreachable).
+///
+/// Pre-fix variants of these would either panic the scanner, get silently
+/// stuck (cannot decode → loop forever), or proceed and corrupt downstream
+/// state. The current implementation deletes the offender + emits a warn +
+/// keeps going. This test injects all three alongside a valid request and
+/// asserts (a) all corrupt rows are gone after one synchronous pass and (b)
+/// the valid request still gets granted.
+#[silo::test]
+async fn grant_scanner_skips_corrupt_request_variants() {
+    use silo::keys::concurrency_request_key;
+
+    let (_tmp, shard) = open_temp_shard_with_reconcile_interval_ms(60 * 60 * 1000).await;
+    // Don't let the background grant scanner race the deterministic
+    // process_concurrency_grants pass below.
+    shard.stop_grant_scanner();
+    let now = now_ms();
+    let tenant = "-";
+    let queue = "corrupt-q".to_string();
+
+    let conc_limit = Limit::Concurrency(ConcurrencyLimit {
+        key: queue.clone(),
+        max_concurrency: 1,
+    });
+
+    // job1 takes the queue's only slot. We need a real holder so the queue
+    // capacity is at limit and the scanner doesn't attempt to grant the
+    // corrupt entries (it would still delete them either way, but staying
+    // at capacity also pins that the valid entry below is genuinely deferred
+    // rather than granted at enqueue time).
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![conc_limit.clone()],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+    assert_eq!(job1_tasks.len(), 1);
+    let job1_task_id = job1_tasks[0].attempt().task_id().to_string();
+
+    // job2 defers on the same queue — produces a valid request the scanner
+    // must process.
+    let job2_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![conc_limit.clone()],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+    let initial_requests = count_concurrency_requests(shard.db()).await;
+    assert!(
+        initial_requests >= 1,
+        "valid deferred request should be present"
+    );
+
+    // Inject three corrupt requests with monotonically increasing suffixes so
+    // they sort distinctly. start_time_ms = now so they're picked up this pass.
+    let truncated_key =
+        concurrency_request_key(tenant, &queue, now, 10, "corrupt-truncated", 1, "corrupt-a");
+    let empty_limits_key = concurrency_request_key(
+        tenant,
+        &queue,
+        now,
+        10,
+        "corrupt-empty-limits",
+        1,
+        "corrupt-b",
+    );
+    let empty_task_id_key =
+        concurrency_request_key(tenant, &queue, now, 10, "corrupt-empty-tid", 1, "corrupt-c");
+
+    let mut batch = WriteBatch::new();
+
+    // (1) Truncated flatbuffer — gibberish bytes that decode_concurrency_action
+    //     will reject outright.
+    batch.put(&truncated_key, &b"\xff\xff\xff\xff\xff\xff\xff\xff"[..]);
+
+    // (2) Empty limits: a well-formed EnqueueTask with an empty limits Vec.
+    //     Post-schema this is invalid; the scanner must delete + skip.
+    let empty_limits_action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: now,
+        priority: 10,
+        job_id: "corrupt-empty-limits".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "default".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "fake-tid-for-empty-limits".to_string(),
+        limits: Vec::new(),
+    };
+    batch.put(
+        &empty_limits_key,
+        &encode_concurrency_action(&empty_limits_action),
+    );
+
+    // (3) Empty task_id: well-formed but missing identity.
+    let empty_tid_action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: now,
+        priority: 10,
+        job_id: "corrupt-empty-tid".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "default".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: String::new(),
+        limits: vec![conc_limit.clone()],
+    };
+    batch.put(
+        &empty_task_id_key,
+        &encode_concurrency_action(&empty_tid_action),
+    );
+
+    shard.db().write(batch).await.expect("inject corrupt rows");
+
+    let with_corrupt = count_concurrency_requests(shard.db()).await;
+    assert_eq!(
+        with_corrupt,
+        initial_requests + 3,
+        "three corrupt entries should be persisted before the pass"
+    );
+
+    // Release job1 so job2's valid request has capacity.
+    shard
+        .report_attempt_outcome(&job1_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("release job1");
+
+    // Drive one synchronous pass. Scanner should: delete all three corrupt
+    // entries, grant job2's valid request, and leave nothing pending.
+    // `process_concurrency_grants` returns the task_groups it granted into,
+    // not job_ids, so we check the more reliable indicator: holder count
+    // came back to 1 (job2 holds A).
+    let granted_task_groups = shard.process_concurrency_grants(tenant, &queue, 16).await;
+    let _ = job2_id; // job_id is for documentation; not in the return shape
+    assert!(
+        !granted_task_groups.is_empty(),
+        "scanner should have granted at least one (valid) request",
+    );
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "the valid request must produce a fresh holder after the pass",
+    );
+
+    // Sanity: requests drained (corrupts deleted, valid was granted).
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "scanner must delete all corrupt entries and consume the valid one",
+    );
+
+    // Spot-check each corrupt key was deleted by the scanner (defensive
+    // against an accidental partial-delete regression).
+    for (label, key) in [
+        ("truncated", &truncated_key),
+        ("empty_limits", &empty_limits_key),
+        ("empty_task_id", &empty_task_id_key),
+    ] {
+        assert!(
+            shard.db().get(key).await.expect("get").is_none(),
+            "corrupt request '{label}' should have been deleted"
+        );
+    }
+}
+
+/// A burst of future-scheduled jobs larger than queue capacity must hold zero
+/// slots at enqueue time. Strengthens `future_scheduled_jobs_do_not_starve_immediate_work`
+/// by (a) sizing the burst above capacity so a single accidental `try_reserve`
+/// would visibly leak, (b) asserting each persisted `Task::RequestTicket`
+/// lives at `task_key_start_ms == scheduled_at_ms`, and (c) confirming a
+/// present-time enqueue afterwards is granted the slot.
+///
+/// Pre-fix (before commit 8f94f59) every future-scheduled enqueue called
+/// `try_reserve` and grabbed a holder until its scheduled time arrived.
+/// A burst of 10 future-scheduled jobs into a cap=1 queue would saturate the
+/// in-memory counter immediately, leaving the immediate job stranded.
+#[silo::test]
+async fn future_scheduled_burst_into_quiet_queue_holds_zero_slots() {
+    use silo::keys::{end_bound, tasks_prefix};
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "-";
+    let queue = "future-burst-q".to_string();
+    let future_at = now + 600_000; // ten minutes out
+
+    // Burst of future-scheduled jobs. Each is solo on the chain (one
+    // Concurrency limit) so the FutureRequestTaskWritten branch is the
+    // observed outcome.
+    let burst = 10;
+    let cap = 1;
+    let mut burst_ids = Vec::with_capacity(burst);
+    for i in 0..burst {
+        let id = shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                future_at,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"f": i})),
+                vec![Limit::Concurrency(ConcurrencyLimit {
+                    key: queue.clone(),
+                    max_concurrency: cap as u32,
+                })],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue future");
+        burst_ids.push(id);
+    }
+
+    // Invariant (a): zero holders on disk + in-memory.
+    let burst_holders = count_concurrency_holders_for_tenant(shard.db(), tenant).await;
+    assert_eq!(
+        burst_holders, 0,
+        "burst of future-scheduled jobs must not grab any concurrency holder",
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, &queue),
+        0,
+        "in-memory holder count must be 0 after a future-scheduled burst",
+    );
+
+    // Invariant (b): every persisted RequestTicket lives at scheduled_at_ms.
+    let start = tasks_prefix();
+    let end = end_bound(&start);
+    let mut iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options())
+        .await
+        .expect("scan tasks");
+    let mut found_tickets = 0usize;
+    while let Ok(Some(kv)) = iter.next().await {
+        if let Ok(Task::RequestTicket { ref job_id, .. }) = decode_task(&kv.value)
+            && burst_ids.contains(job_id)
+        {
+            let parsed = silo::keys::parse_task_key(&kv.key).expect("parse task_key");
+            assert_eq!(
+                parsed.start_time_ms as i64, future_at,
+                "future RequestTicket's task_key must live at scheduled_at_ms",
+            );
+            found_tickets += 1;
+        }
+    }
+    assert_eq!(
+        found_tickets, burst,
+        "every future-scheduled job must have persisted a RequestTicket",
+    );
+
+    // Invariant (c): a present-time enqueue on the same queue still wins the
+    // slot — the future burst did not starve the immediate path.
+    let immediate_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"f": "now"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: cap as u32,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue immediate");
+
+    let tasks = shard
+        .dequeue("w1", "default", 10)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert!(
+        tasks.iter().any(|t| t.job().id() == immediate_id),
+        "present-time job should dequeue despite a burst of future-scheduled work; got {} tasks",
+        tasks.len(),
+    );
 }

@@ -10,6 +10,7 @@ pub(crate) mod helpers;
 pub mod import;
 mod lease;
 mod lease_task;
+pub(crate) mod limit_chain;
 mod rate_limit;
 mod restart;
 mod scan;
@@ -322,6 +323,10 @@ impl From<crate::concurrency::ConcurrencyError> for JobStoreShardError {
         match e {
             crate::concurrency::ConcurrencyError::Slate(e) => JobStoreShardError::Slate(e),
             crate::concurrency::ConcurrencyError::Encoding(s) => JobStoreShardError::Codec(s),
+            crate::concurrency::ConcurrencyError::ShardShuttingDown => {
+                JobStoreShardError::Codec("shard shutting down".to_string())
+            }
+            crate::concurrency::ConcurrencyError::ChainResume(s) => JobStoreShardError::Codec(s),
         }
     }
 }
@@ -496,10 +501,6 @@ impl JobStoreShard {
             range.clone(),
         );
 
-        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready.
-        // It takes the instrumented db so its writes are tagged with the shard span too.
-        concurrency.start_grant_scanner(Arc::clone(&db), Arc::clone(&brokers), range.clone());
-
         let shard = Arc::new(Self {
             name,
             db,
@@ -519,6 +520,23 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
         });
+
+        // Install the chain resumer before starting the grant scanner so the
+        // scanner's first wake-up has a working callback for resuming limit
+        // chains after a deferred grant. Uses a Weak<JobStoreShard> internally
+        // so this trait object does not form a strong reference cycle.
+        shard
+            .concurrency
+            .set_chain_resumer(limit_chain::ShardChainResumer::install(&shard));
+
+        // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready,
+        // and after the chain resumer is installed. It takes the instrumented db so its writes
+        // are tagged with the shard span too.
+        shard.concurrency.start_grant_scanner(
+            Arc::clone(&shard.db),
+            Arc::clone(&shard.brokers),
+            range.clone(),
+        );
 
         // Periodically reconcile pending concurrency requests to self-heal from
         // missed in-memory notifications or transient scanner failures.
@@ -958,6 +976,74 @@ impl JobStoreShard {
         self.concurrency
             .process_grants(&self.db, &range, tenant, queue, count)
             .await
+    }
+
+    /// Test-only: drop the installed chain resumer so the next
+    /// `process_concurrency_grants` exercises the scanner's
+    /// release-and-bail branch. Returns the removed resumer (caller may
+    /// drop it or re-install via `set_chain_resumer`).
+    pub fn take_chain_resumer_for_test(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::concurrency::LimitChainResumer>> {
+        self.concurrency.take_chain_resumer_for_test()
+    }
+
+    /// Test-only: release the in-memory reservation for a (tenant, queue,
+    /// task_id) tuple. Symmetric with `rollback_grant`'s rollback path,
+    /// exposed publicly so tests that fabricate orphan request scenarios
+    /// can clear the in-memory holder created by the natural enqueue path.
+    pub fn rollback_concurrency_grant_for_test(&self, tenant: &str, queue: &str, task_id: &str) {
+        self.concurrency.rollback_grant(tenant, queue, task_id);
+    }
+
+    /// Test-only: inject the broker buffer entries for the given task keys,
+    /// reading the persisted task bytes from the DB. Lets tests deterministically
+    /// drive `dequeue` against future-scheduled or pre-cancel-staged tasks
+    /// without waiting for the background broker scanner.
+    pub async fn force_buffer_tasks_for_test(
+        &self,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<usize, JobStoreShardError> {
+        use crate::codec::decode_task_validated;
+        use crate::task_broker::BrokerTask;
+        let mut tasks = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(raw) = self.db.get(&key).await? else {
+                continue;
+            };
+            let decoded = decode_task_validated(raw)
+                .map_err(|e| JobStoreShardError::Codec(format!("force_buffer decode: {e}")))?;
+            tasks.push(BrokerTask { key, decoded });
+        }
+        let count = tasks.len();
+        self.brokers.requeue(tasks);
+        Ok(count)
+    }
+
+    /// Test-only: reserve an in-memory holder for (tenant, queue, task_id).
+    /// Bypasses DB hydration and capacity checks so tests can fabricate the
+    /// "in-memory and on-disk holder exist for a fake chain" state needed to
+    /// drive cancel/reimport paths through their defensive arms.
+    pub async fn force_reserve_concurrency_for_test(
+        &self,
+        tenant: &str,
+        queue: &str,
+        task_id: &str,
+        limit: usize,
+    ) -> bool {
+        self.concurrency
+            .counts()
+            .try_reserve(
+                &self.db,
+                &self.get_range(),
+                tenant,
+                queue,
+                task_id,
+                limit,
+                "force-reserve-test",
+            )
+            .await
+            .unwrap_or(false)
     }
 
     /// Fetch a job by id as a zero-copy archived view.
