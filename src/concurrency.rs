@@ -107,9 +107,9 @@ pub struct ResumeChainParams {
     pub job_id: String,
     pub attempt_number: u32,
     pub relative_attempt_number: u32,
-    /// Index into `limit_processing_order(limits)` for the next limit to
-    /// evaluate. May equal `limits.len()` (in canonical order) — meaning the
-    /// chain is complete and the resumer should write a `RunAttempt`.
+    /// Index into the client-provided `limits` slice for the next limit to
+    /// evaluate. May equal `limits.len()` — meaning the chain is complete and
+    /// the resumer should write a `RunAttempt`.
     pub limit_index: u32,
     pub priority: u8,
     pub start_at_ms: i64,
@@ -872,10 +872,10 @@ impl ConcurrencyManager {
         attempt_number: u32,
         relative_attempt_number: u32,
         skip_try_reserve: bool,
-        // Position of this limit in the job's canonical limit order. Persisted
-        // on the deferred request/ticket so `process_grants` (or the dequeue
-        // path for future-scheduled tickets) can resume the chain at
-        // `limit_index + 1` after this slot is granted.
+        // Index of this limit in the job's `limits` list. Persisted on the
+        // deferred request/ticket so `process_grants` (or the dequeue path for
+        // future-scheduled tickets) can resume the chain at `limit_index + 1`
+        // after this slot is granted.
         limit_index: u32,
         // Concurrency queues already held by earlier chain steps. Persisted
         // alongside `limit_index` so the resumed chain knows which holders
@@ -1201,8 +1201,8 @@ impl ConcurrencyManager {
             start_time_ms: i64,
             priority: u8,
             task_group: String,
-            /// Position of the gating limit (this queue) in the job's canonical
-            /// order. Resuming the chain starts at `limit_index + 1`.
+            /// Index of the gating limit (this queue) in the job's `limits`
+            /// list. Resuming the chain starts at `limit_index + 1`.
             limit_index: u32,
             /// Holders already in place from earlier chain steps. The resumed
             /// chain appends this queue and continues from there.

@@ -40,9 +40,8 @@ pub enum Task {
         /// reachable by the same id.
         task_id: String,
         task_group: String,
-        /// Position of the gating limit in the job's canonical limit order
-        /// (see `limit_processing_order`). When granted, chain resumes at
-        /// `limit_index + 1`.
+        /// Index of the gating limit in the job's `limits` list. When granted,
+        /// chain resumes at `limit_index + 1`.
         limit_index: u32,
         /// Concurrency queues already held by earlier chain steps.
         held_queues: Vec<String>,
@@ -160,9 +159,8 @@ pub enum ConcurrencyAction {
         /// Attempt number within current run (resets to 1 on job restart)
         relative_attempt_number: u32,
         task_group: String,
-        /// Position of the gating limit in the job's canonical limit order
-        /// (see `limit_processing_order`). When granted, the chain resumes
-        /// at `limit_index + 1`.
+        /// Index of the gating limit in the job's `limits` list. When granted,
+        /// the chain resumes at `limit_index + 1`.
         limit_index: u32,
         /// Concurrency queues already held by earlier chain steps.
         held_queues: Vec<String>,
