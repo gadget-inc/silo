@@ -182,6 +182,18 @@ fn default_concurrency_reconcile_interval_ms() -> u64 {
     DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS
 }
 
+pub const DEFAULT_ORPHANED_HOLDER_GRACE_MS: u64 = 60_000;
+
+fn default_orphaned_holder_grace_ms() -> u64 {
+    DEFAULT_ORPHANED_HOLDER_GRACE_MS
+}
+
+pub const DEFAULT_ORPHANED_HOLDER_MAX_REAP_PER_TICK: usize = 1000;
+
+fn default_orphaned_holder_max_reap_per_tick() -> usize {
+    DEFAULT_ORPHANED_HOLDER_MAX_REAP_PER_TICK
+}
+
 fn default_hydrate_all_at_startup() -> bool {
     false
 }
@@ -210,6 +222,23 @@ pub struct DatabaseTemplate {
     /// to self-heal from missed in-memory notifications.
     #[serde(default = "default_concurrency_reconcile_interval_ms")]
     pub concurrency_reconcile_interval_ms: u64,
+    /// Grace window in milliseconds for the periodic orphaned-holder reaper.
+    /// A concurrency holder whose `task_id` has no lease and whose grant is
+    /// older than this window is treated as orphaned (the worker vanished
+    /// before durably writing a lease) and released. The window guards the
+    /// normal grant→lease handoff and the still-queued case; worker leases are
+    /// `DEFAULT_LEASE_MS` (10 s), so the 60 s default is 6× that — comfortably
+    /// past the gap while still reclaiming a wedged queue within a minute.
+    #[serde(default = "default_orphaned_holder_grace_ms")]
+    pub orphaned_holder_grace_ms: u64,
+    /// Maximum number of orphaned holders the periodic reaper will release in a
+    /// single per-shard scan (one tick). Bounds the size of the durable delete
+    /// batch and the post-commit release loop so a shard with a large orphan
+    /// backlog drains over several ticks instead of one giant write. Any
+    /// remainder is reclaimed on subsequent ticks. Holders are bounded by the
+    /// sum of concurrency caps, so the 1000 default rarely truncates.
+    #[serde(default = "default_orphaned_holder_max_reap_per_tick")]
+    pub orphaned_holder_max_reap_per_tick: usize,
     /// Interval in seconds for the periodic counter reconciliation background
     /// task that re-derives counter truth from JOB_INFO/JOB_STATUS to correct
     /// drift caused by the standalone compactor dropping terminal job rows.
@@ -283,6 +312,8 @@ impl Default for DatabaseTemplate {
             wal: None,
             apply_wal_on_close: default_apply_wal_on_close(),
             concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
+            orphaned_holder_grace_ms: default_orphaned_holder_grace_ms(),
+            orphaned_holder_max_reap_per_tick: default_orphaned_holder_max_reap_per_tick(),
             counter_reconciliation_seconds: None,
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
             completed_job_expire_s: None,

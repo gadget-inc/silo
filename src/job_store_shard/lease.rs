@@ -5,8 +5,8 @@ use slatedb::config::WriteOptions;
 use uuid::Uuid;
 
 use crate::codec::{
-    decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
-    encode_lease,
+    decode_floating_limit_state, decode_holder_granted_at_ms, decode_lease, encode_attempt,
+    encode_floating_limit_state, encode_lease,
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
@@ -14,9 +14,9 @@ use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_tenant_prefix,
-    end_bound, floating_limit_state_key, idx_metadata_key, job_cancelled_key, job_info_key,
-    leased_task_key, parse_concurrency_holder_key,
+    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_prefix,
+    concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key, idx_metadata_key,
+    job_cancelled_key, job_info_key, leased_task_key, parse_concurrency_holder_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
@@ -669,6 +669,156 @@ impl JobStoreShard {
                 queue = %queue,
                 task_id = %task_id,
                 "purged orphaned concurrency holder during late report_outcome cleanup"
+            );
+        }
+
+        Ok(to_delete.len())
+    }
+
+    /// Scan all concurrency holders and release any orphaned ones: a holder
+    /// whose `task_id` has no lease and whose grant is older than `grace_ms`.
+    /// Releases via the full path (delete row + `atomic_release` +
+    /// `request_grant`). Skips tenants outside the shard range (split-aware).
+    /// Returns the number released.
+    ///
+    /// The invariant this repairs: every holder's `task_id` must have either a
+    /// lease (`leased_task_key`) or a still-queued `RunAttempt`. When a worker
+    /// pulls a `RunAttempt` into its in-flight buffer and its dequeue/lease
+    /// future is dropped **before a lease is durably written**, the holder was
+    /// already granted but the task is gone and no lease ever exists — so
+    /// neither the lease reaper (iterates leases) nor a late `report_outcome`
+    /// (`purge_orphaned_holders_for_task`, fires only for that exact `task_id`)
+    /// will ever reclaim it. The in-memory count stays pegged and, once ghost
+    /// holders fill the cap, the queue wedges. Nothing else iterates holders;
+    /// this does.
+    ///
+    /// Scan-then-point-get ordering avoids false positives: if a worker leases
+    /// a holder between the grace check and the point-get, the lease is
+    /// observed and the holder is skipped. The grace window covers holders
+    /// granted after the scan began. Holders are bounded (~Σ concurrency caps),
+    /// so a full `0x09` scan is cheap — comparable to the lease scan.
+    ///
+    /// At most `max_per_tick` holders are released per call; the scan stops
+    /// collecting once the cap is reached and any remainder is reclaimed on the
+    /// next tick. This bounds the durable delete batch and the post-commit
+    /// release loop so a shard with a large orphan backlog drains gradually
+    /// instead of in one giant write.
+    pub async fn reap_orphaned_holders(
+        &self,
+        grace_ms: i64,
+        max_per_tick: usize,
+    ) -> Result<usize, JobStoreShardError> {
+        let start = concurrency_holders_prefix();
+        let end = end_bound(&start);
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
+
+        let now_ms = now_epoch_ms();
+        let shard_range = self.get_range();
+
+        // (key, tenant, queue, task_id) for each orphaned holder found.
+        let mut to_delete: Vec<(Vec<u8>, String, String, String)> = Vec::new();
+
+        while let Some(kv) = iter.next().await? {
+            let Some(parsed) = parse_concurrency_holder_key(&kv.key) else {
+                continue;
+            };
+
+            // Split-aware: skip holders for tenants outside this shard's range.
+            if !shard_range.contains_tenant(&parsed.tenant) {
+                continue;
+            }
+
+            // Skip holders younger than the grace window — guards the normal
+            // grant→lease handoff and freshly granted holders whose RunAttempt
+            // is still legitimately queued.
+            let granted_at_ms = match decode_holder_granted_at_ms(&kv.value) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if now_ms - granted_at_ms < grace_ms {
+                continue;
+            }
+
+            // Healthy if a lease exists for this task_id (the lease reaper owns
+            // it). The point-get runs after the grace check, so a lease written
+            // concurrently is observed here and the holder is skipped.
+            if self
+                .db
+                .get(&leased_task_key(&parsed.task_id))
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            to_delete.push((kv.key.to_vec(), parsed.tenant, parsed.queue, parsed.task_id));
+
+            // Cap the per-tick batch: stop collecting once we hit the limit and
+            // let the next tick reclaim the rest. Bounds the durable write and
+            // the post-commit release loop under a large orphan backlog.
+            if to_delete.len() >= max_per_tick {
+                tracing::warn!(
+                    max_per_tick = max_per_tick,
+                    "orphaned holder reaper hit per-tick cap; remaining orphans \
+                     will be reclaimed on subsequent ticks"
+                );
+                break;
+            }
+        }
+        drop(iter);
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        // Durable batch-delete all orphaned holder rows before touching
+        // in-memory state, mirroring report_attempt_outcome and
+        // purge_orphaned_holders_for_task.
+        let mut batch = WriteBatch::new();
+        for (key, _, _, _) in &to_delete {
+            batch.delete(key);
+        }
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        // Post-commit: drop the in-memory reservation and wake the grant
+        // scanner so queued requesters can be admitted in the orphans' place. A
+        // raw delete that skipped this would leave the count pegged and the
+        // queue wedged until the next rehydrate.
+        //
+        // `request_grant` is per-holder, but it coalesces by (tenant, queue)
+        // into a single pending-grant entry whose accumulated count the scanner
+        // drains in one `process_grants` pass — so even a queue with hundreds of
+        // orphans triggers one grant scan, not one per holder. We collapse the
+        // warn log the same way: one line per queue, not per holder.
+        let mut reaped_per_queue: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
+        for (_, tenant, queue, task_id) in &to_delete {
+            self.concurrency
+                .counts()
+                .atomic_release(tenant, queue, task_id);
+            self.concurrency.request_grant(tenant, queue);
+            *reaped_per_queue
+                .entry((tenant.as_str(), queue.as_str()))
+                .or_default() += 1;
+        }
+        for ((tenant, queue), reaped) in reaped_per_queue {
+            tracing::warn!(
+                tenant = %tenant,
+                queue = %queue,
+                reaped = reaped,
+                grace_ms = grace_ms,
+                "reaped orphaned concurrency holders"
             );
         }
 

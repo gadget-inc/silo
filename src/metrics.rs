@@ -126,6 +126,10 @@ pub struct Metrics {
     lease_reaper_scans_total: CounterVec,
     lease_reaper_leases_reaped_total: CounterVec,
     lease_reaper_errors_total: CounterVec,
+    holder_reaper_duration: HistogramVec,
+    holder_reaper_scans_total: CounterVec,
+    holder_reaper_orphans_reaped_total: CounterVec,
+    holder_reaper_errors_total: CounterVec,
 
     // Concurrency metrics
     concurrency_tickets_granted: CounterVec,
@@ -422,6 +426,30 @@ impl Metrics {
     /// Record a lease reaper scan failure.
     pub fn record_lease_reaper_error(&self, shard: &str) {
         self.lease_reaper_errors_total
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record orphaned-holder reaper duration in seconds (and a scan).
+    pub fn record_holder_reaper_duration(&self, shard: &str, duration_secs: f64) {
+        self.holder_reaper_duration
+            .with_label_values(&[shard])
+            .observe(duration_secs);
+        self.holder_reaper_scans_total
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record the number of orphaned concurrency holders reaped during a scan.
+    pub fn record_holder_reaper_reaped(&self, shard: &str, count: u64) {
+        self.holder_reaper_orphans_reaped_total
+            .with_label_values(&[shard])
+            .inc_by(count as f64);
+    }
+
+    /// Record an orphaned-holder reaper scan failure.
+    pub fn record_holder_reaper_error(&self, shard: &str) {
+        self.holder_reaper_errors_total
             .with_label_values(&[shard])
             .inc();
     }
@@ -1208,6 +1236,51 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let holder_reaper_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_holder_reaper_duration_seconds",
+                "Duration of orphaned concurrency holder reaper scan operations",
+            )
+            .buckets(SCAN_DURATION_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let holder_reaper_scans_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_holder_reaper_scans_total",
+                "Total number of orphaned holder reaper scan operations",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let holder_reaper_orphans_reaped_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_holder_reaper_orphans_reaped_total",
+                "Total number of orphaned concurrency holders reaped",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let holder_reaper_errors_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_holder_reaper_errors_total",
+                "Total number of orphaned holder reaper scan failures",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // Concurrency metrics
     let concurrency_tickets_granted = register(
         &registry,
@@ -1350,6 +1423,10 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_scans_total,
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
+        holder_reaper_duration,
+        holder_reaper_scans_total,
+        holder_reaper_orphans_reaped_total,
+        holder_reaper_errors_total,
         concurrency_tickets_granted,
         concurrency_holders_cache_holders,
         concurrency_holders_cache_queues,

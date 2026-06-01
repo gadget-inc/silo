@@ -2191,6 +2191,58 @@ where
         }
     });
 
+    // Periodic orphaned-holder reaper, decoupled from the lease reaper so a
+    // backpressured holder scan can't stall lease reaping. Releases concurrency
+    // holders whose task_id has no lease and whose grant predates the grace
+    // window — the wedge that the lease reaper and late report_outcome can't
+    // reach because nothing else iterates holders.
+    let holder_reaper_factory = factory.clone();
+    let holder_reaper_metrics = metrics.clone();
+    let holder_grace_ms = cfg.database.orphaned_holder_grace_ms as i64;
+    let holder_max_per_tick = cfg.database.orphaned_holder_max_reap_per_tick;
+    let mut holder_tick_rx = tick_tx.subscribe();
+    let holder_reaper: JoinHandle<()> = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                biased;
+                _ = interval.tick() => {
+                    for (shard_id, shard) in holder_reaper_factory.instances().iter() {
+                        let reap_start = std::time::Instant::now();
+                        let result = shard
+                            .reap_orphaned_holders(holder_grace_ms, holder_max_per_tick)
+                            .await;
+                        let shard_label = shard_id.to_string();
+                        if let Some(ref m) = holder_reaper_metrics {
+                            m.record_holder_reaper_duration(
+                                &shard_label,
+                                reap_start.elapsed().as_secs_f64(),
+                            );
+                        }
+                        match result {
+                            Ok(reaped) => {
+                                if let Some(ref m) = holder_reaper_metrics {
+                                    m.record_holder_reaper_reaped(&shard_label, reaped as u64);
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(ref m) = holder_reaper_metrics {
+                                    m.record_holder_reaper_error(&shard_label);
+                                }
+                                warn!(
+                                    shard = %shard_label,
+                                    error = %e,
+                                    "orphaned holder reaper failed"
+                                );
+                            }
+                        }
+                    }
+                }
+                _ = holder_tick_rx.recv() => { break; }
+            }
+        }
+    });
+
     // Periodic SlateDB metrics scrape, decoupled from the reaper so a
     // backpressured write in `reap_expired_leases` can't stall observability.
     let metrics_factory = factory.clone();
@@ -2287,6 +2339,7 @@ where
     // handles the ordered close→release-lease sequence, which is critical for
     // permanent leases. factory.close_all() in main.rs serves as a safety net.
     reaper.await.ok();
+    holder_reaper.await.ok();
     metrics_scrape.await.ok();
     if let Some(h) = compaction_ticker {
         h.await.ok();

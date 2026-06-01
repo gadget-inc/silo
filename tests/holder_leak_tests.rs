@@ -1305,3 +1305,221 @@ async fn steady_state_zero_holders_under_mixed_workload() {
     // referenced after construction; explicitly drop it here for clarity.
     let _ = MockGubernatorClient::new_arc();
 }
+
+// ---------------------------------------------------------------------------
+// Periodic orphaned-holder reaper (`reap_orphaned_holders`)
+// ---------------------------------------------------------------------------
+
+/// Positive case: a holder whose `task_id` has no lease and whose grant
+/// predates the grace window is released via the full path — the DB row is
+/// deleted and the in-memory count drops so the queue can grant again. This is
+/// the wedge that neither the lease reaper (iterates leases) nor a late
+/// `report_outcome` (`purge_orphaned_holders_for_task`) can reach.
+#[silo::test]
+async fn reap_orphaned_holders_releases_stranded_holder() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "reap-orphan-q";
+    let task_id = "orphan-task";
+
+    // Seed the in-memory reservation (no lease, no holder row yet).
+    assert!(
+        shard
+            .force_reserve_concurrency_for_test(tenant, queue, task_id, 5)
+            .await
+    );
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+
+    // Plant the durable holder row with a grant older than the grace window.
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, task_id),
+            &encode_holder(&HolderRecord {
+                granted_at_ms: now_ms() - 120_000,
+            }),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+
+    let reaped = shard
+        .reap_orphaned_holders(60_000, 1000)
+        .await
+        .expect("reap");
+    assert_eq!(reaped, 1, "stranded holder should be reaped");
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "holder row must be deleted"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        0,
+        "in-memory count must drop so the queue can grant again"
+    );
+}
+
+/// Negative case (a): a holder whose `task_id` still has a lease is healthy and
+/// must not be reaped, even when its grant predates the grace window — the
+/// lease reaper owns it. Exercises the scan-then-point-get path.
+#[silo::test]
+async fn reap_orphaned_holders_skips_holder_with_lease() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "reap-lease-q".to_string();
+
+    shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![fc_limit(&queue, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    let leased = shard.dequeue("w1", "default", 1).await.expect("deq").tasks;
+    let task_id = leased[0].attempt().task_id().to_string();
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+
+    // Age the holder's grant past the grace window; the lease still exists.
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, &queue, &task_id),
+            &encode_holder(&HolderRecord {
+                granted_at_ms: now_ms() - 120_000,
+            }),
+        )
+        .await
+        .expect("age holder");
+    shard.db().flush().await.expect("flush");
+
+    let reaped = shard
+        .reap_orphaned_holders(60_000, 1000)
+        .await
+        .expect("reap");
+    assert_eq!(reaped, 0, "holder with a live lease must not be reaped");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, &queue), 1);
+}
+
+/// Negative case (b): a holder younger than the grace window must be skipped
+/// even with no lease — this guards the normal grant→lease handoff and the
+/// still-queued `RunAttempt` case.
+#[silo::test]
+async fn reap_orphaned_holders_skips_young_holder() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "reap-young-q";
+    let task_id = "young-task";
+
+    assert!(
+        shard
+            .force_reserve_concurrency_for_test(tenant, queue, task_id, 5)
+            .await
+    );
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, task_id),
+            &encode_holder(&HolderRecord {
+                granted_at_ms: now_ms(),
+            }),
+        )
+        .await
+        .expect("plant young holder");
+    shard.db().flush().await.expect("flush");
+
+    let reaped = shard
+        .reap_orphaned_holders(60_000, 1000)
+        .await
+        .expect("reap");
+    assert_eq!(reaped, 0, "holder younger than grace must not be reaped");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+}
+
+/// Negative case (c): a holder for a tenant outside the shard's range must be
+/// skipped — the owning shard is responsible for reaping it (split-aware).
+#[silo::test]
+async fn reap_orphaned_holders_skips_out_of_range_tenant() {
+    // Empty range: start == end, so `contains_tenant` is false for every tenant.
+    let (_tmp, shard) = open_temp_shard_with_range(silo::shard_range::ShardRange::new(
+        "zzzzz".to_string(),
+        "zzzzz".to_string(),
+    ))
+    .await;
+    let tenant = "-";
+    let queue = "reap-oor-q";
+    let task_id = "oor-task";
+
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, task_id),
+            &encode_holder(&HolderRecord {
+                granted_at_ms: now_ms() - 120_000,
+            }),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    let reaped = shard
+        .reap_orphaned_holders(60_000, 1000)
+        .await
+        .expect("reap");
+    assert_eq!(reaped, 0, "out-of-range holder must not be reaped");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+}
+
+/// The per-tick cap bounds how many holders one scan releases: with three
+/// orphans and a cap of two, the first call reaps two and a follow-up tick
+/// drains the last — so a large orphan backlog is reclaimed gradually instead
+/// of in one giant durable write.
+#[silo::test]
+async fn reap_orphaned_holders_respects_per_tick_cap() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "reap-cap-q";
+    let old = now_ms() - 120_000;
+
+    for i in 0..3 {
+        let task_id = format!("cap-task-{i}");
+        assert!(
+            shard
+                .force_reserve_concurrency_for_test(tenant, queue, &task_id, 5)
+                .await
+        );
+        shard
+            .db()
+            .put(
+                &concurrency_holder_key(tenant, queue, &task_id),
+                &encode_holder(&HolderRecord { granted_at_ms: old }),
+            )
+            .await
+            .expect("plant holder");
+    }
+    shard.db().flush().await.expect("flush");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 3);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 3);
+
+    // First tick: cap of 2 releases exactly two, leaving one behind.
+    let reaped = shard.reap_orphaned_holders(60_000, 2).await.expect("reap");
+    assert_eq!(reaped, 2, "per-tick cap must bound the batch");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+
+    // Next tick drains the remainder.
+    let reaped = shard.reap_orphaned_holders(60_000, 2).await.expect("reap");
+    assert_eq!(reaped, 1, "remainder reclaimed on the following tick");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 0);
+}
