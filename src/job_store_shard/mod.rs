@@ -1011,9 +1011,8 @@ impl JobStoreShard {
             let Some(raw) = self.db.get(&key).await? else {
                 continue;
             };
-            let decoded = decode_task_validated(raw).map_err(|e| {
-                JobStoreShardError::Codec(format!("force_buffer decode: {e}"))
-            })?;
+            let decoded = decode_task_validated(raw)
+                .map_err(|e| JobStoreShardError::Codec(format!("force_buffer decode: {e}")))?;
             tasks.push(BrokerTask { key, decoded });
         }
         let count = tasks.len();
@@ -1032,17 +1031,19 @@ impl JobStoreShard {
         task_id: &str,
         limit: usize,
     ) -> bool {
-        self.concurrency.counts().try_reserve(
-            &self.db,
-            &self.get_range(),
-            tenant,
-            queue,
-            task_id,
-            limit,
-            "force-reserve-test",
-        )
-        .await
-        .unwrap_or(false)
+        self.concurrency
+            .counts()
+            .try_reserve(
+                &self.db,
+                &self.get_range(),
+                tenant,
+                queue,
+                task_id,
+                limit,
+                "force-reserve-test",
+            )
+            .await
+            .unwrap_or(false)
     }
 
     /// Fetch a job by id as a zero-copy archived view.

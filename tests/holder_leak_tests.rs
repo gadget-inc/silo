@@ -819,7 +819,9 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
 /// CI rather than waiting for the bench.
 #[silo::test]
 async fn steady_state_zero_holders_under_mixed_workload() {
-    use silo::gubernator::{GubernatorError, MockGubernatorClient, RateLimitClient, RateLimitResult};
+    use silo::gubernator::{
+        GubernatorError, MockGubernatorClient, RateLimitClient, RateLimitResult,
+    };
     use silo::job::{GubernatorAlgorithm, GubernatorRateLimit, RateLimitRetryPolicy};
     use silo::pb::gubernator::Algorithm;
     use std::sync::Arc;
@@ -862,7 +864,9 @@ async fn steady_state_zero_holders_under_mixed_workload() {
 
     // The rate-limit leg needs its own shard so its rate-limit client doesn't
     // affect the other workloads.
-    let rl_client = Arc::new(FailFirstThenPass { seen: AtomicU32::new(0) });
+    let rl_client = Arc::new(FailFirstThenPass {
+        seen: AtomicU32::new(0),
+    });
     let (_rl_tmp, rl_shard) = open_temp_shard_with_rate_limiter(rl_client.clone()).await;
 
     // Everything else: one shard with the default mock rate limiter.
@@ -906,7 +910,10 @@ async fn steady_state_zero_holders_under_mixed_workload() {
     assert_eq!(success_tasks.len(), n_success);
     for t in &success_tasks {
         shard
-            .report_attempt_outcome(t.attempt().task_id(), AttemptOutcome::Success { result: vec![] })
+            .report_attempt_outcome(
+                t.attempt().task_id(),
+                AttemptOutcome::Success { result: vec![] },
+            )
             .await
             .expect("complete success");
     }
@@ -942,7 +949,11 @@ async fn steady_state_zero_holders_under_mixed_workload() {
     }
     // Drain through both attempts (initial + 1 retry).
     for _ in 0..3 {
-        let tasks = shard.dequeue("w-fail", "default", 16).await.expect("dq fail").tasks;
+        let tasks = shard
+            .dequeue("w-fail", "default", 16)
+            .await
+            .expect("dq fail")
+            .tasks;
         if tasks.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             continue;
@@ -998,7 +1009,10 @@ async fn steady_state_zero_holders_under_mixed_workload() {
     // Cancel j1..j4 first (TicketRequested → request-record cleanup, no
     // scanner wake-up race) then complete j0 via the normal worker path.
     for id in pre_ids.iter().skip(1) {
-        shard.cancel_job(tenant, id).await.expect("cancel-pre deferred");
+        shard
+            .cancel_job(tenant, id)
+            .await
+            .expect("cancel-pre deferred");
     }
     let pre_tasks = shard
         .dequeue("w-pre", "default", 5)
@@ -1087,7 +1101,10 @@ async fn steady_state_zero_holders_under_mixed_workload() {
     assert_eq!(reap_tasks.len(), 4);
     expire_all_leases(&shard).await;
     let reaped = shard.reap_expired_leases(tenant).await.expect("reap");
-    assert!(reaped >= 4, "expected at least 4 leases reaped, got {reaped}");
+    assert!(
+        reaped >= 4,
+        "expected at least 4 leases reaped, got {reaped}"
+    );
 
     // ----- 6) Future-scheduled then cancel: 3 future jobs cancelled before their start time.
     let q_future = "mix-future".to_string();
@@ -1154,7 +1171,9 @@ async fn steady_state_zero_holders_under_mixed_workload() {
             metadata: None,
             task_group: "default".to_string(),
             attempts: vec![ImportedAttempt {
-                status: ImportedAttemptStatus::Succeeded { result: vec![4, 5, 6] },
+                status: ImportedAttemptStatus::Succeeded {
+                    result: vec![4, 5, 6],
+                },
                 started_at_ms: now,
                 finished_at_ms: now + 1_000,
             }],
@@ -1224,12 +1243,7 @@ async fn steady_state_zero_holders_under_mixed_workload() {
     // ===== Final assertions =====
     // The grant scanner runs asynchronously after each release; poll briefly
     // so the catch-all assertion isn't racing the background pass.
-    let holders = poll_until(
-        || count_concurrency_holders(shard.db()),
-        |n| *n == 0,
-        3_000,
-    )
-    .await;
+    let holders = poll_until(|| count_concurrency_holders(shard.db()), |n| *n == 0, 3_000).await;
     if holders != 0 {
         // Per-queue diagnostic for the failure mode.
         for q in &queues_touched {

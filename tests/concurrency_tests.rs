@@ -1963,8 +1963,15 @@ async fn grant_scanner_skips_corrupt_request_variants() {
     // they sort distinctly. start_time_ms = now so they're picked up this pass.
     let truncated_key =
         concurrency_request_key(tenant, &queue, now, 10, "corrupt-truncated", 1, "corrupt-a");
-    let empty_limits_key =
-        concurrency_request_key(tenant, &queue, now, 10, "corrupt-empty-limits", 1, "corrupt-b");
+    let empty_limits_key = concurrency_request_key(
+        tenant,
+        &queue,
+        now,
+        10,
+        "corrupt-empty-limits",
+        1,
+        "corrupt-b",
+    );
     let empty_task_id_key =
         concurrency_request_key(tenant, &queue, now, 10, "corrupt-empty-tid", 1, "corrupt-c");
 

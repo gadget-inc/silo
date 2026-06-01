@@ -3856,7 +3856,10 @@ async fn request_ticket_terminal_short_circuit_drops_ticket() {
     let cancelled = JobStatus::new(JobStatusKind::Cancelled, now, None, None);
     shard
         .db()
-        .put(&job_status_key(tenant, &job_id), &encode_job_status(&cancelled))
+        .put(
+            &job_status_key(tenant, &job_id),
+            &encode_job_status(&cancelled),
+        )
         .await
         .expect("write cancelled status");
 
@@ -3977,8 +3980,9 @@ async fn multi_limit_enqueue_persists_only_terminal_run_attempt() {
     );
     let (_key, held) = &run_attempts[0];
     let held_set: HashSet<&String> = held.iter().collect();
-    let expected: HashSet<String> =
-        [queue_a.clone(), queue_b.clone(), queue_c.clone()].into_iter().collect();
+    let expected: HashSet<String> = [queue_a.clone(), queue_b.clone(), queue_c.clone()]
+        .into_iter()
+        .collect();
     let expected_refs: HashSet<&String> = expected.iter().collect();
     assert_eq!(
         held_set, expected_refs,
@@ -4218,7 +4222,9 @@ async fn cancel_request_ticket_releases_upstream_holders() {
         let mut found = None;
         while let Ok(Some(kv)) = iter.next().await {
             if let Ok(task) = decode_task(&kv.value)
-                && let Task::RequestTicket { job_id: ref jid, .. } = task
+                && let Task::RequestTicket {
+                    job_id: ref jid, ..
+                } = task
                 && *jid == job_id
             {
                 found = Some((kv.key.to_vec(), task));
