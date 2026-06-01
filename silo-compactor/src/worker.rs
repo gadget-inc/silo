@@ -6,8 +6,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span, warn};
 
-use crate::compaction_filter::CompletedJobCompactionFilterSupplier;
-use crate::config::CompactionFilterConfig;
 use crate::error::CompactorError;
 use crate::metrics::CompactorMetrics;
 use crate::shard_map::ShardId;
@@ -34,15 +32,11 @@ impl WorkerHandle {
 
 /// Spawn a tokio task that runs slatedb's standalone compactor for `shard_id`,
 /// restarting on transient errors with `restart_backoff` between attempts.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     shard_id: ShardId,
     backend: Backend,
     path_template: Arc<String>,
-    wal_backend: Option<Backend>,
-    wal_path_template: Option<Arc<String>>,
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
-    filter_config: Arc<CompactionFilterConfig>,
     restart_backoff: Duration,
     metrics: Option<Arc<CompactorMetrics>>,
 ) -> WorkerHandle {
@@ -53,10 +47,7 @@ pub fn spawn_worker(
             shard_id,
             backend,
             path_template,
-            wal_backend,
-            wal_path_template,
             compactor_options,
-            filter_config,
             restart_backoff,
             metrics,
             cancel_for_task,
@@ -70,15 +61,11 @@ pub fn spawn_worker(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     shard_id: ShardId,
     backend: Backend,
     path_template: Arc<String>,
-    wal_backend: Option<Backend>,
-    wal_path_template: Option<Arc<String>>,
     compactor_options: Arc<Option<slatedb::config::CompactorOptions>>,
-    filter_config: Arc<CompactionFilterConfig>,
     restart_backoff: Duration,
     metrics: Option<Arc<CompactorMetrics>>,
     cancel: CancellationToken,
@@ -92,10 +79,7 @@ async fn run_supervisor(
             &shard_id,
             &backend,
             &path_template,
-            wal_backend.as_ref(),
-            wal_path_template.as_deref().map(String::as_str),
             compactor_options.as_ref().clone(),
-            filter_config.as_ref(),
             metrics.as_ref(),
             &cancel,
         )
@@ -125,15 +109,11 @@ async fn run_supervisor(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_once(
     shard_id: &ShardId,
     backend: &Backend,
     path_template: &str,
-    wal_backend: Option<&Backend>,
-    wal_path_template: Option<&str>,
     compactor_options: Option<slatedb::config::CompactorOptions>,
-    filter_config: &CompactionFilterConfig,
     metrics: Option<&Arc<CompactorMetrics>>,
     cancel: &CancellationToken,
 ) -> Result<(), CompactorError> {
@@ -148,25 +128,6 @@ async fn run_once(
         "opening compactor",
     );
 
-    // Resolve the per-shard WAL store when configured. The standalone slatedb
-    // compactor doesn't need this — only the per-job DbReader inside the
-    // completed_jobs filter does, because slatedb's manifest validator
-    // refuses a reader open whose split-WAL flag doesn't match what silo
-    // wrote into the manifest.
-    let wal_store = match (wal_backend, wal_path_template) {
-        (Some(wb), Some(wpt)) => {
-            let wal_shard_path = path_for_shard(wpt, shard_id);
-            let resolved_wal = resolve_object_store(wb, &wal_shard_path)?;
-            info!(
-                shard = %shard_id,
-                wal_root = %resolved_wal.root_path,
-                "resolved wal store",
-            );
-            Some(resolved_wal.store)
-        }
-        _ => None,
-    };
-
     let canonical_path = resolved.canonical_path;
     let store = resolved.store;
     // Per-shard slatedb metrics recorder: passed to the CompactorBuilder so
@@ -176,7 +137,7 @@ async fn run_once(
         .is_some()
         .then(|| Arc::new(DefaultMetricsRecorder::new()));
 
-    let mut builder = slatedb::CompactorBuilder::new(canonical_path.clone(), Arc::clone(&store))
+    let mut builder = slatedb::CompactorBuilder::new(canonical_path, Arc::clone(&store))
         .with_merge_operator(silo::job_store_shard::counter_merge_operator());
     if let Some(opts) = compactor_options {
         builder = builder.with_options(opts);
@@ -185,31 +146,6 @@ async fn run_once(
         builder = builder.with_metrics_recorder(
             Arc::clone(rec) as Arc<dyn slatedb_common::metrics::MetricsRecorder>
         );
-    }
-    if let CompactionFilterConfig::CompletedJobs {
-        retention_secs,
-        expired_set_max_entries,
-    } = filter_config
-    {
-        let mut supplier = CompletedJobCompactionFilterSupplier::new(
-            Duration::from_secs(*retention_secs),
-            object_store::path::Path::from(canonical_path.as_str()),
-            Arc::clone(&store),
-        )
-        .with_wal_store(wal_store.clone());
-        if let Some(cap) = expired_set_max_entries {
-            supplier = supplier.with_max_expired_entries(*cap);
-        }
-        if let Some(m) = metrics {
-            supplier = supplier.with_metrics(Arc::clone(m), shard_label.clone());
-        }
-        info!(
-            shard = %shard_id,
-            retention_secs = *retention_secs,
-            expired_set_max_entries = ?expired_set_max_entries,
-            "enabling completed_jobs compaction filter",
-        );
-        builder = builder.with_compaction_filter_supplier(Arc::new(supplier));
     }
     let compactor = builder.build();
 

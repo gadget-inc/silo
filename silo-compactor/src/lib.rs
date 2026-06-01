@@ -1,5 +1,4 @@
 pub mod assignment;
-pub mod compaction_filter;
 pub mod config;
 pub mod coordinator;
 pub mod error;
