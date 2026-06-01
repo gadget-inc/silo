@@ -60,7 +60,6 @@ use crate::codec::{
 use crate::dst_events::{self, DstEvent};
 use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
-use crate::job_store_shard::limit_processing_order;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
     concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
@@ -193,18 +192,16 @@ fn concurrency_queue_for_limit(limit: &Limit) -> Option<&str> {
 }
 
 fn limit_index_matches_queue(limits: &[Limit], limit_index: u32, queue: &str) -> bool {
-    let order = limit_processing_order(limits);
-    order
+    limits
         .get(limit_index as usize)
-        .and_then(|&idx| concurrency_queue_for_limit(&limits[idx]))
+        .and_then(concurrency_queue_for_limit)
         == Some(queue)
 }
 
 fn canonical_limit_index_for_queue(limits: &[Limit], queue: &str) -> Option<u32> {
-    let order = limit_processing_order(limits);
-    order
+    limits
         .iter()
-        .position(|&idx| concurrency_queue_for_limit(&limits[idx]) == Some(queue))
+        .position(|limit| concurrency_queue_for_limit(limit) == Some(queue))
         .map(|idx| idx as u32)
 }
 
