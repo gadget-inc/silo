@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::codec::{encode_job_info, encode_job_status};
 use crate::concurrency::RequestTicketOutcome;
 use crate::dst_events::{self, DstEvent};
-use crate::job::{JobInfo, JobStatus, Limit};
+use crate::job::{JobInfo, JobStatus, JobStatusKind, Limit};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::counters::encode_counter;
@@ -60,12 +60,25 @@ pub(crate) struct LimitTaskParams<'a> {
     pub skip_try_reserve: bool,
 }
 
+/// Result of walking a job's remaining limits.
+pub(crate) struct LimitTaskWriteResult {
+    /// In-memory grants made while walking the chain. Callers must roll these
+    /// back if their surrounding durable write fails.
+    pub grants: Vec<(String, String)>,
+    /// The task-key timestamp when this walk wrote a concrete DB task
+    /// (`RunAttempt`, `CheckRateLimit`, or future `RequestTicket`). `None`
+    /// means the walk parked on a durable concurrency request instead.
+    pub pending_task_key_start_ms: Option<i64>,
+}
+
 /// Whether a concurrency grant was obtained or the job was queued for later.
 enum GrantResult {
     /// Slot granted immediately; caller should advance to the next limit.
     Granted,
     /// Not granted; a RequestTicket/request was written. Caller should return.
-    Queued,
+    Queued {
+        pending_task_key_start_ms: Option<i64>,
+    },
 }
 
 /// Process the outcome of a `handle_enqueue` call, updating shared loop state.
@@ -74,6 +87,7 @@ enum GrantResult {
 fn record_grant_outcome(
     outcome: Option<RequestTicketOutcome>,
     queue_key: &str,
+    task_key_start_ms: i64,
     grants: &mut Vec<(String, String)>,
     current_task_id: &str,
     current_held_queues: &mut Vec<String>,
@@ -103,13 +117,17 @@ fn record_grant_outcome(
             *current_index += 1;
             GrantResult::Granted
         }
-        Some(RequestTicketOutcome::TicketRequested { .. })
-        | Some(RequestTicketOutcome::FutureRequestTaskWritten { .. }) => {
+        Some(RequestTicketOutcome::TicketRequested { .. }) => {
             // Not granted - a request/RequestTicket was already written by
             // handle_enqueue. Stop processing further limits; remaining ones
             // will be applied when the queued request is granted later.
-            GrantResult::Queued
+            GrantResult::Queued {
+                pending_task_key_start_ms: None,
+            }
         }
+        Some(RequestTicketOutcome::FutureRequestTaskWritten { .. }) => GrantResult::Queued {
+            pending_task_key_start_ms: Some(task_key_start_ms),
+        },
     }
 }
 
@@ -409,6 +427,7 @@ impl JobStoreShard {
             },
         )
         .await
+        .map(|result| result.grants)
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
@@ -450,7 +469,8 @@ impl JobStoreShard {
     /// For concurrency limits (regular and floating), this tries immediate grant as an
     /// optimization. If granted, it proceeds to the next limit (iteratively).
     ///
-    /// Returns a Vec of all grants made (queue, task_id) for potential rollback if DB write fails.
+    /// Returns all grants made for potential rollback if DB write fails, plus
+    /// the concrete task-key timestamp when this walk wrote a DB task.
     ///
     /// **Error semantics:** if the walk errors mid-chain (e.g. a db.get for
     /// floating-limit state fails between an immediate grant and the next
@@ -464,13 +484,16 @@ impl JobStoreShard {
         &self,
         writer: &mut W,
         params: LimitTaskParams<'_>,
-    ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+    ) -> Result<LimitTaskWriteResult, JobStoreShardError> {
         // Save the tenant ref so we can roll back grants if walk_limit_chain errors.
         // (references are Copy, so this doesn't conflict with moving `params`.)
         let tenant_for_rollback: &str = params.tenant;
         let mut grants: Vec<(String, String)> = Vec::new();
         match self.walk_limit_chain(writer, params, &mut grants).await {
-            Ok(()) => Ok(grants),
+            Ok(pending_task_key_start_ms) => Ok(LimitTaskWriteResult {
+                grants,
+                pending_task_key_start_ms,
+            }),
             Err(e) => {
                 for (queue, task_id) in &grants {
                     self.concurrency
@@ -483,15 +506,17 @@ impl JobStoreShard {
 
     /// Inner loop body for `enqueue_limit_task_at_index`. Pushes successful
     /// in-memory grants to `grants` as it goes. Returns `Ok(())` on normal
-    /// completion (the caller hands `grants` back to its caller) or `Err(_)`
-    /// with `grants` containing whatever was accumulated up to the failure
-    /// point — the outer wrapper rolls those back before returning the error.
+    /// completion (the caller hands `grants` back to its caller), returning
+    /// the concrete task-key timestamp when the walk wrote a DB task, or
+    /// `Err(_)` with `grants` containing whatever was accumulated up to the
+    /// failure point — the outer wrapper rolls those back before returning the
+    /// error.
     async fn walk_limit_chain<W: WriteBatcher>(
         &self,
         writer: &mut W,
         params: LimitTaskParams<'_>,
         grants: &mut Vec<(String, String)>,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<Option<i64>, JobStoreShardError> {
         let LimitTaskParams {
             tenant,
             task_id,
@@ -554,7 +579,7 @@ impl JobStoreShard {
                     attempt_number,
                     &run_task,
                 )?;
-                return Ok(());
+                return Ok(Some(task_key_start_ms));
             }
 
             match &limits[current_index] {
@@ -592,23 +617,24 @@ impl JobStoreShard {
                         crate::concurrency::ConcurrencyLimitType::Fixed,
                     );
 
-                    if matches!(
-                        record_grant_outcome(
-                            outcome,
-                            &cl.key,
-                            grants,
-                            &current_task_id,
-                            &mut current_held_queues,
-                            &mut current_index,
-                        ),
-                        GrantResult::Queued
+                    match record_grant_outcome(
+                        outcome,
+                        &cl.key,
+                        task_key_start_ms,
+                        grants,
+                        &current_task_id,
+                        &mut current_held_queues,
+                        &mut current_index,
                     ) {
-                        // No interim `task_key` write to clean up here:
-                        // `append_grant_edits` only writes the holder; the
-                        // `RunAttempt` task_key is written exclusively by the
-                        // terminal branch below, which we won't reach on this
-                        // return.
-                        return Ok(());
+                        GrantResult::Granted => {}
+                        GrantResult::Queued {
+                            pending_task_key_start_ms,
+                        } => {
+                            // No partial RunAttempt task is written before a
+                            // queued concurrency gate; if this was a future
+                            // RequestTicket, report its concrete task key.
+                            return Ok(pending_task_key_start_ms);
+                        }
                     }
                 }
 
@@ -677,21 +703,23 @@ impl JobStoreShard {
                         )?;
                     }
 
-                    if matches!(
-                        record_grant_outcome(
-                            outcome,
-                            &fl.key,
-                            grants,
-                            &current_task_id,
-                            &mut current_held_queues,
-                            &mut current_index,
-                        ),
-                        GrantResult::Queued
+                    match record_grant_outcome(
+                        outcome,
+                        &fl.key,
+                        task_key_start_ms,
+                        grants,
+                        &current_task_id,
+                        &mut current_held_queues,
+                        &mut current_index,
                     ) {
-                        // See the Conc-branch comment: `append_grant_edits`
-                        // doesn't write a `task_key` anymore, so there's
-                        // nothing here to clean up before returning.
-                        return Ok(());
+                        GrantResult::Granted => {}
+                        GrantResult::Queued {
+                            pending_task_key_start_ms,
+                        } => {
+                            // See the Concurrency branch comment: holder-only
+                            // grants continue, queued gates stop the walk.
+                            return Ok(pending_task_key_start_ms);
+                        }
                     }
                 }
 
@@ -720,7 +748,7 @@ impl JobStoreShard {
                         attempt_number,
                         &task,
                     )?;
-                    return Ok(());
+                    return Ok(Some(task_key_start_ms));
                 }
             }
         }
@@ -812,5 +840,42 @@ impl JobStoreShard {
         )?;
 
         Ok(())
+    }
+
+    /// Retarget a Scheduled job's pending-task timestamp to the concrete DB
+    /// task key written by a resumed limit chain.
+    ///
+    /// Status-based operations such as cancel, reimport, and direct lease
+    /// reconstruct the pending task key from `next_attempt_starts_after_ms`.
+    /// When a resumed chain deliberately writes at a fresh task-key timestamp
+    /// to dodge broker tombstones, this keeps those operations able to find
+    /// the task without falling back to a broad task scan.
+    pub(crate) async fn retarget_scheduled_task_key<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        attempt_number: u32,
+        task_key_start_ms: i64,
+    ) -> Result<(), JobStoreShardError> {
+        let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? else {
+            return Ok(());
+        };
+        let old = decode_job_status_owned(&old_raw)?;
+        if old.kind != JobStatusKind::Scheduled
+            || old.current_attempt != Some(attempt_number)
+            || old.next_attempt_starts_after_ms == Some(task_key_start_ms)
+        {
+            return Ok(());
+        }
+
+        let new_status = JobStatus::new(
+            JobStatusKind::Scheduled,
+            old.changed_at_ms,
+            Some(task_key_start_ms),
+            old.current_attempt,
+        );
+        self.set_job_status_with_index(writer, tenant, job_id, new_status)
+            .await
     }
 }

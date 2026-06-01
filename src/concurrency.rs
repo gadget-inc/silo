@@ -1251,7 +1251,12 @@ impl ConcurrencyManager {
                     }
                 };
 
-                let parsed_req = parse_concurrency_request_key(&kv.key);
+                let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
+                    tracing::warn!(queue = %queue, "grant scanner: malformed request key, deleting");
+                    batch.delete(&kv.key);
+                    stale_and_corrupt_count += 1;
+                    continue;
+                };
 
                 let decoded = match decode_concurrency_action(kv.value.clone()) {
                     Ok(d) => d,
@@ -1270,8 +1275,13 @@ impl ConcurrencyManager {
                     continue;
                 };
 
-                let start_time_ms = et.start_time_ms();
-                let job_id_str = et.job_id().unwrap_or_default();
+                // The request key is authoritative for scheduler ordering and
+                // storage identity. Legacy values written before task_id/limits
+                // were added still have these fields in the key.
+                let start_time_ms = parsed_req.start_time_ms as i64;
+                let job_id_str = parsed_req.job_id.as_str();
+                let attempt_number = parsed_req.attempt_number;
+                let priority = parsed_req.priority;
 
                 if start_time_ms > now_ms {
                     // Concurrency request keys encode `start_time_ms` ahead of
@@ -1284,12 +1294,14 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                // The request key's suffix is only used for storage
-                // uniqueness; we no longer use it as the task_id. (`parsed_req`
-                // could be Some or None; both are fine because we delete by
-                // the raw key bytes below.)
-                let _ = parsed_req;
-
+                // Post-deploy of the unify-chain schema, every request value
+                // populates `task_id`, `limits`, `task_group`, `held_queues`,
+                // and a `limit_index` pointing at this queue's position in
+                // the canonical limit order. Any value missing those fields
+                // is pre-upgrade data left over from a rolling deploy; the
+                // operator clears it (bump `cluster_prefix` / rotate
+                // storage) before shipping this change, and the scanner
+                // treats whatever remains as corrupt below.
                 let task_id_str = et.task_id().unwrap_or_default().to_string();
                 if task_id_str.is_empty() {
                     tracing::warn!(
@@ -1306,15 +1318,9 @@ impl ConcurrencyManager {
                     .map(|v| v.iter().map(|s| s.to_string()).collect())
                     .unwrap_or_default();
                 let limits = crate::codec::limit_entries_to_owned(et.limits());
+                let task_group = et.task_group().unwrap_or_default().to_string();
 
                 if limits.is_empty() {
-                    // Post-schema-update every request has its limits
-                    // populated. An empty list is either a decode-shape
-                    // failure or a stale pre-deploy record. The chain
-                    // resumer with `limits=[]` would silently fall through
-                    // to a terminal RunAttempt that bypasses every gate —
-                    // safer to treat this exactly like a decode failure:
-                    // log, delete, skip.
                     tracing::warn!(
                         queue = %queue,
                         job_id = %job_id_str,
@@ -1324,6 +1330,18 @@ impl ConcurrencyManager {
                     stale_and_corrupt_count += 1;
                     continue;
                 }
+                if task_group.is_empty() {
+                    tracing::warn!(
+                        queue = %queue,
+                        job_id = %job_id_str,
+                        "grant scanner: request has no task group; deleting"
+                    );
+                    batch.delete(&kv.key);
+                    stale_and_corrupt_count += 1;
+                    continue;
+                }
+
+                let limit_index = et.limit_index();
 
                 // Resolve max_concurrency from the first request's limits
                 // (always populated, per the check above).
@@ -1338,12 +1356,15 @@ impl ConcurrencyManager {
                     request_key: kv.key.to_vec(),
                     task_id: task_id_str,
                     job_id: job_id_str.to_string(),
-                    attempt_number: et.attempt_number(),
-                    relative_attempt_number: et.relative_attempt_number(),
+                    attempt_number,
+                    relative_attempt_number: {
+                        let rel = et.relative_attempt_number();
+                        if rel == 0 { attempt_number } else { rel }
+                    },
                     start_time_ms,
-                    priority: et.priority(),
-                    task_group: et.task_group().unwrap_or_default().to_string(),
-                    limit_index: et.limit_index(),
+                    priority,
+                    task_group,
+                    limit_index,
                     held_queues,
                     limits,
                 });
