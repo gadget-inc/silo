@@ -176,6 +176,8 @@ pub struct SlatedbShardMetrics {
     sst_filter_false_positives: CounterVec,
     bytes_compacted: CounterVec,
     flush_requests: CounterVec,
+    expired_entries_purged_value: CounterVec,
+    expired_entries_purged_merge: CounterVec,
 
     // Gauges (point-in-time)
     wal_buffer_estimated_bytes: GaugeVec,
@@ -549,6 +551,14 @@ impl SlatedbShardMetrics {
                 "slatedb_flush_requests_total",
                 "Total number of flush requests to SlateDB",
             )?,
+            expired_entries_purged_value: counter(
+                "slatedb_expired_entries_purged_value_total",
+                "Total expired value entries purged (rewritten as tombstones) by the SlateDB RetentionIterator during compaction",
+            )?,
+            expired_entries_purged_merge: counter(
+                "slatedb_expired_entries_purged_merge_total",
+                "Total expired merge entries dropped (without a tombstone) by the SlateDB RetentionIterator during compaction",
+            )?,
             wal_buffer_estimated_bytes: gauge(
                 "slatedb_wal_buffer_estimated_bytes",
                 "Estimated bytes buffered in the SlateDB WAL buffer",
@@ -636,6 +646,24 @@ impl SlatedbShardMetrics {
                 slatedb::db_stats::REQUEST_COUNT,
                 &[("op", "flush")],
                 &self.flush_requests,
+            ),
+            // RetentionIterator splits the EXPIRED_ENTRIES_PURGED counter by an
+            // `entry_type` label; map each value into its own per-shard instrument.
+            (
+                slatedb::compactor::stats::EXPIRED_ENTRIES_PURGED,
+                &[(
+                    slatedb::compactor::stats::ENTRY_TYPE_LABEL,
+                    slatedb::compactor::stats::ENTRY_TYPE_VALUE,
+                )],
+                &self.expired_entries_purged_value,
+            ),
+            (
+                slatedb::compactor::stats::EXPIRED_ENTRIES_PURGED,
+                &[(
+                    slatedb::compactor::stats::ENTRY_TYPE_LABEL,
+                    slatedb::compactor::stats::ENTRY_TYPE_MERGE,
+                )],
+                &self.expired_entries_purged_merge,
             ),
         ];
         let counter_mappings: &[(&str, &CounterVec)] = &[
