@@ -951,13 +951,10 @@ impl JobStoreShard {
     /// Whether a specific `task_id` is currently recorded as an in-memory
     /// holder for `(tenant, queue)`. Test-only accessor used by the
     /// four-quadrant reconciler test.
-    pub fn concurrency_contains_holder(
-        &self,
-        tenant: &str,
-        queue: &str,
-        task_id: &str,
-    ) -> bool {
-        self.concurrency.counts().contains_holder(tenant, queue, task_id)
+    pub fn concurrency_contains_holder(&self, tenant: &str, queue: &str, task_id: &str) -> bool {
+        self.concurrency
+            .counts()
+            .contains_holder(tenant, queue, task_id)
     }
 
     /// Test-only: enqueue a `(tenant, queue, task_id)` for reconciliation.
@@ -977,7 +974,9 @@ impl JobStoreShard {
     /// Test-only: insert an in-memory holder directly, used to set up the
     /// "in_mem present, durable absent" ghost quadrant.
     pub fn concurrency_insert_holder(&self, tenant: &str, queue: &str, task_id: &str) {
-        self.concurrency.counts().insert_holder(tenant, queue, task_id);
+        self.concurrency
+            .counts()
+            .insert_holder(tenant, queue, task_id);
     }
 
     /// Test-only: drain pending reconciliations and apply them now. The
