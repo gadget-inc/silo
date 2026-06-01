@@ -355,7 +355,8 @@ impl JobStoreShard {
     /// compaction to reclaim storage space from the deleted data.
     ///
     /// This uses SlateDB's Admin API to request a full compaction that merges
-    /// all L0 SSTs and sorted runs into a single sorted run, removing tombstones.
+    /// the sorted runs down into the base run, removing tombstones. See
+    /// [`Self::submit_full_compaction`] for exactly which runs are merged.
     pub async fn run_full_compaction(&self) -> Result<(), JobStoreShardError> {
         info!(shard = %self.name, "starting full compaction");
 
@@ -382,9 +383,17 @@ impl JobStoreShard {
 
     /// Submit a full compaction via the SlateDB Admin API.
     ///
-    /// Reads the current manifest to discover all L0 SSTs and sorted runs,
-    /// then submits a compaction spec that merges everything into a single
-    /// sorted run. The background compactor will execute this asynchronously.
+    /// Reads the current manifest and submits a compaction spec that merges the
+    /// sorted runs down into the base (lowest-id) run, dropping tombstones. The
+    /// background compactor executes this asynchronously.
+    ///
+    /// We deliberately EXCLUDE all L0 SSTs and the topmost (highest-id) sorted
+    /// run from the spec. The topmost run is SlateDB's target for L0→sorted-run
+    /// compactions; by leaving the L0 SSTs and that run untouched, this full
+    /// compaction does not tie up the L0 SSTs as sources and therefore does not
+    /// block the background L0→SR compactions while it runs. See
+    /// [`full_compaction_window`] for the exact `(sources, destination)` and the
+    /// single-run special case.
     pub async fn submit_full_compaction(&self) -> Result<(), JobStoreShardError> {
         use slatedb::admin::AdminBuilder;
         use slatedb::compactor::{CompactionSpec, SourceId};
@@ -395,32 +404,17 @@ impl JobStoreShard {
             JobStoreShardError::Codec(format!("failed to read compactor state: {e}"))
         })?;
 
-        // Build a full compaction spec: merge all L0 SSTs and sorted runs into
-        // the lowest sorted run, which allows tombstones to be dropped.
+        // `compacted()` is descending by id; collect ids in that order so the
+        // window builder produces a valid contiguous (descending) source slice.
         let manifest = state.manifest();
-        let sources: Vec<SourceId> = manifest
-            .l0()
-            .iter()
-            .map(|sst| SourceId::SstView(sst.sst.id.unwrap_compacted_id()))
-            .chain(
-                manifest
-                    .compacted()
-                    .iter()
-                    .map(|sr| SourceId::SortedRun(sr.id)),
-            )
-            .collect();
+        let run_ids: Vec<u32> = manifest.compacted().iter().map(|sr| sr.id).collect();
 
-        if sources.is_empty() {
-            info!(shard = %self.name, "no SSTs or sorted runs to compact");
+        let Some((source_ids, destination)) = full_compaction_window(&run_ids) else {
+            info!(shard = %self.name, "no sorted runs to compact");
             return Ok(());
-        }
+        };
 
-        let destination = manifest
-            .compacted()
-            .iter()
-            .map(|sr| sr.id)
-            .min()
-            .unwrap_or(0);
+        let sources: Vec<SourceId> = source_ids.into_iter().map(SourceId::SortedRun).collect();
         let spec = CompactionSpec::new(sources, destination);
 
         admin
@@ -620,5 +614,72 @@ impl JobStoreShard {
                 }
             }
         });
+    }
+}
+
+/// Build `(sources, destination)` for a full compaction from sorted-run ids in
+/// SlateDB's `compacted()` order (strictly DESCENDING by id).
+///
+/// L0 SSTs are intentionally excluded (callers never pass them) and so is the
+/// topmost (index 0, highest-id) run — that run is SlateDB's target for L0→SR
+/// compactions, so leaving the L0 SSTs and that run untouched means this spec
+/// does not block the background L0→SR compactions while it runs. The remaining
+/// runs are merged down into the base (lowest-id, last) run, where tombstones
+/// are dropped.
+///
+/// The SlateDB compactor requires `sources` to be a contiguous window of the
+/// logical order `[L0 newest→oldest, then SRs highest-id→lowest-id]` and
+/// `destination` to be the lowest-id SR among the sources. `compacted()[1..]`
+/// satisfies both (it is the descending-id suffix, and its last element is the
+/// base run).
+///
+/// Returns `None` when there are no sorted runs (nothing to compact).
+fn full_compaction_window(run_ids_desc: &[u32]) -> Option<(Vec<u32>, u32)> {
+    match run_ids_desc {
+        [] => None,
+        // Exactly one run: it is both topmost and base. Compact it in place to
+        // reclaim tombstone space — a valid length-1 window over the base run.
+        // This briefly locks the L0-target run, but that is unavoidable with a
+        // single run and self-resolves once a second run exists.
+        [only] => Some((vec![*only], *only)),
+        // >1 run: every run except the topmost; destination = base run
+        // (last element = lowest id, since `compacted()` is descending).
+        [_topmost, rest @ ..] => {
+            let destination = *rest.last().expect("rest is non-empty when len > 1");
+            Some((rest.to_vec(), destination))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_compaction_window;
+
+    #[test]
+    fn no_sorted_runs_is_noop() {
+        assert_eq!(full_compaction_window(&[]), None);
+    }
+
+    #[test]
+    fn single_run_compacts_in_place() {
+        // The only run is both topmost and base: source == destination == itself.
+        assert_eq!(full_compaction_window(&[5]), Some((vec![5], 5)));
+    }
+
+    #[test]
+    fn excludes_topmost_and_targets_base() {
+        // Topmost (id 9) excluded; sources keep descending order; destination is
+        // the base (lowest id, 2).
+        assert_eq!(
+            full_compaction_window(&[9, 7, 4, 2]),
+            Some((vec![7, 4, 2], 2))
+        );
+    }
+
+    #[test]
+    fn two_runs_base_is_source_and_destination() {
+        // Topmost (id 9) excluded; the base run (id 4) is both the only source
+        // and the destination.
+        assert_eq!(full_compaction_window(&[9, 4]), Some((vec![4], 4)));
     }
 }
