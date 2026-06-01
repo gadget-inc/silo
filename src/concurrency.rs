@@ -58,14 +58,13 @@ use crate::codec::{
     encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
-use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
+use crate::job::{ConcurrencyLimit, JobStatusKind, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
-use crate::job_store_shard::limit_processing_order;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
     concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
     concurrency_requester_counter_key, concurrency_requests_prefix, end_bound,
-    floating_limit_state_key, job_info_key, job_status_key, parse_concurrency_holder_key,
+    floating_limit_state_key, job_status_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, task_key,
 };
 use crate::metrics::Metrics;
@@ -183,30 +182,6 @@ const STATUS_LOOKUP_CONCURRENCY: usize = 64;
 /// memory; the outer loop iterates as many passes as needed to drain
 /// the requested count.
 const MAX_GRANTS_PER_PASS: usize = 256;
-
-fn concurrency_queue_for_limit(limit: &Limit) -> Option<&str> {
-    match limit {
-        Limit::Concurrency(cl) => Some(&cl.key),
-        Limit::FloatingConcurrency(fl) => Some(&fl.key),
-        Limit::RateLimit(_) => None,
-    }
-}
-
-fn limit_index_matches_queue(limits: &[Limit], limit_index: u32, queue: &str) -> bool {
-    let order = limit_processing_order(limits);
-    order
-        .get(limit_index as usize)
-        .and_then(|&idx| concurrency_queue_for_limit(&limits[idx]))
-        == Some(queue)
-}
-
-fn canonical_limit_index_for_queue(limits: &[Limit], queue: &str) -> Option<u32> {
-    let order = limit_processing_order(limits);
-    order
-        .iter()
-        .position(|&idx| concurrency_queue_for_limit(&limits[idx]) == Some(queue))
-        .map(|idx| idx as u32)
-}
 
 /// Result of attempting to enqueue a job with concurrency limits
 #[derive(Debug)]
@@ -1319,61 +1294,31 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                let task_id_str = match et.task_id() {
-                    Some(task_id) if !task_id.is_empty() => task_id.to_string(),
-                    _ => parsed_req.request_id(),
-                };
-                let mut held_queues: Vec<String> = et
+                // Post-deploy of the unify-chain schema, every request value
+                // populates `task_id`, `limits`, `task_group`, `held_queues`,
+                // and a `limit_index` pointing at this queue's position in
+                // the canonical limit order. Any value missing those fields
+                // is pre-upgrade data left over from a rolling deploy; the
+                // operator clears it (bump `cluster_prefix` / rotate
+                // storage) before shipping this change, and the scanner
+                // treats whatever remains as corrupt below.
+                let task_id_str = et.task_id().unwrap_or_default().to_string();
+                if task_id_str.is_empty() {
+                    tracing::warn!(
+                        queue = %queue,
+                        job_id = %job_id_str,
+                        "grant scanner: request missing task_id; deleting"
+                    );
+                    batch.delete(&kv.key);
+                    stale_and_corrupt_count += 1;
+                    continue;
+                }
+                let held_queues: Vec<String> = et
                     .held_queues()
                     .map(|v| v.iter().map(|s| s.to_string()).collect())
                     .unwrap_or_default();
-                let mut limits = crate::codec::limit_entries_to_owned(et.limits());
-                let mut task_group = et.task_group().unwrap_or_default().to_string();
-
-                if limits.is_empty() || task_group.is_empty() {
-                    match db.get(&job_info_key(tenant, job_id_str)).await {
-                        Ok(Some(job_raw)) => match JobView::new(job_raw) {
-                            Ok(job_view) => {
-                                if limits.is_empty() {
-                                    limits = job_view.limits();
-                                }
-                                if task_group.is_empty() {
-                                    task_group = job_view.task_group().to_string();
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    queue = %queue,
-                                    job_id = %job_id_str,
-                                    error = %e,
-                                    "grant scanner: request needs JobInfo fallback but JobInfo is unreadable; deleting"
-                                );
-                                batch.delete(&kv.key);
-                                stale_and_corrupt_count += 1;
-                                continue;
-                            }
-                        },
-                        Ok(None) => {
-                            tracing::warn!(
-                                queue = %queue,
-                                job_id = %job_id_str,
-                                "grant scanner: request needs JobInfo fallback but JobInfo is missing; deleting"
-                            );
-                            batch.delete(&kv.key);
-                            stale_and_corrupt_count += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                queue = %queue,
-                                job_id = %job_id_str,
-                                error = %e,
-                                "grant scanner: failed to load JobInfo fallback; skipping request this pass"
-                            );
-                            continue;
-                        }
-                    }
-                }
+                let limits = crate::codec::limit_entries_to_owned(et.limits());
+                let task_group = et.task_group().unwrap_or_default().to_string();
 
                 if limits.is_empty() {
                     tracing::warn!(
@@ -1389,64 +1334,14 @@ impl ConcurrencyManager {
                     tracing::warn!(
                         queue = %queue,
                         job_id = %job_id_str,
-                        "grant scanner: request has no task group after fallback; deleting"
+                        "grant scanner: request has no task group; deleting"
                     );
                     batch.delete(&kv.key);
                     stale_and_corrupt_count += 1;
                     continue;
                 }
 
-                let raw_limit_index = et.limit_index();
-                let limit_index = if limit_index_matches_queue(&limits, raw_limit_index, queue) {
-                    raw_limit_index
-                } else if let Some(idx) = canonical_limit_index_for_queue(&limits, queue) {
-                    idx
-                } else {
-                    tracing::warn!(
-                        queue = %queue,
-                        job_id = %job_id_str,
-                        "grant scanner: request queue is not in job limits; deleting"
-                    );
-                    batch.delete(&kv.key);
-                    stale_and_corrupt_count += 1;
-                    continue;
-                };
-
-                // If the value omitted `held_queues` (pre-unify-chain
-                // schema) but the chain is gated at a later limit, upstream
-                // concurrency slots may have been acquired under this
-                // task_id. Probe each earlier concurrency queue and add any
-                // matching holder to `held_queues` so completion / cancel
-                // releases them. Pre-unify chains used a UUID task_id
-                // distinct from `parsed_req.request_id()`, so the probe
-                // won't reach those — they stay orphaned regardless. This
-                // matters for any storage state where task_id consistency
-                // was preserved but held_queues was dropped.
-                if held_queues.is_empty() && limit_index > 0 {
-                    let order = limit_processing_order(&limits);
-                    let upstream_end = (limit_index as usize).min(order.len());
-                    for &lim_idx in &order[..upstream_end] {
-                        let Some(upstream_queue) = concurrency_queue_for_limit(&limits[lim_idx])
-                        else {
-                            continue;
-                        };
-                        let holder_key =
-                            concurrency_holder_key(tenant, upstream_queue, &task_id_str);
-                        match db.get(&holder_key).await {
-                            Ok(Some(_)) => held_queues.push(upstream_queue.to_string()),
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    queue = %queue,
-                                    upstream_queue = %upstream_queue,
-                                    job_id = %job_id_str,
-                                    error = %e,
-                                    "grant scanner: upstream holder probe failed; held_queues may be incomplete"
-                                );
-                            }
-                        }
-                    }
-                }
+                let limit_index = et.limit_index();
 
                 // Resolve max_concurrency from the first request's limits
                 // (always populated, per the check above).

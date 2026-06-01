@@ -26,7 +26,7 @@ pub use import::JobNotReimportableError;
 pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
-pub(crate) use enqueue::{LimitTaskParams, LimitTaskWriteResult, limit_processing_order};
+pub(crate) use enqueue::{LimitTaskParams, LimitTaskWriteResult};
 use helpers::DbWriteBatcher;
 use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
