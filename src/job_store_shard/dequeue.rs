@@ -14,6 +14,7 @@ use crate::keys::{
     attempt_key, concurrency_holder_key, job_info_key, job_status_key, leased_task_key,
     parse_task_key,
 };
+use crate::concurrency::ConcurrencyManager;
 use crate::shard_range::ShardRange;
 use crate::task::{
     DEFAULT_LEASE_MS, HolderRecord, LeaseRecord, LeasedRefreshTask, LeasedTask, Task,
@@ -120,6 +121,161 @@ impl Drop for ClaimedInflightGuard<'_> {
     }
 }
 
+/// RAII guard over the in-memory concurrency reservations made by
+/// `try_reserve` during a dequeue iteration but not yet confirmed durable.
+///
+/// **Why this exists.** `try_reserve` bumps `ConcurrencyCounts.holders` *before*
+/// the batch commits, so admission decisions see the reservation immediately
+/// (see `concurrency.rs` TOCTOU note). Three exit paths handle this today:
+/// handler-error-before-commit and commit-failure both call `rollback_grant`;
+/// commit-success leaves the reservation in place (now backed by the durable
+/// holder row written by the same batch). A fourth exit — the dequeue future
+/// being cancelled around the `write_with_options(...await_durable).await`
+/// — was unhandled, so on cancellation the in-memory reservation stayed but
+/// nothing in the rollback paths ran, leaking a phantom holder.
+///
+/// **What it does.** Holds the `(tenant, queue, task_id)` tuples awaiting
+/// commit confirmation. On every normal exit (handler-error / commit-failure
+/// / commit-success), the dequeue body calls `take()` or `clear()` to handle
+/// the contents itself. If the future is instead dropped or panics, the Drop
+/// fires with whatever is still in `pending` and enqueues each tuple onto
+/// `ConcurrencyManager`'s reconciliation queue. The periodic reconciler then
+/// resolves the ambiguous "did the WAL apply?" by point-lookup against the
+/// durable holder row — see `ConcurrencyManager::reconcile_pending_holders`.
+///
+/// Sibling to [`ClaimedInflightGuard`]; same `Option<Vec<…>>` armed/disarmed
+/// pattern.
+struct PendingGrantGuard<'a> {
+    concurrency: &'a ConcurrencyManager,
+    pending: Option<Vec<(String, String, String)>>,
+}
+
+impl<'a> PendingGrantGuard<'a> {
+    fn new(concurrency: &'a ConcurrencyManager) -> Self {
+        Self {
+            concurrency,
+            pending: Some(Vec::new()),
+        }
+    }
+
+    fn extend<I: IntoIterator<Item = (String, String, String)>>(&mut self, iter: I) {
+        if let Some(v) = self.pending.as_mut() {
+            v.extend(iter);
+        }
+    }
+
+    /// Empty the buffer without disarming. Used after commit-success — the
+    /// reservations are now backed by durable rows, no further action needed,
+    /// and the guard stays armed for the next iteration.
+    fn clear(&mut self) {
+        if let Some(v) = self.pending.as_mut() {
+            v.clear();
+        }
+    }
+
+    /// Take ownership of the pending tuples back, neutralizing the guard so
+    /// its Drop is a no-op. Used at terminal exit paths (commit-failure +
+    /// dequeue Ok return); callers that disarm on commit-failure run
+    /// `rollback_grant` over the returned vec themselves.
+    fn disarm(&mut self) -> Vec<(String, String, String)> {
+        self.pending.take().unwrap_or_default()
+    }
+}
+
+impl Drop for PendingGrantGuard<'_> {
+    fn drop(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            count = pending.len(),
+            "dequeue future dropped/panicked with pending concurrency grants; queueing reconciliation"
+        );
+        for (tenant, queue, task_id) in pending {
+            self.concurrency
+                .request_reconciliation(tenant, queue, task_id);
+        }
+    }
+}
+
+/// RAII guard over durable concurrency holders that the iteration's batch
+/// has staged for deletion, paired with an in-memory `atomic_release` +
+/// `request_grant` that the dequeue body runs post-commit.
+///
+/// **Why this exists.** When `handle_run_attempt` finds a task whose
+/// `job_info` is missing (migration/cleanup race), it adds the durable
+/// holder-row delete to the batch and queues a matching in-memory release.
+/// `write_with_options(... await_durable: true)` applies the batch to the
+/// WAL on first poll, so by the time the await yields, the durable row may
+/// already be gone — but the post-commit `atomic_release` loop only runs if
+/// the await resolves cleanly. Cancellation mid-await leaves durable=0,
+/// in_memory=1: a ghost holder that wedges the queue (the prod 300/300 bug).
+///
+/// **What it does.** Same shape as [`PendingGrantGuard`]. On normal exit the
+/// dequeue body calls `take_all()` to run the in-memory release loop itself.
+/// If the future is dropped or panics, Drop enqueues each tuple for the
+/// reconciler, which point-looks-up the durable holder row to decide
+/// whether to release the in-memory entry (the WAL apply landed) or leave
+/// it alone (the WAL apply did not). Per-task_id, idempotent, correct in
+/// both branches of the ambiguity.
+struct PendingHolderReleaseGuard<'a> {
+    concurrency: &'a ConcurrencyManager,
+    pending: Option<Vec<(String, String, String)>>,
+}
+
+impl<'a> PendingHolderReleaseGuard<'a> {
+    fn new(concurrency: &'a ConcurrencyManager) -> Self {
+        Self {
+            concurrency,
+            pending: Some(Vec::new()),
+        }
+    }
+
+    fn extend<I: IntoIterator<Item = (String, String, String)>>(&mut self, iter: I) {
+        if let Some(v) = self.pending.as_mut() {
+            v.extend(iter);
+        }
+    }
+
+    /// Drain and return the current pending releases while leaving the guard
+    /// armed (with an empty buffer) for the next iteration. Used on the
+    /// commit-success path so the dequeue body runs the existing
+    /// `atomic_release` + `request_grant` loop itself.
+    fn take_all(&mut self) -> Vec<(String, String, String)> {
+        self.pending.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Neutralize the guard. Used at terminal exit paths (commit-failure /
+    /// dequeue Ok return). On commit-failure the caller discards the
+    /// returned vec: the batch didn't land so the durable holder is still
+    /// there and the in-memory state is already correct.
+    fn disarm(&mut self) -> Vec<(String, String, String)> {
+        self.pending.take().unwrap_or_default()
+    }
+}
+
+impl Drop for PendingHolderReleaseGuard<'_> {
+    fn drop(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            count = pending.len(),
+            "dequeue future dropped/panicked with pending holder releases; queueing reconciliation"
+        );
+        for (tenant, queue, task_id) in pending {
+            self.concurrency
+                .request_reconciliation(tenant, queue, task_id);
+        }
+    }
+}
+
 impl JobStoreShard {
     /// Dequeue up to `max_tasks` tasks available now, ordered by time then priority.
     ///
@@ -147,14 +303,18 @@ impl JobStoreShard {
         let mut pending_attempts: Vec<(String, JobView, Vec<u8>)> = Vec::with_capacity(max_tasks);
 
         // Track grants made during this dequeue for rollback on failure
-        // Format: (tenant, queue, task_id)
-        let mut grants_to_rollback: Vec<(String, String, String)> = Vec::new();
+        // *and* for reconciliation on dequeue-future cancellation. Format:
+        // (tenant, queue, task_id). See `PendingGrantGuard` for the
+        // cancellation-safety rationale.
+        let mut grant_guard = PendingGrantGuard::new(&self.concurrency);
         // Track leased tasks for DST event emission after commit
         // Format: (tenant, job_id, task_id)
         let mut leased_tasks_for_dst: Vec<(String, String, String)> = Vec::new();
         // Track holders deleted in the batch that need post-commit in-memory
-        // release + grant-scanner wakeup. Format: (tenant, queue, task_id).
-        let mut holder_releases: Vec<(String, String, String)> = Vec::new();
+        // release + grant-scanner wakeup *and* reconciliation on
+        // cancellation. Format: (tenant, queue, task_id). See
+        // `PendingHolderReleaseGuard` for the cancellation-safety rationale.
+        let mut holder_guard = PendingHolderReleaseGuard::new(&self.concurrency);
 
         // Loop to process internal tasks until we have tasks that are destined for the worker, or no more ready tasks at all.
         const MAX_INTERNAL_ITERATIONS: usize = 10;
@@ -269,9 +429,14 @@ impl JobStoreShard {
                 return Err(e);
             }
 
-            // Merge iteration state into outer accumulators
-            grants_to_rollback.append(&mut state.grants_to_rollback);
-            holder_releases.append(&mut state.holder_releases);
+            // Merge iteration state into the cancellation-safe guards. Pushes
+            // moved here from the iteration-local `state.*` only after every
+            // handler in this iteration succeeded — the handler-error path
+            // above already drained `state.grants_to_rollback` synchronously
+            // and discarded `state.holder_releases` (paired with a batch that
+            // will not commit), matching today's semantics.
+            grant_guard.extend(state.grants_to_rollback.drain(..));
+            holder_guard.extend(state.holder_releases.drain(..));
 
             // Two-phase DST events: emit before write for correct causal ordering,
             // confirm after write succeeds, cancel if write fails.
@@ -314,24 +479,33 @@ impl JobStoreShard {
                     .await
             {
                 dst_events::cancel_write(write_op);
-                // Rollback all grants made during this iteration
-                for (tenant, queue, task_id) in &grants_to_rollback {
-                    self.concurrency.rollback_grant(tenant, queue, task_id);
+                // Commit failed: known not-durable. Roll back all grants and
+                // discard pending holder releases (paired durable deletes
+                // didn't land, so the durable rows still exist and the
+                // in-memory state is already correct). Disarming both guards
+                // here means their Drop is a no-op on the `return Err` below.
+                for (tenant, queue, task_id) in grant_guard.disarm() {
+                    self.concurrency.rollback_grant(&tenant, &queue, &task_id);
                 }
+                let _ = holder_guard.disarm();
                 // Put back all claimed entries since we didn't lease them durably
                 self.brokers.requeue(inflight_guard.disarm());
                 return Err(JobStoreShardError::from(e));
             }
             dst_events::confirm_write(write_op);
 
-            // DB write succeeded - clear rollback lists for next iteration
-            grants_to_rollback.clear();
+            // DB write succeeded — grants are now backed by durable holder
+            // rows, no rollback needed. Clear the guard's buffer (keeps it
+            // armed for the next iteration); the next iteration's pushes
+            // start from empty.
+            grant_guard.clear();
 
             // Post-commit: drop in-memory slots for any holders we removed in
             // this batch (e.g. a RunAttempt task we dropped because its job_info
             // was missing) and wake the grant scanner so a queued requester
-            // can take the freed slot.
-            for (tenant, queue, task_id) in holder_releases.drain(..) {
+            // can take the freed slot. `take_all` empties the guard but keeps
+            // it armed for the next iteration.
+            for (tenant, queue, task_id) in holder_guard.take_all() {
                 self.concurrency
                     .counts()
                     .atomic_release(&tenant, &queue, &task_id);
