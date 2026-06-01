@@ -3785,7 +3785,6 @@ async fn find_task_key_and_task_for_tenant(
     None
 }
 
-
 /// Helper: count `CheckRateLimit` tasks for a tenant.
 async fn count_check_rate_limit_tasks_for_tenant(
     db: &silo::instrumented_db::InstrumentedDb,
