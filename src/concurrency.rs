@@ -1323,7 +1323,7 @@ impl ConcurrencyManager {
                     Some(task_id) if !task_id.is_empty() => task_id.to_string(),
                     _ => parsed_req.request_id(),
                 };
-                let held_queues: Vec<String> = et
+                let mut held_queues: Vec<String> = et
                     .held_queues()
                     .map(|v| v.iter().map(|s| s.to_string()).collect())
                     .unwrap_or_default();
@@ -1411,6 +1411,42 @@ impl ConcurrencyManager {
                     stale_and_corrupt_count += 1;
                     continue;
                 };
+
+                // If the value omitted `held_queues` (pre-unify-chain
+                // schema) but the chain is gated at a later limit, upstream
+                // concurrency slots may have been acquired under this
+                // task_id. Probe each earlier concurrency queue and add any
+                // matching holder to `held_queues` so completion / cancel
+                // releases them. Pre-unify chains used a UUID task_id
+                // distinct from `parsed_req.request_id()`, so the probe
+                // won't reach those — they stay orphaned regardless. This
+                // matters for any storage state where task_id consistency
+                // was preserved but held_queues was dropped.
+                if held_queues.is_empty() && limit_index > 0 {
+                    let order = limit_processing_order(&limits);
+                    let upstream_end = (limit_index as usize).min(order.len());
+                    for &lim_idx in &order[..upstream_end] {
+                        let Some(upstream_queue) = concurrency_queue_for_limit(&limits[lim_idx])
+                        else {
+                            continue;
+                        };
+                        let holder_key =
+                            concurrency_holder_key(tenant, upstream_queue, &task_id_str);
+                        match db.get(&holder_key).await {
+                            Ok(Some(_)) => held_queues.push(upstream_queue.to_string()),
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    queue = %queue,
+                                    upstream_queue = %upstream_queue,
+                                    job_id = %job_id_str,
+                                    error = %e,
+                                    "grant scanner: upstream holder probe failed; held_queues may be incomplete"
+                                );
+                            }
+                        }
+                    }
+                }
 
                 // Resolve max_concurrency from the first request's limits
                 // (always populated, per the check above).
