@@ -71,26 +71,6 @@ pub(crate) struct LimitTaskWriteResult {
     pub pending_task_key_start_ms: Option<i64>,
 }
 
-/// Canonical processing order for a job's limits: Concurrency first, then
-/// FloatingConcurrency, then RateLimit, stable within each kind. Returns
-/// indices into the caller-provided `limits` slice. A `Limit::Concurrency`
-/// must always be processed before any `Limit::FloatingConcurrency` so a
-/// strictly-tighter Concurrency limit blocks the job *before* it acquires a
-/// FloatingConcurrency slot — otherwise the FC grant produces a leasable
-/// `RunAttempt[FC]` that bypasses the still-full Concurrency limit.
-pub(crate) fn limit_processing_order(limits: &[Limit]) -> Vec<usize> {
-    let kind_rank = |i: usize| -> u8 {
-        match &limits[i] {
-            Limit::Concurrency(_) => 0,
-            Limit::FloatingConcurrency(_) => 1,
-            Limit::RateLimit(_) => 2,
-        }
-    };
-    let mut order: Vec<usize> = (0..limits.len()).collect();
-    order.sort_by_key(|&i| kind_rank(i));
-    order
-}
-
 /// Whether a concurrency grant was obtained or the job was queued for later.
 enum GrantResult {
     /// Slot granted immediately; caller should advance to the next limit.
