@@ -27,6 +27,16 @@ backend = "fs"
 # NOTE: %shard% must be at a directory boundary (after /) for split/clone to work correctly
 path = "./tmp/silo-data/%shard%"
 
+# Submit a full-compaction spec for each shard every N seconds (consumed by the
+# standalone silo-compactor). Omit to disable periodic compaction.
+periodic_full_compaction_s = 60
+# TTL (seconds) applied to non-success terminal jobs' associated records.
+terminal_job_expire_s = 900
+# TTL (seconds) applied to Succeeded jobs' associated records.
+completed_job_expire_s = 60
+# Periodically rederive counter values from surviving job rows to correct drift.
+counter_reconciliation_seconds = 30
+
 # Garbage collection — disabled by default in SlateDB!
 [database.slatedb.garbage_collector_options.manifest_options]
 interval = "300s"
