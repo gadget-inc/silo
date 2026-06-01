@@ -132,6 +132,17 @@ pub struct Metrics {
     concurrency_holders_cache_holders: GaugeVec,
     concurrency_holders_cache_queues: GaugeVec,
     concurrency_holders_cache_hydrated_queues: GaugeVec,
+    /// Sum of `|in_memory_holders - durable_holders|` across hydrated queues.
+    /// A non-zero value means a reconciler tick observed a drift between the
+    /// authoritative durable holder rows and the in-memory `holders` set —
+    /// the same signal that, if left to persist, would manifest as a wedge
+    /// (the 300/300 production case).
+    concurrency_holder_drift: GaugeVec,
+    /// Count of `(tenant, queue, task_id)` tuples currently queued for the
+    /// per-task_id reconciler (drained on each tick + on `reconcile_notify`).
+    /// Steady-state expected to be 0; sustained growth means the reconciler
+    /// is stuck (slatedb unavailable, etc.).
+    concurrency_reconciliation_pending: GaugeVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -451,6 +462,25 @@ impl Metrics {
         self.concurrency_holders_cache_hydrated_queues
             .with_label_values(&[shard])
             .set(stats.hydrated_queue_count as f64);
+    }
+
+    /// Update per-shard reconciler signal gauges:
+    /// * `drift` = sum of |in_memory - durable| holder counts across hydrated
+    ///   queues, computed at the end of each periodic reconciler tick.
+    /// * `pending` = current size of the per-task_id reconciliation queue.
+    ///
+    /// Non-zero `drift` or sustained-non-zero `pending` indicates the
+    /// reconciler is observing inconsistency between in-memory and durable
+    /// holder state — the same signal that, if it grows, manifests as the
+    /// production queue wedge. Pair with an alert that fires if either
+    /// remains non-zero across multiple scrape intervals.
+    pub fn set_concurrency_reconciler_signals(&self, shard: &str, drift: u64, pending: u64) {
+        self.concurrency_holder_drift
+            .with_label_values(&[shard])
+            .set(drift as f64);
+        self.concurrency_reconciliation_pending
+            .with_label_values(&[shard])
+            .set(pending as f64);
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -1253,6 +1283,28 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_holder_drift = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_concurrency_holder_drift",
+                "Per-shard sum of |in_memory - durable| holder counts across hydrated queues, observed at the last reconciler tick. Non-zero = drift the reconciler will release; sustained non-zero means the reconciler is stuck.",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconciliation_pending = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_concurrency_reconciliation_pending",
+                "Number of (tenant, queue, task_id) tuples awaiting per-task_id reconciliation against durable holder rows. Steady-state expected 0; sustained > 0 means the reconciler is wedged.",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // SlateDB watcher metrics (driven by Db::subscribe)
     let slatedb_durable_seq = register(
         &registry,
@@ -1354,6 +1406,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_holders_cache_holders,
         concurrency_holders_cache_queues,
         concurrency_holders_cache_hydrated_queues,
+        concurrency_holder_drift,
+        concurrency_reconciliation_pending,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
         slatedb_manifest_last_l0_seq,

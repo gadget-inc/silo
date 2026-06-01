@@ -1357,3 +1357,424 @@ async fn steady_state_zero_holders_under_mixed_workload() {
     // referenced after construction; explicitly drop it here for clarity.
     let _ = MockGubernatorClient::new_arc();
 }
+
+/// Regression for the "stranded inflight task → orphaned holder" defect that
+/// `e6660cd` ("Clear up stranded inflight tasks with drop guard") targets.
+///
+/// Failure shape this reproduces:
+///   1. A concurrency-limited job is enqueued. `handle_enqueue` grants the slot
+///      immediately: `append_grant_edits` writes the durable holder in the SAME
+///      batch as the terminal `RunAttempt` task. Holder committed, task durable.
+///   2. A worker dequeues the `RunAttempt`. `claim_ready` moves the task into the
+///      broker's in-memory `inflight` set. Then, under worker overload, the
+///      `LeaseTasks` RPC future is *cancelled* (deadline / disconnect / drop)
+///      before the lease is durably written.
+///   3. Without the drop guard the task is stranded in `inflight` forever (no
+///      TTL): the scanner skips inflight keys, so the `RunAttempt` is never
+///      re-leased — yet the holder from step 1 keeps consuming the slot. That's
+///      the leak: holder committed, task consumed, no lease ever appears.
+///
+/// The guard closes this by releasing the claimed key from `inflight` on drop
+/// (without re-buffering), so the DB scanner — which still sees the un-deleted
+/// task key — re-adds it and a later dequeue leases it exactly once. This test
+/// drives the *real* `dequeue` future, cancels it mid-flight right after the
+/// claim, and asserts the task recovers and the holder never leaks.
+///
+/// If the guard regresses, the recovery loop below never re-leases the task and
+/// the `expect` fires with "never re-leased — holder orphaned".
+#[silo::test]
+async fn dropped_dequeue_future_does_not_orphan_holder() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "drop-guard-q";
+
+    // (1) Enqueue a Concurrency(max=1) job. The slot is free, so the grant is
+    // immediate: holder + RunAttempt land together in the enqueue batch.
+    let _job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![conc_limit(queue, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "concurrency grant should write a holder at enqueue time"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        1,
+        "in-memory holder reservation should exist after the immediate grant"
+    );
+
+    // Wait for the background scanner to buffer the RunAttempt so the dequeue's
+    // first `claim_ready` is synchronous — guaranteeing the single poll below
+    // claims the task (moves it into `inflight`) before parking on an await.
+    let buffered = poll_until(|| async { shard.broker_buffer_len() }, |n| *n >= 1, 2_000).await;
+    assert!(buffered >= 1, "scanner should buffer the RunAttempt task");
+
+    // (2) Drive the real dequeue future, poll it exactly once, then drop it.
+    // The first poll claims the task synchronously — `claim_ready` moves the key
+    // into the broker's `inflight` set — then parks awaiting durability. The
+    // future is then dropped (cancelled RPC), which must run
+    // `ClaimedInflightGuard::drop`.
+    {
+        let mut fut = Box::pin(shard.dequeue("w-overloaded", "default", 1));
+        let polled = futures::poll!(fut.as_mut());
+        assert!(
+            polled.is_pending(),
+            "single poll must leave the dequeue mid-flight (claimed, not yet acked); \
+             got a ready result instead, so the cancellation window was not exercised"
+        );
+        // While the future is alive and parked, the claimed key is in-flight.
+        assert_eq!(
+            shard.broker_inflight_len("default"),
+            1,
+            "the claimed RunAttempt must be in-flight while the dequeue is mid-flight"
+        );
+        drop(fut); // ClaimedInflightGuard::drop → release_inflight(key)
+    }
+
+    // PRIMARY REGRESSION ASSERTION (deterministic): dropping the dequeue future
+    // must have released the claimed key from the in-flight set. Without the
+    // drop guard (e6660cd) the key is stranded here forever — the scanner skips
+    // in-flight keys, so the RunAttempt is never re-leased and its holder leaks.
+    assert_eq!(
+        shard.broker_inflight_len("default"),
+        0,
+        "cancelled dequeue left the claimed task stranded in-flight — drop guard regression; \
+         the holder it backs can never be re-leased and is orphaned"
+    );
+
+    // Holder is still committed from enqueue and must NOT have been doubled or
+    // dropped by the cancellation.
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "holder count must stay at exactly 1 across the cancellation"
+    );
+
+    // (3) Recovery: a subsequent dequeue must re-lease the stranded task. With a
+    // broken/absent guard the task is stuck in `inflight`, the scanner never
+    // re-adds it, and this loop never finds a lease.
+    let mut recovered_task_id: Option<String> = None;
+    for _ in 0..50 {
+        let res = shard
+            .dequeue("w-healthy", "default", 1)
+            .await
+            .expect("recovery dequeue");
+        if let Some(t) = res.tasks.first() {
+            recovered_task_id = Some(t.attempt().task_id().to_string());
+            break;
+        }
+        // Tolerate the ambiguous case where the cancelled write actually landed:
+        // a lease may already exist even though the future was dropped.
+        if let Some((_, lease_val)) = first_lease_kv(shard.db()).await {
+            if let Ok(Task::RunAttempt { id, .. }) =
+                decode_lease(lease_val).expect("decode lease").to_task()
+            {
+                recovered_task_id = Some(id);
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    let task_id = recovered_task_id.expect(
+        "dropped RunAttempt was never re-leased — the holder is orphaned (no task, no lease, \
+         yet the concurrency slot stays consumed). This is the stranded-inflight holder leak \
+         the e6660cd drop guard must prevent.",
+    );
+
+    // Exactly one holder backs the (now re-leased) task — no phantom duplicate.
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "re-lease must reuse the original holder, not mint a second one"
+    );
+
+    // (4) Completing the job releases the holder — proving it was never orphaned
+    // and the slot is reclaimable.
+    shard
+        .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "durable holder must be released once the recovered job completes"
+    );
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        0,
+        "in-memory holder reservation must also drain to zero — no slot leak"
+    );
+}
+
+/// PRODUCTION WEDGE REPRODUCTION — an in-memory concurrency holder that the
+/// dequeue drop guard does NOT release, permanently consuming a queue's cap.
+///
+/// A concurrency holder has two halves: a durable KV row (prefix 0x09) AND an
+/// in-memory reservation (`ConcurrencyCounts`, a per-(tenant,queue) set of
+/// task_ids). `try_reserve`/`process_grants` gate admission on the IN-MEMORY
+/// count, so an in-memory reservation with no durable backing silently steals a
+/// slot forever (nothing durable for cancel/reap/expiry to key a release off,
+/// and hydration only ever *inserts*). Accumulate enough — prod hit 300/300 for
+/// env-10000215255 — and the queue wedges while ~1M requesters starve.
+///
+/// The drop guard `ClaimedInflightGuard` (e6660cd) only rolls back the broker's
+/// `inflight` set; it has no reference to `self.concurrency`. So any in-memory
+/// holder bookkeeping that lives in `dequeue`'s post-commit tail is lost when
+/// the future is cancelled. This test pins the cleanest, deterministic instance:
+///
+///   `handle_run_attempt` for a RunAttempt whose `job_info` is gone deletes the
+///   held concurrency holder *in the committed batch* but performs the matching
+///   in-memory `atomic_release` only afterwards, in `dequeue`'s post-commit loop
+///   (dequeue.rs ~334-339). `write_with_options` applies the batch to the WAL on
+///   its first poll, so the durable delete lands even if the future is then
+///   dropped — but the post-commit `atomic_release` never runs. Net: durable
+///   holder gone, in-memory reservation retained = a ghost that wedges the queue.
+///
+/// The sibling on the *grant* side (handle_request_ticket's `try_reserve` not
+/// rolled back on drop) produces the same ghost when the commit doesn't land;
+/// it needs a genuinely-pending pre-commit await (a cold hydration scan over a
+/// large queue in prod) to hit, so it isn't deterministic in the warm test DB.
+/// Both share one root cause and one fix: roll back in-memory concurrency state
+/// on the dequeue future-drop path, exactly as the error/commit-failure paths do.
+///
+/// This test cancels the real `dequeue` future at the commit and asserts the
+/// queue is NOT wedged. It FAILS on current code (durable=0 but in-memory=1),
+/// reproducing the leak; it passes once the drop path releases in-memory holders.
+///
+/// Fixed: a pair of layered RAII guards (`PendingHolderReleaseGuard` and
+/// `PendingGrantGuard` in `src/job_store_shard/dequeue.rs`, sibling to the
+/// pre-existing `ClaimedInflightGuard`) now own the iteration's in-memory
+/// holder-release and grant-bump tuples. On dequeue-future drop their `Drop`
+/// enqueues each `(tenant, queue, task_id)` onto
+/// `ConcurrencyManager::request_reconciliation`; the periodic reconciler
+/// (`spawn_concurrency_reconcile_task`, woken sub-tick by `reconcile_notify`)
+/// point-looks-up the durable holder row, observes durable=0/in_mem=1, and
+/// calls `atomic_release` + `request_grant`. The queue un-wedges before the
+/// test's recovery dequeue loop expires.
+#[tokio::test]
+async fn dropped_dequeue_future_skips_inmemory_holder_release_and_wedges_queue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "wedge-q";
+    let task_group = "default";
+
+    // Enqueue a Concurrency(max=1) job: holder granted at enqueue (in-memory +
+    // durable), and a RunAttempt carrying held_queues=[queue] is written.
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![conc_limit(queue, 1)],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue");
+
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1, "durable holder at enqueue");
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1, "in-memory holder at enqueue");
+
+    // The job_info row disappears before the worker dequeues (migration / cleanup
+    // race / partial restore). `handle_run_attempt` will take the missing-job
+    // branch: delete the task AND the held concurrency holder in the batch, then
+    // (post-commit) `atomic_release` the in-memory slot.
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.delete(&job_info_key(tenant, &job_id));
+        shard.db().write(batch).await.expect("delete job_info");
+        shard.db().flush().await.expect("flush");
+    }
+
+    // Wait for the scanner to buffer the RunAttempt.
+    let buffered = poll_until(|| async { shard.broker_buffer_len() }, |n| *n >= 1, 5_000).await;
+    assert!(buffered >= 1, "scanner should buffer the RunAttempt");
+
+    // Drive the real dequeue future to the commit, then cancel it there.
+    //
+    // We poll with `yield_now` (which does NOT advance the paused clock), so the
+    // 10ms flush timer never fires and the `write_with_options` await stays
+    // pending — the future parks exactly at the commit with the batch already
+    // applied to the WAL. Dropping there is the overloaded-worker RPC cancel.
+    {
+        let mut fut = Box::pin(shard.dequeue("w-overloaded", task_group, 1));
+        for _ in 0..500 {
+            let polled = futures::poll!(fut.as_mut());
+            assert!(
+                polled.is_pending(),
+                "dequeue completed before we could cancel it at the commit"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(fut); // cancel at the commit await; the post-commit atomic_release never runs
+    }
+
+    // Let the flush land the buffered batch (durable holder delete).
+    let durable = poll_until(
+        || async { count_concurrency_holders(shard.db()).await },
+        |n| *n == 0,
+        5_000,
+    )
+    .await;
+
+    // The committed batch's durable delete landed during the parked
+    // `write_with_options.await`. Pre-fix, the in-memory `atomic_release`
+    // only ran in dequeue's post-commit loop — which the cancelled future
+    // skipped — so in_mem stayed at 1 (a "ghost") and wedged the queue.
+    //
+    // Post-fix, the `PendingHolderReleaseGuard`'s Drop queues a
+    // reconciliation request; the reactive `spawn_holder_reconcile_task`
+    // wakes on `reconcile_notify`, point-looks-up the durable row (gone),
+    // and `atomic_release`s the ghost. The reactive task is a sibling
+    // tokio::spawn, so its run is concurrent with this test thread —
+    // depending on the runtime's scheduling decision the in-memory count
+    // read here may be 0 (reconciler already ran) or 1 (still queued).
+    // Either is correct as long as the queue un-wedges before the
+    // recovery dequeue loop below times out.
+    assert_eq!(durable, 0, "durable holder should be deleted by the committed batch");
+
+    // The slot must not stay wedged: a fresh Concurrency(max=1) job on the
+    // same queue must be grantable once the reconciler has released the
+    // ghost (or immediately if it already had).
+    let _job2 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![conc_limit(queue, 1)],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue job2");
+
+    let mut job2_leased = false;
+    for _ in 0..50 {
+        let res = shard.dequeue("w2", task_group, 1).await.expect("dequeue job2");
+        if !res.tasks.is_empty() {
+            job2_leased = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        job2_leased,
+        "QUEUE WEDGED: the ghost in-memory holder is still occupying the only slot \
+         (durable={durable}, in_mem={final_inmem}) — pre-fix this was permanent, lasting \
+         until process restart; with the fix the reactive holder reconciler should have \
+         released it within the recovery loop's 1s budget.",
+        final_inmem = shard.concurrency_holder_count(tenant, queue),
+    );
+
+    // After job2 leases, in-memory count is 1 again (job2's own grant) but
+    // the ghost is provably gone (because admission was granted). The
+    // wedge is cleared.
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "exactly one durable holder (job2's) — the ghost left no trace"
+    );
+}
+
+/// Direct exercise of `ConcurrencyManager::reconcile_pending_holders` over
+/// all four (durable, in_memory) quadrants. Drives the reconciler via the
+/// test accessor on `JobStoreShard` so the assertions hold without racing a
+/// background task.
+#[tokio::test]
+async fn reconcile_pending_holders_four_quadrants() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "quadrants-q";
+
+    // Force per-queue hydration before the reconciler runs, so
+    // `contains_holder` reads against a Hydrated entry rather than a
+    // NotHydrated one (whose presence/absence semantics differ).
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            &concurrency_holder_key(tenant, queue, "hydrate-seed"),
+            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+        );
+        shard.db().write(batch).await.expect("seed write");
+        shard.db().flush().await.expect("flush seed");
+    }
+
+    // Quadrant 1: durable=Y, in_mem=Y — both present.
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            &concurrency_holder_key(tenant, queue, "task-both"),
+            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+        );
+        shard.db().write(batch).await.expect("durable write");
+        shard.db().flush().await.expect("flush");
+    }
+    shard.concurrency_insert_holder(tenant, queue, "task-both");
+
+    // Quadrant 2: durable=N, in_mem=N — both absent. No setup needed.
+
+    // Quadrant 3: durable=Y, in_mem=N — mirror case (commit landed but the
+    // in-memory entry was somehow lost).
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            &concurrency_holder_key(tenant, queue, "task-durable-only"),
+            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+        );
+        shard.db().write(batch).await.expect("durable-only write");
+        shard.db().flush().await.expect("flush");
+    }
+
+    // Quadrant 4: durable=N, in_mem=Y — the ghost, the wedge bug.
+    shard.concurrency_insert_holder(tenant, queue, "task-ghost");
+
+    // Enqueue all four for reconciliation.
+    for tid in ["task-both", "task-neither", "task-durable-only", "task-ghost"] {
+        shard.request_concurrency_reconciliation(
+            tenant.to_string(),
+            queue.to_string(),
+            tid.to_string(),
+        );
+    }
+
+    shard.reconcile_pending_holders_for_test().await;
+
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, "task-both"),
+        "Q1 (durable=Y, in_mem=Y): reconciler must leave consistent state alone"
+    );
+    assert!(
+        !shard.concurrency_contains_holder(tenant, queue, "task-neither"),
+        "Q2 (durable=N, in_mem=N): reconciler must leave consistent state alone"
+    );
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, "task-durable-only"),
+        "Q3 (durable=Y, in_mem=N): reconciler must re-insert to match durable"
+    );
+    assert!(
+        !shard.concurrency_contains_holder(tenant, queue, "task-ghost"),
+        "Q4 (durable=N, in_mem=Y): reconciler must release the ghost — the wedge fix"
+    );
+}
