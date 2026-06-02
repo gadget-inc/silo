@@ -1019,6 +1019,13 @@ impl JobStoreShard {
             .insert_holder(tenant, queue, task_id);
     }
 
+    /// Test-only: peek the current pending-grant count accumulated for
+    /// `(tenant, queue)`. Used by the reconciler regression test to assert
+    /// that each ghost release fired its own `request_grant`.
+    pub fn pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        self.concurrency.pending_grant_count_for_test(tenant, queue)
+    }
+
     /// Test-only: drain pending reconciliations and apply them now. Returns
     /// whether the pass had to re-queue anything (transient DB error
     /// during hydrate or `db.get`). The production path goes through

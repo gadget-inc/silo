@@ -1804,3 +1804,72 @@ async fn reconcile_pending_holders_four_quadrants() {
         "Q4 (durable=N, in_mem=Y): reconciler must release the ghost — the wedge fix"
     );
 }
+
+/// Regression for the under-counted grant kicks bug: when
+/// `reconcile_pending_holders` frees N ghost holders for the same queue in
+/// a single pass, it must `request_grant` N times (so the grant scanner
+/// processes N pending requests in one go), not once. Pre-fix the code
+/// flipped an `any_released: bool` and fired a single `request_grant` at
+/// the end of the per-queue loop, which capped the immediate grant pass
+/// at 1 regardless of how many ghosts were freed — leaving N-1 requesters
+/// waiting on the periodic `reconcile_pending_requests` tick.
+#[tokio::test]
+async fn reconcile_pending_holders_kicks_grant_per_release() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "kicks-q";
+
+    // Suspend the grant scanner so `pending_grants` accumulates rather than
+    // being drained mid-test. Matches the established pattern in
+    // tests/job_store_shard_concurrency_tests.rs.
+    shard.stop_grant_scanner();
+
+    // Seed the (tenant, queue) entry as Hydrated by writing then deleting a
+    // dummy holder. Without hydration the reconciler's per-queue
+    // `ensure_hydrated` call would actually scan the slatedb — fine, but
+    // forcing hydration up front keeps the test self-contained.
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            &concurrency_holder_key(tenant, queue, "hydrate-seed"),
+            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+        );
+        shard.db().write(batch).await.expect("seed write");
+        shard.db().flush().await.expect("flush seed");
+    }
+
+    // Install N ghosts (durable=0, in_mem=Y for each task_id we add). The
+    // four-quadrant logic in `reconcile_pending_holders` treats each as a
+    // "(false, true)" release.
+    const N: u32 = 5;
+    for i in 0..N {
+        let task_id = format!("ghost-{i}");
+        shard.concurrency_insert_holder(tenant, queue, &task_id);
+        shard.request_concurrency_reconciliation(tenant.to_string(), queue.to_string(), task_id);
+    }
+
+    assert_eq!(
+        shard.pending_grant_count_for_test(tenant, queue),
+        0,
+        "no grants accumulated before reconciliation runs"
+    );
+
+    let requeued = shard.reconcile_pending_holders_for_test().await;
+    assert!(!requeued, "no transient DB failures expected");
+
+    for i in 0..N {
+        let task_id = format!("ghost-{i}");
+        assert!(
+            !shard.concurrency_contains_holder(tenant, queue, &task_id),
+            "ghost {task_id} should have been released",
+        );
+    }
+
+    let pending = shard.pending_grant_count_for_test(tenant, queue);
+    assert_eq!(
+        pending, N,
+        "reconciler must `request_grant` once per ghost release (N={N}); \
+         pre-fix this was 1 regardless of how many ghosts were freed, capping \
+         the immediate grant pass at 1 in production-scale wedges (300 ghosts → 1 grant)"
+    );
+}

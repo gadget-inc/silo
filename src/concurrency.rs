@@ -1213,7 +1213,6 @@ impl ConcurrencyManager {
                 continue;
             }
 
-            let mut any_released = false;
             for task_id in task_ids {
                 let key = concurrency_holder_key(&tenant, &queue, &task_id);
                 let durable_present = match db.get(&key).await {
@@ -1254,9 +1253,14 @@ impl ConcurrencyManager {
                     (false, true) => {
                         // Ghost: durable holder is gone but the in-memory
                         // reservation survives. This is the wedge bug.
-                        // Release and wake the grant scanner.
+                        // Release and kick the grant scanner *per release*
+                        // (mirroring `dequeue.rs` post-commit holder loop)
+                        // so a reconcile pass that frees N ghosts grants N
+                        // pending requests, not just 1 — `request_grant_count`
+                        // accumulates in a single map entry and the grant
+                        // scanner drains it in one pass with count = N.
                         self.counts.atomic_release(&tenant, &queue, &task_id);
-                        any_released = true;
+                        self.request_grant(&tenant, &queue);
                         tracing::info!(
                             tenant = %tenant,
                             queue = %queue,
@@ -1265,10 +1269,6 @@ impl ConcurrencyManager {
                         );
                     }
                 }
-            }
-            if any_released {
-                // One grant kick per queue that saw a release.
-                self.request_grant(&tenant, &queue);
             }
         }
 
@@ -1360,6 +1360,16 @@ impl ConcurrencyManager {
             entry.2 += count;
         }
         self.grant_notify.notify_one();
+    }
+
+    /// Test-only: peek the current pending-grant count for a queue. Used by
+    /// `reconcile_pending_holders_kicks_grant_per_release` to assert that
+    /// the reconciler kicked the scanner once per ghost release rather than
+    /// once per queue.
+    pub fn pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        let key = concurrency_counts_key(tenant, queue);
+        let pending = self.pending_grants.lock().unwrap();
+        pending.get(&key).map(|(_, _, n)| *n).unwrap_or(0)
     }
 
     /// Start the background grant scanner task.
