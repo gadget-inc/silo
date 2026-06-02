@@ -531,6 +531,37 @@ export interface CancelJobRequest {
 export interface CancelJobResponse {
 }
 /**
+ * Forcibly drop all concurrency holders and in-flight run attempts for a tenant
+ * on a single shard. Admin/operator action used to clear stuck concurrency state.
+ *
+ * @generated from protobuf message silo.v1.DropTenantStateRequest
+ */
+export interface DropTenantStateRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // Shard ID (UUID) to operate on.
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
+}
+/**
+ * Response reporting what was dropped.
+ *
+ * @generated from protobuf message silo.v1.DropTenantStateResponse
+ */
+export interface DropTenantStateResponse {
+    /**
+     * @generated from protobuf field: uint64 holders_dropped = 1
+     */
+    holdersDropped: bigint; // Number of concurrency holders deleted.
+    /**
+     * @generated from protobuf field: uint64 run_attempts_dropped = 2
+     */
+    runAttemptsDropped: bigint; // Number of in-flight run attempts deleted.
+}
+/**
  * Restart a cancelled or failed job, allowing it to be processed again.
  * The job will get a fresh set of retries according to its retry policy.
  *
@@ -3333,6 +3364,115 @@ class CancelJobResponse$Type extends MessageType<CancelJobResponse> {
  * @generated MessageType for protobuf message silo.v1.CancelJobResponse
  */
 export const CancelJobResponse = new CancelJobResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class DropTenantStateRequest$Type extends MessageType<DropTenantStateRequest> {
+    constructor() {
+        super("silo.v1.DropTenantStateRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<DropTenantStateRequest>): DropTenantStateRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<DropTenantStateRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: DropTenantStateRequest): DropTenantStateRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: DropTenantStateRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.DropTenantStateRequest
+ */
+export const DropTenantStateRequest = new DropTenantStateRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class DropTenantStateResponse$Type extends MessageType<DropTenantStateResponse> {
+    constructor() {
+        super("silo.v1.DropTenantStateResponse", [
+            { no: 1, name: "holders_dropped", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 2, name: "run_attempts_dropped", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<DropTenantStateResponse>): DropTenantStateResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.holdersDropped = 0n;
+        message.runAttemptsDropped = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<DropTenantStateResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: DropTenantStateResponse): DropTenantStateResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint64 holders_dropped */ 1:
+                    message.holdersDropped = reader.uint64().toBigInt();
+                    break;
+                case /* uint64 run_attempts_dropped */ 2:
+                    message.runAttemptsDropped = reader.uint64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: DropTenantStateResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint64 holders_dropped = 1; */
+        if (message.holdersDropped !== 0n)
+            writer.tag(1, WireType.Varint).uint64(message.holdersDropped);
+        /* uint64 run_attempts_dropped = 2; */
+        if (message.runAttemptsDropped !== 0n)
+            writer.tag(2, WireType.Varint).uint64(message.runAttemptsDropped);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.DropTenantStateResponse
+ */
+export const DropTenantStateResponse = new DropTenantStateResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class RestartJobRequest$Type extends MessageType<RestartJobRequest> {
     constructor() {
@@ -7186,6 +7326,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "GetJobResult", options: {}, I: GetJobResultRequest, O: GetJobResultResponse },
     { name: "DeleteJob", options: {}, I: DeleteJobRequest, O: DeleteJobResponse },
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
+    { name: "DropTenantState", options: {}, I: DropTenantStateRequest, O: DropTenantStateResponse },
     { name: "RestartJob", options: {}, I: RestartJobRequest, O: RestartJobResponse },
     { name: "ExpediteJob", options: {}, I: ExpediteJobRequest, O: ExpediteJobResponse },
     { name: "LeaseTask", options: {}, I: LeaseTaskRequest, O: LeaseTaskResponse },
