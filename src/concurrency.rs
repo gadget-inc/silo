@@ -36,7 +36,7 @@
 //!   request from a restart or retry is still in the DB. Since Cancelled is terminal,
 //!   this also catches any stale cancelled requests.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -58,13 +58,13 @@ use crate::codec::{
     encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
-use crate::job::{ConcurrencyLimit, JobStatusKind, Limit};
+use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
     concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
     concurrency_requester_counter_key, concurrency_requests_prefix, end_bound,
-    floating_limit_state_key, job_status_key, parse_concurrency_holder_key,
+    floating_limit_state_key, job_info_key, job_status_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, task_key,
 };
 use crate::metrics::Metrics;
@@ -183,6 +183,28 @@ const STATUS_LOOKUP_CONCURRENCY: usize = 64;
 /// the requested count.
 const MAX_GRANTS_PER_PASS: usize = 256;
 
+fn concurrency_queue_for_limit(limit: &Limit) -> Option<&str> {
+    match limit {
+        Limit::Concurrency(cl) => Some(&cl.key),
+        Limit::FloatingConcurrency(fl) => Some(&fl.key),
+        Limit::RateLimit(_) => None,
+    }
+}
+
+fn limit_index_matches_queue(limits: &[Limit], limit_index: u32, queue: &str) -> bool {
+    limits
+        .get(limit_index as usize)
+        .and_then(concurrency_queue_for_limit)
+        == Some(queue)
+}
+
+fn canonical_limit_index_for_queue(limits: &[Limit], queue: &str) -> Option<u32> {
+    limits
+        .iter()
+        .position(|limit| concurrency_queue_for_limit(limit) == Some(queue))
+        .map(|idx| idx as u32)
+}
+
 /// Result of attempting to enqueue a job with concurrency limits
 #[derive(Debug)]
 pub enum RequestTicketOutcome {
@@ -259,6 +281,15 @@ pub struct ConcurrencyCounts {
     /// have already scanned every non-empty queue. When `false`, the
     /// singleflighted per-queue scan runs on miss.
     hydrate_all_at_startup: bool,
+    /// (tenant, queue, task_id) tuples submitted by RAII guards on drop of a
+    /// dequeue future, awaiting per-task_id reconciliation against the durable
+    /// holder row. BTreeSet for deterministic iteration order (DST) and
+    /// natural deduplication of repeated tuples.
+    ///
+    /// Mutex is held only for synchronous `insert` and `mem::take` — never
+    /// across `.await`, matching the locking discipline at the top of this
+    /// module.
+    pending_reconciliations: Mutex<BTreeSet<(String, String, String)>>,
 }
 
 impl Default for ConcurrencyCounts {
@@ -279,6 +310,7 @@ impl ConcurrencyCounts {
         Self {
             queues: Arc::new(DashMap::new()),
             hydrate_all_at_startup,
+            pending_reconciliations: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -559,6 +591,77 @@ impl ConcurrencyCounts {
             .unwrap_or(0)
     }
 
+    /// Whether this task_id is currently recorded as an in-memory holder for
+    /// `(tenant, queue)`. Used by the reconciler to compare against the
+    /// durable holder row.
+    pub fn contains_holder(&self, tenant: &str, queue: &str, task_id: &str) -> bool {
+        let key = queue_key(tenant, queue);
+        self.queues
+            .get(&key)
+            .map(|entry| entry.holders.contains(task_id))
+            .unwrap_or(false)
+    }
+
+    /// Insert an in-memory holder without going through `try_reserve` (no
+    /// capacity check). Used by the reconciler when it observes a durable
+    /// holder row with no matching in-memory entry — a possible outcome of
+    /// the ambiguous "commit landed during cancellation" case on the
+    /// grant-side guard, which the reconciler self-heals.
+    pub fn insert_holder(&self, tenant: &str, queue: &str, task_id: &str) {
+        let key = queue_key(tenant, queue);
+        let mut entry = self.queues.entry(key).or_insert_with(QueueEntry::new);
+        entry.holders.insert(task_id.to_string());
+    }
+
+    /// Push a `(tenant, queue, task_id)` tuple onto the per-task_id
+    /// reconciliation queue. Idempotent: BTreeSet dedupes repeats.
+    ///
+    /// Called by `PendingGrantGuard::drop` and `PendingHolderReleaseGuard::drop`
+    /// in `dequeue.rs` when a dequeue future is cancelled around its commit.
+    /// The actual reconciliation runs on the periodic
+    /// `spawn_concurrency_reconcile_task`, woken sub-tick via
+    /// `ConcurrencyManager::request_reconciliation`.
+    pub fn enqueue_reconciliation(&self, tenant: String, queue: String, task_id: String) {
+        let mut p = self.pending_reconciliations.lock().unwrap();
+        p.insert((tenant, queue, task_id));
+    }
+
+    /// Drain the pending reconciliation set. Synchronous — does not touch the
+    /// `await_durable` path.
+    fn drain_pending_reconciliations(&self) -> BTreeSet<(String, String, String)> {
+        let mut p = self.pending_reconciliations.lock().unwrap();
+        std::mem::take(&mut *p)
+    }
+
+    /// Count of pending reconciliation tuples. Used by metrics and a stuck-
+    /// reconciler warn.
+    pub fn pending_reconciliations_len(&self) -> usize {
+        self.pending_reconciliations.lock().unwrap().len()
+    }
+
+    /// Snapshot every hydrated (tenant, queue) and its current in-memory
+    /// holder count. Used by the reconciler tick to compute drift against
+    /// the durable holder rows for each queue.
+    ///
+    /// `NotHydrated` and `Hydrating` queues are intentionally skipped: we
+    /// haven't loaded their durable rows yet, so comparing in-memory (empty)
+    /// against durable (unknown) is meaningless.
+    pub fn hydrated_queue_holders_snapshot(&self) -> Vec<(String, String, usize)> {
+        let mut out = Vec::new();
+        for entry in self.queues.iter() {
+            if !matches!(entry.state, HydrationState::Hydrated) {
+                continue;
+            }
+            let (tenant_arc, queue_arc) = entry.key();
+            out.push((
+                tenant_arc.to_string(),
+                queue_arc.to_string(),
+                entry.holders.len(),
+            ));
+        }
+        out
+    }
+
     /// Snapshot the sizes of the in-memory holders cache for metrics reporting.
     pub fn cache_stats(&self) -> ConcurrencyCacheStats {
         let mut total_holders = 0usize;
@@ -706,6 +809,13 @@ pub struct ConcurrencyManager {
     pending_grants: Mutex<BTreeMap<Vec<u8>, (String, String, u32)>>,
     grant_notify: tokio::sync::Notify,
     grant_running: AtomicBool,
+    /// Sub-tick wake for the periodic holder reconciler. Fired by
+    /// `request_reconciliation` after a dequeue future is cancelled around
+    /// its commit (via `PendingGrantGuard::drop` / `PendingHolderReleaseGuard::drop`).
+    /// Sibling to `grant_notify` — separate notify because the grant scanner
+    /// and the holder reconciler are distinct concerns (granting vs
+    /// reconciling); the periodic-reconcile task selects on this directly.
+    reconcile_notify: Arc<tokio::sync::Notify>,
     /// In-memory cache of resolved concurrency limits per queue.
     /// Key: concurrency_counts_key(tenant, queue). Populated during enqueue and grant_next.
     limit_cache: Mutex<HashMap<Vec<u8>, CachedQueueLimit>>,
@@ -735,6 +845,7 @@ impl ConcurrencyManager {
             pending_grants: Mutex::new(BTreeMap::new()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
+            reconcile_notify: Arc::new(tokio::sync::Notify::new()),
             limit_cache: Mutex::new(HashMap::new()),
             metrics,
             chain_resumer: Mutex::new(None),
@@ -1021,6 +1132,224 @@ impl ConcurrencyManager {
         self.request_grant_count(tenant, queue, 1);
     }
 
+    /// Clone-able handle to the reconcile-notify so the periodic reconcile
+    /// task can `select!` on it without holding the manager.
+    pub fn reconcile_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.reconcile_notify)
+    }
+
+    /// Queue a `(tenant, queue, task_id)` for the periodic reconciler to
+    /// verify against the durable holder row. Wakes the reconciler sub-tick.
+    ///
+    /// Called by `PendingGrantGuard::drop` and `PendingHolderReleaseGuard::drop`
+    /// in `dequeue.rs` after a dequeue future is cancelled around its commit
+    /// — the only place where in-memory and durable holder state can drift.
+    pub fn request_reconciliation(&self, tenant: String, queue: String, task_id: String) {
+        self.counts.enqueue_reconciliation(tenant, queue, task_id);
+        self.reconcile_notify.notify_one();
+    }
+
+    /// Drain the pending reconciliation set and reconcile each
+    /// `(tenant, queue, task_id)` against the durable holder row.
+    ///
+    /// Per-task_id, idempotent. Resolves the ambiguity of "cancellation mid
+    /// commit-await may or may not have applied to the WAL" deterministically:
+    ///
+    /// | durable | in-memory | action                                   |
+    /// |---------|-----------|------------------------------------------|
+    /// | Y       | Y         | no-op (consistent)                       |
+    /// | N       | N         | no-op (consistent)                       |
+    /// | Y       | N         | `insert_holder` (mirror case self-heal)  |
+    /// | N       | Y         | `atomic_release` + `request_grant` (ghost) |
+    ///
+    /// On a transient DB error, the failing tuple is re-queued so the next
+    /// tick (or sub-tick wake) retries it.
+    /// Reconcile each pending `(tenant, queue, task_id)` against its durable
+    /// holder row. Returns `true` if any tuple had to be re-queued (hydrate
+    /// or per-task `db.get` returned an error), so the caller knows to
+    /// schedule a retry — see `spawn_holder_reconcile_task` for the
+    /// backoff-and-renotify loop that consumes this signal.
+    pub async fn reconcile_pending_holders(
+        &self,
+        db: &Arc<InstrumentedDb>,
+        range: &ShardRange,
+    ) -> bool {
+        let pending = self.counts.drain_pending_reconciliations();
+        if pending.is_empty() {
+            return false;
+        }
+        let mut requeued = false;
+
+        // Group by (tenant, queue) so each queue is hydrated at most once
+        // per pass.
+        let mut by_queue: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for (tenant, queue, task_id) in pending {
+            by_queue.entry((tenant, queue)).or_default().push(task_id);
+        }
+
+        for ((tenant, queue), task_ids) in by_queue {
+            // Skip tenants outside this shard's range — they may have been
+            // queued before a shard split.
+            if !range.contains_tenant(&tenant) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .counts
+                .ensure_hydrated(db, range, &tenant, &queue)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    tenant = %tenant,
+                    queue = %queue,
+                    "reconciler: hydrate failed; re-queueing for next tick"
+                );
+                for tid in task_ids {
+                    self.counts
+                        .enqueue_reconciliation(tenant.clone(), queue.clone(), tid);
+                }
+                requeued = true;
+                continue;
+            }
+
+            for task_id in task_ids {
+                let key = concurrency_holder_key(&tenant, &queue, &task_id);
+                let durable_present = match db.get(&key).await {
+                    Ok(opt) => opt.is_some(),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            tenant = %tenant,
+                            queue = %queue,
+                            task_id = %task_id,
+                            "reconciler: durable lookup failed; re-queueing"
+                        );
+                        self.counts
+                            .enqueue_reconciliation(tenant.clone(), queue.clone(), task_id);
+                        requeued = true;
+                        continue;
+                    }
+                };
+                let in_mem_present = self.counts.contains_holder(&tenant, &queue, &task_id);
+
+                match (durable_present, in_mem_present) {
+                    (true, true) | (false, false) => {
+                        // Consistent — nothing to do.
+                    }
+                    (true, false) => {
+                        // Durable holder exists with no in-memory entry.
+                        // Reachable if a grant-side guard's Drop fired after
+                        // the commit landed but the rollback never ran (the
+                        // mirror case of the ghost). Re-insert to match.
+                        self.counts.insert_holder(&tenant, &queue, &task_id);
+                        tracing::info!(
+                            tenant = %tenant,
+                            queue = %queue,
+                            task_id = %task_id,
+                            "reconciler: re-inserted in-memory holder to match durable"
+                        );
+                    }
+                    (false, true) => {
+                        // Ghost: durable holder is gone but the in-memory
+                        // reservation survives. This is the wedge bug.
+                        // Release and kick the grant scanner *per release*
+                        // (mirroring `dequeue.rs` post-commit holder loop)
+                        // so a reconcile pass that frees N ghosts grants N
+                        // pending requests, not just 1 — `request_grant_count`
+                        // accumulates in a single map entry and the grant
+                        // scanner drains it in one pass with count = N.
+                        self.counts.atomic_release(&tenant, &queue, &task_id);
+                        self.request_grant(&tenant, &queue);
+                        tracing::info!(
+                            tenant = %tenant,
+                            queue = %queue,
+                            task_id = %task_id,
+                            "reconciler: released ghost in-memory holder (no durable row)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Stuck-reconciler signal: if the pending set keeps growing across
+        // ticks, something is wrong (slatedb unavailable, etc.).
+        let remaining = self.counts.pending_reconciliations_len();
+        if remaining > 10_000 {
+            tracing::warn!(
+                pending = remaining,
+                "reconciler: pending_reconciliations growing — backlog suggests stuck reconciler"
+            );
+        }
+
+        requeued
+    }
+
+    /// Walk every hydrated (tenant, queue) in this shard, compare the
+    /// in-memory holder count to the durable holder count (one ranged scan
+    /// per queue), and publish:
+    ///
+    /// * `silo_concurrency_holder_drift` — Σ |in_mem - durable| across hydrated queues
+    /// * `silo_concurrency_reconciliation_pending` — current size of the
+    ///   per-task_id reconciliation queue (stuck-reconciler signal)
+    ///
+    /// Called from the periodic reconciler's tick (NOT from the reactive
+    /// sub-tick wake) — keeps the cost amortized at the deployment-configured
+    /// `concurrency_reconcile_interval` rather than firing on every dropped
+    /// dequeue future. Noop if metrics are disabled.
+    pub async fn report_holder_drift(&self, db: &Arc<InstrumentedDb>, range: &ShardRange) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            // Always publish the pending gauge if metrics are present; if not, skip everything.
+            return;
+        };
+
+        let mut drift_total: u64 = 0;
+        for (tenant, queue, in_mem_count) in self.counts.hydrated_queue_holders_snapshot() {
+            if !range.contains_tenant(&tenant) {
+                continue;
+            }
+            // Per-queue ranged scan. Cost dominated by holder count; capped
+            // by the deployment's reconcile interval.
+            let start = crate::keys::concurrency_holders_queue_prefix(&tenant, &queue);
+            let end = crate::keys::end_bound(&start);
+            let mut iter = match db
+                .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+                .await
+            {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        tenant = %tenant,
+                        queue = %queue,
+                        "report_holder_drift: scan failed; skipping queue"
+                    );
+                    continue;
+                }
+            };
+            let mut durable_count: usize = 0;
+            loop {
+                match iter.next().await {
+                    Ok(Some(_)) => durable_count += 1,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            tenant = %tenant,
+                            queue = %queue,
+                            "report_holder_drift: iter error; partial count"
+                        );
+                        break;
+                    }
+                }
+            }
+            drift_total += (in_mem_count as i64 - durable_count as i64).unsigned_abs();
+        }
+
+        let pending = self.counts.pending_reconciliations_len() as u64;
+        metrics.set_concurrency_reconciler_signals(&self.shard, drift_total, pending);
+    }
+
     fn request_grant_count(&self, tenant: &str, queue: &str, count: u32) {
         let key = concurrency_counts_key(tenant, queue);
         {
@@ -1031,6 +1360,16 @@ impl ConcurrencyManager {
             entry.2 += count;
         }
         self.grant_notify.notify_one();
+    }
+
+    /// Test-only: peek the current pending-grant count for a queue. Used by
+    /// `reconcile_pending_holders_kicks_grant_per_release` to assert that
+    /// the reconciler kicked the scanner once per ghost release rather than
+    /// once per queue.
+    pub fn pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        let key = concurrency_counts_key(tenant, queue);
+        let pending = self.pending_grants.lock().unwrap();
+        pending.get(&key).map(|(_, _, n)| *n).unwrap_or(0)
     }
 
     /// Start the background grant scanner task.
@@ -1294,31 +1633,61 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                // Post-deploy of the unify-chain schema, every request value
-                // populates `task_id`, `limits`, `task_group`, `held_queues`,
-                // and a `limit_index` pointing at this queue's position in
-                // the canonical limit order. Any value missing those fields
-                // is pre-upgrade data left over from a rolling deploy; the
-                // operator clears it (bump `cluster_prefix` / rotate
-                // storage) before shipping this change, and the scanner
-                // treats whatever remains as corrupt below.
-                let task_id_str = et.task_id().unwrap_or_default().to_string();
-                if task_id_str.is_empty() {
-                    tracing::warn!(
-                        queue = %queue,
-                        job_id = %job_id_str,
-                        "grant scanner: request missing task_id; deleting"
-                    );
-                    batch.delete(&kv.key);
-                    stale_and_corrupt_count += 1;
-                    continue;
-                }
+                let task_id_str = match et.task_id() {
+                    Some(task_id) if !task_id.is_empty() => task_id.to_string(),
+                    _ => parsed_req.request_id(),
+                };
                 let held_queues: Vec<String> = et
                     .held_queues()
                     .map(|v| v.iter().map(|s| s.to_string()).collect())
                     .unwrap_or_default();
-                let limits = crate::codec::limit_entries_to_owned(et.limits());
-                let task_group = et.task_group().unwrap_or_default().to_string();
+                let mut limits = crate::codec::limit_entries_to_owned(et.limits());
+                let mut task_group = et.task_group().unwrap_or_default().to_string();
+
+                if limits.is_empty() || task_group.is_empty() {
+                    match db.get(&job_info_key(tenant, job_id_str)).await {
+                        Ok(Some(job_raw)) => match JobView::new(job_raw) {
+                            Ok(job_view) => {
+                                if limits.is_empty() {
+                                    limits = job_view.limits();
+                                }
+                                if task_group.is_empty() {
+                                    task_group = job_view.task_group().to_string();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    queue = %queue,
+                                    job_id = %job_id_str,
+                                    error = %e,
+                                    "grant scanner: request needs JobInfo fallback but JobInfo is unreadable; deleting"
+                                );
+                                batch.delete(&kv.key);
+                                stale_and_corrupt_count += 1;
+                                continue;
+                            }
+                        },
+                        Ok(None) => {
+                            tracing::warn!(
+                                queue = %queue,
+                                job_id = %job_id_str,
+                                "grant scanner: request needs JobInfo fallback but JobInfo is missing; deleting"
+                            );
+                            batch.delete(&kv.key);
+                            stale_and_corrupt_count += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                queue = %queue,
+                                job_id = %job_id_str,
+                                error = %e,
+                                "grant scanner: failed to load JobInfo fallback; skipping request this pass"
+                            );
+                            continue;
+                        }
+                    }
+                }
 
                 if limits.is_empty() {
                     tracing::warn!(
@@ -1334,14 +1703,28 @@ impl ConcurrencyManager {
                     tracing::warn!(
                         queue = %queue,
                         job_id = %job_id_str,
-                        "grant scanner: request has no task group; deleting"
+                        "grant scanner: request has no task group after fallback; deleting"
                     );
                     batch.delete(&kv.key);
                     stale_and_corrupt_count += 1;
                     continue;
                 }
 
-                let limit_index = et.limit_index();
+                let raw_limit_index = et.limit_index();
+                let limit_index = if limit_index_matches_queue(&limits, raw_limit_index, queue) {
+                    raw_limit_index
+                } else if let Some(idx) = canonical_limit_index_for_queue(&limits, queue) {
+                    idx
+                } else {
+                    tracing::warn!(
+                        queue = %queue,
+                        job_id = %job_id_str,
+                        "grant scanner: request queue is not in job limits; deleting"
+                    );
+                    batch.delete(&kv.key);
+                    stale_and_corrupt_count += 1;
+                    continue;
+                };
 
                 // Resolve max_concurrency from the first request's limits
                 // (always populated, per the check above).

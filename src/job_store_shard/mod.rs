@@ -542,6 +542,15 @@ impl JobStoreShard {
         // missed in-memory notifications or transient scanner failures.
         shard.spawn_concurrency_reconcile_task(range.clone());
 
+        // Reactive holder reconciler — wakes on `reconcile_notify` from a
+        // `PendingGrantGuard` / `PendingHolderReleaseGuard` Drop in dequeue
+        // and immediately reconciles. Sibling to the periodic task above; no
+        // jitter and no interval, so a dropped dequeue future un-wedges its
+        // queue within milliseconds rather than waiting up to one reconcile
+        // interval. The periodic task still runs `reconcile_pending_holders`
+        // on its tick as a safety net against missed notifications.
+        shard.spawn_holder_reconcile_task(range.clone());
+
         // Watch slatedb's status channel and emit prometheus metrics on each
         // change (durable_seq advances, manifest revisions). No-op when
         // metrics are disabled.
@@ -712,6 +721,71 @@ impl JobStoreShard {
         });
     }
 
+    /// Reactive holder reconciler — drains the per-task_id reconciliation
+    /// queue immediately on a `reconcile_notify` wake from a dropped
+    /// `PendingGrantGuard` / `PendingHolderReleaseGuard`. No jitter, no
+    /// periodic tick: a wedged queue (durable=0, in_mem=1 after the dequeue
+    /// future was cancelled around its commit) un-wedges as soon as Drop
+    /// runs. The periodic task (`spawn_concurrency_reconcile_task`) still
+    /// calls `reconcile_pending_holders` on its tick as a safety net.
+    ///
+    /// If a pass re-queues anything (transient hydrate / `db.get` failure),
+    /// we sleep `RECONCILE_RETRY_BACKOFF` then poke `reconcile_notify` so
+    /// the next iteration retries promptly — without this, the re-queued
+    /// tuple would sit idle until the next unrelated Drop or the 5 s
+    /// periodic tick. The sleep also bounds the retry rate so a sustained
+    /// failure (slatedb temporarily unavailable, etc.) doesn't tight-loop.
+    fn spawn_holder_reconcile_task(self: &Arc<Self>, range: ShardRange) {
+        /// Delay between reactive-reconciler retries when a pass re-queued
+        /// at least one tuple. 100 ms = ~10 retries/sec ceiling under
+        /// sustained failure, ~100 ms recovery on a transient one.
+        const RECONCILE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+        let shard = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        let shard_name = self.name.clone();
+        let reconcile_notify = self.concurrency.reconcile_notify();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = reconcile_notify.notified() => {
+                        let requeued = shard
+                            .concurrency
+                            .reconcile_pending_holders(&shard.db, &range)
+                            .await;
+                        if requeued {
+                            // Bound retry rate; cancellation must still
+                            // short-circuit the sleep so shard close is
+                            // prompt.
+                            tokio::select! {
+                                biased;
+                                _ = tokio::time::sleep(RECONCILE_RETRY_BACKOFF) => {
+                                    reconcile_notify.notify_one();
+                                }
+                                _ = cancellation.cancelled() => {
+                                    tracing::debug!(
+                                        shard = %shard_name,
+                                        "stopping reactive holder reconciler during retry backoff (shard closing)"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ = cancellation.cancelled() => {
+                        tracing::debug!(
+                            shard = %shard_name,
+                            "stopping reactive holder reconciler (shard closing)"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     fn spawn_concurrency_reconcile_task(self: &Arc<Self>, range: ShardRange) {
         let shard = Arc::clone(self);
         let cancellation = self.cancellation.clone();
@@ -753,9 +827,29 @@ impl JobStoreShard {
                 tokio::select! {
                     biased;
                     _ = interval.tick() => {
+                        // Holders first: the request scan can grant new slots,
+                        // and we want the in-memory holder set consistent
+                        // before that grant decision runs. This is the safety
+                        // net for any missed `reconcile_notify` wake; the
+                        // reactive `spawn_holder_reconcile_task` is the
+                        // primary low-latency path. The periodic tick
+                        // already rate-limits, so we drop the re-queue
+                        // signal from the reactive path here.
+                        let _ = shard
+                            .concurrency
+                            .reconcile_pending_holders(&shard.db, &range)
+                            .await;
                         shard
                             .concurrency
                             .reconcile_pending_requests(shard.db.as_ref(), &range)
+                            .await;
+                        // After draining, snapshot drift + pending-queue size
+                        // for prometheus. Cheap per tick (one ranged scan per
+                        // hydrated queue); the per-tick cadence keeps the
+                        // total cost bounded.
+                        shard
+                            .concurrency
+                            .report_holder_drift(&shard.db, &range)
                             .await;
                     }
                     _ = cancellation.cancelled() => {
@@ -875,6 +969,14 @@ impl JobStoreShard {
         self.brokers.buffer_len()
     }
 
+    /// Number of tasks currently held in the broker's in-flight set for a task
+    /// group (claimed by a worker but not yet durably acked). Exposed for
+    /// observability and for tests that assert the dequeue drop-guard releases
+    /// claimed keys when its future is cancelled.
+    pub fn broker_inflight_len(&self, task_group: &str) -> usize {
+        self.brokers.group_inflight_len(task_group)
+    }
+
     /// Snapshot the sizes of the in-memory concurrency holders cache.
     pub fn concurrency_cache_stats(&self) -> crate::concurrency::ConcurrencyCacheStats {
         self.concurrency.cache_stats()
@@ -884,6 +986,57 @@ impl JobStoreShard {
     /// (tenant, queue). Useful for tests and ad-hoc debugging.
     pub fn concurrency_holder_count(&self, tenant: &str, queue: &str) -> usize {
         self.concurrency.counts().holder_count(tenant, queue)
+    }
+
+    /// Whether a specific `task_id` is currently recorded as an in-memory
+    /// holder for `(tenant, queue)`. Test-only accessor used by the
+    /// four-quadrant reconciler test.
+    pub fn concurrency_contains_holder(&self, tenant: &str, queue: &str, task_id: &str) -> bool {
+        self.concurrency
+            .counts()
+            .contains_holder(tenant, queue, task_id)
+    }
+
+    /// Test-only: enqueue a `(tenant, queue, task_id)` for reconciliation.
+    /// Mirrors what `PendingHolderReleaseGuard::drop` does on cancellation,
+    /// so the four-quadrant test can drive the reconciler deterministically
+    /// without orchestrating a real dequeue future cancellation.
+    pub fn request_concurrency_reconciliation(
+        &self,
+        tenant: String,
+        queue: String,
+        task_id: String,
+    ) {
+        self.concurrency
+            .request_reconciliation(tenant, queue, task_id);
+    }
+
+    /// Test-only: insert an in-memory holder directly, used to set up the
+    /// "in_mem present, durable absent" ghost quadrant.
+    pub fn concurrency_insert_holder(&self, tenant: &str, queue: &str, task_id: &str) {
+        self.concurrency
+            .counts()
+            .insert_holder(tenant, queue, task_id);
+    }
+
+    /// Test-only: peek the current pending-grant count accumulated for
+    /// `(tenant, queue)`. Used by the reconciler regression test to assert
+    /// that each ghost release fired its own `request_grant`.
+    pub fn pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        self.concurrency.pending_grant_count_for_test(tenant, queue)
+    }
+
+    /// Test-only: drain pending reconciliations and apply them now. Returns
+    /// whether the pass had to re-queue anything (transient DB error
+    /// during hydrate or `db.get`). The production path goes through
+    /// `spawn_holder_reconcile_task` woken via `reconcile_notify`; this
+    /// synchronous entry point lets tests assert post-state without a
+    /// sleep race.
+    pub async fn reconcile_pending_holders_for_test(&self) -> bool {
+        let range = self.get_range();
+        self.concurrency
+            .reconcile_pending_holders(&self.db, &range)
+            .await
     }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
