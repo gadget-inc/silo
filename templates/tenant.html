@@ -6,8 +6,20 @@
 <div class="space-y-4">
     <div class="flex items-center justify-between">
         <h1 class="text-xl font-bold text-zinc-100">Tenant: <span class="text-emerald-400">{{ tenant_name }}</span></h1>
-        <a href="/tenants" class="text-sm text-zinc-400 hover:text-emerald-400">← All tenants</a>
+        <div class="flex items-center gap-4">
+            <form hx-post="/tenant/drop-state?name={{ tenant_name_url }}"
+                  hx-confirm="Drop ALL holders and run attempts for tenant {{ tenant_name }}? This cannot be undone."
+                  hx-target="#drop-state-result" hx-swap="innerHTML" class="inline">
+                <button type="submit"
+                        class="px-3 py-1 text-sm bg-red-900/50 border border-red-700 text-red-400 hover:bg-red-900 transition-colors">
+                    Drop holders &amp; run attempts
+                </button>
+            </form>
+            <a href="/tenants" class="text-sm text-zinc-400 hover:text-emerald-400">← All tenants</a>
+        </div>
     </div>
+
+    <div id="drop-state-result"></div>
 
     {% if error.is_some() %}
     <div class="bg-red-900/30 border border-red-700 p-4">

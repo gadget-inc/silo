@@ -39,13 +39,14 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
+use crate::job_store_shard::DropTenantStats;
 #[cfg(feature = "server")]
 use crate::pb::QueryRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, CompactShardRequest, GetJobRequest, GetJobResponse,
-    GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse, JobStatus,
-    RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
+    CancelJobRequest, ColumnInfo, CompactShardRequest, DropTenantStateRequest, GetJobRequest,
+    GetJobResponse, GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse,
+    JobStatus, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
 };
 use crate::shard_range::ShardId;
 
@@ -836,6 +837,48 @@ impl ClusterClient {
         }
 
         Ok(())
+    }
+
+    /// Drop all concurrency holders and in-flight run attempts for a tenant on a
+    /// shard (local or remote).
+    pub async fn drop_tenant_state(
+        &self,
+        shard_id: &ShardId,
+        tenant: &str,
+    ) -> Result<DropTenantStats, ClusterClientError> {
+        // Check if shard is local first
+        if let Some(shard) = self.factory.get(shard_id) {
+            debug!(shard_id = %shard_id, tenant, "dropping tenant state on local shard");
+            return shard
+                .drop_tenant_holders_and_runattempts(tenant)
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()));
+        }
+
+        // Shard is not local, need to call remote node
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = %shard_id, addr = %addr, tenant, "dropping tenant state on remote shard");
+
+        let mut client = self.get_client(&addr).await?;
+        let request = DropTenantStateRequest {
+            shard: shard_id.to_string(),
+            tenant: Some(tenant.to_string()),
+        };
+
+        match client.drop_tenant_state(request).await {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                Ok(DropTenantStats {
+                    holders_dropped: resp.holders_dropped as usize,
+                    run_attempts_dropped: resp.run_attempts_dropped as usize,
+                })
+            }
+            Err(e) => {
+                // Invalidate connection on failure to force reconnect on next attempt
+                self.invalidate_connection(&addr);
+                Err(ClusterClientError::RpcFailed(e.to_string()))
+            }
+        }
     }
 
     /// Trigger a full compaction on a shard (local or remote)
