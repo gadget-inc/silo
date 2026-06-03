@@ -11,7 +11,10 @@ use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, JobStatusKind, Limit};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
-use crate::job_store_shard::counters::encode_counter;
+use crate::job_store_shard::counters::{
+    BackgroundActionMetricTransition, background_action_queue_counter_transition_is_relevant,
+    encode_counter,
+};
 use crate::job_store_shard::helpers::{
     DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, now_epoch_ms, put_task,
     retry_on_txn_conflict,
@@ -202,6 +205,7 @@ impl JobStoreShard {
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let mut batch = WriteBatch::new();
+        let background_action_metadata = metadata.clone().unwrap_or_default();
         let grants = self
             .write_enqueue_data(
                 &mut DbWriteBatcher::new(&self.db, &mut batch),
@@ -244,6 +248,13 @@ impl JobStoreShard {
         {
             dst_events::cancel_write(write_op);
             self.rollback_grants(tenant, &grants);
+            self.rollback_background_action_queue_counter_transition(
+                tenant,
+                task_group,
+                None,
+                JobStatusKind::Scheduled,
+                &background_action_metadata,
+            );
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
@@ -300,6 +311,7 @@ impl JobStoreShard {
     ) -> Result<(), JobStoreShardError> {
         // Start a transaction with SerializableSnapshot isolation for conflict detection
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let background_action_metadata = metadata.clone().unwrap_or_default();
 
         // [SILO-ENQ-1] If caller provided an id, ensure it doesn't already exist
         let info_key = job_info_key(tenant, job_id);
@@ -347,6 +359,13 @@ impl JobStoreShard {
         {
             dst_events::cancel_write(write_op);
             self.rollback_grants(tenant, &grants);
+            self.rollback_background_action_queue_counter_transition(
+                tenant,
+                task_group,
+                None,
+                JobStatusKind::Scheduled,
+                &background_action_metadata,
+            );
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
@@ -394,6 +413,7 @@ impl JobStoreShard {
 
         // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time
         let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
+        let job_status_kind = job_status.kind;
 
         writer.put(job_info_key(tenant, job_id), &job_value)?;
 
@@ -403,39 +423,48 @@ impl JobStoreShard {
             writer.put(&mkey, [])?;
         }
 
-        Self::write_job_status_with_index(writer, tenant, job_id, job_status)?;
+        Self::write_job_status_with_index_and_metadata(writer, tenant, job_id, job_status)?;
 
-        self.enqueue_limit_task_at_index(
-            writer,
-            LimitTaskParams {
-                tenant,
-                task_id: &first_task_id,
-                job_id,
-                attempt_number: 1,
-                relative_attempt_number: 1,
-                limit_index: 0,
-                limits: &job.limits,
-                priority,
-                // Fresh enqueue: the task_key starts at the job's schedule. If
-                // the job is future-scheduled (`start_at_ms > now_ms`) the
-                // resulting `RequestTicket` lands at the future time so the
-                // broker picks it up exactly then. Use `effective_start_at_ms`
-                // (not the raw `start_at_ms`) so an immediate enqueue
-                // (`start_at_ms <= 0`) keys the task at `now_ms` — matching the
-                // `effective_start_at_ms` the JobStatus stores and the import
-                // path, so identity lookups never have to fall back to time=0.
-                // Fresh chain head → epoch is just the write time; no
-                // predecessor tombstone to dodge.
-                scheduled_at_ms: effective_start_at_ms,
-                task_key_epoch_ms: now_ms,
-                now_ms,
-                held_queues: Vec::new(),
-                task_group,
-                skip_try_reserve: false,
-            },
-        )
-        .await
-        .map(|result| result.grants)
+        let result = self
+            .enqueue_limit_task_at_index(
+                writer,
+                LimitTaskParams {
+                    tenant,
+                    task_id: &first_task_id,
+                    job_id,
+                    attempt_number: 1,
+                    relative_attempt_number: 1,
+                    limit_index: 0,
+                    limits: &job.limits,
+                    priority,
+                    // Fresh enqueue: the task_key starts at the job's schedule. If
+                    // the job is future-scheduled (`start_at_ms > now_ms`) the
+                    // resulting `RequestTicket` lands at the future time so the
+                    // broker picks it up exactly then. Use `effective_start_at_ms`
+                    // (not the raw `start_at_ms`) so an immediate enqueue
+                    // (`start_at_ms <= 0`) keys the task at `now_ms` — matching the
+                    // `effective_start_at_ms` the JobStatus stores and the import
+                    // path, so identity lookups never have to fall back to time=0.
+                    // Fresh chain head → epoch is just the write time; no
+                    // predecessor tombstone to dodge.
+                    scheduled_at_ms: effective_start_at_ms,
+                    task_key_epoch_ms: now_ms,
+                    now_ms,
+                    held_queues: Vec::new(),
+                    task_group,
+                    skip_try_reserve: false,
+                },
+            )
+            .await
+            .map(|result| result.grants)?;
+        self.apply_background_action_queue_counter_transition(
+            tenant,
+            task_group,
+            None,
+            job_status_kind,
+            &job.metadata,
+        );
+        Ok(result)
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
@@ -771,7 +800,7 @@ impl JobStoreShard {
         tenant: &str,
         job_id: &str,
         new_status: JobStatus,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
         self.set_job_status_with_index_opts(writer, tenant, job_id, new_status, None)
             .await
     }
@@ -788,9 +817,9 @@ impl JobStoreShard {
         job_id: &str,
         new_status: JobStatus,
         expire_ts: Option<i64>,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
         // Delete old index entries if present
-        if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
+        let old_status = if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
             let old = decode_job_status_owned(&old_raw)?;
             let old_ts = status_index_timestamp(&old);
             let old_time = idx_status_time_key(tenant, old.kind.as_str(), old_ts, job_id);
@@ -800,24 +829,70 @@ impl JobStoreShard {
                 tenant_status_counter_key(tenant, old.kind.as_str()),
                 encode_counter(-1),
             )?;
+            Some(old)
+        } else {
+            None
+        };
+
+        let old_kind = old_status.as_ref().map(|old| old.kind);
+        let new_kind = new_status.kind;
+        let needs_background_action_counters =
+            background_action_queue_counter_transition_is_relevant(old_kind, new_kind);
+        let job_metric_info = if needs_background_action_counters {
+            writer
+                .get(&job_info_key(tenant, job_id))
+                .await?
+                .map(|raw| {
+                    crate::job::JobView::new(raw)
+                        .map(|view| (view.task_group().to_string(), view.metadata()))
+                        .map_err(|e| JobStoreShardError::Codec(e.to_string()))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let background_action_transition =
+            job_metric_info.as_ref().map(|(task_group, metadata)| {
+                BackgroundActionMetricTransition {
+                    tenant: tenant.to_string(),
+                    task_group: task_group.clone(),
+                    old_status: old_kind,
+                    new_status: new_kind,
+                    metadata: metadata.clone(),
+                }
+            });
+        if let Some((task_group, metadata)) = job_metric_info.as_ref() {
+            self.apply_background_action_queue_counter_transition(
+                tenant, task_group, old_kind, new_kind, metadata,
+            );
         }
 
-        Self::write_job_status_with_index_opts(writer, tenant, job_id, new_status, expire_ts)
+        if let Err(e) = Self::write_job_status_with_index_opts_and_metadata(
+            writer, tenant, job_id, new_status, expire_ts,
+        ) {
+            if let Some((task_group, metadata)) = job_metric_info.as_ref() {
+                self.rollback_background_action_queue_counter_transition(
+                    tenant, task_group, old_kind, new_kind, metadata,
+                );
+            }
+            return Err(e);
+        }
+        Ok(background_action_transition)
     }
 
     /// Shared helper: write status value and index entry.
-    pub(crate) fn write_job_status_with_index<W: WriteBatcher>(
+    pub(crate) fn write_job_status_with_index_and_metadata<W: WriteBatcher>(
         writer: &mut W,
         tenant: &str,
         job_id: &str,
         new_status: JobStatus,
     ) -> Result<(), JobStoreShardError> {
-        Self::write_job_status_with_index_opts(writer, tenant, job_id, new_status, None)
+        Self::write_job_status_with_index_opts_and_metadata(
+            writer, tenant, job_id, new_status, None,
+        )
     }
 
-    /// Shared helper variant that accepts an optional `expire_ts` for the new
-    /// status and index rows.
-    pub(crate) fn write_job_status_with_index_opts<W: WriteBatcher>(
+    pub(crate) fn write_job_status_with_index_opts_and_metadata<W: WriteBatcher>(
         writer: &mut W,
         tenant: &str,
         job_id: &str,
@@ -867,16 +942,16 @@ impl JobStoreShard {
         job_id: &str,
         attempt_number: u32,
         task_key_start_ms: i64,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
         let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? else {
-            return Ok(());
+            return Ok(None);
         };
         let old = decode_job_status_owned(&old_raw)?;
         if old.kind != JobStatusKind::Scheduled
             || old.current_attempt != Some(attempt_number)
             || old.next_attempt_starts_after_ms == Some(task_key_start_ms)
         {
-            return Ok(());
+            return Ok(None);
         }
 
         let new_status = JobStatus::new(

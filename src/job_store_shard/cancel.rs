@@ -4,7 +4,7 @@ use slatedb::IsolationLevel;
 
 use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
-use crate::job_store_shard::counters::encode_counter;
+use crate::job_store_shard::counters::{BackgroundActionMetricTransition, encode_counter};
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms,
     put_with_optional_expire, retry_on_txn_conflict,
@@ -117,6 +117,20 @@ impl JobStoreShard {
         // by task_id, and the grant scanner is woken per queue.
         let mut holders_to_release: Vec<(String, String)> = Vec::new();
         let mut deleted_task_key: Option<Vec<u8>> = None;
+        let mut background_action_transition: Option<BackgroundActionMetricTransition> = None;
+        macro_rules! try_after_status {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(e) => {
+                        if let Some(transition) = &background_action_transition {
+                            self.rollback_background_action_metric_gauge_transition(transition);
+                        }
+                        return Err(e.into());
+                    }
+                }
+            };
+        }
 
         // [SILO-CXL-3] For Scheduled jobs, eagerly delete task and concurrency state
         if was_scheduled {
@@ -128,19 +142,20 @@ impl JobStoreShard {
                 status.next_attempt_starts_after_ms,
                 status.current_attempt,
             );
-            self.set_job_status_with_index_opts(
-                &mut TxnWriter(&txn),
-                tenant,
-                id,
-                cancelled_status,
-                terminal_expire_ts,
-            )
-            .await?;
+            background_action_transition = self
+                .set_job_status_with_index_opts(
+                    &mut TxnWriter(&txn),
+                    tenant,
+                    id,
+                    cancelled_status,
+                    terminal_expire_ts,
+                )
+                .await?;
 
             // Read job info to get task_group, priority, and limits for task key reconstruction
             let job_key = job_info_key(tenant, id);
-            if let Some(job_bytes) = txn.get(&job_key).await? {
-                let job_view = JobView::new(job_bytes)?;
+            if let Some(job_bytes) = try_after_status!(txn.get(&job_key).await) {
+                let job_view = try_after_status!(JobView::new(job_bytes));
                 let task_group = job_view.task_group().to_string();
                 let priority = job_view.priority();
                 let limits = job_view.limits();
@@ -150,31 +165,41 @@ impl JobStoreShard {
                 // exact key).
                 let attempt_number = status.current_attempt.unwrap_or(1);
                 let start_time_ms = status.next_attempt_starts_after_ms.unwrap_or(0);
-                let task_found = match find_task_by_identity(
-                    &txn,
-                    &task_group,
-                    start_time_ms,
-                    priority,
-                    id,
-                    attempt_number,
-                )
-                .await?
-                {
+                let task_found = match try_after_status!(
+                    find_task_by_identity(
+                        &txn,
+                        &task_group,
+                        start_time_ms,
+                        priority,
+                        id,
+                        attempt_number
+                    )
+                    .await
+                ) {
                     Some(found) => Some(found),
                     None => {
                         // Fallback: try with time=0 (immediate scheduling case)
-                        find_task_by_identity(&txn, &task_group, 0, priority, id, attempt_number)
-                            .await?
+                        try_after_status!(
+                            find_task_by_identity(
+                                &txn,
+                                &task_group,
+                                0,
+                                priority,
+                                id,
+                                attempt_number
+                            )
+                            .await
+                        )
                     }
                 };
 
                 if let Some((found_key, task_raw)) = task_found {
-                    let decoded = decode_task(&task_raw).map_err(|e| {
+                    let decoded = try_after_status!(decode_task(&task_raw).map_err(|e| {
                         JobStoreShardError::Codec(format!("cancel task decode: {e}"))
-                    })?;
+                    }));
 
                     // Delete the task from the DB queue
-                    txn.delete(&found_key)?;
+                    try_after_status!(txn.delete(&found_key));
                     deleted_task_key = Some(found_key);
 
                     match decoded {
@@ -185,7 +210,9 @@ impl JobStoreShard {
                         } => {
                             // Delete concurrency holders for each held queue
                             for queue in held_queues {
-                                txn.delete(concurrency_holder_key(tenant, &queue, &tid))?;
+                                try_after_status!(
+                                    txn.delete(concurrency_holder_key(tenant, &queue, &tid))
+                                );
                                 holders_to_release.push((tid.clone(), queue));
                             }
                         }
@@ -201,7 +228,9 @@ impl JobStoreShard {
                             // granted (carried on the ticket's `held_queues`);
                             // those must be released or the slots leak.
                             for queue in held_queues {
-                                txn.delete(concurrency_holder_key(tenant, &queue, &tid))?;
+                                try_after_status!(
+                                    txn.delete(concurrency_holder_key(tenant, &queue, &tid))
+                                );
                                 holders_to_release.push((tid.clone(), queue));
                             }
                         }
@@ -216,7 +245,9 @@ impl JobStoreShard {
                             // chain, but the holders must be released too or
                             // those slots leak.
                             for queue in held_queues {
-                                txn.delete(concurrency_holder_key(tenant, &queue, &tid))?;
+                                try_after_status!(
+                                    txn.delete(concurrency_holder_key(tenant, &queue, &tid))
+                                );
                                 holders_to_release.push((tid.clone(), queue));
                             }
                         }
@@ -242,7 +273,8 @@ impl JobStoreShard {
                             start_time_ms,
                             priority,
                         )
-                        .await?;
+                        .await;
+                    let released = try_after_status!(released);
                     holders_to_release.extend(released);
                 }
             }
@@ -253,7 +285,7 @@ impl JobStoreShard {
 
         // Include counter in the transaction (unmark_write excludes it from conflict detection)
         if was_scheduled {
-            self.increment_completed_jobs_counter(&mut TxnWriter(&txn))?;
+            try_after_status!(self.increment_completed_jobs_counter(&mut TxnWriter(&txn)));
         }
 
         // Re-put the job's prior associated records (JOB_INFO, IDX_METADATA,
@@ -271,14 +303,25 @@ impl JobStoreShard {
         // prior ATTEMPT rows were written by earlier transactions; re-putting
         // them here tags them with the row TTL.
         if let Some(ts) = terminal_expire_ts {
-            self.expire_terminal_job_records(&mut TxnWriter(&txn), tenant, id, ts)
-                .await?;
+            let expire_result = self
+                .expire_terminal_job_records(&mut TxnWriter(&txn), tenant, id, ts)
+                .await;
+            try_after_status!(expire_result);
         }
 
         // Commit the transaction - this will detect conflicts with concurrent modifications
-        txn.commit().await?;
+        if let Err(e) = txn.commit().await {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e.into());
+        }
 
         // ---- Post-commit: update in-memory state ----
+
+        if let Some(transition) = &background_action_transition {
+            self.apply_background_action_metric_transition(transition);
+        }
 
         // Evict the deleted task from the broker buffer
         if let Some(ref key) = deleted_task_key {

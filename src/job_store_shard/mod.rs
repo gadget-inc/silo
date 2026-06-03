@@ -56,6 +56,7 @@ use crate::shard_range::ShardRange;
 use crate::storage::resolve_object_store;
 use crate::task::{LeasedRefreshTask, LeasedTask};
 use crate::task_broker::TaskBrokerRegistry;
+use dashmap::DashMap;
 
 /// Configuration for WAL cleanup during shard close
 #[derive(Debug, Clone)]
@@ -197,6 +198,10 @@ pub struct JobStoreShard {
     range: ShardRange,
     /// Metrics recorder for SlateDB, passed to DbBuilder and used for stats collection.
     slatedb_metrics_recorder: Arc<DefaultMetricsRecorder>,
+    /// Sparse in-memory counters for background action queue metrics.
+    /// Keyed by `(tenant, task_group, status_bucket, queue_kind, queue)`.
+    pub(crate) background_action_queue_counts:
+        DashMap<(String, String, String, String, String), i64>,
     /// TTL (seconds) applied to Succeeded jobs' associated records. `None`
     /// disables the feature for successful jobs.
     pub(crate) completed_job_expire_s: Option<u64>,
@@ -517,6 +522,7 @@ impl JobStoreShard {
             db_path: db_path.to_string(),
             range: range.clone(),
             slatedb_metrics_recorder,
+            background_action_queue_counts: DashMap::new(),
             completed_job_expire_s,
             terminal_job_expire_s,
         });
@@ -528,6 +534,10 @@ impl JobStoreShard {
         shard
             .concurrency
             .set_chain_resumer(limit_chain::ShardChainResumer::install(&shard));
+
+        shard
+            .rebuild_background_action_queue_counters(&range)
+            .await?;
 
         // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready,
         // and after the chain resumer is installed. It takes the instrumented db so its writes
@@ -1392,13 +1402,16 @@ impl JobStoreShard {
             batch.delete(&timek);
         }
         // Clean up metadata index entries (load job info to enumerate metadata)
-        if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
+        let job_metric_info = if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
             let view = JobView::new(raw)?;
             for (mk, mv) in view.metadata().into_iter() {
                 let mkey = idx_metadata_key(tenant, &mk, &mv, id);
                 batch.delete(&mkey);
             }
-        }
+            Some((view.task_group().to_string(), view.metadata()))
+        } else {
+            None
+        };
         batch.delete(&job_info_key_bytes);
         batch.delete(&job_status_key_bytes);
         // Also delete cancellation record if present
@@ -1418,7 +1431,32 @@ impl JobStoreShard {
             )?;
         }
 
-        self.db.write(batch).await?;
+        if let (Some(status), Some((task_group, metadata))) =
+            (status.as_ref(), job_metric_info.as_ref())
+        {
+            self.apply_background_action_queue_counter_transition(
+                tenant,
+                task_group,
+                Some(status.kind),
+                JobStatusKind::Succeeded,
+                metadata,
+            );
+        }
+
+        if let Err(e) = self.db.write(batch).await {
+            if let (Some(status), Some((task_group, metadata))) =
+                (status.as_ref(), job_metric_info.as_ref())
+            {
+                self.rollback_background_action_queue_counter_transition(
+                    tenant,
+                    task_group,
+                    Some(status.kind),
+                    JobStatusKind::Succeeded,
+                    metadata,
+                );
+            }
+            return Err(e.into());
+        }
 
         Ok(())
     }

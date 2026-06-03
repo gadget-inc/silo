@@ -21,12 +21,14 @@ use slatedb::bytes::Bytes;
 use slatedb::{MergeOperator, MergeOperatorError};
 
 use crate::codec::decode_job_status_owned;
+use crate::job::{JobStatusKind, JobView};
 use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     concurrency_requester_counter_key, concurrency_requester_counter_tenant_prefix, end_bound,
-    parse_concurrency_requester_counter_key, parse_job_info_key, parse_job_status_key, prefix,
-    shard_completed_jobs_counter_key, shard_total_jobs_counter_key, tenant_status_counter_key,
+    job_info_key, parse_concurrency_requester_counter_key, parse_job_info_key,
+    parse_job_status_key, prefix, shard_completed_jobs_counter_key, shard_total_jobs_counter_key,
+    tenant_status_counter_key,
 };
 use crate::shard_range::ShardRange;
 
@@ -37,6 +39,31 @@ pub struct ShardCounters {
     pub total_jobs: i64,
     /// Number of jobs in terminal states (Succeeded, Failed, Cancelled).
     pub completed_jobs: i64,
+}
+
+pub(crate) const BACKGROUND_ACTION_QUEUE_SIZE_BUCKET: &str = "queue_size";
+pub(crate) const BACKGROUND_ACTION_RUNNING_SIZE_BUCKET: &str = "running_size";
+pub(crate) const BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND: &str = "explicit";
+pub(crate) const BACKGROUND_ACTION_PLATFORM_QUEUE_KIND: &str = "platform";
+
+/// Stored queue counter row for background action metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundActionQueueCounter {
+    pub tenant: String,
+    pub task_group: String,
+    pub status_bucket: String,
+    pub queue_kind: String,
+    pub queue: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundActionMetricTransition {
+    pub tenant: String,
+    pub task_group: String,
+    pub old_status: Option<JobStatusKind>,
+    pub new_status: JobStatusKind,
+    pub metadata: Vec<(String, String)>,
 }
 
 /// Optional lexicographic tenant bounds for scanning tenant status counters.
@@ -152,6 +179,33 @@ pub(crate) fn decode_counter(bytes: &[u8]) -> i64 {
     }
 }
 
+pub(crate) fn background_action_status_bucket(status: JobStatusKind) -> Option<&'static str> {
+    match status {
+        JobStatusKind::Scheduled => Some(BACKGROUND_ACTION_QUEUE_SIZE_BUCKET),
+        JobStatusKind::Running => Some(BACKGROUND_ACTION_RUNNING_SIZE_BUCKET),
+        JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled => None,
+    }
+}
+
+pub(crate) fn background_action_queue_counter_transition_is_relevant(
+    old_status: Option<JobStatusKind>,
+    new_status: JobStatusKind,
+) -> bool {
+    old_status
+        .and_then(background_action_status_bucket)
+        .is_some()
+        || background_action_status_bucket(new_status).is_some()
+}
+
+fn background_action_metadata_value<'a>(
+    metadata: &'a [(String, String)],
+    key: &str,
+) -> Option<&'a str> {
+    metadata
+        .iter()
+        .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+}
+
 impl JobStoreShard {
     /// Get the current job counters for this shard.
     pub async fn get_counters(&self) -> Result<ShardCounters, JobStoreShardError> {
@@ -212,6 +266,199 @@ impl JobStoreShard {
         let key = shard_completed_jobs_counter_key();
         writer.merge(&key, encode_counter(-1))?;
         Ok(())
+    }
+
+    /// Apply a signed delta to background action queue counters for this job
+    /// metadata and status. Terminal statuses are intentionally not
+    /// represented as gauges.
+    pub(crate) fn apply_background_action_queue_counter_delta(
+        &self,
+        tenant: &str,
+        task_group: &str,
+        status: JobStatusKind,
+        metadata: &[(String, String)],
+        delta: i64,
+    ) {
+        let Some(status_bucket) = background_action_status_bucket(status) else {
+            return;
+        };
+
+        if let Some(queue) = background_action_metadata_value(metadata, "queue") {
+            self.apply_background_action_queue_counter_delta_for_key(
+                tenant,
+                task_group,
+                status_bucket,
+                BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND,
+                queue,
+                delta,
+            );
+        }
+
+        if let Some(queue) = background_action_metadata_value(metadata, "platformConcurrencyQueue")
+        {
+            self.apply_background_action_queue_counter_delta_for_key(
+                tenant,
+                task_group,
+                status_bucket,
+                BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+                queue,
+                delta,
+            );
+        }
+    }
+
+    /// Apply the background-action queue counter movement for one status
+    /// transition. Terminal statuses are intentionally not represented in the
+    /// gauges; failure/cancellation visibility is emitted as event counters.
+    pub(crate) fn apply_background_action_queue_counter_transition(
+        &self,
+        tenant: &str,
+        task_group: &str,
+        old_status: Option<JobStatusKind>,
+        new_status: JobStatusKind,
+        metadata: &[(String, String)],
+    ) {
+        if old_status
+            .and_then(background_action_status_bucket)
+            .is_some()
+        {
+            let old_status = old_status.expect("checked above");
+            self.apply_background_action_queue_counter_delta(
+                tenant, task_group, old_status, metadata, -1,
+            );
+        }
+        if background_action_status_bucket(new_status).is_some() {
+            self.apply_background_action_queue_counter_delta(
+                tenant, task_group, new_status, metadata, 1,
+            );
+        }
+    }
+
+    /// Reverse a previously applied background-action queue counter transition.
+    pub(crate) fn rollback_background_action_queue_counter_transition(
+        &self,
+        tenant: &str,
+        task_group: &str,
+        old_status: Option<JobStatusKind>,
+        new_status: JobStatusKind,
+        metadata: &[(String, String)],
+    ) {
+        if background_action_status_bucket(new_status).is_some() {
+            self.apply_background_action_queue_counter_delta(
+                tenant, task_group, new_status, metadata, -1,
+            );
+        }
+        if old_status
+            .and_then(background_action_status_bucket)
+            .is_some()
+        {
+            let old_status = old_status.expect("checked above");
+            self.apply_background_action_queue_counter_delta(
+                tenant, task_group, old_status, metadata, 1,
+            );
+        }
+    }
+
+    pub(crate) fn apply_background_action_metric_transition(
+        &self,
+        transition: &BackgroundActionMetricTransition,
+    ) {
+        self.record_background_action_terminal_counter_transition(
+            &transition.tenant,
+            &transition.task_group,
+            transition.new_status,
+            &transition.metadata,
+        );
+    }
+
+    pub(crate) fn rollback_background_action_metric_gauge_transition(
+        &self,
+        transition: &BackgroundActionMetricTransition,
+    ) {
+        self.rollback_background_action_queue_counter_transition(
+            &transition.tenant,
+            &transition.task_group,
+            transition.old_status,
+            transition.new_status,
+            &transition.metadata,
+        );
+    }
+
+    pub(crate) fn rollback_background_action_metric_gauge_transitions(
+        &self,
+        transitions: &[BackgroundActionMetricTransition],
+    ) {
+        for transition in transitions {
+            self.rollback_background_action_metric_gauge_transition(transition);
+        }
+    }
+
+    pub(crate) fn record_background_action_terminal_counter_transition(
+        &self,
+        tenant: &str,
+        task_group: &str,
+        new_status: JobStatusKind,
+        metadata: &[(String, String)],
+    ) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        metrics.record_background_action_terminal_event(
+            &self.name, tenant, task_group, new_status, metadata,
+        );
+    }
+
+    fn apply_background_action_queue_counter_delta_for_key(
+        &self,
+        tenant: &str,
+        task_group: &str,
+        status_bucket: &str,
+        queue_kind: &str,
+        queue: &str,
+        delta: i64,
+    ) {
+        let key = (
+            tenant.to_string(),
+            task_group.to_string(),
+            status_bucket.to_string(),
+            queue_kind.to_string(),
+            queue.to_string(),
+        );
+        let mut entry = self
+            .background_action_queue_counts
+            .entry(key.clone())
+            .or_insert(0);
+        *entry = entry.saturating_add(delta);
+        if *entry <= 0 {
+            drop(entry);
+            self.background_action_queue_counts
+                .remove_if(&key, |_, value| *value <= 0);
+        }
+    }
+
+    /// Snapshot sparse in-memory background action queue counters for this shard.
+    ///
+    /// Entries with count <= 0 are excluded. The metric layer derives
+    /// synthetic `<no queue>` values from explicit/platform rows per
+    /// `(tenant, task_group)`.
+    pub fn snapshot_background_action_queue_counters(&self) -> Vec<BackgroundActionQueueCounter> {
+        let mut results = Vec::new();
+        for entry in self.background_action_queue_counts.iter() {
+            let count = *entry.value();
+            if count <= 0 {
+                continue;
+            }
+            let (tenant, task_group, status_bucket, queue_kind, queue) = entry.key();
+            results.push(BackgroundActionQueueCounter {
+                tenant: tenant.clone(),
+                task_group: task_group.clone(),
+                status_bucket: status_bucket.clone(),
+                queue_kind: queue_kind.clone(),
+                queue: queue.clone(),
+                count,
+            });
+        }
+        results
     }
 
     /// Scan all tenant status counters for this shard.
@@ -422,7 +669,7 @@ impl JobStoreShard {
                     }
                     *truth
                         .per_tenant_status
-                        .entry((parsed.tenant, status.kind.as_str().to_owned()))
+                        .entry((parsed.tenant.clone(), status.kind.as_str().to_owned()))
                         .or_insert(0) += 1;
                 }
                 Err(e) => {
@@ -535,6 +782,79 @@ impl JobStoreShard {
         }
         self.db.merge(&key, &encode_counter(delta)).await?;
         Ok(1)
+    }
+
+    /// Rebuild the sparse in-memory background action queue counters from
+    /// current Scheduled/Running job rows. This runs at shard open so
+    /// process-local counters recover after a restart without durable queue
+    /// counter state.
+    pub async fn rebuild_background_action_queue_counters(
+        &self,
+        range: &ShardRange,
+    ) -> Result<(), JobStoreShardError> {
+        self.background_action_queue_counts.clear();
+
+        let status_prefix = vec![prefix::JOB_STATUS];
+        let status_end = end_bound(&status_prefix);
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(status_prefix..status_end, &crate::scan_options())
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            let Some(parsed) = parse_job_status_key(&kv.key) else {
+                continue;
+            };
+            if !range.contains_tenant(&parsed.tenant) {
+                continue;
+            }
+
+            let status = match decode_job_status_owned(&kv.value) {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::warn!(
+                        shard = %self.name,
+                        tenant = %parsed.tenant,
+                        job_id = %parsed.job_id,
+                        error = %e,
+                        "background action queue counter rebuild: failed to decode job status, skipping row"
+                    );
+                    continue;
+                }
+            };
+            if background_action_status_bucket(status.kind).is_none() {
+                continue;
+            }
+
+            let Some(raw_info) = self
+                .db
+                .get(&job_info_key(&parsed.tenant, &parsed.job_id))
+                .await?
+            else {
+                continue;
+            };
+            let view = match JobView::new(raw_info) {
+                Ok(view) => view,
+                Err(e) => {
+                    tracing::warn!(
+                        shard = %self.name,
+                        tenant = %parsed.tenant,
+                        job_id = %parsed.job_id,
+                        error = %e,
+                        "background action queue counter rebuild: failed to decode job info, skipping row"
+                    );
+                    continue;
+                }
+            };
+            self.apply_background_action_queue_counter_delta(
+                &parsed.tenant,
+                view.task_group(),
+                status.kind,
+                &view.metadata(),
+                1,
+            );
+        }
+
+        Ok(())
     }
 }
 

@@ -2203,6 +2203,8 @@ where
                 biased;
                 _ = interval.tick() => {
                     if let Some(ref m) = metrics_for_scrape {
+                        let mut background_action_snapshot =
+                            crate::metrics::BackgroundActionMetricSnapshot::default();
                         for (shard_id, shard) in metrics_factory.instances().iter() {
                             let shard_label = shard_id.to_string();
                             let recorder = shard.slatedb_metrics_recorder();
@@ -2211,7 +2213,23 @@ where
                                 &shard_label,
                                 shard.concurrency_cache_stats(),
                             );
+                            match crate::metrics::collect_background_action_metrics_for_shard(
+                                &shard_label,
+                                shard.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(snapshot) => background_action_snapshot.merge(snapshot),
+                                Err(e) => {
+                                    warn!(
+                                        shard = %shard_label,
+                                        error = %e,
+                                        "failed to collect background action metrics"
+                                    );
+                                }
+                            }
                         }
+                        m.record_background_action_metrics(background_action_snapshot);
                     }
                 }
                 _ = metrics_tick_rx.recv() => { break; }

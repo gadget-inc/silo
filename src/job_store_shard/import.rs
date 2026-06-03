@@ -13,6 +13,7 @@ use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
+use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms,
     put_with_optional_expire, retry_on_txn_conflict,
@@ -254,7 +255,7 @@ impl JobStoreShard {
 
         // Write status + index (TTL applied when the import lands terminal)
         let mut writer = TxnWriter(&txn);
-        Self::write_job_status_with_index_opts(
+        Self::write_job_status_with_index_opts_and_metadata(
             &mut writer,
             tenant,
             job_id,
@@ -307,6 +308,27 @@ impl JobStoreShard {
         if is_terminal {
             self.increment_completed_jobs_counter(&mut writer)?;
         }
+        let background_action_transition = if matches!(
+            status_kind,
+            JobStatusKind::Failed | JobStatusKind::Cancelled
+        ) {
+            Some(BackgroundActionMetricTransition {
+                tenant: tenant.to_string(),
+                task_group: params.task_group.clone(),
+                old_status: None,
+                new_status: status_kind,
+                metadata: job.metadata.clone(),
+            })
+        } else {
+            None
+        };
+        self.apply_background_action_queue_counter_transition(
+            tenant,
+            &params.task_group,
+            None,
+            status_kind,
+            &job.metadata,
+        );
 
         let write_op = if !is_terminal {
             let op = dst_events::next_write_op();
@@ -333,10 +355,20 @@ impl JobStoreShard {
                 dst_events::cancel_write(op);
             }
             self.rollback_grants(tenant, &grants);
+            self.rollback_background_action_queue_counter_transition(
+                tenant,
+                &params.task_group,
+                None,
+                status_kind,
+                &job.metadata,
+            );
             return Err(e.into());
         }
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
+        }
+        if let Some(transition) = &background_action_transition {
+            self.apply_background_action_metric_transition(transition);
         }
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
@@ -574,6 +606,7 @@ impl JobStoreShard {
             limits: existing_job.limits(),
             task_group: existing_job.task_group().to_string(),
         };
+        let background_action_metadata = updated_job.metadata.clone();
         let updated_job_value = encode_job_info(&updated_job);
         let info_key = job_info_key(tenant, job_id);
         put_with_optional_expire(&txn, &info_key, &updated_job_value, terminal_expire_ts)?;
@@ -687,19 +720,25 @@ impl JobStoreShard {
         // === Update status, scheduling state, and counters ===
         let mut writer = TxnWriter(&txn);
 
-        self.set_job_status_with_index_opts(
-            &mut writer,
-            tenant,
-            job_id,
-            new_job_status,
-            terminal_expire_ts,
-        )
-        .await?;
+        let background_action_transition = self
+            .set_job_status_with_index_opts(
+                &mut writer,
+                tenant,
+                job_id,
+                new_job_status,
+                terminal_expire_ts,
+            )
+            .await?;
 
         // Clean up cancelled key: cancel_job writes a separate cancelled key that blocks
         // lease creation. The marker can outlive Cancelled status (for example when a
         // running cancelled job later reports Error), so always delete it on reimport.
-        txn.delete(job_cancelled_key(tenant, job_id))?;
+        if let Err(e) = txn.delete(job_cancelled_key(tenant, job_id)) {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e.into());
+        }
 
         // Create new scheduling state if non-terminal
         let mut grants = Vec::new();
@@ -711,7 +750,7 @@ impl JobStoreShard {
             // [SILO-REIMP-9] new task in DB queue, old tasks for j removed
             // [SILO-REIMP-CONC-1/2] concurrency granted path
             // [SILO-REIMP-CONC-3/4] concurrency queued path
-            grants = self
+            grants = match self
                 .enqueue_limit_task_at_index(
                     &mut writer,
                     LimitTaskParams {
@@ -733,18 +772,42 @@ impl JobStoreShard {
                         skip_try_reserve: false,
                     },
                 )
-                .await?
-                .grants;
+                .await
+            {
+                Ok(result) => result.grants,
+                Err(e) => {
+                    self.rollback_background_action_queue_counter_transition(
+                        tenant,
+                        &task_group,
+                        Some(old_status.kind),
+                        status_kind,
+                        &background_action_metadata,
+                    );
+                    return Err(e);
+                }
+            };
         }
         // [SILO-REIMP-7] If terminal: status is terminal, no new tasks
 
         // Update counters
         let was_terminal = old_status.is_terminal();
-        if !was_terminal && is_terminal {
-            self.increment_completed_jobs_counter(&mut writer)?;
+        if !was_terminal
+            && is_terminal
+            && let Err(e) = self.increment_completed_jobs_counter(&mut writer)
+        {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e);
         }
-        if was_terminal && !is_terminal {
-            self.decrement_completed_jobs_counter(&mut writer)?;
+        if was_terminal
+            && !is_terminal
+            && let Err(e) = self.decrement_completed_jobs_counter(&mut writer)
+        {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e);
         }
         // total_jobs counter unchanged (job already counted)
 
@@ -775,10 +838,20 @@ impl JobStoreShard {
             }
             // Rollback new grants
             self.rollback_grants(tenant, &grants);
+            self.rollback_background_action_queue_counter_transition(
+                tenant,
+                &task_group,
+                Some(old_status.kind),
+                status_kind,
+                &background_action_metadata,
+            );
             return Err(e.into());
         }
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
+        }
+        if let Some(transition) = &background_action_transition {
+            self.apply_background_action_metric_transition(transition);
         }
 
         // [SILO-REIMP-6] Remove buffered tasks for this job.

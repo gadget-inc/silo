@@ -9,6 +9,7 @@ use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
+use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
@@ -29,6 +30,7 @@ struct DequeueIterationState {
     release_keys: Vec<Vec<u8>>,
     tombstone_keys: Vec<Vec<u8>>,
     grants_to_rollback: Vec<(String, String, String)>,
+    background_action_transitions: Vec<BackgroundActionMetricTransition>,
     leased_tasks_for_dst: Vec<(String, String, String)>,
     pending_attempts: Vec<(String, JobView, Vec<u8>)>,
     /// Holders that were deleted in this iteration's batch and need their
@@ -45,6 +47,7 @@ impl DequeueIterationState {
             release_keys: Vec::with_capacity(claimed_len),
             tombstone_keys: Vec::with_capacity(claimed_len),
             grants_to_rollback: Vec::new(),
+            background_action_transitions: Vec::new(),
             leased_tasks_for_dst: Vec::new(),
             pending_attempts: Vec::new(),
             holder_releases: Vec::new(),
@@ -427,6 +430,9 @@ impl JobStoreShard {
                 }
             }
             if let Some(e) = handler_err {
+                for transition in &state.background_action_transitions {
+                    self.rollback_background_action_metric_gauge_transition(transition);
+                }
                 // Known not-committed state: re-buffer for immediate re-pickup.
                 self.brokers.requeue(inflight_guard.disarm());
                 return Err(e);
@@ -489,6 +495,9 @@ impl JobStoreShard {
                 // here means their Drop is a no-op on the `return Err` below.
                 for (tenant, queue, task_id) in grant_guard.disarm() {
                     self.concurrency.rollback_grant(&tenant, &queue, &task_id);
+                }
+                for transition in &state.background_action_transitions {
+                    self.rollback_background_action_metric_gauge_transition(transition);
                 }
                 let _ = holder_guard.disarm();
                 // Put back all claimed entries since we didn't lease them durably
@@ -578,7 +587,7 @@ impl JobStoreShard {
         relative_attempt_number: u32,
         now_ms: i64,
         expiry_ms: i64,
-    ) -> Result<Vec<u8>, JobStoreShardError> {
+    ) -> Result<(Vec<u8>, Option<BackgroundActionMetricTransition>), JobStoreShardError> {
         // [SILO-DEQ-4] Create lease record
         let lease_key = leased_task_key(task_id);
         let record = LeaseRecord {
@@ -592,13 +601,14 @@ impl JobStoreShard {
 
         // [SILO-DEQ-6] Mark job as running
         let job_status = JobStatus::running(now_ms);
-        self.set_job_status_with_index(
-            &mut DbWriteBatcher::new(&self.db, batch),
-            tenant,
-            job_id,
-            job_status,
-        )
-        .await?;
+        let background_action_transition = self
+            .set_job_status_with_index(
+                &mut DbWriteBatcher::new(&self.db, batch),
+                tenant,
+                job_id,
+                job_status,
+            )
+            .await?;
 
         // [SILO-DEQ-5] Create attempt record
         let attempt = JobAttempt {
@@ -613,7 +623,7 @@ impl JobStoreShard {
         let akey = attempt_key(tenant, job_id, attempt_number);
         batch.put(&akey, &attempt_val);
 
-        Ok(attempt_val)
+        Ok((attempt_val, background_action_transition))
     }
 
     /// Process a RequestTicket task.
@@ -815,15 +825,18 @@ impl JobStoreShard {
         for (q, tid) in chain_result.grants {
             state.grants_to_rollback.push((tenant.clone(), q, tid));
         }
-        if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms {
-            self.retarget_scheduled_task_key(
-                &mut writer,
-                &tenant,
-                &job_id,
-                attempt_number,
-                task_key_start_ms,
-            )
-            .await?;
+        if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms
+            && let Some(transition) = self
+                .retarget_scheduled_task_key(
+                    &mut writer,
+                    &tenant,
+                    &job_id,
+                    attempt_number,
+                    task_key_start_ms,
+                )
+                .await?
+        {
+            state.background_action_transitions.push(transition);
         }
 
         // Metrics: account the grant as a Scanned-path ticket.
@@ -984,15 +997,18 @@ impl JobStoreShard {
                         .grants_to_rollback
                         .push((tenant.clone(), queue, task_id));
                 }
-                if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms {
-                    self.retarget_scheduled_task_key(
-                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
-                        tenant,
-                        job_id,
-                        attempt_number,
-                        task_key_start_ms,
-                    )
-                    .await?;
+                if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms
+                    && let Some(transition) = self
+                        .retarget_scheduled_task_key(
+                            &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                            tenant,
+                            job_id,
+                            attempt_number,
+                            task_key_start_ms,
+                        )
+                        .await?
+                {
+                    state.background_action_transitions.push(transition);
                 }
             }
             Ok(result) => {
@@ -1180,7 +1196,7 @@ impl JobStoreShard {
         state.batch.delete(task_key);
 
         let task = decoded.to_task()?;
-        let attempt_val = self
+        let (attempt_val, background_action_transition) = self
             .write_lease_and_attempt(
                 &mut state.batch,
                 worker_id,
@@ -1194,6 +1210,9 @@ impl JobStoreShard {
                 expiry_ms,
             )
             .await?;
+        if let Some(transition) = background_action_transition {
+            state.background_action_transitions.push(transition);
+        }
 
         // Construct AttemptView directly from encoded bytes (no DB readback needed)
         state

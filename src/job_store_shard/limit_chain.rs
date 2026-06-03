@@ -121,7 +121,7 @@ async fn retarget_if_concrete_task(
     if task_key_start_ms == params.start_at_ms {
         return Ok(());
     }
-    shard
+    let _ = shard
         .retarget_scheduled_task_key(
             writer,
             &params.tenant,
@@ -129,7 +129,8 @@ async fn retarget_if_concrete_task(
             params.attempt_number,
             task_key_start_ms,
         )
-        .await
+        .await?;
+    Ok(())
 }
 
 fn into_concurrency_error(e: JobStoreShardError) -> ConcurrencyError {

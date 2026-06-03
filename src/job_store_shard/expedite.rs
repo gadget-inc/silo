@@ -178,11 +178,17 @@ impl JobStoreShard {
 
         // Update job status with new start time (keeping same attempt number)
         let new_status = crate::job::JobStatus::scheduled(now_ms, now_ms, attempt_number);
-        self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
+        let background_action_transition = self
+            .set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
             .await?;
 
         // Commit the transaction
-        txn.commit().await?;
+        if let Err(e) = txn.commit().await {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e.into());
+        }
 
         // Wake the broker to pick up the expedited task promptly
         self.brokers.wakeup(&task_group);
