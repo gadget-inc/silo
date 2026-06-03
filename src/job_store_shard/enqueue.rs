@@ -419,9 +419,14 @@ impl JobStoreShard {
                 // Fresh enqueue: the task_key starts at the job's schedule. If
                 // the job is future-scheduled (`start_at_ms > now_ms`) the
                 // resulting `RequestTicket` lands at the future time so the
-                // broker picks it up exactly then. Fresh chain head → epoch is
-                // just the write time; no predecessor tombstone to dodge.
-                scheduled_at_ms: start_at_ms,
+                // broker picks it up exactly then. Use `effective_start_at_ms`
+                // (not the raw `start_at_ms`) so an immediate enqueue
+                // (`start_at_ms <= 0`) keys the task at `now_ms` — matching the
+                // `effective_start_at_ms` the JobStatus stores and the import
+                // path, so identity lookups never have to fall back to time=0.
+                // Fresh chain head → epoch is just the write time; no
+                // predecessor tombstone to dodge.
+                scheduled_at_ms: effective_start_at_ms,
                 task_key_epoch_ms: now_ms,
                 now_ms,
                 held_queues: Vec::new(),
