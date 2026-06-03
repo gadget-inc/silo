@@ -25,9 +25,9 @@ version = "0.3.0"
 [dependencies]
 clap = { version = "4.3.14", features = ["derive", "env"] }
 futures = "0.3"
-slatedb = "0.13"
-slatedb-common = "0.13"
-object_store = { version = "0.12", features = ["gcp"] }
+slatedb = { git = "https://github.com/slatedb/slatedb", rev = "a9ab64507e677ba1ab18576e7e86fb15b971a233" }
+slatedb-common = { git = "https://github.com/slatedb/slatedb", rev = "a9ab64507e677ba1ab18576e7e86fb15b971a233" }
+object_store = { version = "0.13", features = ["gcp"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
 rmp = "0.8"
