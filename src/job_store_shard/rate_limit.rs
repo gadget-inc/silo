@@ -38,8 +38,9 @@ impl JobStoreShard {
         // must dispatch it after the backoff). `handle_check_rate_limit`
         // ack-deleted the parent CheckRateLimit, installing a broker tombstone at
         // its task_key; every other key component is identical to the parent's,
-        // so we dodge it with an `epoch_ms` strictly past the parent's. This
-        // holds even for zero backoff (`retry_at_ms == parent_start_time_ms`).
+        // so we dodge it with an `epoch_ms` strictly past the parent's —
+        // `rate_limit_retry_epoch_ms` returns `parent_epoch_ms + 1`. This holds
+        // even for zero backoff (`retry_at_ms == parent_start_time_ms`).
         let task_key_epoch_ms = rate_limit_retry_epoch_ms(parent_epoch_ms);
         let retry_task = Task::CheckRateLimit {
             task_id: task_id.to_string(),

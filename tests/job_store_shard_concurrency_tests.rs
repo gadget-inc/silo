@@ -2693,7 +2693,8 @@ async fn find_run_attempt_task_key(
     None
 }
 
-/// Regression for the granted-RunAttempt back-of-queue leak (env-10000042940).
+/// Regression for the granted-RunAttempt back-of-queue leak (the production
+/// back-of-queue wedge incident).
 ///
 /// When the grant scanner resumes a waiting job's limit-chain, the terminal
 /// `RunAttempt` must be written at a task_key whose `start_time_ms` is the job's

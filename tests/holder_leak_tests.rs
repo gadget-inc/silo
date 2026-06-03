@@ -718,10 +718,10 @@ async fn floating_concurrency_steady_state_zero_holders_after_full_cycle() {
 /// The original dodge bumped the task_key's `start_time_ms` to `now_ms`. That
 /// dodged the tombstone but shoved the holder-bearing RunAttempt to the back of
 /// the broker's start-time-ordered scan; under load a capped scan never reached
-/// it, so it never ran, never released its slot, and wedged the tenant
-/// (env-10000042940). The fix keeps the job's ORIGINAL `start_at_ms` as the
-/// task_key start time (so it sorts by its true schedule) and moves the dodge to
-/// the trailing write-only `epoch_ms`. See
+/// it, so it never ran, never released its slot, and wedged the tenant (the
+/// production back-of-queue wedge incident). The fix keeps the job's ORIGINAL
+/// `start_at_ms` as the task_key start time (so it sorts by its true schedule)
+/// and moves the dodge to the trailing write-only `epoch_ms`. See
 /// `project_broker_tombstone_chain_continuation`.
 ///
 /// This test pins both halves of that invariant: after a queued job is granted
@@ -844,7 +844,7 @@ async fn resume_chain_writes_run_attempt_at_original_start_with_fresh_epoch() {
         "resumed RunAttempt must keep the job's ORIGINAL start_at_ms as its \
          task_key start_time so it sorts by its true schedule — got start_time_ms={} \
          vs original={}. A regression to now_ms here re-introduces the \
-         back-of-queue leak (env-10000042940).",
+         back-of-queue leak (the production back-of-queue wedge incident).",
         b_start, original_enqueue_ms,
     );
     assert!(

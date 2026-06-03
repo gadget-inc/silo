@@ -771,8 +771,9 @@ impl JobStoreShard {
         // re-stamping it at `now_ms` would shove the holder-bearing follow-up to
         // the back of the broker's start-time-ordered scan, where a capped scan
         // may never reach it — the granted-RunAttempt back-of-queue leak
-        // (env-10000042940). The tombstone dodge for the just-deleted ticket's
-        // task_key moves to the trailing `epoch_ms`: all other key components
+        // (the production back-of-queue wedge incident). The tombstone dodge
+        // for the just-deleted ticket's task_key moves to the trailing
+        // `epoch_ms`: all other key components
         // (task_group, priority, job_id, attempt_number) are constant within a
         // chain, so a fresh `epoch_ms` strictly past the parent's makes the
         // follow-up key unique even when it reuses the parent's start_time.

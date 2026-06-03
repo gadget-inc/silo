@@ -58,7 +58,7 @@ impl LimitChainResumer for ShardChainResumer {
         // not be shoved to the back of the broker's start-time-ordered scan, or
         // the capped scan may never reach it (it holds concurrency slots that
         // then never release; see the granted-RunAttempt back-of-queue leak,
-        // env-10000042940).
+        // the production back-of-queue wedge incident).
         //
         // The tombstone dodge moves to the trailing `epoch_ms` instead. The
         // broker tombstones any task_key it ack-deleted, and an interim
