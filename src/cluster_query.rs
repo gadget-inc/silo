@@ -665,7 +665,9 @@ async fn query_remote_shard_batches(
         };
 
         let interceptor = AuthInterceptor::new(auth_token.map(|s| s.to_string()));
-        let mut client = SiloClient::with_interceptor(channel, interceptor);
+        let mut client = SiloClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(32 * 1024 * 1024)
+            .max_encoding_message_size(32 * 1024 * 1024);
 
         // Make streaming query
         let request = QueryArrowRequest {
