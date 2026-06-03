@@ -34,22 +34,24 @@ pub(crate) struct LimitTaskParams<'a> {
     pub limit_index: usize,
     pub limits: &'a [Limit],
     pub priority: u8,
-    /// The job's user-requested start time. Used purely as the "is this
-    /// future-scheduled?" predicate (`scheduled_at_ms > now_ms` ⇒ write a
-    /// `Task::RequestTicket` instead of an in-queue request record) and as
-    /// the `start_time_ms` we persist on `EnqueueTask` so `process_grants`
-    /// can skip future-dated requests on resume.
+    /// The job's user-requested start time. This is the `start_time_ms`
+    /// component baked into every `task_key` / `concurrency_request_key` this
+    /// chain step writes (so the broker orders the task by its logical schedule)
+    /// AND the predicate for "is this future-scheduled?" (`scheduled_at_ms >
+    /// now_ms` ⇒ write a `Task::RequestTicket` at that future time). It is
+    /// persisted as `start_time_ms` on `EnqueueTask` so `process_grants` can
+    /// skip future-dated requests on resume. A chain *resume* keeps the job's
+    /// original schedule here — the tombstone dodge lives in `task_key_epoch_ms`.
     pub scheduled_at_ms: i64,
-    /// The time component baked into every `task_key` / `concurrency_request_key`
-    /// this chain step writes. For a fresh enqueue this equals
-    /// `scheduled_at_ms` so a future-scheduled `RequestTicket` lands at the
-    /// future time. For a chain *resume* — `ShardChainResumer::resume_chain`
-    /// — this is `now_ms`, so the resumed task cannot collide with a broker
-    /// tombstone pinned by an earlier ack-delete at the original
-    /// `task_key(scheduled_at_ms, …)`. See
+    /// Write-time disambiguator for the trailing `epoch_ms` of every `task_key`
+    /// this chain step writes. It does NOT affect broker ordering; it only makes
+    /// a rewritten task_key unique versus the broker ack-tombstone left by an
+    /// earlier ack-delete at the same `(start_time_ms, …)`. For a fresh chain
+    /// head use `now_ms`; for a rewrite of a just-deleted predecessor use
+    /// `now_ms.max(parent_epoch_ms + 1)`. See
     /// `project_broker_tombstone_chain_continuation` and the precedent in
     /// `handle_request_ticket` (dequeue.rs).
-    pub task_key_start_ms: i64,
+    pub task_key_epoch_ms: i64,
     pub now_ms: i64,
     pub held_queues: Vec<String>,
     pub task_group: &'a str,
@@ -87,7 +89,7 @@ enum GrantResult {
 fn record_grant_outcome(
     outcome: Option<RequestTicketOutcome>,
     queue_key: &str,
-    task_key_start_ms: i64,
+    scheduled_at_ms: i64,
     grants: &mut Vec<(String, String)>,
     current_task_id: &str,
     current_held_queues: &mut Vec<String>,
@@ -126,7 +128,7 @@ fn record_grant_outcome(
             }
         }
         Some(RequestTicketOutcome::FutureRequestTaskWritten { .. }) => GrantResult::Queued {
-            pending_task_key_start_ms: Some(task_key_start_ms),
+            pending_task_key_start_ms: Some(scheduled_at_ms),
         },
     }
 }
@@ -414,12 +416,13 @@ impl JobStoreShard {
                 limit_index: 0,
                 limits: &job.limits,
                 priority,
-                // Fresh enqueue: scheduled and task_key time coincide. If the
-                // job is future-scheduled (`start_at_ms > now_ms`) the
+                // Fresh enqueue: the task_key starts at the job's schedule. If
+                // the job is future-scheduled (`start_at_ms > now_ms`) the
                 // resulting `RequestTicket` lands at the future time so the
-                // broker picks it up exactly then.
+                // broker picks it up exactly then. Fresh chain head → epoch is
+                // just the write time; no predecessor tombstone to dodge.
                 scheduled_at_ms: start_at_ms,
-                task_key_start_ms: start_at_ms,
+                task_key_epoch_ms: now_ms,
                 now_ms,
                 held_queues: Vec::new(),
                 task_group,
@@ -527,7 +530,7 @@ impl JobStoreShard {
             limits,
             priority,
             scheduled_at_ms,
-            task_key_start_ms,
+            task_key_epoch_ms,
             now_ms,
             held_queues,
             task_group,
@@ -573,13 +576,14 @@ impl JobStoreShard {
                 put_task(
                     writer,
                     task_group,
-                    task_key_start_ms,
+                    scheduled_at_ms,
                     priority,
                     job_id,
                     attempt_number,
+                    task_key_epoch_ms,
                     &run_task,
                 )?;
-                return Ok(Some(task_key_start_ms));
+                return Ok(Some(scheduled_at_ms));
             }
 
             match &limits[current_index] {
@@ -596,7 +600,7 @@ impl JobStoreShard {
                             job_id,
                             priority,
                             scheduled_at_ms,
-                            task_key_start_ms,
+                            task_key_epoch_ms,
                             now_ms,
                             std::slice::from_ref(cl),
                             task_group,
@@ -620,7 +624,7 @@ impl JobStoreShard {
                     match record_grant_outcome(
                         outcome,
                         &cl.key,
-                        task_key_start_ms,
+                        scheduled_at_ms,
                         grants,
                         &current_task_id,
                         &mut current_held_queues,
@@ -663,7 +667,7 @@ impl JobStoreShard {
                             job_id,
                             priority,
                             scheduled_at_ms,
-                            task_key_start_ms,
+                            task_key_epoch_ms,
                             now_ms,
                             std::slice::from_ref(&temp_cl),
                             task_group,
@@ -706,7 +710,7 @@ impl JobStoreShard {
                     match record_grant_outcome(
                         outcome,
                         &fl.key,
-                        task_key_start_ms,
+                        scheduled_at_ms,
                         grants,
                         &current_task_id,
                         &mut current_held_queues,
@@ -742,13 +746,14 @@ impl JobStoreShard {
                     put_task(
                         writer,
                         task_group,
-                        task_key_start_ms,
+                        scheduled_at_ms,
                         priority,
                         job_id,
                         attempt_number,
+                        task_key_epoch_ms,
                         &task,
                     )?;
-                    return Ok(Some(task_key_start_ms));
+                    return Ok(Some(scheduled_at_ms));
                 }
             }
         }

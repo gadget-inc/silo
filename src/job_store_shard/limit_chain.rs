@@ -53,27 +53,25 @@ impl LimitChainResumer for ShardChainResumer {
         // baked into this batch.
         let now_ms = params.now_ms;
 
-        // `scheduled_at_ms` stays honest — the chain's original user-requested
-        // start time — so the future-scheduling check and any persisted
-        // `start_time_ms` on a follow-up request keep their semantics. But
-        // every `task_key` this walk writes lands at `now_ms`: the broker
-        // tombstones any task_key it has ack-deleted, and an LSM scan can
-        // momentarily observe the interim RunAttempt earlier chain steps
-        // wrote at `task_key(scheduled_at_ms, …)` even though that interim is
-        // deleted in the same batch. Once a worker claims and ack-deletes
-        // that key, every later write at the same task_key is silently
-        // suppressed by the tombstone, which strands the holders this
-        // resumer just granted. Mirrors the precedent in
+        // The resumed task_key keeps the job's ORIGINAL `start_at_ms` as its
+        // broker-ordering start time — a job that has waited for its slot must
+        // not be shoved to the back of the broker's start-time-ordered scan, or
+        // the capped scan may never reach it (it holds concurrency slots that
+        // then never release; see the granted-RunAttempt back-of-queue leak,
+        // env-10000042940).
+        //
+        // The tombstone dodge moves to the trailing `epoch_ms` instead. The
+        // broker tombstones any task_key it ack-deleted, and an interim
+        // RunAttempt/CheckRateLimit an earlier chain step wrote at
+        // `task_key(start_at_ms, …, epoch=earlier)` may still be observed by an
+        // in-flight LSM scan even though it's deleted; re-emitting at the same
+        // full key would be suppressed and strand the holders this resumer just
+        // granted. Stamping `now_ms` as the epoch makes the resumed key unique
+        // versus that interim (whose epoch was set at an earlier enqueue/grant,
+        // so strictly less than `now_ms`) without perturbing ordering. Mirrors
         // `handle_request_ticket` (dequeue.rs) — see
         // `project_broker_tombstone_chain_continuation`.
-        //
-        // `now_ms` typically exceeds `params.start_at_ms`, but a granted
-        // request that fires within the same millisecond would write
-        // `task_key(now_ms, …) == task_key(start_at_ms, …)` and collide
-        // with the tombstoned interim. Bump past `start_at_ms` to make the
-        // dodge unconditional. The other key components (task_group,
-        // priority, job_id, attempt_number) are constant within a chain.
-        let task_key_start_ms = now_ms.max(params.start_at_ms + 1);
+        let task_key_epoch_ms = now_ms;
         let mut writer = DbWriteBatcher::new(&shard.db, batch);
         let result = shard
             .enqueue_limit_task_at_index(
@@ -88,7 +86,7 @@ impl LimitChainResumer for ShardChainResumer {
                     limits: &params.limits,
                     priority: params.priority,
                     scheduled_at_ms: params.start_at_ms,
-                    task_key_start_ms,
+                    task_key_epoch_ms,
                     now_ms,
                     held_queues: params.held_queues.clone(),
                     task_group: &params.task_group,

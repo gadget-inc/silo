@@ -165,8 +165,15 @@ impl JobStoreShard {
 
         // Use a temporary WriteBatch to encode the task, then extract and put via txn
         let task_value = crate::codec::encode_task(&new_task);
-        let task_key =
-            crate::keys::task_key(&task_group, start_at_ms, priority, id, next_attempt_number);
+        // Fresh attempt_number → fresh task_key; epoch is just the write time.
+        let task_key = crate::keys::task_key(
+            &task_group,
+            start_at_ms,
+            priority,
+            id,
+            next_attempt_number,
+            now_ms,
+        );
         txn.put(&task_key, &task_value)?;
 
         // Two-phase DST event: emit before commit for correct causal ordering,

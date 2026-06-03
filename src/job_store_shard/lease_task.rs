@@ -12,12 +12,10 @@ use crate::codec::{decode_task_validated, encode_attempt, encode_lease};
 use crate::job::{JobStatusKind, JobView};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{
-    attempt_key, job_cancelled_key, job_info_key, job_status_key, leased_task_key, task_key,
-};
+use crate::keys::{attempt_key, job_cancelled_key, job_info_key, job_status_key, leased_task_key};
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedTask, Task};
 
 /// Error returned when a job cannot be leased because it's not in a leaseable state.
@@ -137,26 +135,35 @@ impl JobStoreShard {
             })
         })?;
 
-        // Read the pending task via O(1) key reconstruction.
+        // Locate the pending task by identity (the trailing epoch_ms is
+        // write-only, so we prefix-scan instead of reconstructing the exact key).
         // When start_at_ms <= 0 at enqueue time, the task key uses 0 as its time
         // component but the status stores the effective time (now_ms). Try the
         // status time first, then fall back to 0 to handle immediate jobs.
-        let old_task_key = task_key(&task_group, start_time_ms, priority, id, attempt_number);
-        let (old_task_key, task_raw) = match txn.get(&old_task_key).await? {
-            Some(raw) => (old_task_key, raw),
+        let found = match find_task_by_identity(
+            &txn,
+            &task_group,
+            start_time_ms,
+            priority,
+            id,
+            attempt_number,
+        )
+        .await?
+        {
+            Some(found) => Some(found),
             None => {
                 // Fallback: try with time=0 (immediate scheduling case)
-                let zero_key = task_key(&task_group, 0, priority, id, attempt_number);
-                match txn.get(&zero_key).await? {
-                    Some(raw) => (zero_key, raw),
-                    None => {
-                        return Err(JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
-                            job_id: id.to_string(),
-                            status: status.kind,
-                            reason: "job has no pending task in queue".to_string(),
-                        }));
-                    }
-                }
+                find_task_by_identity(&txn, &task_group, 0, priority, id, attempt_number).await?
+            }
+        };
+        let (old_task_key, task_raw) = match found {
+            Some(found) => found,
+            None => {
+                return Err(JobStoreShardError::JobNotLeaseable(JobNotLeaseableError {
+                    job_id: id.to_string(),
+                    status: status.kind,
+                    reason: "job has no pending task in queue".to_string(),
+                }));
             }
         };
         // Validate that the raw bytes decode to a valid task before replacing it

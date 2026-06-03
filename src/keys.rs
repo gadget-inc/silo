@@ -229,7 +229,39 @@ pub fn parse_metadata_index_key(key: &[u8]) -> Option<ParsedMetadataIndexKey> {
 }
 
 /// Construct the key for a task, ordered by task group then start time.
+///
+/// `epoch_ms` is a trailing write-time disambiguator that does NOT participate
+/// in cross-job ordering (it sorts after every other field). It exists so a
+/// chain rewrite can re-emit a task at the same logical `start_time_ms` without
+/// colliding with the broker ack-tombstone left by the just-deleted prior key.
+/// No reader reconstructs it — point lookups use [`task_key_lookup_prefix`].
 pub fn task_key(
+    task_group: &str,
+    start_time_ms: i64,
+    priority: u8,
+    job_id: &str,
+    attempt: u32,
+    epoch_ms: i64,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::TASK,
+        &(
+            task_group,
+            start_time_ms.max(0) as u64,
+            priority,
+            job_id,
+            attempt,
+            epoch_ms.max(0) as u64,
+        ),
+    )
+}
+
+/// Prefix that uniquely identifies the at-most-one live task for a given
+/// `(task_group, start_time_ms, priority, job_id, attempt)`, omitting the
+/// trailing `epoch_ms`. Scanning `[P, end_bound(P))` yields that single task
+/// regardless of which `epoch_ms` it carries — the lookup path for callers that
+/// know a task's identity but not its (write-only) epoch.
+pub fn task_key_lookup_prefix(
     task_group: &str,
     start_time_ms: i64,
     priority: u8,
@@ -266,6 +298,8 @@ pub struct ParsedTaskKey {
     pub priority: u8,
     pub job_id: String,
     pub attempt: u32,
+    /// Write-time disambiguator; see [`task_key`]. Not part of task identity.
+    pub epoch_ms: u64,
 }
 
 /// Parse a task key back to its components.
@@ -273,14 +307,21 @@ pub fn parse_task_key(key: &[u8]) -> Option<ParsedTaskKey> {
     if key.first() != Some(&prefix::TASK) {
         return None;
     }
-    let (task_group, start_time_ms, priority, job_id, attempt): (String, u64, u8, String, u32) =
-        decode(&key[1..]).ok()?;
+    let (task_group, start_time_ms, priority, job_id, attempt, epoch_ms): (
+        String,
+        u64,
+        u8,
+        String,
+        u32,
+        u64,
+    ) = decode(&key[1..]).ok()?;
     Some(ParsedTaskKey {
         task_group,
         start_time_ms,
         priority,
         job_id,
         attempt,
+        epoch_ms,
     })
 }
 

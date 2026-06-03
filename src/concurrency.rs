@@ -970,13 +970,12 @@ impl ConcurrencyManager {
         // request record / RequestTicket task so `process_grants` can later
         // skip future-dated requests.
         scheduled_at_ms: i64,
-        // Time component for every `task_key` / `concurrency_request_key` this
-        // call writes. For a fresh enqueue this equals `scheduled_at_ms`. For
-        // a chain *resume* this is `now_ms`, so the resumed task can't
-        // collide with a broker tombstone pinned by an earlier ack-delete at
-        // `task_key(scheduled_at_ms, …)`. See
+        // Write-time disambiguator for the trailing `epoch_ms` of any `task_key`
+        // this call writes (only the future-`RequestTicket` branch writes one).
+        // It does not affect broker ordering; it only keeps a rewritten task_key
+        // distinct from the broker tombstone of a just-deleted predecessor. See
         // `project_broker_tombstone_chain_continuation`.
-        task_key_start_ms: i64,
+        task_key_epoch_ms: i64,
         now_ms: i64,
         limits: &[ConcurrencyLimit],
         task_group: &str,
@@ -1076,17 +1075,10 @@ impl ConcurrencyManager {
             // as any prior holders accumulated by the chain (avoiding the
             // task_id mismatch that used to orphan earlier grants).
             //
-            // For a future-scheduled enqueue the broker must see this task
-            // at the user-requested time, so `task_key_start_ms ==
-            // scheduled_at_ms` on this branch. (No call site sets them apart
-            // here — resume goes through the request branch above.) If a
-            // future call site ever passes them apart, the persisted
-            // `start_time_ms` and the `task_key` would disagree and the
-            // broker would notice.
-            debug_assert_eq!(
-                scheduled_at_ms, task_key_start_ms,
-                "future RequestTicket: task_key_start_ms must equal scheduled_at_ms"
-            );
+            // For a future-scheduled enqueue the broker must see this task at
+            // the user-requested time: the `task_key` start component is
+            // `scheduled_at_ms`, matching the persisted `start_time_ms` below.
+            // `task_key_epoch_ms` is only the trailing disambiguator.
             let ticket = Task::RequestTicket {
                 queue: queue.clone(),
                 start_time_ms: scheduled_at_ms,
@@ -1105,10 +1097,11 @@ impl ConcurrencyManager {
             writer.put(
                 task_key(
                     task_group,
-                    task_key_start_ms,
+                    scheduled_at_ms,
                     priority,
                     job_id,
                     attempt_number,
+                    task_key_epoch_ms,
                 ),
                 &ticket_value,
             )?;

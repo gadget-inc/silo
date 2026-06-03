@@ -2668,6 +2668,160 @@ async fn two_concurrency_limits_chain_resumes_correctly() {
     );
 }
 
+/// Scan a task group's keyspace for the (single) pending RunAttempt task of
+/// `job_id` and return its parsed task key. Returns `None` if no such task is
+/// currently in the DB queue.
+async fn find_run_attempt_task_key(
+    shard: &std::sync::Arc<silo::job_store_shard::JobStoreShard>,
+    task_group: &str,
+    job_id: &str,
+) -> Option<silo::keys::ParsedTaskKey> {
+    let prefix = silo::keys::task_group_prefix(task_group);
+    let end = silo::keys::end_bound(&prefix);
+    let mut iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(prefix..end, &silo::scan_options())
+        .await
+        .ok()?;
+    while let Ok(Some(kv)) = iter.next().await {
+        if let Ok(Task::RunAttempt { job_id: jid, .. }) = decode_task(&kv.value)
+            && jid == job_id
+        {
+            return silo::keys::parse_task_key(&kv.key);
+        }
+    }
+    None
+}
+
+/// Regression for the granted-RunAttempt back-of-queue leak (env-10000042940).
+///
+/// When the grant scanner resumes a waiting job's limit-chain, the terminal
+/// `RunAttempt` must be written at a task_key whose `start_time_ms` is the job's
+/// ORIGINAL scheduled time — not the grant time. The chain resumer historically
+/// bumped `task_key_start_ms` to `now_ms` to dodge the broker's ack tombstone,
+/// which shoved freshly-granted RunAttempts to the back of the broker's
+/// start-time-ordered scan. Behind a wall of old, ungrantable RequestTickets the
+/// capped scan never reached them, so they never ran, never released their
+/// holders, and wedged the whole tenant.
+#[silo::test]
+async fn granted_run_attempt_keeps_original_start_time() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    // Original schedule is well in the past, so a grant-time (now_ms) stamp is
+    // unmistakably distinguishable from the scheduled-time stamp.
+    let old_start = now_ms() - 3_600_000; // 1h ago
+    let queue_a = "oldstart-a".to_string();
+    let queue_b = "oldstart-b".to_string();
+    let limits = |n: i64| {
+        (
+            n,
+            vec![
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_a.clone(),
+                    max_concurrency: 1,
+                }),
+                Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: queue_b.clone(),
+                    max_concurrency: 1,
+                }),
+            ],
+        )
+    };
+
+    // job1 holds both A and B (both limits capped at 1).
+    let (_, l1) = limits(1);
+    let _job1 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            old_start,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            l1,
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job1");
+    let job1_tasks = shard.dequeue("w1", "default", 1).await.unwrap().tasks;
+    assert_eq!(job1_tasks.len(), 1);
+    let job1_task_id = job1_tasks[0].attempt().task_id().to_string();
+
+    // job2 waits on A, scheduled at the SAME old start time.
+    let (_, l2) = limits(2);
+    let job2 = shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            old_start,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            l2,
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job2");
+
+    // Release job1 — the grant scanner resumes job2's chain across A and B and
+    // writes job2's terminal RunAttempt into the task keyspace.
+    shard
+        .report_attempt_outcome(&job1_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report job1 success");
+
+    // Poll until job2's terminal RunAttempt appears in the DB (grant scanner is
+    // async). Inspect it in place — do NOT dequeue it, or it leaves the keyspace.
+    let mut parsed = None;
+    for _ in 0..50 {
+        if let Some(p) = find_run_attempt_task_key(&shard, "default", &job2).await {
+            parsed = Some(p);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let parsed = parsed.expect("job2's terminal RunAttempt should be written after job1 completes");
+
+    // THE INVARIANT: the granted RunAttempt keeps its original scheduled start
+    // time. Pre-fix this is ~now_ms (≈1h after old_start), pushing it to the
+    // back of the broker scan.
+    assert_eq!(
+        parsed.start_time_ms, old_start as u64,
+        "granted RunAttempt must keep the job's original scheduled start_time \
+         ({old_start}); got {} (≈grant time = back of the broker queue)",
+        parsed.start_time_ms
+    );
+
+    // Sanity: it must also actually be runnable and hold both queues.
+    let mut job2_tasks = vec![];
+    for _ in 0..50 {
+        let t = shard.dequeue("w2", "default", 1).await.unwrap().tasks;
+        if !t.is_empty() {
+            job2_tasks = t;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(job2_tasks.len(), 1, "job2 should be dequeuable");
+    let job2_task_id = job2_tasks[0].attempt().task_id().to_string();
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&job2_task_id))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let held = silo::codec::decode_lease(lease_bytes)
+        .expect("decode lease")
+        .held_queues();
+    assert!(
+        held.iter().any(|q| q == &queue_a) && held.iter().any(|q| q == &queue_b),
+        "job2 must hold both A and B; got {:?}",
+        held
+    );
+}
+
 /// When the chain resumer hits a STILL-FULL downstream concurrency limit, it
 /// must write a fresh deferred request rather than fabricating a RunAttempt.
 /// The fresh request must carry the partial chain state (limit_index pointing

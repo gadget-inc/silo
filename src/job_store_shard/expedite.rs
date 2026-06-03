@@ -9,7 +9,8 @@ use crate::codec::decode_task_validated;
 use crate::fb::silo::fb;
 use crate::job::JobStatusKind;
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, find_task_by_identity, load_job_view, now_epoch_ms,
+    retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{job_cancelled_key, job_status_key, task_key};
@@ -122,9 +123,18 @@ impl JobStoreShard {
             })
         })?;
 
-        let old_task_key = task_key(&task_group, start_time_ms, priority, id, attempt_number);
-        let maybe_task_raw = txn.get(&old_task_key).await?;
-        let Some(task_raw) = maybe_task_raw else {
+        // Locate the pending task by identity (the trailing epoch_ms is
+        // write-only, so we prefix-scan instead of reconstructing the exact key).
+        let Some((old_task_key, task_raw)) = find_task_by_identity(
+            &txn,
+            &task_group,
+            start_time_ms,
+            priority,
+            id,
+            attempt_number,
+        )
+        .await?
+        else {
             return Err(JobStoreShardError::JobNotExpediteable(
                 JobNotExpediteableError {
                     job_id: id.to_string(),
@@ -161,9 +171,9 @@ impl JobStoreShard {
         // Delete the old task key
         txn.delete(&old_task_key)?;
 
-        // Create new task key with current timestamp
+        // Create new task key with current timestamp (epoch = write time).
         // Raw byte passthrough: task data is identical, only the key changes
-        let new_task_key = task_key(&task_group, now_ms, priority, id, attempt_number);
+        let new_task_key = task_key(&task_group, now_ms, priority, id, attempt_number, now_ms);
         txn.put(&new_task_key, decoded.as_bytes())?;
 
         // Update job status with new start time (keeping same attempt number)

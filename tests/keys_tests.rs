@@ -18,29 +18,36 @@ fn test_job_info_key_roundtrip() {
 
 #[test]
 fn test_task_key_roundtrip() {
-    let key = task_key("group1", 1000, 10, "job123", 1);
+    let key = task_key("group1", 1000, 10, "job123", 1, 1234);
     let parsed = parse_task_key(&key).unwrap();
     assert_eq!(parsed.task_group, "group1");
     assert_eq!(parsed.start_time_ms, 1000);
     assert_eq!(parsed.priority, 10);
     assert_eq!(parsed.job_id, "job123");
     assert_eq!(parsed.attempt, 1);
+    assert_eq!(parsed.epoch_ms, 1234);
 }
 
 #[test]
 fn test_task_key_ordering() {
-    // Tasks should sort by task_group, then time, then priority
-    let key1 = task_key("group1", 1000, 10, "job1", 1);
-    let key2 = task_key("group1", 1001, 10, "job2", 1);
-    let key3 = task_key("group1", 1000, 20, "job3", 1);
-    let key4 = task_key("group2", 500, 5, "job4", 1);
+    // Tasks should sort by task_group, then time, then priority. epoch_ms is the
+    // trailing field and must NOT perturb any of those orderings.
+    let key1 = task_key("group1", 1000, 10, "job1", 1, 9999);
+    let key2 = task_key("group1", 1001, 10, "job2", 1, 0);
+    let key3 = task_key("group1", 1000, 20, "job3", 1, 0);
+    let key4 = task_key("group2", 500, 5, "job4", 1, 0);
 
     // group1 < group2
     assert!(key1 < key4);
-    // Same group, earlier time comes first
+    // Same group, earlier time comes first (even with a larger epoch_ms)
     assert!(key1 < key2);
-    // Same group and time, lower priority comes first
+    // Same group and time, lower priority comes first (even with larger epoch_ms)
     assert!(key1 < key3);
+
+    // epoch_ms only breaks ties among otherwise-identical keys, and sorts last.
+    let early_epoch = task_key("group1", 1000, 10, "job1", 1, 100);
+    let late_epoch = task_key("group1", 1000, 10, "job1", 1, 200);
+    assert!(early_epoch < late_epoch);
 }
 
 #[test]
@@ -93,14 +100,14 @@ fn test_prefix_scanning() {
 
 #[test]
 fn test_task_group_prefix_scanning() {
-    let key1 = task_key("mygroup", 1000, 10, "job1", 1);
-    let key2 = task_key("mygroup", 2000, 20, "job2", 2);
+    let key1 = task_key("mygroup", 1000, 10, "job1", 1, 0);
+    let key2 = task_key("mygroup", 2000, 20, "job2", 2, 0);
     let prefix = task_group_prefix("mygroup");
 
     assert!(key1.starts_with(&prefix));
     assert!(key2.starts_with(&prefix));
 
-    let key3 = task_key("othergroup", 1000, 10, "job3", 1);
+    let key3 = task_key("othergroup", 1000, 10, "job3", 1, 0);
     assert!(!key3.starts_with(&prefix));
 }
 
@@ -427,9 +434,26 @@ fn test_parse_empty_slice_returns_none() {
 fn test_large_numeric_values() {
     // Test with large timestamp values near u64::MAX
     let large_time: i64 = i64::MAX;
-    let key = task_key("group", large_time, 255, "job", u32::MAX);
+    let key = task_key("group", large_time, 255, "job", u32::MAX, large_time);
     let parsed = parse_task_key(&key).unwrap();
     assert_eq!(parsed.start_time_ms, large_time as u64);
     assert_eq!(parsed.priority, 255);
     assert_eq!(parsed.attempt, u32::MAX);
+    assert_eq!(parsed.epoch_ms, large_time as u64);
+}
+
+#[test]
+fn test_task_key_lookup_prefix_matches_any_epoch() {
+    // The identity prefix (omitting epoch_ms) must be a proper prefix of the
+    // full key regardless of which epoch_ms the task carries — that's what lets
+    // status-driven lookups find a task without knowing its epoch.
+    let prefix = silo::keys::task_key_lookup_prefix("group1", 1000, 10, "job123", 1);
+    let key_a = task_key("group1", 1000, 10, "job123", 1, 0);
+    let key_b = task_key("group1", 1000, 10, "job123", 1, 9_999_999);
+    assert!(key_a.starts_with(&prefix));
+    assert!(key_b.starts_with(&prefix));
+
+    // A different identity must NOT match the prefix.
+    let other = task_key("group1", 1000, 10, "job124", 1, 0);
+    assert!(!other.starts_with(&prefix));
 }

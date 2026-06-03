@@ -31,11 +31,16 @@ impl JobStoreShard {
         priority: u8,
         held_queues: &[String],
         retry_at_ms: i64,
-        parent_start_time_ms: i64,
+        parent_epoch_ms: i64,
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
-        let task_key_start_ms =
-            rate_limit_retry_task_key_start_ms(retry_at_ms, parent_start_time_ms);
+        // The retry's task_key keeps `retry_at_ms` as its start time (the broker
+        // must dispatch it after the backoff). `handle_check_rate_limit`
+        // ack-deleted the parent CheckRateLimit, installing a broker tombstone at
+        // its task_key; every other key component is identical to the parent's,
+        // so we dodge it with an `epoch_ms` strictly past the parent's. This
+        // holds even for zero backoff (`retry_at_ms == parent_start_time_ms`).
+        let task_key_epoch_ms = rate_limit_retry_epoch_ms(parent_epoch_ms);
         let retry_task = Task::CheckRateLimit {
             task_id: task_id.to_string(),
             tenant: tenant.to_string(),
@@ -53,10 +58,11 @@ impl JobStoreShard {
         put_task(
             writer,
             task_group,
-            task_key_start_ms,
+            retry_at_ms,
             priority,
             job_id,
             attempt_number,
+            task_key_epoch_ms,
             &retry_task,
         )
     }
@@ -109,61 +115,32 @@ impl JobStoreShard {
     }
 }
 
-/// Compute the `task_key_start_ms` for a rate-limit retry given the
-/// caller's requested `retry_at_ms` and the parent CheckRateLimit's
-/// `start_time_ms` (the value baked into the just-tombstoned task_key).
+/// Compute the trailing `epoch_ms` for a rate-limit retry's task_key.
 ///
-/// `handle_check_rate_limit` ack-deletes the parent CheckRateLimit's
-/// task_key, which installs a broker tombstone keyed by
-/// `(task_group, parent_start_time_ms, priority, job_id, attempt_number)`.
-/// All other components of the retry's task_key are identical to the
-/// parent's; the only differentiator is `start_time_ms`. If
-/// `retry_at_ms == parent_start_time_ms` — possible with zero/near-zero
-/// backoff, or with `reset_time_ms == parent.start_time_ms` — the retry
-/// write would land on the tombstoned key and be silently suppressed,
-/// stalling the chain and stranding every `held_queues` entry. Bumping
-/// past the parent by one millisecond costs nothing on the broker's
-/// dispatch ordering and makes the dodge unconditional.
+/// `handle_check_rate_limit` ack-deletes the parent CheckRateLimit's task_key,
+/// installing a broker tombstone keyed by the FULL key bytes
+/// `(task_group, start_time_ms, priority, job_id, attempt_number, epoch_ms)`.
+/// The retry keeps `retry_at_ms` as its start time (so the broker dispatches it
+/// after the backoff) and reuses the same task_group/priority/job_id/attempt, so
+/// the only field free to disambiguate from the tombstone is `epoch_ms`. One
+/// past the parent's epoch makes the dodge unconditional — even for zero backoff
+/// where `retry_at_ms == parent_start_time_ms`.
 ///
-/// Extracted as a free function so the invariant can be unit-tested
-/// without spinning up a `JobStoreShard`.
-pub(crate) fn rate_limit_retry_task_key_start_ms(
-    retry_at_ms: i64,
-    parent_start_time_ms: i64,
-) -> i64 {
-    retry_at_ms.max(parent_start_time_ms + 1)
+/// Extracted as a free function so the invariant can be unit-tested without
+/// spinning up a `JobStoreShard`.
+pub(crate) fn rate_limit_retry_epoch_ms(parent_epoch_ms: i64) -> i64 {
+    parent_epoch_ms + 1
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rate_limit_retry_task_key_start_ms;
+    use super::rate_limit_retry_epoch_ms;
 
     #[test]
-    fn equal_retry_and_parent_bumps_by_one() {
-        // The exact collision case: zero backoff with the dequeue happening
-        // in the same millisecond as the parent's start_time_ms.
-        assert_eq!(rate_limit_retry_task_key_start_ms(100, 100), 101);
-    }
-
-    #[test]
-    fn retry_before_parent_jumps_to_parent_plus_one() {
-        // Clock skew or a Gubernator reset_time pointing at an earlier
-        // millisecond than the parent's start. Still must dodge the
-        // tombstone.
-        assert_eq!(rate_limit_retry_task_key_start_ms(50, 100), 101);
-    }
-
-    #[test]
-    fn retry_strictly_after_parent_is_unchanged() {
-        // The common case: backoff > 0 carries retry_at_ms past the parent.
-        // No bump needed.
-        assert_eq!(rate_limit_retry_task_key_start_ms(200, 100), 200);
-    }
-
-    #[test]
-    fn retry_one_past_parent_is_unchanged() {
-        // Boundary: retry_at_ms is exactly parent + 1. The `max` returns
-        // retry_at_ms unchanged; no double-bump.
-        assert_eq!(rate_limit_retry_task_key_start_ms(101, 100), 101);
+    fn retry_epoch_is_one_past_parent() {
+        // The retry's task_key reuses the parent's start_time (and every other
+        // component); a strictly-greater epoch dodges the parent's tombstone.
+        assert_eq!(rate_limit_retry_epoch_ms(100), 101);
+        assert_eq!(rate_limit_retry_epoch_ms(0), 1);
     }
 }
