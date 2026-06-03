@@ -143,4 +143,26 @@ mod tests {
         assert_eq!(rate_limit_retry_epoch_ms(100), 101);
         assert_eq!(rate_limit_retry_epoch_ms(0), 1);
     }
+
+    #[test]
+    fn retry_epoch_strictly_increases_across_a_multi_hop_chain() {
+        // A rate-limited job can retry many times. Each hop feeds the prior
+        // hop's epoch back through this function (handle_check_rate_limit parses
+        // the parent CheckRateLimit's key and passes its `epoch_ms`), so the
+        // chain's epochs must form a strictly increasing sequence. Under zero
+        // backoff every hop reuses the same `start_time`, so this epoch growth is
+        // the *only* thing keeping each retry clear of the previous hop's broker
+        // ack-tombstone — a single non-increasing step would silently suppress a
+        // retry and strand the chain's held_queues.
+        let mut epoch = 7; // arbitrary starting epoch from the initial CheckRateLimit
+        for _ in 0..10 {
+            let next = rate_limit_retry_epoch_ms(epoch);
+            assert!(
+                next > epoch,
+                "retry epoch must strictly exceed the parent's: {next} !> {epoch}",
+            );
+            epoch = next;
+        }
+        assert_eq!(epoch, 17, "10 hops from epoch 7 should land at 17");
+    }
 }
