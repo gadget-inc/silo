@@ -2333,8 +2333,8 @@ impl Scan for TasksScanner {
                     ..
                 } => {
                     let start = if let Some(lower) = start_time_lower {
-                        // Encode a key with the lower time bound (priority=0, empty job_id, attempt=0)
-                        crate::keys::task_key(task_group, *lower, 0, "", 0)
+                        // Encode a key with the lower time bound (priority=0, empty job_id, attempt=0, epoch=0)
+                        crate::keys::task_key(task_group, *lower, 0, "", 0, 0)
                     } else {
                         crate::keys::task_group_prefix(task_group)
                     };

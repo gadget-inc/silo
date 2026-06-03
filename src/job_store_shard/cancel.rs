@@ -6,13 +6,13 @@ use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellati
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, put_with_optional_expire,
-    retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms,
+    put_with_optional_expire, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     concurrency_holder_key, concurrency_request_job_prefix, concurrency_requester_counter_key,
-    end_bound, job_cancelled_key, job_info_key, job_status_key, task_key,
+    end_bound, job_cancelled_key, job_info_key, job_status_key,
 };
 use crate::task::Task;
 
@@ -145,17 +145,26 @@ impl JobStoreShard {
                 let priority = job_view.priority();
                 let limits = job_view.limits();
 
-                // Try O(1) task key reconstruction from status fields
+                // Locate the pending task by identity (the trailing epoch_ms is
+                // write-only, so we prefix-scan instead of reconstructing the
+                // exact key).
                 let attempt_number = status.current_attempt.unwrap_or(1);
                 let start_time_ms = status.next_attempt_starts_after_ms.unwrap_or(0);
-                let computed_key =
-                    task_key(&task_group, start_time_ms, priority, id, attempt_number);
-                let task_found = match txn.get(&computed_key).await? {
-                    Some(raw) => Some((computed_key, raw)),
+                let task_found = match find_task_by_identity(
+                    &txn,
+                    &task_group,
+                    start_time_ms,
+                    priority,
+                    id,
+                    attempt_number,
+                )
+                .await?
+                {
+                    Some(found) => Some(found),
                     None => {
                         // Fallback: try with time=0 (immediate scheduling case)
-                        let zero_key = task_key(&task_group, 0, priority, id, attempt_number);
-                        txn.get(&zero_key).await?.map(|raw| (zero_key, raw))
+                        find_task_by_identity(&txn, &task_group, 0, priority, id, attempt_number)
+                            .await?
                     }
                 };
 

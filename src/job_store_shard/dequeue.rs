@@ -766,19 +766,24 @@ impl JobStoreShard {
         let mut new_held = stored_held_queues;
         new_held.push(queue.clone());
 
-        // task_key is `(task_group, start_time_ms, priority, job_id,
-        // attempt_number)`. The chain continues with the same task_group,
-        // priority, job_id, and attempt_number, so the *only* differentiator
-        // versus the just-tombstoned parent key is start_time_ms. `now_ms`
-        // usually exceeds the parent's start_time_ms, but for a worker that
-        // processes a future-scheduled ticket in the same millisecond it
-        // becomes ready, the two could collide and the follow-up would be
-        // silently suppressed. Bump past the parent to make the dodge
-        // unconditional.
-        let parent_start_time_ms = parse_task_key(task_key)
+        // The continuation keeps the ticket's original `start_time_ms` as its
+        // broker-ordering start time. A just-granted ticket has already waited;
+        // re-stamping it at `now_ms` would shove the holder-bearing follow-up to
+        // the back of the broker's start-time-ordered scan, where a capped scan
+        // may never reach it — the granted-RunAttempt back-of-queue leak
+        // (the production back-of-queue wedge incident). The tombstone dodge
+        // for the just-deleted ticket's task_key moves to the trailing
+        // `epoch_ms`: all other key components
+        // (task_group, priority, job_id, attempt_number) are constant within a
+        // chain, so a fresh `epoch_ms` strictly past the parent's makes the
+        // follow-up key unique even when it reuses the parent's start_time.
+        let parent = parse_task_key(task_key);
+        let parent_start_time_ms = parent
+            .as_ref()
             .map(|p| p.start_time_ms as i64)
             .unwrap_or(now_ms);
-        let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
+        let parent_epoch_ms = parent.as_ref().map(|p| p.epoch_ms as i64).unwrap_or(0);
+        let task_key_epoch_ms = now_ms.max(parent_epoch_ms + 1);
 
         let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
         let chain_result = self
@@ -793,13 +798,10 @@ impl JobStoreShard {
                     limit_index: (limit_index + 1) as usize,
                     limits: &limits,
                     priority: rt.priority(),
-                    // Future-scheduled `RequestTicket` was just granted; the
-                    // chain is past its scheduled time. Use `now_ms` for
-                    // `scheduled_at_ms`; `task_key_start_ms` may need a +1
-                    // bump versus the parent to dodge the broker tombstone
-                    // for the just-deleted ticket.
-                    scheduled_at_ms: new_task_key_start_ms,
-                    task_key_start_ms: new_task_key_start_ms,
+                    // Keep the original scheduled start (the ticket's key start);
+                    // dodge the just-deleted ticket's tombstone via epoch.
+                    scheduled_at_ms: parent_start_time_ms,
+                    task_key_epoch_ms,
                     now_ms,
                     held_queues: new_held,
                     task_group: &req_task_group,
@@ -873,12 +875,16 @@ impl JobStoreShard {
         state.batch.delete(task_key);
         state.ack_deleted(task_key);
 
-        // Parent task_key's start_time_ms — needed by both the success and
-        // retry branches to bump their follow-up task_key past the
-        // tombstone we just installed.
-        let parent_start_time_ms = parse_task_key(task_key)
+        // Parent task_key's start_time_ms / epoch_ms. Both the success and retry
+        // branches keep the parent's start_time (so the follow-up keeps its
+        // broker-ordering position) and dodge the tombstone we just installed via
+        // a fresh `epoch_ms` strictly past the parent's.
+        let parent = parse_task_key(task_key);
+        let parent_start_time_ms = parent
+            .as_ref()
             .map(|p| p.start_time_ms as i64)
             .unwrap_or(now_ms);
+        let parent_epoch_ms = parent.as_ref().map(|p| p.epoch_ms as i64).unwrap_or(0);
 
         // Terminal-status short-circuit. Symmetric with handle_request_ticket:
         // if the job is Succeeded/Failed/Cancelled there's no point calling
@@ -947,11 +953,10 @@ impl JobStoreShard {
         match rate_limit_result {
             Ok(result) if result.under_limit => {
                 // Rate limit passed! Proceed to next limit or RunAttempt.
-                // Same-millisecond tombstone dodge as handle_request_ticket:
-                // bump task_key_start_ms past the parent if necessary so
-                // the follow-up key cannot collide with the just-deleted
-                // CheckRateLimit's task_key.
-                let new_task_key_start_ms = now_ms.max(parent_start_time_ms + 1);
+                // Keep the parent's start_time so the follow-up retains its
+                // broker-ordering position; dodge the just-deleted
+                // CheckRateLimit's tombstone via a fresh `epoch_ms`.
+                let task_key_epoch_ms = now_ms.max(parent_epoch_ms + 1);
                 let chain_result = self
                     .enqueue_limit_task_at_index(
                         &mut DbWriteBatcher::new(&self.db, &mut state.batch),
@@ -964,8 +969,8 @@ impl JobStoreShard {
                             limit_index: (limit_index + 1) as usize,
                             limits: &job_view.limits(),
                             priority,
-                            scheduled_at_ms: new_task_key_start_ms,
-                            task_key_start_ms: new_task_key_start_ms,
+                            scheduled_at_ms: parent_start_time_ms,
+                            task_key_epoch_ms,
                             now_ms,
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,
@@ -1038,7 +1043,7 @@ impl JobStoreShard {
                     priority,
                     held_queues,
                     retry_backoff,
-                    parent_start_time_ms,
+                    parent_epoch_ms,
                     check_task_group,
                 )?;
             }
@@ -1059,7 +1064,7 @@ impl JobStoreShard {
                     priority,
                     held_queues,
                     retry_backoff,
-                    parent_start_time_ms,
+                    parent_epoch_ms,
                     check_task_group,
                 )?;
             }
@@ -1297,7 +1302,7 @@ mod claimed_inflight_guard_tests {
             held_queues: vec![],
             task_group: task_group.to_string(),
         };
-        let key = crate::keys::task_key(task_group, 1, 0, job_id, 1);
+        let key = crate::keys::task_key(task_group, 1, 0, job_id, 1, 1);
         let decoded = decode_task_validated(encode_task(&task)).expect("decode task");
         BrokerTask { key, decoded }
     }

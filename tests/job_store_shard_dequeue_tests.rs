@@ -607,6 +607,26 @@ async fn dequeue_ignores_recently_acked_task_keys() {
             .await
             .expect("enqueue");
 
+        // Capture the actual task key before dequeue. Its trailing `epoch_ms` is
+        // assigned at enqueue time (a write-only disambiguator), so we can't
+        // reconstruct it — read it from the queue so we reinject the SAME key the
+        // dequeue will ack-delete (and thus tombstone).
+        let real_key = {
+            let prefix = silo::keys::task_group_prefix("default");
+            let end = silo::keys::end_bound(&prefix);
+            let mut iter = shard
+                .db()
+                .scan::<Vec<u8>, _>(prefix..end)
+                .await
+                .expect("scan tasks");
+            iter.next()
+                .await
+                .expect("iter")
+                .expect("task present before dequeue")
+                .key
+                .to_vec()
+        };
+
         let first = shard
             .dequeue("worker-1", "default", 1)
             .await
@@ -631,10 +651,9 @@ async fn dequeue_ignores_recently_acked_task_keys() {
             task_group: "default".to_string(),
         };
         let task_bytes = encode_task(&reinjected);
-        let task_key = silo::keys::task_key("default", 0, 1, &job_id, 1);
 
         let mut batch = WriteBatch::new();
-        batch.put(&task_key, &task_bytes);
+        batch.put(&real_key, &task_bytes);
         shard
             .db()
             .write(batch)

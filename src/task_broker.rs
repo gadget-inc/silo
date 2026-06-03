@@ -726,7 +726,7 @@ mod inflight_release_tests {
             held_queues: vec![],
             task_group: "tg".to_string(),
         };
-        let key = crate::keys::task_key("tg", 1, 0, job_id, 1);
+        let key = crate::keys::task_key("tg", 1, 0, job_id, 1, 1);
         let decoded = decode_task_validated(encode_task(&task)).expect("decode task");
         BrokerTask { key, decoded }
     }

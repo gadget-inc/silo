@@ -8,7 +8,7 @@ use crate::codec::encode_task;
 use crate::instrumented_db::{InstrumentedDb, InstrumentedDbIterator, InstrumentedDbTransaction};
 use crate::job::JobStatus;
 use crate::job_store_shard::JobStoreShardError;
-use crate::keys::{end_bound, task_key};
+use crate::keys::{end_bound, task_key, task_key_lookup_prefix};
 use crate::task::Task;
 
 /// A trait that abstracts over SlateDB's two ways of writing in groups: `WriteBatch` and `DbTransaction`.
@@ -239,6 +239,12 @@ pub fn now_epoch_ms() -> i64 {
 }
 
 /// Encode and write a task to a batch or transaction at the standard task key location.
+///
+/// `time_ms` is the logical start time (governs broker ordering); `epoch_ms` is
+/// the write-time disambiguator that lets a chain rewrite dodge the broker
+/// ack-tombstone of a just-deleted predecessor without perturbing ordering. See
+/// [`crate::keys::task_key`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn put_task<W: WriteBatcher>(
     writer: &mut W,
     task_group: &str,
@@ -246,14 +252,42 @@ pub(crate) fn put_task<W: WriteBatcher>(
     priority: u8,
     job_id: &str,
     attempt: u32,
+    epoch_ms: i64,
     task: &Task,
 ) -> Result<(), JobStoreShardError> {
     let task_value = encode_task(task);
     writer.put(
-        task_key(task_group, time_ms, priority, job_id, attempt),
+        task_key(task_group, time_ms, priority, job_id, attempt, epoch_ms),
         &task_value,
     )?;
     Ok(())
+}
+
+/// Find the single live task identified by
+/// `(task_group, start_time_ms, priority, job_id, attempt)`, ignoring the
+/// trailing write-time `epoch_ms`. Returns the task's full key bytes and encoded
+/// value, or `None` if absent.
+///
+/// Status-driven point lookups (lease, cancel, expedite, reimport) know a task's
+/// identity from `JobStatus` but not its `epoch_ms`, which is a write-only
+/// disambiguator (see [`crate::keys::task_key`]). Only one chain task is ever
+/// live per `(job_id, attempt)` — a rewrite deletes the old key and writes the
+/// new one in the same batch — so this prefix scan returns at most one row.
+pub(crate) async fn find_task_by_identity(
+    txn: &InstrumentedDbTransaction,
+    task_group: &str,
+    start_time_ms: i64,
+    priority: u8,
+    job_id: &str,
+    attempt: u32,
+) -> Result<Option<(Vec<u8>, Bytes)>, JobStoreShardError> {
+    let prefix = task_key_lookup_prefix(task_group, start_time_ms, priority, job_id, attempt);
+    let end = end_bound(&prefix);
+    let mut iter = txn.scan::<Vec<u8>, _>(prefix..end).await?;
+    match iter.next().await? {
+        Some(kv) => Ok(Some((kv.key.to_vec(), kv.value))),
+        None => Ok(None),
+    }
 }
 
 /// Retry an operation that may fail with a SlateDB transaction conflict.

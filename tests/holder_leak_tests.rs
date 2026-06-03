@@ -355,7 +355,14 @@ async fn check_rate_limit_max_retries_releases_held_queues() {
         held_queues: vec![queue.to_string()],
         task_group: task_group.to_string(),
     };
-    let crl_key = task_key(task_group, now_ms(), priority, &job_id, attempt_number);
+    let crl_key = task_key(
+        task_group,
+        now_ms(),
+        priority,
+        &job_id,
+        attempt_number,
+        now_ms(),
+    );
     shard
         .db()
         .put(&crl_key, &encode_task(&crl))
@@ -448,7 +455,14 @@ async fn check_rate_limit_missing_job_info_releases_held_queues() {
         held_queues: vec![queue.to_string()],
         task_group: task_group.to_string(),
     };
-    let crl_key = task_key(task_group, now_ms(), priority, &job_id, attempt_number);
+    let crl_key = task_key(
+        task_group,
+        now_ms(),
+        priority,
+        &job_id,
+        attempt_number,
+        now_ms(),
+    );
     shard
         .db()
         .put(&crl_key, &encode_task(&crl))
@@ -693,29 +707,30 @@ async fn floating_concurrency_steady_state_zero_holders_after_full_cycle() {
     );
 }
 
-/// Regression test for the broker-tombstone collision in process_grants' chain
-/// resumer.
+/// Regression test for the broker-tombstone dodge in process_grants' chain
+/// resumer — and for the back-of-queue leak that the original dodge caused.
 ///
-/// Before the fix, `ShardChainResumer::resume_chain` re-emitted the resumed
-/// chain's `RunAttempt` task at `task_key(params.start_at_ms, …)` — the same
-/// task_key the original enqueue's chain had written (and the same batch had
-/// then deleted) when the job first queued. If the broker's scan happened to
-/// observe the interim RunAttempt before the delete won in the LSM, a worker
-/// could lease and ack-delete it, installing a tombstone for that task_key.
-/// The resumed chain's subsequent write at the same key was then silently
-/// suppressed, stranding the holders the resumer had just granted.
+/// `ShardChainResumer::resume_chain` re-emits the resumed chain's terminal
+/// `RunAttempt`. It must dodge the broker tombstone of any interim chain task
+/// that was claimed and ack-deleted at the same task_key — otherwise the write
+/// is silently suppressed and the holders the resumer just granted are stranded.
 ///
-/// The fix lands the resumed task at `task_key(now_ms, …)` so the broker
-/// tombstone for the original key cannot suppress it — mirroring the
-/// long-standing precedent in `handle_request_ticket`. See
+/// The original dodge bumped the task_key's `start_time_ms` to `now_ms`. That
+/// dodged the tombstone but shoved the holder-bearing RunAttempt to the back of
+/// the broker's start-time-ordered scan; under load a capped scan never reached
+/// it, so it never ran, never released its slot, and wedged the tenant (the
+/// production back-of-queue wedge incident). The fix keeps the job's ORIGINAL
+/// `start_at_ms` as the task_key start time (so it sorts by its true schedule)
+/// and moves the dodge to the trailing write-only `epoch_ms`. See
 /// `project_broker_tombstone_chain_continuation`.
 ///
-/// This test pins down the simpler invariant the fix introduces: after a
-/// queued job is granted by `process_grants`, its terminal `RunAttempt` lives
-/// at a `task_key` whose `start_time_ms` is strictly greater than the job's
-/// original enqueue `start_at_ms`, provided enough wall-clock has passed.
+/// This test pins both halves of that invariant: after a queued job is granted
+/// by `process_grants`, its terminal `RunAttempt` lives at a `task_key` whose
+/// `start_time_ms` equals the original enqueue `start_at_ms`, while its
+/// `epoch_ms` is strictly greater (the tombstone dodge), provided enough
+/// wall-clock has passed.
 #[silo::test]
-async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
+async fn resume_chain_writes_run_attempt_at_original_start_with_fresh_epoch() {
     use silo::job::ConcurrencyLimit;
     use silo::keys::{parse_task_key, tasks_prefix};
 
@@ -794,7 +809,7 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
     // Poll for B's RunAttempt task to appear; the grant scanner runs
     // asynchronously after the release.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut b_task_start_time_ms: Option<u64> = None;
+    let mut b_task: Option<silo::keys::ParsedTaskKey> = None;
     while std::time::Instant::now() < deadline {
         let start = tasks_prefix();
         let end = silo::keys::end_bound(&start);
@@ -810,34 +825,37 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
             };
             // The leased Job A's task_key has already been ack-deleted, so any
             // surviving task at this point is Job B's resumed RunAttempt.
-            found = Some(parsed.start_time_ms);
+            found = Some(parsed);
             break;
         }
-        if let Some(t) = found {
-            b_task_start_time_ms = Some(t);
+        if found.is_some() {
+            b_task = found;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    let b_start = b_task_start_time_ms
-        .expect("grant scanner failed to write Job B's RunAttempt within the deadline");
+    let b_task =
+        b_task.expect("grant scanner failed to write Job B's RunAttempt within the deadline");
+    let b_start = b_task.start_time_ms;
 
-    assert!(
-        b_start >= before_release_ms as u64,
-        "resumed chain must write at task_key(now_ms, …), not at the original \
-         enqueue's start_at_ms — got start_time_ms={} which is not >= now-at-release={}. \
-         A regression here re-introduces the broker-tombstone collision tracked in \
-         project_broker_tombstone_chain_continuation.",
-        b_start,
-        before_release_ms,
+    assert_eq!(
+        b_start, original_enqueue_ms as u64,
+        "resumed RunAttempt must keep the job's ORIGINAL start_at_ms as its \
+         task_key start_time so it sorts by its true schedule — got start_time_ms={} \
+         vs original={}. A regression to now_ms here re-introduces the \
+         back-of-queue leak (the production back-of-queue wedge incident).",
+        b_start, original_enqueue_ms,
     );
     assert!(
-        b_start > original_enqueue_ms as u64,
-        "resumed RunAttempt's task_key still encodes the original enqueue time \
-         ({}), so any tombstone planted at that key would silently suppress this \
-         task — exactly the leak the fix is meant to prevent.",
-        original_enqueue_ms,
+        b_task.epoch_ms >= before_release_ms as u64,
+        "resumed RunAttempt must carry a fresh epoch_ms (the tombstone dodge) \
+         strictly past the interim task's epoch — got epoch_ms={} which is not \
+         >= now-at-release={}. Without this the broker tombstone for the \
+         interim key would silently suppress this task. See \
+         project_broker_tombstone_chain_continuation.",
+        b_task.epoch_ms,
+        before_release_ms,
     );
 
     let b_status = shard
@@ -849,7 +867,8 @@ async fn resume_chain_writes_run_attempt_at_now_not_original_start_at_ms() {
     assert_eq!(
         b_status.next_attempt_starts_after_ms,
         Some(b_start as i64),
-        "Scheduled status must point at the retargeted resumed RunAttempt key"
+        "Scheduled status must point at the resumed RunAttempt's start_time \
+         (the original schedule) so status-derived lookups locate it"
     );
 
     shard

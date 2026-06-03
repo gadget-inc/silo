@@ -135,7 +135,8 @@ impl JobStoreShard {
             now_ms,
             0, // highest priority for refresh tasks
             &synthetic_job_id,
-            0, // attempt not used for refresh tasks
+            0,      // attempt not used for refresh tasks
+            now_ms, // standalone refresh task; epoch is just the write time
         );
         writer.put(&task_key_bytes, &task_value)?;
 
@@ -310,7 +311,8 @@ impl JobStoreShard {
                 next_retry_at,
                 0, // highest priority
                 &synthetic_job_id,
-                0, // attempt not used for refresh tasks
+                0,             // attempt not used for refresh tasks
+                next_retry_at, // standalone refresh task; epoch is just the write time
             );
             batch.put(&task_key_bytes, &task_value);
         }

@@ -14,13 +14,13 @@ use crate::fb::silo::fb;
 use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, now_epoch_ms, put_with_optional_expire,
-    retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms,
+    put_with_optional_expire, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
     attempt_key, attempt_prefix, concurrency_holder_key, end_bound, idx_metadata_key,
-    job_cancelled_key, job_info_key, job_status_key, task_key,
+    job_cancelled_key, job_info_key, job_status_key,
 };
 use crate::retry::{RetryPolicy, retries_exhausted};
 use crate::task::Task;
@@ -287,11 +287,11 @@ impl JobStoreShard {
                         limit_index: 0,
                         limits: &params.limits,
                         priority: params.priority,
-                        // Fresh import → fresh chain. Scheduled and task_key
-                        // time coincide; this attempt_number is unseen so no
-                        // tombstone can collide.
+                        // Fresh import → fresh chain. The task_key starts at the
+                        // scheduled time; this attempt_number is unseen so the
+                        // epoch is just the write time.
                         scheduled_at_ms: effective_start_at_ms,
-                        task_key_start_ms: effective_start_at_ms,
+                        task_key_epoch_ms: now_ms,
                         now_ms,
                         held_queues: Vec::new(),
                         task_group: &params.task_group,
@@ -593,17 +593,26 @@ impl JobStoreShard {
         let mut released_holders: Vec<(String, String)> = Vec::new();
 
         if old_status.kind == JobStatusKind::Scheduled {
-            // O(1) task key reconstruction from status fields (same pattern as cancel/expedite/lease)
+            // Locate the pending task by identity (same pattern as
+            // cancel/expedite/lease). The trailing epoch_ms is write-only, so we
+            // prefix-scan instead of reconstructing the exact key.
             let attempt_number = old_status.current_attempt.unwrap_or(1);
             let start_time_ms = old_status.next_attempt_starts_after_ms.unwrap_or(0);
-            let computed_key =
-                task_key(&task_group, start_time_ms, priority, job_id, attempt_number);
-            let task_found = match txn.get(&computed_key).await? {
-                Some(raw) => Some((computed_key, raw)),
+            let task_found = match find_task_by_identity(
+                &txn,
+                &task_group,
+                start_time_ms,
+                priority,
+                job_id,
+                attempt_number,
+            )
+            .await?
+            {
+                Some(found) => Some(found),
                 None => {
                     // Fallback: try with time=0 (immediate scheduling case)
-                    let zero_key = task_key(&task_group, 0, priority, job_id, attempt_number);
-                    txn.get(&zero_key).await?.map(|raw| (zero_key, raw))
+                    find_task_by_identity(&txn, &task_group, 0, priority, job_id, attempt_number)
+                        .await?
                 }
             };
 
@@ -715,10 +724,9 @@ impl JobStoreShard {
                         limits: &stored_limits,
                         priority,
                         // Reimport advances to a new attempt_number, so the
-                        // task_key is fresh — scheduled and task_key time
-                        // coincide.
+                        // task_key is fresh; the epoch is just the write time.
                         scheduled_at_ms: effective_start_at_ms,
-                        task_key_start_ms: effective_start_at_ms,
+                        task_key_epoch_ms: now_ms,
                         now_ms,
                         held_queues: Vec::new(),
                         task_group: &task_group,
