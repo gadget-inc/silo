@@ -166,23 +166,6 @@ impl From<crate::codec::CodecError> for ConcurrencyError {
     }
 }
 
-/// Max in-flight `db.get(job_status_key)` lookups during a single
-/// `process_grants` pass. Caps slatedb-side block-fetch fan-out so the
-/// scanner can't pin unbounded `Bytes` while validating a large pending
-/// backlog. Mirrors the `CONCURRENCY = 64` pattern used in
-/// `job_store_shard::get_jobs_status_batch` for the same reason.
-const STATUS_LOOKUP_CONCURRENCY: usize = 64;
-
-/// Max grants written in a single `process_grants` pass. A single
-/// `request_grant_count` accumulation can be arbitrarily large (every
-/// release between scanner wakeups adds to it), and without a per-pass
-/// cap the scanner would materialize `count` `ScannedRequest`s, issue
-/// `count` buffered status gets, and accumulate `count` edits in a
-/// single `WriteBatch` before committing. Capping per pass bounds peak
-/// memory; the outer loop iterates as many passes as needed to drain
-/// the requested count.
-const MAX_GRANTS_PER_PASS: usize = 256;
-
 fn concurrency_queue_for_limit(limit: &Limit) -> Option<&str> {
     match limit {
         Limit::Concurrency(cl) => Some(&cl.key),
@@ -831,6 +814,24 @@ pub struct ConcurrencyManager {
     /// `take_chain_resumer_for_test` to exercise the not-installed bailout
     /// path; production code calls `set_chain_resumer` once and never clears.
     chain_resumer: Mutex<Option<Arc<dyn LimitChainResumer>>>,
+    /// Max grants written in a single `process_grants` pass. A single
+    /// `request_grant_count` accumulation can be arbitrarily large (every
+    /// release between scanner wakeups adds to it), and without a per-pass
+    /// cap the scanner would materialize `count` `ScannedRequest`s, issue
+    /// `count` buffered status gets, and accumulate `count` edits in a
+    /// single `WriteBatch` before committing. Capping per pass bounds peak
+    /// memory; the outer loop iterates as many passes as needed to drain
+    /// the requested count. Configurable via `grant_scanner_batch_size`
+    /// (default 256); stored already clamped to `>= 1`.
+    grant_scanner_batch_size: usize,
+    /// Max in-flight `db.get(job_status_key)` lookups during a single
+    /// `process_grants` pass. Caps slatedb-side block-fetch fan-out so the
+    /// scanner can't pin unbounded `Bytes` while validating a large pending
+    /// backlog. Mirrors the `CONCURRENCY = 64` pattern used in
+    /// `job_store_shard::get_jobs_status_batch` for the same reason.
+    /// Configurable via `grant_scanner_buffer_size` (default 64); stored
+    /// already clamped to `>= 1`.
+    grant_scanner_buffer_size: usize,
 }
 
 impl ConcurrencyManager {
@@ -838,6 +839,8 @@ impl ConcurrencyManager {
         shard: impl Into<String>,
         metrics: Option<Metrics>,
         hydrate_all_at_startup: bool,
+        grant_scanner_batch_size: usize,
+        grant_scanner_buffer_size: usize,
     ) -> Self {
         Self {
             shard: shard.into(),
@@ -849,6 +852,10 @@ impl ConcurrencyManager {
             limit_cache: Mutex::new(HashMap::new()),
             metrics,
             chain_resumer: Mutex::new(None),
+            // Clamp to >= 1: a 0 batch would stall the drain loop and
+            // `.buffered(0)` is invalid.
+            grant_scanner_batch_size: grant_scanner_batch_size.max(1),
+            grant_scanner_buffer_size: grant_scanner_buffer_size.max(1),
         }
     }
 
@@ -1554,14 +1561,14 @@ impl ConcurrencyManager {
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
         // granted `count` requests, or hit the end / capacity limit. Each pass
-        // scans up to `MAX_GRANTS_PER_PASS` candidates, validates them concurrently,
+        // scans up to `grant_scanner_batch_size` candidates, validates them concurrently,
         // reserves slots for valid ones, and commits the batch. Stale/corrupt entries
         // are cleaned up along the way. Bounding per-pass scan size caps peak memory
         // (the scanned Vec, buffered status results, and WriteBatch all scale with it),
         // so a large accumulated `count` is drained over multiple bounded passes
         // rather than one unbounded one.
         while total_granted < count as usize && !iter_exhausted && !capacity_exhausted {
-            let needed = (count as usize - total_granted).min(MAX_GRANTS_PER_PASS);
+            let needed = (count as usize - total_granted).min(self.grant_scanner_batch_size);
 
             let mut batch = WriteBatch::new();
             let mut grants: Vec<(String, String)> = Vec::new();
@@ -1753,7 +1760,7 @@ impl ConcurrencyManager {
             //
             // --- Batch validate status ---
             // Use `buffered` (order-preserving) rather than `join_all` so that
-            // we cap in-flight slatedb reads at STATUS_LOOKUP_CONCURRENCY. Each
+            // we cap in-flight slatedb reads at grant_scanner_buffer_size. Each
             // db.get() can fan out to many SST block fetches; with thousands of
             // pending requests, an unbounded join_all pinned multi-GB of Bytes.
             // `buffered` (not `buffer_unordered`) keeps results in scanned-order
@@ -1768,7 +1775,7 @@ impl ConcurrencyManager {
                     .into_iter()
                     .map(|key| async move { db.get(&key).await }),
             )
-            .buffered(STATUS_LOOKUP_CONCURRENCY)
+            .buffered(self.grant_scanner_buffer_size)
             .collect()
             .await;
 

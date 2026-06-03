@@ -100,6 +100,12 @@ pub struct OpenShardOptions {
     /// Populated from `DatabaseConfig::hydrate_all_at_startup` /
     /// `DatabaseTemplate::hydrate_all_at_startup`; tests set it explicitly.
     pub hydrate_all_at_startup: bool,
+    /// Max grants the background grant scanner commits per `process_grants`
+    /// pass. Populated from `grant_scanner_batch_size` in the database config.
+    pub grant_scanner_batch_size: usize,
+    /// Max in-flight status lookups the grant scanner buffers per pass.
+    /// Populated from `grant_scanner_buffer_size` in the database config.
+    pub grant_scanner_buffer_size: usize,
     /// When set, jobs that reach Succeeded have their associated KV records
     /// re-put with a SlateDB row TTL of this many seconds. `None` disables
     /// the feature for successful jobs.
@@ -382,6 +388,8 @@ impl JobStoreShard {
                 ),
                 counter_reconciliation_seconds: cfg.counter_reconciliation_seconds,
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
+                grant_scanner_batch_size: cfg.grant_scanner_batch_size,
+                grant_scanner_buffer_size: cfg.grant_scanner_buffer_size,
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
             },
@@ -422,6 +430,8 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
             counter_reconciliation_seconds,
             hydrate_all_at_startup,
+            grant_scanner_batch_size,
+            grant_scanner_buffer_size,
             completed_job_expire_s,
             terminal_job_expire_s,
         } = options;
@@ -479,6 +489,8 @@ impl JobStoreShard {
             name.clone(),
             metrics.clone(),
             hydrate_all_at_startup,
+            grant_scanner_batch_size,
+            grant_scanner_buffer_size,
         ));
 
         // Eagerly hydrate the in-memory holders cache from durable storage so
