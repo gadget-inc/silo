@@ -9,9 +9,9 @@ name = "silo-compactor"
 path = "src/main.rs"
 
 [dependencies]
-slatedb = "0.13"
-slatedb-common = "0.13"
-object_store = { version = "0.12", features = ["gcp"] }
+slatedb = { git = "https://github.com/slatedb/slatedb", rev = "a9ab64507e677ba1ab18576e7e86fb15b971a233" }
+slatedb-common = { git = "https://github.com/slatedb/slatedb", rev = "a9ab64507e677ba1ab18576e7e86fb15b971a233" }
+object_store = { version = "0.13", features = ["gcp"] }
 prometheus = "0.13"
 
 # silo provides the counter merge operator and shared metrics/storage helpers.
