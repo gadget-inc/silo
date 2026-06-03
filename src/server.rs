@@ -2129,8 +2129,8 @@ where
     let svc = SiloService::new(factory.clone(), coordinator, cfg.clone(), metrics.clone());
     let interceptor = make_auth_interceptor(cfg.server.auth_token.clone());
     let silo_server = SiloServer::new(svc)
-        .max_decoding_message_size(128 * 1024 * 1024)
-        .max_encoding_message_size(128 * 1024 * 1024);
+        .max_decoding_message_size(32 * 1024 * 1024)
+        .max_encoding_message_size(32 * 1024 * 1024);
     let server = tonic::service::interceptor::InterceptedService::new(silo_server, interceptor);
 
     // Create health service for gRPC health probes

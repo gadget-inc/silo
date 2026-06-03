@@ -233,8 +233,8 @@ pub fn create_silo_client_lazy(
     let channel = endpoint.connect_lazy();
     let interceptor = AuthInterceptor::new(config.auth_token.clone());
     Ok(SiloClient::with_interceptor(channel, interceptor)
-        .max_decoding_message_size(128 * 1024 * 1024)
-        .max_encoding_message_size(128 * 1024 * 1024))
+        .max_decoding_message_size(32 * 1024 * 1024)
+        .max_encoding_message_size(32 * 1024 * 1024))
 }
 
 /// Helper to create a SiloClient with an eager connection and retry logic.
@@ -276,8 +276,8 @@ pub async fn create_silo_client(
             Ok(Ok(channel)) => {
                 let interceptor = AuthInterceptor::new(config.auth_token.clone());
                 return Ok(SiloClient::with_interceptor(channel, interceptor)
-                    .max_decoding_message_size(128 * 1024 * 1024)
-                    .max_encoding_message_size(128 * 1024 * 1024));
+                    .max_decoding_message_size(32 * 1024 * 1024)
+                    .max_encoding_message_size(32 * 1024 * 1024));
             }
             Ok(Err(e)) => {
                 trace!(
