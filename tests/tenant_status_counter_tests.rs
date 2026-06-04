@@ -25,6 +25,28 @@ async fn get_status_counts(
         .collect()
 }
 
+async fn get_background_action_queue_counts(
+    shard: &std::sync::Arc<silo::job_store_shard::JobStoreShard>,
+    tenant: &str,
+) -> std::collections::HashMap<(String, String, String, String), i64> {
+    shard
+        .snapshot_background_action_queue_counters()
+        .into_iter()
+        .filter(|counter| counter.tenant == tenant)
+        .map(|counter| {
+            (
+                (
+                    counter.task_group,
+                    counter.status_bucket,
+                    counter.queue_kind,
+                    counter.queue,
+                ),
+                counter.count,
+            )
+        })
+        .collect()
+}
+
 #[silo::test]
 async fn counter_increments_on_enqueue() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -113,6 +135,220 @@ async fn counter_transitions_through_lifecycle() {
             .expect("get status")
             .expect("exists");
         assert_eq!(status.kind, JobStatusKind::Succeeded);
+    });
+}
+
+#[silo::test]
+async fn background_action_queue_counters_transition_through_lifecycle() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let job_id = shard
+            .enqueue(
+                "env-tenant-1",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                msgpack_payload(&serde_json::json!({"test": "background counters"})),
+                vec![],
+                Some(vec![
+                    ("queue".to_string(), "user-queue".to_string()),
+                    (
+                        "platformConcurrencyQueue".to_string(),
+                        "platform-queue".to_string(),
+                    ),
+                ]),
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let counts = get_background_action_queue_counts(&shard, "env-tenant-1").await;
+        assert_eq!(
+            counts
+                .get(&(
+                    "default".to_string(),
+                    "queue_size".to_string(),
+                    "explicit".to_string(),
+                    "user-queue".to_string()
+                ))
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            counts
+                .get(&(
+                    "default".to_string(),
+                    "queue_size".to_string(),
+                    "platform".to_string(),
+                    "platform-queue".to_string()
+                ))
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        assert_eq!(tasks.len(), 1);
+
+        let counts = get_background_action_queue_counts(&shard, "env-tenant-1").await;
+        assert_eq!(
+            counts
+                .get(&(
+                    "default".to_string(),
+                    "queue_size".to_string(),
+                    "explicit".to_string(),
+                    "user-queue".to_string()
+                ))
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            counts
+                .get(&(
+                    "default".to_string(),
+                    "running_size".to_string(),
+                    "explicit".to_string(),
+                    "user-queue".to_string()
+                ))
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            counts
+                .get(&(
+                    "default".to_string(),
+                    "running_size".to_string(),
+                    "platform".to_string(),
+                    "platform-queue".to_string()
+                ))
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report success");
+
+        let counts = get_background_action_queue_counts(&shard, "env-tenant-1").await;
+        assert!(
+            counts.is_empty(),
+            "terminal job counters should be removed, got {counts:?}"
+        );
+
+        let status = shard
+            .get_job_status("env-tenant-1", &job_id)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(status.kind, JobStatusKind::Succeeded);
+    });
+}
+
+#[silo::test]
+async fn background_action_queue_counters_drop_failed_and_cancelled_gauges() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let failed_job_id = shard
+            .enqueue(
+                "env-tenant-1",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                msgpack_payload(&serde_json::json!({"test": "background failed"})),
+                vec![],
+                Some(vec![
+                    ("queue".to_string(), "user-queue".to_string()),
+                    (
+                        "platformConcurrencyQueue".to_string(),
+                        "platform-queue".to_string(),
+                    ),
+                ]),
+                "default",
+            )
+            .await
+            .expect("enqueue failed job");
+
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        assert_eq!(tasks.len(), 1);
+
+        let task_id = tasks[0].attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: vec![],
+                },
+            )
+            .await
+            .expect("report error");
+
+        let counts = get_background_action_queue_counts(&shard, "env-tenant-1").await;
+        assert!(
+            counts.is_empty(),
+            "failed jobs should emit event counters, not retained gauges: {counts:?}"
+        );
+
+        let cancelled_job_id = shard
+            .enqueue(
+                "env-tenant-1",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                msgpack_payload(&serde_json::json!({"test": "background cancelled"})),
+                vec![],
+                Some(vec![
+                    ("queue".to_string(), "cancel-queue".to_string()),
+                    (
+                        "platformConcurrencyQueue".to_string(),
+                        "cancel-platform".to_string(),
+                    ),
+                ]),
+                "default",
+            )
+            .await
+            .expect("enqueue cancelled job");
+
+        shard
+            .cancel_job("env-tenant-1", &cancelled_job_id)
+            .await
+            .expect("cancel");
+
+        let counts = get_background_action_queue_counts(&shard, "env-tenant-1").await;
+        assert!(
+            counts.is_empty(),
+            "cancelled jobs should emit event counters, not retained gauges: {counts:?}"
+        );
+
+        shard
+            .delete_job("env-tenant-1", &failed_job_id)
+            .await
+            .expect("delete failed job");
+
+        let counts = get_background_action_queue_counts(&shard, "env-tenant-1").await;
+        assert!(
+            counts.is_empty(),
+            "deleted failed job should not reintroduce gauges: {counts:?}"
+        );
     });
 }
 

@@ -11,6 +11,7 @@ use crate::codec::{
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
+use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
@@ -164,6 +165,7 @@ impl JobStoreShard {
         let mut followup_next_time: Option<i64> = None;
         // Track grants from retry scheduling for rollback if DB write fails
         let mut retry_grants: Vec<(String, String)> = Vec::new();
+        let mut background_action_transitions: Vec<BackgroundActionMetricTransition> = Vec::new();
         // Track the new job status for DST event emission
         let mut new_job_status_for_dst: Option<String> = None;
         // Whether the job reached a terminal status during this call. Drives
@@ -177,18 +179,31 @@ impl JobStoreShard {
                 let job_status = JobStatus::succeeded(now_ms);
                 terminal_expire_ts =
                     self.terminal_expire_ts(crate::job::JobStatusKind::Succeeded, now_ms);
-                self.set_job_status_with_index_opts(
-                    &mut DbWriteBatcher::new(&self.db, &mut batch),
-                    &tenant,
-                    &job_id,
-                    job_status,
-                    terminal_expire_ts,
-                )
-                .await?;
+                // No JobView is loaded on the Success/Cancelled branches; the
+                // helper falls back to its own JOB_INFO get. The Error branch
+                // below already loads `view` and threads it through.
+                if let Some(transition) = self
+                    .set_job_status_with_index_opts(
+                        &mut DbWriteBatcher::new(&self.db, &mut batch),
+                        &tenant,
+                        &job_id,
+                        job_status,
+                        terminal_expire_ts,
+                        None,
+                    )
+                    .await?
+                {
+                    background_action_transitions.push(transition);
+                }
                 // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
+                if let Err(e) = self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
                     &self.db, &mut batch,
-                ))?;
+                )) {
+                    self.rollback_background_action_metric_gauge_transitions(
+                        &background_action_transitions,
+                    );
+                    return Err(e);
+                }
                 new_job_status_for_dst = Some("Succeeded".to_string());
                 reached_terminal = true;
             }
@@ -197,18 +212,28 @@ impl JobStoreShard {
                 let job_status = JobStatus::cancelled(now_ms);
                 terminal_expire_ts =
                     self.terminal_expire_ts(crate::job::JobStatusKind::Cancelled, now_ms);
-                self.set_job_status_with_index_opts(
-                    &mut DbWriteBatcher::new(&self.db, &mut batch),
-                    &tenant,
-                    &job_id,
-                    job_status,
-                    terminal_expire_ts,
-                )
-                .await?;
+                if let Some(transition) = self
+                    .set_job_status_with_index_opts(
+                        &mut DbWriteBatcher::new(&self.db, &mut batch),
+                        &tenant,
+                        &job_id,
+                        job_status,
+                        terminal_expire_ts,
+                        None,
+                    )
+                    .await?
+                {
+                    background_action_transitions.push(transition);
+                }
                 // Job reached terminal state - include counter in batch
-                self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
+                if let Err(e) = self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
                     &self.db, &mut batch,
-                ))?;
+                )) {
+                    self.rollback_background_action_metric_gauge_transitions(
+                        &background_action_transitions,
+                    );
+                    return Err(e);
+                }
                 new_job_status_for_dst = Some("Cancelled".to_string());
                 reached_terminal = true;
             }
@@ -275,13 +300,18 @@ impl JobStoreShard {
                         // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                         let job_status =
                             JobStatus::scheduled(now_ms, next_time, next_attempt_number);
-                        self.set_job_status_with_index(
-                            &mut DbWriteBatcher::new(&self.db, &mut batch),
-                            &tenant,
-                            &job_id,
-                            job_status,
-                        )
-                        .await?;
+                        if let Some(transition) = self
+                            .set_job_status_with_index(
+                                &mut DbWriteBatcher::new(&self.db, &mut batch),
+                                &tenant,
+                                &job_id,
+                                job_status,
+                                Some(&view),
+                            )
+                            .await?
+                        {
+                            background_action_transitions.push(transition);
+                        }
                         scheduled_followup = true;
                         followup_next_time = Some(next_time);
                         new_job_status_for_dst = Some("Scheduled".to_string());
@@ -291,18 +321,28 @@ impl JobStoreShard {
                         let job_status = JobStatus::failed(now_ms);
                         terminal_expire_ts =
                             self.terminal_expire_ts(crate::job::JobStatusKind::Failed, now_ms);
-                        self.set_job_status_with_index_opts(
-                            &mut DbWriteBatcher::new(&self.db, &mut batch),
-                            &tenant,
-                            &job_id,
-                            job_status,
-                            terminal_expire_ts,
-                        )
-                        .await?;
+                        if let Some(transition) = self
+                            .set_job_status_with_index_opts(
+                                &mut DbWriteBatcher::new(&self.db, &mut batch),
+                                &tenant,
+                                &job_id,
+                                job_status,
+                                terminal_expire_ts,
+                                Some(&view),
+                            )
+                            .await?
+                        {
+                            background_action_transitions.push(transition);
+                        }
                         // Job reached terminal state (failed permanently) - include counter in batch
-                        self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(
-                            &self.db, &mut batch,
-                        ))?;
+                        if let Err(e) = self.increment_completed_jobs_counter(
+                            &mut DbWriteBatcher::new(&self.db, &mut batch),
+                        ) {
+                            self.rollback_background_action_metric_gauge_transitions(
+                                &background_action_transitions,
+                            );
+                            return Err(e);
+                        }
                         new_job_status_for_dst = Some("Failed".to_string());
                         reached_terminal = true;
                     }
@@ -328,14 +368,21 @@ impl JobStoreShard {
         // just deleted earlier in this batch, no other attempt for this
         // job_id can be Running, and the job's terminal status will block
         // dequeue / restart / reimport, so the scan sees a stable view.
-        if reached_terminal && let Some(ts) = terminal_expire_ts {
-            self.expire_terminal_job_records(
-                &mut DbWriteBatcher::new(&self.db, &mut batch),
-                &tenant,
-                &job_id,
-                ts,
-            )
-            .await?;
+        if reached_terminal
+            && let Some(ts) = terminal_expire_ts
+            && let Err(e) = self
+                .expire_terminal_job_records(
+                    &mut DbWriteBatcher::new(&self.db, &mut batch),
+                    &tenant,
+                    &job_id,
+                    ts,
+                )
+                .await
+        {
+            self.rollback_background_action_metric_gauge_transitions(
+                &background_action_transitions,
+            );
+            return Err(e);
         }
 
         // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status.
@@ -404,6 +451,9 @@ impl JobStoreShard {
                 self.concurrency
                     .rollback_grant(&tenant, queue, grant_task_id);
             }
+            self.rollback_background_action_metric_gauge_transitions(
+                &background_action_transitions,
+            );
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);

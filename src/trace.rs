@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, Once};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::{Resource, runtime, trace as sdktrace};
 use tracing_subscriber::fmt::MakeWriter;
@@ -11,6 +12,8 @@ use tracing_subscriber::{EnvFilter, filter::LevelFilter, prelude::*};
 use crate::settings::LogFormat;
 
 static INIT: Once = Once::new();
+static METER_PROVIDER: std::sync::OnceLock<Mutex<Option<SdkMeterProvider>>> =
+    std::sync::OnceLock::new();
 
 fn build_env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
@@ -148,6 +151,27 @@ where
             tracing_perfetto::PerfettoLayer::new(Mutex::new(file)).with_filter(LevelFilter::DEBUG);
         base.with(perfetto_layer).init();
     } else if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        let resource = Resource::new(vec![KeyValue::new("service.name", "silo")]);
+        match opentelemetry_otlp::new_pipeline()
+            .metrics(runtime::Tokio)
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .http()
+                    .with_endpoint(endpoint.clone()),
+            )
+            .with_resource(resource.clone())
+            .build()
+        {
+            Ok(provider) => {
+                opentelemetry::global::set_meter_provider(provider.clone());
+                let store = METER_PROVIDER.get_or_init(|| Mutex::new(None));
+                *store.lock().unwrap() = Some(provider);
+            }
+            Err(err) => {
+                eprintln!("otlp metrics init failed, continuing without otlp metrics: {err}");
+            }
+        }
+
         match opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_exporter(
@@ -155,10 +179,7 @@ where
                     .http()
                     .with_endpoint(endpoint),
             )
-            .with_trace_config(
-                sdktrace::Config::default()
-                    .with_resource(Resource::new(vec![KeyValue::new("service.name", "silo")])),
-            )
+            .with_trace_config(sdktrace::Config::default().with_resource(resource))
             .install_batch(runtime::Tokio)
         {
             Ok(provider) => {
@@ -209,6 +230,12 @@ where
 
 /// Flush OTLP exporter if configured.
 pub fn shutdown() {
+    if let Some(store) = METER_PROVIDER.get()
+        && let Some(provider) = store.lock().unwrap().take()
+        && let Err(err) = provider.shutdown()
+    {
+        eprintln!("otlp metrics shutdown failed: {err}");
+    }
     opentelemetry::global::shutdown_tracer_provider();
 }
 

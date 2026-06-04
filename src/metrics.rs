@@ -22,7 +22,7 @@
 //! metrics.jobs_enqueued.with_label_values(&["0", "default"]).inc();
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::Gauge as OtelGauge;
 use prometheus::{
     CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
     core::Collector,
@@ -38,6 +40,12 @@ use slatedb_common::metrics::{DefaultMetricsRecorder, LATENCY_BOUNDARIES, Metric
 use tokio::sync::broadcast;
 use tower::{Layer, Service};
 use tracing::{debug, error};
+
+use crate::job_store_shard::counters::{
+    BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND, BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+    BACKGROUND_ACTION_QUEUE_SIZE_BUCKET, BACKGROUND_ACTION_RUNNING_SIZE_BUCKET,
+};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 
 /// Default histogram buckets for request latencies (in seconds)
 const LATENCY_BUCKETS: &[f64] = &[
@@ -89,6 +97,9 @@ impl GrantPath {
     }
 }
 
+type BackgroundActionMetricKey = (String, String, String, String);
+type BackgroundActionLabelSet = Arc<Mutex<HashSet<BackgroundActionMetricKey>>>;
+
 /// Silo metrics handle containing all metric instruments.
 #[derive(Clone)]
 pub struct Metrics {
@@ -100,6 +111,10 @@ pub struct Metrics {
     jobs_completed: CounterVec,
     job_attempts: CounterVec,
     job_wait_time: HistogramVec,
+    background_actions_queue_size: OtelGauge<u64>,
+    background_actions_running_size: OtelGauge<u64>,
+    previous_background_actions_queue_labels: BackgroundActionLabelSet,
+    previous_background_actions_running_labels: BackgroundActionLabelSet,
 
     // gRPC metrics
     grpc_requests: CounterVec,
@@ -163,6 +178,32 @@ pub struct Metrics {
     /// Jemalloc allocator stats driven by a periodic scraper spawned in `main.rs`.
     #[cfg(unix)]
     pub jemalloc: crate::jemalloc_metrics::JemallocMetrics,
+}
+
+/// Computed status gauges for Gadget background actions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackgroundActionMetricSnapshot {
+    pub queue_size: HashMap<(String, String, String, String), u64>,
+    pub running_size: HashMap<(String, String, String, String), u64>,
+}
+
+impl BackgroundActionMetricSnapshot {
+    pub fn merge(&mut self, other: BackgroundActionMetricSnapshot) {
+        for (key, value) in other.queue_size {
+            increment(&mut self.queue_size, key, value);
+        }
+        for (key, value) in other.running_size {
+            increment(&mut self.running_size, key, value);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BackgroundActionStatusCounts {
+    explicit_by_queue: HashMap<(String, String, String, String), u64>,
+    platform_by_queue: HashMap<(String, String, String, String), u64>,
+    explicit_by_shard_tenant_task_group: HashMap<(String, String, String), u64>,
+    platform_by_shard_tenant_task_group: HashMap<(String, String, String), u64>,
 }
 
 /// SlateDB per-shard metric instruments plus the previous-value map needed
@@ -262,6 +303,47 @@ impl Metrics {
         self.job_wait_time
             .with_label_values(&[shard, task_group])
             .observe(wait_time_secs);
+    }
+
+    /// Record background action status gauge values for the current scrape.
+    pub fn record_background_action_metrics(&self, snapshot: BackgroundActionMetricSnapshot) {
+        self.record_background_action_gauge(
+            &self.background_actions_queue_size,
+            &self.previous_background_actions_queue_labels,
+            &snapshot.queue_size,
+        );
+        self.record_background_action_gauge(
+            &self.background_actions_running_size,
+            &self.previous_background_actions_running_labels,
+            &snapshot.running_size,
+        );
+    }
+
+    fn record_background_action_gauge(
+        &self,
+        gauge: &OtelGauge<u64>,
+        previous_labels: &BackgroundActionLabelSet,
+        values: &HashMap<BackgroundActionMetricKey, u64>,
+    ) {
+        let current: HashSet<BackgroundActionMetricKey> = values.keys().cloned().collect();
+        let stale: Vec<BackgroundActionMetricKey> = {
+            let mut previous = previous_labels.lock().unwrap();
+            let stale = previous
+                .difference(&current)
+                .cloned()
+                .collect::<Vec<(String, String, String, String)>>();
+            *previous = current;
+            stale
+        };
+
+        for (shard_id, tenant, task_group, queue) in stale {
+            record_background_action_gauge_value(gauge, &shard_id, &tenant, &task_group, &queue, 0);
+        }
+        for ((shard_id, tenant, task_group, queue), value) in values {
+            record_background_action_gauge_value(
+                gauge, shard_id, tenant, task_group, queue, *value,
+            );
+        }
     }
 
     /// Record a gRPC request.
@@ -490,6 +572,290 @@ impl Metrics {
     /// since Prometheus counters only support `inc_by()`, not `set()`.
     pub fn update_slatedb_stats(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
         self.slatedb.update(shard, recorder);
+    }
+}
+
+fn record_background_action_gauge_value(
+    gauge: &OtelGauge<u64>,
+    shard_id: &str,
+    tenant: &str,
+    task_group: &str,
+    queue: &str,
+    value: u64,
+) {
+    gauge.record(
+        value,
+        &[
+            KeyValue::new("shard_id", shard_id.to_string()),
+            KeyValue::new("tenant", tenant.to_string()),
+            KeyValue::new("task_group", task_group.to_string()),
+            KeyValue::new("queue", queue.to_string()),
+        ],
+    );
+}
+
+/// Build background action status gauges from all represented jobs in a shard.
+pub async fn collect_background_action_metrics_for_shard(
+    shard_id: &str,
+    shard: &JobStoreShard,
+) -> Result<BackgroundActionMetricSnapshot, JobStoreShardError> {
+    let mut queued = BackgroundActionStatusCounts::default();
+    let mut running = BackgroundActionStatusCounts::default();
+
+    for counter in shard.snapshot_background_action_queue_counters() {
+        match counter.status_bucket.as_str() {
+            BACKGROUND_ACTION_QUEUE_SIZE_BUCKET => queued.add_counter(
+                shard_id,
+                &counter.tenant,
+                &counter.task_group,
+                &counter.queue_kind,
+                &counter.queue,
+                counter.count,
+            ),
+            BACKGROUND_ACTION_RUNNING_SIZE_BUCKET => running.add_counter(
+                shard_id,
+                &counter.tenant,
+                &counter.task_group,
+                &counter.queue_kind,
+                &counter.queue,
+                counter.count,
+            ),
+            _ => {}
+        }
+    }
+
+    let mut snapshot = BackgroundActionMetricSnapshot::default();
+    queued.finish_into(&mut snapshot.queue_size);
+    running.finish_into(&mut snapshot.running_size);
+    Ok(snapshot)
+}
+
+impl BackgroundActionStatusCounts {
+    fn add_counter(
+        &mut self,
+        shard_id: &str,
+        tenant: &str,
+        task_group: &str,
+        queue_kind: &str,
+        queue: &str,
+        count: i64,
+    ) {
+        let Ok(count) = u64::try_from(count) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+
+        match queue_kind {
+            BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND => {
+                increment(
+                    &mut self.explicit_by_queue,
+                    (
+                        shard_id.to_string(),
+                        tenant.to_string(),
+                        task_group.to_string(),
+                        queue.to_string(),
+                    ),
+                    count,
+                );
+                increment(
+                    &mut self.explicit_by_shard_tenant_task_group,
+                    (
+                        shard_id.to_string(),
+                        tenant.to_string(),
+                        task_group.to_string(),
+                    ),
+                    count,
+                );
+            }
+            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND => {
+                increment(
+                    &mut self.platform_by_queue,
+                    (
+                        shard_id.to_string(),
+                        tenant.to_string(),
+                        task_group.to_string(),
+                        queue.to_string(),
+                    ),
+                    count,
+                );
+                increment(
+                    &mut self.platform_by_shard_tenant_task_group,
+                    (
+                        shard_id.to_string(),
+                        tenant.to_string(),
+                        task_group.to_string(),
+                    ),
+                    count,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_into(self, output: &mut HashMap<(String, String, String, String), u64>) {
+        for (key, count) in self.explicit_by_queue {
+            increment(output, key, count);
+        }
+        for (key, count) in self.platform_by_queue {
+            increment(output, key, count);
+        }
+
+        let shard_tenant_task_groups: HashSet<(String, String, String)> = self
+            .platform_by_shard_tenant_task_group
+            .keys()
+            .chain(self.explicit_by_shard_tenant_task_group.keys())
+            .cloned()
+            .collect();
+        for (shard_id, tenant, task_group) in shard_tenant_task_groups {
+            let key = (shard_id.clone(), tenant.clone(), task_group.clone());
+            let platform = self
+                .platform_by_shard_tenant_task_group
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            let explicit = self
+                .explicit_by_shard_tenant_task_group
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            let unqueued = platform.saturating_sub(explicit);
+            if unqueued > 0 {
+                output.insert(
+                    (shard_id, tenant, task_group, "<no queue>".to_string()),
+                    unqueued,
+                );
+            }
+        }
+    }
+}
+
+fn increment<K: Eq + std::hash::Hash>(map: &mut HashMap<K, u64>, key: K, amount: u64) {
+    *map.entry(key).or_insert(0) += amount;
+}
+
+#[cfg(test)]
+mod background_action_metric_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_and_platform_queues_are_reported_with_synthetic_unqueued() {
+        let mut counts = BackgroundActionStatusCounts::default();
+
+        counts.add_counter(
+            "shard-a",
+            "env-env-1",
+            "default",
+            BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND,
+            "user-a",
+            1,
+        );
+        counts.add_counter(
+            "shard-a",
+            "env-env-1",
+            "default",
+            BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND,
+            "user-b",
+            1,
+        );
+        counts.add_counter(
+            "shard-a",
+            "env-env-1",
+            "default",
+            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+            "platform-a",
+            3,
+        );
+        counts.add_counter(
+            "shard-b",
+            "tenant-env-1",
+            "background",
+            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+            "x",
+            1,
+        );
+        let mut output = HashMap::new();
+        counts.finish_into(&mut output);
+
+        assert_eq!(
+            output.get(&(
+                "shard-a".to_string(),
+                "env-env-1".to_string(),
+                "default".to_string(),
+                "user-a".to_string()
+            )),
+            Some(&1)
+        );
+        assert_eq!(
+            output.get(&(
+                "shard-a".to_string(),
+                "env-env-1".to_string(),
+                "default".to_string(),
+                "user-b".to_string()
+            )),
+            Some(&1)
+        );
+        assert_eq!(
+            output.get(&(
+                "shard-a".to_string(),
+                "env-env-1".to_string(),
+                "default".to_string(),
+                "platform-a".to_string()
+            )),
+            Some(&3)
+        );
+        assert_eq!(
+            output.get(&(
+                "shard-a".to_string(),
+                "env-env-1".to_string(),
+                "default".to_string(),
+                "<no queue>".to_string()
+            )),
+            Some(&1)
+        );
+        assert_eq!(
+            output.get(&(
+                "shard-b".to_string(),
+                "tenant-env-1".to_string(),
+                "background".to_string(),
+                "x".to_string()
+            )),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn synthetic_unqueued_never_goes_negative() {
+        let mut counts = BackgroundActionStatusCounts::default();
+
+        counts.add_counter(
+            "shard-a",
+            "env-env-1",
+            "default",
+            BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND,
+            "user-a",
+            1,
+        );
+
+        let mut output = HashMap::new();
+        counts.finish_into(&mut output);
+
+        assert_eq!(
+            output.get(&(
+                "shard-a".to_string(),
+                "env-env-1".to_string(),
+                "default".to_string(),
+                "user-a".to_string()
+            )),
+            Some(&1)
+        );
+        assert!(!output.contains_key(&(
+            "shard-a".to_string(),
+            "env-env-1".to_string(),
+            "default".to_string(),
+            "<no queue>".to_string()
+        )));
     }
 }
 
@@ -1042,6 +1408,15 @@ pub fn init() -> anyhow::Result<Metrics> {
             &["shard", "task_group"],
         )?,
     );
+    let meter = opentelemetry::global::meter("silo");
+    let background_actions_queue_size = meter
+        .u64_gauge("background_actions.queue_size")
+        .with_description("Number of Silo background action jobs waiting or scheduled to run")
+        .init();
+    let background_actions_running_size = meter
+        .u64_gauge("background_actions.running_size")
+        .with_description("Number of Silo background action jobs currently running")
+        .init();
 
     // gRPC metrics
     let grpc_requests = register(
@@ -1384,6 +1759,10 @@ pub fn init() -> anyhow::Result<Metrics> {
         jobs_completed,
         job_attempts,
         job_wait_time,
+        background_actions_queue_size,
+        background_actions_running_size,
+        previous_background_actions_queue_labels: Arc::new(Mutex::new(HashSet::new())),
+        previous_background_actions_running_labels: Arc::new(Mutex::new(HashSet::new())),
         grpc_requests,
         grpc_request_duration,
         shards_owned,

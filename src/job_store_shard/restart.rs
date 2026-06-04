@@ -147,7 +147,14 @@ impl JobStoreShard {
 
         // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time and attempt number
         let new_status = JobStatus::scheduled(now_ms, start_at_ms, next_attempt_number);
-        self.set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
+        let background_action_transition = self
+            .set_job_status_with_index(
+                &mut TxnWriter(&txn),
+                tenant,
+                id,
+                new_status,
+                Some(&job_view),
+            )
             .await?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number
@@ -174,7 +181,12 @@ impl JobStoreShard {
             next_attempt_number,
             now_ms,
         );
-        txn.put(&task_key, &task_value)?;
+        if let Err(e) = txn.put(&task_key, &task_value) {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e.into());
+        }
 
         // Two-phase DST event: emit before commit for correct causal ordering,
         // confirm after commit succeeds.
@@ -189,13 +201,21 @@ impl JobStoreShard {
         );
 
         // Include counter in the transaction (unmark_write excludes it from conflict detection)
-        self.decrement_completed_jobs_counter(&mut TxnWriter(&txn))?;
+        if let Err(e) = self.decrement_completed_jobs_counter(&mut TxnWriter(&txn)) {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e);
+        }
 
         // Commit the transaction
         match txn.commit().await {
             Ok(_) => dst_events::confirm_write(write_op),
             Err(e) => {
                 dst_events::cancel_write(write_op);
+                if let Some(transition) = &background_action_transition {
+                    self.rollback_background_action_metric_gauge_transition(transition);
+                }
                 return Err(e.into());
             }
         }

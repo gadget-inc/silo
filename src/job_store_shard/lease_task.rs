@@ -211,20 +211,29 @@ impl JobStoreShard {
 
         // Update job status to Running
         let mut writer = TxnWriter(&txn);
-        self.set_job_status_with_index(
-            &mut writer,
-            tenant,
-            id,
-            crate::job::JobStatus::running(now_ms),
-        )
-        .await?;
+        let background_action_transition = self
+            .set_job_status_with_index(
+                &mut writer,
+                tenant,
+                id,
+                crate::job::JobStatus::running(now_ms),
+                Some(&job_view),
+            )
+            .await?;
 
         // Commit the transaction with durable writes
-        txn.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await?;
+        if let Err(e) = txn
+            .commit_with_options(&WriteOptions {
+                await_durable: true,
+                ..Default::default()
+            })
+            .await
+        {
+            if let Some(transition) = &background_action_transition {
+                self.rollback_background_action_metric_gauge_transition(transition);
+            }
+            return Err(e.into());
+        }
 
         // Post-commit: evict old task key from broker buffer and wake broker
         self.brokers.evict_keys(&[old_task_key]);
