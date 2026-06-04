@@ -217,6 +217,7 @@ impl JobStoreShard {
                 tenant,
                 id,
                 crate::job::JobStatus::running(now_ms),
+                Some(&job_view),
             )
             .await?;
 

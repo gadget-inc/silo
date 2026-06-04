@@ -179,7 +179,13 @@ impl JobStoreShard {
         // Update job status with new start time (keeping same attempt number)
         let new_status = crate::job::JobStatus::scheduled(now_ms, now_ms, attempt_number);
         let background_action_transition = self
-            .set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
+            .set_job_status_with_index(
+                &mut TxnWriter(&txn),
+                tenant,
+                id,
+                new_status,
+                Some(&job_view),
+            )
             .await?;
 
         // Commit the transaction

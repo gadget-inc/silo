@@ -148,7 +148,13 @@ impl JobStoreShard {
         // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time and attempt number
         let new_status = JobStatus::scheduled(now_ms, start_at_ms, next_attempt_number);
         let background_action_transition = self
-            .set_job_status_with_index(&mut TxnWriter(&txn), tenant, id, new_status)
+            .set_job_status_with_index(
+                &mut TxnWriter(&txn),
+                tenant,
+                id,
+                new_status,
+                Some(&job_view),
+            )
             .await?;
 
         // [SILO-RESTART-5] Post: Create new task in DB queue with next attempt number

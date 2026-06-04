@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::codec::{encode_job_info, encode_job_status};
 use crate::concurrency::RequestTicketOutcome;
 use crate::dst_events::{self, DstEvent};
-use crate::job::{JobInfo, JobStatus, JobStatusKind, Limit};
+use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::counters::{
@@ -800,9 +800,17 @@ impl JobStoreShard {
         tenant: &str,
         job_id: &str,
         new_status: JobStatus,
+        job_metric_info: Option<&JobView>,
     ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
-        self.set_job_status_with_index_opts(writer, tenant, job_id, new_status, None)
-            .await
+        self.set_job_status_with_index_opts(
+            writer,
+            tenant,
+            job_id,
+            new_status,
+            None,
+            job_metric_info,
+        )
+        .await
     }
 
     /// Update job status with optional row TTL on the new status/index records.
@@ -810,6 +818,14 @@ impl JobStoreShard {
     /// When `expire_ts` is `Some`, the new `JOB_STATUS` and `IDX_STATUS_TIME`
     /// rows are written with a SlateDB TTL expiring at `expire_ts` (epoch ms).
     /// Used by the terminal-job expiration path; pass `None` everywhere else.
+    ///
+    /// `job_metric_info` is an optional `JobView` reference supplied by the
+    /// caller when one is already in scope. When provided, it short-circuits
+    /// the `JOB_INFO` lookup that this helper would otherwise issue to derive
+    /// the task_group and metadata needed for background-action queue gauges —
+    /// the lookup is on the hot path for callers like dequeue and
+    /// `report_attempt_outcome`. Callers without a `JobView` in scope pass
+    /// `None` and the helper falls back to reading `JOB_INFO` itself.
     pub(crate) async fn set_job_status_with_index_opts<W: WriteBatcher>(
         &self,
         writer: &mut W,
@@ -817,6 +833,7 @@ impl JobStoreShard {
         job_id: &str,
         new_status: JobStatus,
         expire_ts: Option<i64>,
+        job_metric_info: Option<&JobView>,
     ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
         // Delete old index entries if present
         let old_status = if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
@@ -838,21 +855,25 @@ impl JobStoreShard {
         let new_kind = new_status.kind;
         let needs_background_action_counters =
             background_action_queue_counter_transition_is_relevant(old_kind, new_kind);
-        let job_metric_info = if needs_background_action_counters {
-            writer
-                .get(&job_info_key(tenant, job_id))
-                .await?
-                .map(|raw| {
-                    crate::job::JobView::new(raw)
-                        .map(|view| (view.task_group().to_string(), view.metadata()))
-                        .map_err(|e| JobStoreShardError::Codec(e.to_string()))
-                })
-                .transpose()?
-        } else {
-            None
-        };
+        let derived_metric_info: Option<(String, Vec<(String, String)>)> =
+            if needs_background_action_counters {
+                match job_metric_info {
+                    Some(view) => Some((view.task_group().to_string(), view.metadata())),
+                    None => writer
+                        .get(&job_info_key(tenant, job_id))
+                        .await?
+                        .map(|raw| {
+                            JobView::new(raw)
+                                .map(|view| (view.task_group().to_string(), view.metadata()))
+                                .map_err(|e| JobStoreShardError::Codec(e.to_string()))
+                        })
+                        .transpose()?,
+                }
+            } else {
+                None
+            };
         let background_action_transition =
-            job_metric_info.as_ref().map(|(task_group, metadata)| {
+            derived_metric_info.as_ref().map(|(task_group, metadata)| {
                 BackgroundActionMetricTransition {
                     tenant: tenant.to_string(),
                     task_group: task_group.clone(),
@@ -861,7 +882,7 @@ impl JobStoreShard {
                     metadata: metadata.clone(),
                 }
             });
-        if let Some((task_group, metadata)) = job_metric_info.as_ref() {
+        if let Some((task_group, metadata)) = derived_metric_info.as_ref() {
             self.apply_background_action_queue_counter_transition(
                 tenant, task_group, old_kind, new_kind, metadata,
             );
@@ -870,7 +891,7 @@ impl JobStoreShard {
         if let Err(e) = Self::write_job_status_with_index_opts_and_metadata(
             writer, tenant, job_id, new_status, expire_ts,
         ) {
-            if let Some((task_group, metadata)) = job_metric_info.as_ref() {
+            if let Some((task_group, metadata)) = derived_metric_info.as_ref() {
                 self.rollback_background_action_queue_counter_transition(
                     tenant, task_group, old_kind, new_kind, metadata,
                 );
@@ -960,7 +981,10 @@ impl JobStoreShard {
             Some(task_key_start_ms),
             old.current_attempt,
         );
-        self.set_job_status_with_index(writer, tenant, job_id, new_status)
+        // No JobView is loaded on the retarget path (Scheduled→Scheduled is
+        // not a gauge-relevant transition either), so let the helper's
+        // fallback handle the rare case where the predicate ever does fire.
+        self.set_job_status_with_index(writer, tenant, job_id, new_status, None)
             .await
     }
 }

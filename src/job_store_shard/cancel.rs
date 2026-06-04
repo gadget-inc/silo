@@ -142,6 +142,10 @@ impl JobStoreShard {
                 status.next_attempt_starts_after_ms,
                 status.current_attempt,
             );
+            // JobView is loaded just below for task-key reconstruction; that
+            // ordering predates the metric helper. Pass None for now and let
+            // the helper fall back to its own JOB_INFO lookup — cancel is not
+            // a hot path. Re-ordering the load is the deferred refactor.
             background_action_transition = self
                 .set_job_status_with_index_opts(
                     &mut TxnWriter(&txn),
@@ -149,6 +153,7 @@ impl JobStoreShard {
                     id,
                     cancelled_status,
                     terminal_expire_ts,
+                    None,
                 )
                 .await?;
 

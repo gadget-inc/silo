@@ -587,6 +587,7 @@ impl JobStoreShard {
         relative_attempt_number: u32,
         now_ms: i64,
         expiry_ms: i64,
+        job_metric_info: Option<&JobView>,
     ) -> Result<(Vec<u8>, Option<BackgroundActionMetricTransition>), JobStoreShardError> {
         // [SILO-DEQ-4] Create lease record
         let lease_key = leased_task_key(task_id);
@@ -607,6 +608,7 @@ impl JobStoreShard {
                 tenant,
                 job_id,
                 job_status,
+                job_metric_info,
             )
             .await?;
 
@@ -1208,6 +1210,7 @@ impl JobStoreShard {
                 relative_attempt_number,
                 now_ms,
                 expiry_ms,
+                Some(&view),
             )
             .await?;
         if let Some(transition) = background_action_transition {

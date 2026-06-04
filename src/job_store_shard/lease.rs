@@ -179,6 +179,9 @@ impl JobStoreShard {
                 let job_status = JobStatus::succeeded(now_ms);
                 terminal_expire_ts =
                     self.terminal_expire_ts(crate::job::JobStatusKind::Succeeded, now_ms);
+                // No JobView is loaded on the Success/Cancelled branches; the
+                // helper falls back to its own JOB_INFO get. The Error branch
+                // below already loads `view` and threads it through.
                 if let Some(transition) = self
                     .set_job_status_with_index_opts(
                         &mut DbWriteBatcher::new(&self.db, &mut batch),
@@ -186,6 +189,7 @@ impl JobStoreShard {
                         &job_id,
                         job_status,
                         terminal_expire_ts,
+                        None,
                     )
                     .await?
                 {
@@ -215,6 +219,7 @@ impl JobStoreShard {
                         &job_id,
                         job_status,
                         terminal_expire_ts,
+                        None,
                     )
                     .await?
                 {
@@ -301,6 +306,7 @@ impl JobStoreShard {
                                 &tenant,
                                 &job_id,
                                 job_status,
+                                Some(&view),
                             )
                             .await?
                         {
@@ -322,6 +328,7 @@ impl JobStoreShard {
                                 &job_id,
                                 job_status,
                                 terminal_expire_ts,
+                                Some(&view),
                             )
                             .await?
                         {

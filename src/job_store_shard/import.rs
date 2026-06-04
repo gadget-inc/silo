@@ -13,7 +13,6 @@ use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
-use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms,
     put_with_optional_expire, retry_on_txn_conflict,
@@ -308,27 +307,12 @@ impl JobStoreShard {
         if is_terminal {
             self.increment_completed_jobs_counter(&mut writer)?;
         }
-        let background_action_transition = if matches!(
-            status_kind,
-            JobStatusKind::Failed | JobStatusKind::Cancelled
-        ) {
-            Some(BackgroundActionMetricTransition {
-                tenant: tenant.to_string(),
-                task_group: params.task_group.clone(),
-                old_status: None,
-                new_status: status_kind,
-                metadata: job.metadata.clone(),
-            })
-        } else {
-            None
-        };
-        self.apply_background_action_queue_counter_transition(
-            tenant,
-            &params.task_group,
-            None,
-            status_kind,
-            &job.metadata,
-        );
+        // Imported jobs intentionally don't move the background-action queue
+        // gauges or terminal event counters: imports are admin-driven and
+        // represent historical state being seeded, not live enqueues. The
+        // reimport path goes through `set_job_status_with_index_opts` and
+        // therefore still updates the gauges as part of a normal status
+        // transition.
 
         let write_op = if !is_terminal {
             let op = dst_events::next_write_op();
@@ -355,20 +339,10 @@ impl JobStoreShard {
                 dst_events::cancel_write(op);
             }
             self.rollback_grants(tenant, &grants);
-            self.rollback_background_action_queue_counter_transition(
-                tenant,
-                &params.task_group,
-                None,
-                status_kind,
-                &job.metadata,
-            );
             return Err(e.into());
         }
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
-        }
-        if let Some(transition) = &background_action_transition {
-            self.apply_background_action_metric_transition(transition);
         }
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
@@ -720,6 +694,9 @@ impl JobStoreShard {
         // === Update status, scheduling state, and counters ===
         let mut writer = TxnWriter(&txn);
 
+        // `existing_job` is the pre-reimport JobView; reimport copies its
+        // metadata + task_group into the new JobInfo unchanged, so passing it
+        // to the metric helper short-circuits the JOB_INFO refetch.
         let background_action_transition = self
             .set_job_status_with_index_opts(
                 &mut writer,
@@ -727,6 +704,7 @@ impl JobStoreShard {
                 job_id,
                 new_job_status,
                 terminal_expire_ts,
+                Some(&existing_job),
             )
             .await?;
 
