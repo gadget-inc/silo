@@ -186,6 +186,22 @@ fn default_hydrate_all_at_startup() -> bool {
     false
 }
 
+/// Default for `grant_scanner_batch_size`: max grants the scanner materializes,
+/// status-gets, and commits in a single `process_grants` pass.
+pub const DEFAULT_GRANT_SCANNER_BATCH_SIZE: usize = 256;
+
+fn default_grant_scanner_batch_size() -> usize {
+    DEFAULT_GRANT_SCANNER_BATCH_SIZE
+}
+
+/// Default for `grant_scanner_buffer_size`: max in-flight status lookups the
+/// scanner buffers concurrently within a single `process_grants` pass.
+pub const DEFAULT_GRANT_SCANNER_BUFFER_SIZE: usize = 64;
+
+fn default_grant_scanner_buffer_size() -> usize {
+    DEFAULT_GRANT_SCANNER_BUFFER_SIZE
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -225,6 +241,19 @@ pub struct DatabaseTemplate {
     /// access. Defaults to false.
     #[serde(default = "default_hydrate_all_at_startup")]
     pub hydrate_all_at_startup: bool,
+    /// Max grants the background grant scanner materializes, status-checks, and
+    /// commits in a single `process_grants` pass. A single accumulated grant
+    /// request can be arbitrarily large; this caps peak per-pass memory, and the
+    /// scanner iterates as many passes as needed to drain the backlog. Defaults
+    /// to 256. Values below 1 are treated as 1.
+    #[serde(default = "default_grant_scanner_batch_size")]
+    pub grant_scanner_batch_size: usize,
+    /// Max in-flight job-status lookups the grant scanner buffers concurrently
+    /// within a single `process_grants` pass. Caps slatedb-side block-fetch
+    /// fan-out while the scanner validates a large pending backlog. Defaults to
+    /// 64. Values below 1 are treated as 1.
+    #[serde(default = "default_grant_scanner_buffer_size")]
+    pub grant_scanner_buffer_size: usize,
     /// When set, jobs that finished successfully (Succeeded) have all of their
     /// associated KV records re-put with a SlateDB row TTL expiring this many
     /// seconds in the future. `None` (the default) disables the behaviour for
@@ -285,6 +314,8 @@ impl Default for DatabaseTemplate {
             concurrency_reconcile_interval_ms: default_concurrency_reconcile_interval_ms(),
             counter_reconciliation_seconds: None,
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
+            grant_scanner_batch_size: default_grant_scanner_batch_size(),
+            grant_scanner_buffer_size: default_grant_scanner_buffer_size(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
@@ -547,6 +578,14 @@ pub struct DatabaseConfig {
     /// details. Defaults to false.
     #[serde(default = "default_hydrate_all_at_startup")]
     pub hydrate_all_at_startup: bool,
+    /// Max grants the grant scanner commits per `process_grants` pass. See
+    /// `DatabaseTemplate::grant_scanner_batch_size` for details. Defaults to 256.
+    #[serde(default = "default_grant_scanner_batch_size")]
+    pub grant_scanner_batch_size: usize,
+    /// Max in-flight status lookups the grant scanner buffers per pass. See
+    /// `DatabaseTemplate::grant_scanner_buffer_size` for details. Defaults to 64.
+    #[serde(default = "default_grant_scanner_buffer_size")]
+    pub grant_scanner_buffer_size: usize,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
     /// `DatabaseTemplate::completed_job_expire_s` for details.
     #[serde(default)]
@@ -579,6 +618,8 @@ impl Default for DatabaseConfig {
             apply_wal_on_close: default_apply_wal_on_close(),
             counter_reconciliation_seconds: None,
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
+            grant_scanner_batch_size: default_grant_scanner_batch_size(),
+            grant_scanner_buffer_size: default_grant_scanner_buffer_size(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             slatedb: None,

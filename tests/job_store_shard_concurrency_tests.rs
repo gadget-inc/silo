@@ -2054,14 +2054,14 @@ async fn grant_scanner_interleaved_stale_and_valid_requests() {
 /// that drove production OOMs (heap profile showed ~5.5 GB pinned in
 /// `CachedObjectStore::read_part` from concurrent slatedb reads).
 ///
-/// Exercises the bounded `buffered(STATUS_LOOKUP_CONCURRENCY)` path with a
-/// pending backlog larger than the in-flight cap (currently 64). Verifies
+/// Exercises the bounded `buffered(grant_scanner_buffer_size)` path with a
+/// pending backlog larger than the in-flight cap (default 64). Verifies
 /// correctness — order-preserving validation must still pair each result
 /// with the right request — across more than one buffered batch.
 #[silo::test]
 async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
-    // Sized to be a multiple of STATUS_LOOKUP_CONCURRENCY (64) plus extras
-    // so we cross at least two buffered windows. Kept modest to keep the
+    // Sized to be a multiple of the default grant_scanner_buffer_size (64) plus
+    // extras so we cross at least two buffered windows. Kept modest to keep the
     // test fast while still beating the in-flight cap meaningfully.
     const N: usize = 200;
 
@@ -2132,7 +2132,7 @@ async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
 
     // One process_grants call should drain all N waiters. Internally this
     // runs the buffered status-lookup pipeline across multiple batches of
-    // up to STATUS_LOOKUP_CONCURRENCY (64) in-flight db.gets.
+    // up to grant_scanner_buffer_size (default 64) in-flight db.gets.
     let granted = shard
         .process_concurrency_grants(tenant, queue, N as u32)
         .await;
@@ -2151,7 +2151,7 @@ async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
     assert_eq!(count_concurrency_holders(shard.db()).await, N);
 }
 
-/// Regression test for `MAX_GRANTS_PER_PASS` bounding in `process_grants`.
+/// Regression test for `grant_scanner_batch_size` bounding in `process_grants`.
 ///
 /// A single `request_grant_count` accumulation can be arbitrarily large (every
 /// release between scanner wakeups adds to it). Without a per-pass cap, the
@@ -2159,7 +2159,7 @@ async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
 /// status gets, and accumulate `count` edits in one `WriteBatch` before
 /// committing. The cap forces the scanner to drain a large `count` over multiple
 /// bounded passes — this test verifies that an end-to-end drain of a backlog
-/// larger than `MAX_GRANTS_PER_PASS` (256) still grants every waiter.
+/// larger than the default `grant_scanner_batch_size` (256) still grants every waiter.
 #[silo::test]
 async fn grant_scanner_drains_backlog_larger_than_max_per_pass() {
     // Sized to cross the per-pass cap (256) by enough to require at least three
@@ -2231,7 +2231,7 @@ async fn grant_scanner_drains_backlog_larger_than_max_per_pass() {
     }
 
     // One process_grants call asks for N grants. Internally this must run as
-    // multiple bounded passes (each ≤ MAX_GRANTS_PER_PASS = 256) and still
+    // multiple bounded passes (each ≤ grant_scanner_batch_size = 256) and still
     // return all N grants.
     let granted = shard
         .process_concurrency_grants(tenant, queue, N as u32)

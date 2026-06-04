@@ -616,6 +616,8 @@ pub async fn clone_golden_shard(
             hydrate_all_at_startup: false,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
+            grant_scanner_batch_size: silo::settings::DEFAULT_GRANT_SCANNER_BATCH_SIZE,
+            grant_scanner_buffer_size: silo::settings::DEFAULT_GRANT_SCANNER_BUFFER_SIZE,
         },
         ShardRange::full(),
     )
