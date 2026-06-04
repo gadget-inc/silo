@@ -31,7 +31,6 @@ use std::task::{Context, Poll};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::Counter as OtelCounter;
 use opentelemetry::metrics::Gauge as OtelGauge;
 use prometheus::{
     CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
@@ -42,7 +41,6 @@ use tokio::sync::broadcast;
 use tower::{Layer, Service};
 use tracing::{debug, error};
 
-use crate::job::JobStatusKind;
 use crate::job_store_shard::counters::{
     BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND, BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
     BACKGROUND_ACTION_QUEUE_SIZE_BUCKET, BACKGROUND_ACTION_RUNNING_SIZE_BUCKET,
@@ -115,8 +113,6 @@ pub struct Metrics {
     job_wait_time: HistogramVec,
     background_actions_queue_size: OtelGauge<u64>,
     background_actions_running_size: OtelGauge<u64>,
-    background_actions_failed_total: OtelCounter<u64>,
-    background_actions_cancelled_total: OtelCounter<u64>,
     previous_background_actions_queue_labels: BackgroundActionLabelSet,
     previous_background_actions_running_labels: BackgroundActionLabelSet,
 
@@ -346,41 +342,6 @@ impl Metrics {
         for ((shard_id, tenant, task_group, queue), value) in values {
             record_background_action_gauge_value(
                 gauge, shard_id, tenant, task_group, queue, *value,
-            );
-        }
-    }
-
-    pub fn record_background_action_terminal_event(
-        &self,
-        shard_id: &str,
-        tenant: &str,
-        task_group: &str,
-        status: JobStatusKind,
-        metadata: &[(String, String)],
-    ) {
-        let counter = match status {
-            JobStatusKind::Failed => &self.background_actions_failed_total,
-            JobStatusKind::Cancelled => &self.background_actions_cancelled_total,
-            JobStatusKind::Scheduled | JobStatusKind::Running | JobStatusKind::Succeeded => return,
-        };
-
-        let explicit_queue = background_action_metadata_value(metadata, "queue");
-        let platform_queue = background_action_metadata_value(metadata, "platformConcurrencyQueue");
-
-        if let Some(queue) = explicit_queue {
-            record_background_action_counter_value(counter, shard_id, tenant, task_group, queue, 1);
-        }
-        if let Some(queue) = platform_queue {
-            record_background_action_counter_value(counter, shard_id, tenant, task_group, queue, 1);
-        }
-        if explicit_queue.is_none() && platform_queue.is_some() {
-            record_background_action_counter_value(
-                counter,
-                shard_id,
-                tenant,
-                task_group,
-                "<no queue>",
-                1,
             );
         }
     }
@@ -631,34 +592,6 @@ fn record_background_action_gauge_value(
             KeyValue::new("queue", queue.to_string()),
         ],
     );
-}
-
-fn record_background_action_counter_value(
-    counter: &OtelCounter<u64>,
-    shard_id: &str,
-    tenant: &str,
-    task_group: &str,
-    queue: &str,
-    value: u64,
-) {
-    counter.add(
-        value,
-        &[
-            KeyValue::new("shard_id", shard_id.to_string()),
-            KeyValue::new("tenant", tenant.to_string()),
-            KeyValue::new("task_group", task_group.to_string()),
-            KeyValue::new("queue", queue.to_string()),
-        ],
-    );
-}
-
-fn background_action_metadata_value<'a>(
-    metadata: &'a [(String, String)],
-    key: &str,
-) -> Option<&'a str> {
-    metadata
-        .iter()
-        .find_map(|(k, v)| (k == key).then_some(v.as_str()))
 }
 
 /// Build background action status gauges from all represented jobs in a shard.
@@ -1484,14 +1417,6 @@ pub fn init() -> anyhow::Result<Metrics> {
         .u64_gauge("background_actions.running_size")
         .with_description("Number of Silo background action jobs currently running")
         .init();
-    let background_actions_failed_total = meter
-        .u64_counter("background_actions.failed_total")
-        .with_description("Total number of Silo background action jobs that failed")
-        .init();
-    let background_actions_cancelled_total = meter
-        .u64_counter("background_actions.cancelled_total")
-        .with_description("Total number of Silo background action jobs that were cancelled")
-        .init();
 
     // gRPC metrics
     let grpc_requests = register(
@@ -1836,8 +1761,6 @@ pub fn init() -> anyhow::Result<Metrics> {
         job_wait_time,
         background_actions_queue_size,
         background_actions_running_size,
-        background_actions_failed_total,
-        background_actions_cancelled_total,
         previous_background_actions_queue_labels: Arc::new(Mutex::new(HashSet::new())),
         previous_background_actions_running_labels: Arc::new(Mutex::new(HashSet::new())),
         grpc_requests,

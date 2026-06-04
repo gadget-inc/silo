@@ -359,18 +359,6 @@ impl JobStoreShard {
         }
     }
 
-    pub(crate) fn apply_background_action_metric_transition(
-        &self,
-        transition: &BackgroundActionMetricTransition,
-    ) {
-        self.record_background_action_terminal_counter_transition(
-            &transition.tenant,
-            &transition.task_group,
-            transition.new_status,
-            &transition.metadata,
-        );
-    }
-
     pub(crate) fn rollback_background_action_metric_gauge_transition(
         &self,
         transition: &BackgroundActionMetricTransition,
@@ -391,21 +379,6 @@ impl JobStoreShard {
         for transition in transitions {
             self.rollback_background_action_metric_gauge_transition(transition);
         }
-    }
-
-    pub(crate) fn record_background_action_terminal_counter_transition(
-        &self,
-        tenant: &str,
-        task_group: &str,
-        new_status: JobStatusKind,
-        metadata: &[(String, String)],
-    ) {
-        let Some(metrics) = self.metrics.as_ref() else {
-            return;
-        };
-        metrics.record_background_action_terminal_event(
-            &self.name, tenant, task_group, new_status, metadata,
-        );
     }
 
     fn apply_background_action_queue_counter_delta_for_key(

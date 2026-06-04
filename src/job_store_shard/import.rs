@@ -828,9 +828,6 @@ impl JobStoreShard {
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
         }
-        if let Some(transition) = &background_action_transition {
-            self.apply_background_action_metric_transition(transition);
-        }
 
         // [SILO-REIMP-6] Remove buffered tasks for this job.
         // Must happen after commit so the scanner cannot re-buffer old tasks from DB.

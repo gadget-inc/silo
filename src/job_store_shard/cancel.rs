@@ -324,10 +324,6 @@ impl JobStoreShard {
 
         // ---- Post-commit: update in-memory state ----
 
-        if let Some(transition) = &background_action_transition {
-            self.apply_background_action_metric_transition(transition);
-        }
-
         // Evict the deleted task from the broker buffer
         if let Some(ref key) = deleted_task_key {
             self.brokers.evict_keys(std::slice::from_ref(key));

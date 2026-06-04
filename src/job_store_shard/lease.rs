@@ -457,9 +457,6 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
-        for transition in &background_action_transitions {
-            self.apply_background_action_metric_transition(transition);
-        }
 
         // Post-commit: release in-memory concurrency counts and signal grant scanner.
         for queue in &held_queues_local {
