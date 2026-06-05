@@ -58,5 +58,118 @@
         setInterval(updateClock, 1000);
         updateClock();
     </script>
+
+    <!--
+      Client-side table sorting for non-paginated tables. Any <table data-sortable>
+      gets clickable column headers: click to sort ascending, click again to toggle.
+      A cell may carry data-sort-value to override its sort key (used where the
+      displayed text isn't directly comparable, e.g. "P5" or "1.50 MiB").
+      Paginated tables (e.g. tenants) sort server-side instead, so they are not
+      marked data-sortable.
+    -->
+    <script>
+        (function () {
+            function cellKey(row, idx) {
+                var cell = row.children[idx];
+                if (!cell) return '';
+                var override = cell.getAttribute('data-sort-value');
+                return (override !== null ? override : cell.textContent).trim();
+            }
+            function asNumber(s) {
+                if (s === '') return null;
+                var n = Number(s.replace(/,/g, ''));
+                return isNaN(n) ? null : n;
+            }
+            // Decide a column's type once per sort: it is numeric only if every
+            // non-empty cell parses as a number. Mixing numeric and string
+            // comparisons within one sort would be non-transitive (and produce a
+            // bogus order), so we pick one comparison for the whole column.
+            function columnIsNumeric(table, idx) {
+                var tbody = table.tBodies[0];
+                if (!tbody) return false;
+                var rows = tbody.rows, sawValue = false;
+                for (var i = 0; i < rows.length; i++) {
+                    var k = cellKey(rows[i], idx);
+                    if (k === '') continue;
+                    if (asNumber(k) === null) return false;
+                    sawValue = true;
+                }
+                return sawValue;
+            }
+            function sortBody(table, colIdx, dir, numeric) {
+                var tbody = table.tBodies[0];
+                if (!tbody) return;
+                var rows = Array.prototype.slice.call(tbody.rows);
+                var sign = dir === 'asc' ? 1 : -1;
+                rows.sort(function (r1, r2) {
+                    var a = cellKey(r1, colIdx), b = cellKey(r2, colIdx);
+                    var c;
+                    if (numeric) {
+                        var na = asNumber(a), nb = asNumber(b);
+                        // Empty cells in a numeric column sort as the smallest value.
+                        if (na === null) na = -Infinity;
+                        if (nb === null) nb = -Infinity;
+                        c = na < nb ? -1 : (na > nb ? 1 : 0);
+                    } else {
+                        c = a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+                    }
+                    return sign * c;
+                });
+                rows.forEach(function (r) { tbody.appendChild(r); });
+            }
+            function initTable(table) {
+                if (table.dataset.sortableReady) return;
+                table.dataset.sortableReady = '1';
+                var headRow = table.tHead && table.tHead.rows[0];
+                if (!headRow) return;
+                var ths = Array.prototype.slice.call(headRow.cells);
+                ths.forEach(function (th, idx) {
+                    if (th.hasAttribute('data-no-sort')) return;
+                    th.style.cursor = 'pointer';
+                    th.classList.add('select-none');
+                    th.title = 'Click to sort';
+                    var ind = document.createElement('span');
+                    ind.className = 'sort-indicator text-zinc-600 ml-1';
+                    ind.textContent = '↕'; // ↕
+                    th.appendChild(ind);
+                    th.addEventListener('click', function () {
+                        var numeric = columnIsNumeric(table, idx);
+                        var dir;
+                        if (table.dataset.sortCol === String(idx)) {
+                            // Same column: toggle direction.
+                            dir = table.dataset.sortDir === 'asc' ? 'desc' : 'asc';
+                        } else {
+                            // New column: open descending if numeric, ascending if
+                            // text — matching the server-side tenants table.
+                            dir = numeric ? 'desc' : 'asc';
+                        }
+                        table.dataset.sortCol = String(idx);
+                        table.dataset.sortDir = dir;
+                        sortBody(table, idx, dir, numeric);
+                        ths.forEach(function (h) {
+                            var si = h.querySelector('.sort-indicator');
+                            if (!si) return;
+                            if (h === th) {
+                                si.textContent = dir === 'asc' ? '▲' : '▼'; // ▲ / ▼
+                                si.className = 'sort-indicator text-emerald-400 ml-1';
+                            } else {
+                                si.textContent = '↕';
+                                si.className = 'sort-indicator text-zinc-600 ml-1';
+                            }
+                        });
+                    });
+                });
+            }
+            function initAll(root) {
+                var tables = (root || document).querySelectorAll('table[data-sortable]');
+                Array.prototype.forEach.call(tables, initTable);
+            }
+            initAll(document);
+            // Re-scan content swapped in by htmx (e.g. the SQL results table).
+            document.body.addEventListener('htmx:afterSwap', function (e) {
+                initAll(e.target);
+            });
+        })();
+    </script>
 </body>
 </html>
