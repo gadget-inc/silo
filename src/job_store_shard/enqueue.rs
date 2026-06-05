@@ -222,7 +222,18 @@ impl JobStoreShard {
             .await?;
 
         // Include counter in the same batch for efficiency
-        self.increment_total_jobs_counter(&mut DbWriteBatcher::new(&self.db, &mut batch))?;
+        if let Err(e) =
+            self.increment_total_jobs_counter(&mut DbWriteBatcher::new(&self.db, &mut batch))
+        {
+            self.rollback_background_action_queue_counter_transition(
+                tenant,
+                task_group,
+                None,
+                JobStatusKind::Scheduled,
+                &background_action_metadata,
+            );
+            return Err(e);
+        }
 
         // Two-phase DST event: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.
@@ -335,7 +346,16 @@ impl JobStoreShard {
             .await?;
 
         // Include counter in the transaction (unmark_write excludes it from conflict detection)
-        self.increment_total_jobs_counter(&mut TxnWriter(&txn))?;
+        if let Err(e) = self.increment_total_jobs_counter(&mut TxnWriter(&txn)) {
+            self.rollback_background_action_queue_counter_transition(
+                tenant,
+                task_group,
+                None,
+                JobStatusKind::Scheduled,
+                &background_action_metadata,
+            );
+            return Err(e);
+        }
 
         // Two-phase DST event: emit before commit for correct causal ordering,
         // confirm after commit succeeds, cancel if commit fails.

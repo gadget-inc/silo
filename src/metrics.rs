@@ -30,8 +30,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
-use opentelemetry::KeyValue;
-use opentelemetry::metrics::Gauge as OtelGauge;
 use prometheus::{
     CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
     core::Collector,
@@ -111,8 +109,8 @@ pub struct Metrics {
     jobs_completed: CounterVec,
     job_attempts: CounterVec,
     job_wait_time: HistogramVec,
-    background_actions_queue_size: OtelGauge<u64>,
-    background_actions_running_size: OtelGauge<u64>,
+    silo_background_actions_queue_size: GaugeVec,
+    silo_background_actions_running_size: GaugeVec,
     previous_background_actions_queue_labels: BackgroundActionLabelSet,
     previous_background_actions_running_labels: BackgroundActionLabelSet,
 
@@ -308,12 +306,12 @@ impl Metrics {
     /// Record background action status gauge values for the current scrape.
     pub fn record_background_action_metrics(&self, snapshot: BackgroundActionMetricSnapshot) {
         self.record_background_action_gauge(
-            &self.background_actions_queue_size,
+            &self.silo_background_actions_queue_size,
             &self.previous_background_actions_queue_labels,
             &snapshot.queue_size,
         );
         self.record_background_action_gauge(
-            &self.background_actions_running_size,
+            &self.silo_background_actions_running_size,
             &self.previous_background_actions_running_labels,
             &snapshot.running_size,
         );
@@ -321,28 +319,31 @@ impl Metrics {
 
     fn record_background_action_gauge(
         &self,
-        gauge: &OtelGauge<u64>,
+        gauge: &GaugeVec,
         previous_labels: &BackgroundActionLabelSet,
         values: &HashMap<BackgroundActionMetricKey, u64>,
     ) {
+        // Zero out label combinations that disappeared since the last scrape.
+        // Prometheus GaugeVec retains label sets across scrapes, so we have to
+        // explicitly set them to 0 (and drop them from `previous`) for the
+        // series to ever go away from a graph.
         let current: HashSet<BackgroundActionMetricKey> = values.keys().cloned().collect();
         let stale: Vec<BackgroundActionMetricKey> = {
             let mut previous = previous_labels.lock().unwrap();
-            let stale = previous
-                .difference(&current)
-                .cloned()
-                .collect::<Vec<(String, String, String, String)>>();
+            let stale = previous.difference(&current).cloned().collect();
             *previous = current;
             stale
         };
 
-        for (shard_id, tenant, task_group, queue) in stale {
-            record_background_action_gauge_value(gauge, &shard_id, &tenant, &task_group, &queue, 0);
+        for (shard_id, tenant, task_group, queue) in &stale {
+            gauge
+                .with_label_values(&[shard_id, tenant, task_group, queue])
+                .set(0.0);
         }
         for ((shard_id, tenant, task_group, queue), value) in values {
-            record_background_action_gauge_value(
-                gauge, shard_id, tenant, task_group, queue, *value,
-            );
+            gauge
+                .with_label_values(&[shard_id, tenant, task_group, queue])
+                .set(*value as f64);
         }
     }
 
@@ -573,25 +574,6 @@ impl Metrics {
     pub fn update_slatedb_stats(&self, shard: &str, recorder: &DefaultMetricsRecorder) {
         self.slatedb.update(shard, recorder);
     }
-}
-
-fn record_background_action_gauge_value(
-    gauge: &OtelGauge<u64>,
-    shard_id: &str,
-    tenant: &str,
-    task_group: &str,
-    queue: &str,
-    value: u64,
-) {
-    gauge.record(
-        value,
-        &[
-            KeyValue::new("shard_id", shard_id.to_string()),
-            KeyValue::new("tenant", tenant.to_string()),
-            KeyValue::new("task_group", task_group.to_string()),
-            KeyValue::new("queue", queue.to_string()),
-        ],
-    );
 }
 
 /// Build background action status gauges from all represented jobs in a shard.
@@ -1408,15 +1390,26 @@ pub fn init() -> anyhow::Result<Metrics> {
             &["shard", "task_group"],
         )?,
     );
-    let meter = opentelemetry::global::meter("silo");
-    let background_actions_queue_size = meter
-        .u64_gauge("background_actions.queue_size")
-        .with_description("Number of Silo background action jobs waiting or scheduled to run")
-        .init();
-    let background_actions_running_size = meter
-        .u64_gauge("background_actions.running_size")
-        .with_description("Number of Silo background action jobs currently running")
-        .init();
+    let silo_background_actions_queue_size = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_background_actions_queue_size",
+                "Number of Silo background action jobs waiting or scheduled to run",
+            ),
+            &["shard", "tenant", "task_group", "queue"],
+        )?,
+    );
+    let silo_background_actions_running_size = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_background_actions_running_size",
+                "Number of Silo background action jobs currently running",
+            ),
+            &["shard", "tenant", "task_group", "queue"],
+        )?,
+    );
 
     // gRPC metrics
     let grpc_requests = register(
@@ -1759,8 +1752,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         jobs_completed,
         job_attempts,
         job_wait_time,
-        background_actions_queue_size,
-        background_actions_running_size,
+        silo_background_actions_queue_size,
+        silo_background_actions_running_size,
         previous_background_actions_queue_labels: Arc::new(Mutex::new(HashSet::new())),
         previous_background_actions_running_labels: Arc::new(Mutex::new(HashSet::new())),
         grpc_requests,
