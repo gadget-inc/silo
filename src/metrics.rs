@@ -200,8 +200,6 @@ impl BackgroundActionMetricSnapshot {
 struct BackgroundActionStatusCounts {
     explicit_by_queue: HashMap<(String, String, String, String), u64>,
     platform_by_queue: HashMap<(String, String, String, String), u64>,
-    explicit_by_shard_tenant_task_group: HashMap<(String, String, String), u64>,
-    platform_by_shard_tenant_task_group: HashMap<(String, String, String), u64>,
 }
 
 /// SlateDB per-shard metric instruments plus the previous-value map needed
@@ -629,51 +627,21 @@ impl BackgroundActionStatusCounts {
             return;
         }
 
-        match queue_kind {
-            BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND => {
-                increment(
-                    &mut self.explicit_by_queue,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                        queue.to_string(),
-                    ),
-                    count,
-                );
-                increment(
-                    &mut self.explicit_by_shard_tenant_task_group,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                    ),
-                    count,
-                );
-            }
-            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND => {
-                increment(
-                    &mut self.platform_by_queue,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                        queue.to_string(),
-                    ),
-                    count,
-                );
-                increment(
-                    &mut self.platform_by_shard_tenant_task_group,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                    ),
-                    count,
-                );
-            }
-            _ => {}
-        }
+        let bucket = match queue_kind {
+            BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND => &mut self.explicit_by_queue,
+            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND => &mut self.platform_by_queue,
+            _ => return,
+        };
+        increment(
+            bucket,
+            (
+                shard_id.to_string(),
+                tenant.to_string(),
+                task_group.to_string(),
+                queue.to_string(),
+            ),
+            count,
+        );
     }
 
     fn finish_into(self, output: &mut HashMap<(String, String, String, String), u64>) {
@@ -682,33 +650,6 @@ impl BackgroundActionStatusCounts {
         }
         for (key, count) in self.platform_by_queue {
             increment(output, key, count);
-        }
-
-        let shard_tenant_task_groups: HashSet<(String, String, String)> = self
-            .platform_by_shard_tenant_task_group
-            .keys()
-            .chain(self.explicit_by_shard_tenant_task_group.keys())
-            .cloned()
-            .collect();
-        for (shard_id, tenant, task_group) in shard_tenant_task_groups {
-            let key = (shard_id.clone(), tenant.clone(), task_group.clone());
-            let platform = self
-                .platform_by_shard_tenant_task_group
-                .get(&key)
-                .copied()
-                .unwrap_or(0);
-            let explicit = self
-                .explicit_by_shard_tenant_task_group
-                .get(&key)
-                .copied()
-                .unwrap_or(0);
-            let unqueued = platform.saturating_sub(explicit);
-            if unqueued > 0 {
-                output.insert(
-                    (shard_id, tenant, task_group, "<no queue>".to_string()),
-                    unqueued,
-                );
-            }
         }
     }
 }
@@ -722,7 +663,7 @@ mod background_action_metric_tests {
     use super::*;
 
     #[test]
-    fn explicit_and_platform_queues_are_reported_with_synthetic_unqueued() {
+    fn explicit_and_platform_queues_are_reported_separately() {
         let mut counts = BackgroundActionStatusCounts::default();
 
         counts.add_counter(
@@ -789,15 +730,6 @@ mod background_action_metric_tests {
         );
         assert_eq!(
             output.get(&(
-                "shard-a".to_string(),
-                "env-env-1".to_string(),
-                "default".to_string(),
-                "<no queue>".to_string()
-            )),
-            Some(&1)
-        );
-        assert_eq!(
-            output.get(&(
                 "shard-b".to_string(),
                 "tenant-env-1".to_string(),
                 "background".to_string(),
@@ -805,10 +737,18 @@ mod background_action_metric_tests {
             )),
             Some(&1)
         );
+        // No `<no queue>` synthesis. Dashboards reconstruct it themselves
+        // as sum(platform) - sum(explicit); the prior subtraction inside
+        // `finish_into` just duplicated the platform-queue counts when no
+        // user-specified queues were in play, which is the common case.
+        assert!(
+            output.keys().all(|(_, _, _, queue)| queue != "<no queue>"),
+            "no `<no queue>` synthesis: {output:?}"
+        );
     }
 
     #[test]
-    fn synthetic_unqueued_never_goes_negative() {
+    fn explicit_only_emits_only_explicit_series() {
         let mut counts = BackgroundActionStatusCounts::default();
 
         counts.add_counter(
@@ -832,12 +772,7 @@ mod background_action_metric_tests {
             )),
             Some(&1)
         );
-        assert!(!output.contains_key(&(
-            "shard-a".to_string(),
-            "env-env-1".to_string(),
-            "default".to_string(),
-            "<no queue>".to_string()
-        )));
+        assert_eq!(output.len(), 1);
     }
 }
 
