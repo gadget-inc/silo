@@ -43,8 +43,15 @@ pub struct ShardCounters {
 
 pub(crate) const BACKGROUND_ACTION_QUEUE_SIZE_BUCKET: &str = "queue_size";
 pub(crate) const BACKGROUND_ACTION_RUNNING_SIZE_BUCKET: &str = "running_size";
+/// A job tagged with a user-provided `metadata["queue"]` value emits an
+/// `explicit` series under that queue name.
 pub(crate) const BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND: &str = "explicit";
-pub(crate) const BACKGROUND_ACTION_PLATFORM_QUEUE_KIND: &str = "platform";
+/// A job tagged with `metadata["platformConcurrencyQueue"]` (set by the
+/// platform regardless of whether the developer also passed a user queue)
+/// emits an `implicit` series under that platform queue name. Computing
+/// `sum(implicit) - sum(explicit)` per `(tenant, task_group)` recovers the
+/// "no user-specified queue" count without us synthesising it server-side.
+pub(crate) const BACKGROUND_ACTION_IMPLICIT_QUEUE_KIND: &str = "implicit";
 
 /// Stored queue counter row for background action metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +307,7 @@ impl JobStoreShard {
                 tenant,
                 task_group,
                 status_bucket,
-                BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+                BACKGROUND_ACTION_IMPLICIT_QUEUE_KIND,
                 queue,
                 delta,
             );
@@ -411,9 +418,13 @@ impl JobStoreShard {
 
     /// Snapshot sparse in-memory background action queue counters for this shard.
     ///
-    /// Entries with count <= 0 are excluded. The metric layer derives
-    /// synthetic `<no queue>` values from explicit/platform rows per
-    /// `(tenant, task_group)`.
+    /// Entries with count <= 0 are excluded; the in-memory map drops them as
+    /// soon as the count hits zero so the snapshot is naturally sparse. The
+    /// metric layer emits one Prometheus series per surviving entry, tagged
+    /// with the entry's `queue_kind` (`explicit` for user-named queues,
+    /// `implicit` for the platform queue). Dashboards reconstruct the
+    /// "actions without a user-named queue" total as
+    /// `sum(implicit) - sum(explicit)` per `(tenant, task_group)`.
     pub fn snapshot_background_action_queue_counters(&self) -> Vec<BackgroundActionQueueCounter> {
         let mut results = Vec::new();
         for entry in self.background_action_queue_counts.iter() {

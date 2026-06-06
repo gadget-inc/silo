@@ -182,7 +182,7 @@ async fn background_action_queue_counters_transition_through_lifecycle() {
                 .get(&(
                     "default".to_string(),
                     "queue_size".to_string(),
-                    "platform".to_string(),
+                    "implicit".to_string(),
                     "platform-queue".to_string()
                 ))
                 .copied()
@@ -227,7 +227,7 @@ async fn background_action_queue_counters_transition_through_lifecycle() {
                 .get(&(
                     "default".to_string(),
                     "running_size".to_string(),
-                    "platform".to_string(),
+                    "implicit".to_string(),
                     "platform-queue".to_string()
                 ))
                 .copied()
