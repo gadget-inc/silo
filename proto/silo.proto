@@ -216,13 +216,13 @@ message CancelJobResponse {}
 
 // Forcibly drop all concurrency holders and in-flight run attempts for a tenant
 // on a single shard. Admin/operator action used to clear stuck concurrency state.
-message DropTenantStateRequest {
+message DropTenantHoldersRequest {
   string shard = 1;           // Shard ID (UUID) to operate on.
   optional string tenant = 2; // Tenant ID if multi-tenancy is enabled.
 }
 
 // Response reporting what was dropped.
-message DropTenantStateResponse {
+message DropTenantHoldersResponse {
   uint64 holders_dropped = 1;      // Number of concurrency holders deleted.
   uint64 run_attempts_dropped = 2; // Number of in-flight run attempts deleted.
 }
@@ -685,7 +685,7 @@ service Silo {
 
   // Forcibly drop all concurrency holders and in-flight run attempts for a
   // tenant on this shard. Admin action to clear stuck concurrency state.
-  rpc DropTenantState(DropTenantStateRequest) returns (DropTenantStateResponse);
+  rpc DropTenantHolders(DropTenantHoldersRequest) returns (DropTenantHoldersResponse);
   
   // Restart a cancelled or failed job for another attempt.
   // Returns FAILED_PRECONDITION if job is not in a restartable state.

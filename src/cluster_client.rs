@@ -44,7 +44,7 @@ use crate::job_store_shard::DropTenantStats;
 use crate::pb::QueryRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
-    CancelJobRequest, ColumnInfo, CompactShardRequest, DropTenantStateRequest, GetJobRequest,
+    CancelJobRequest, ColumnInfo, CompactShardRequest, DropTenantHoldersRequest, GetJobRequest,
     GetJobResponse, GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse,
     JobStatus, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
 };
@@ -841,7 +841,7 @@ impl ClusterClient {
 
     /// Drop all concurrency holders and in-flight run attempts for a tenant on a
     /// shard (local or remote).
-    pub async fn drop_tenant_state(
+    pub async fn drop_tenant_holders(
         &self,
         shard_id: &ShardId,
         tenant: &str,
@@ -860,12 +860,12 @@ impl ClusterClient {
         debug!(shard_id = %shard_id, addr = %addr, tenant, "dropping tenant state on remote shard");
 
         let mut client = self.get_client(&addr).await?;
-        let request = DropTenantStateRequest {
+        let request = DropTenantHoldersRequest {
             shard: shard_id.to_string(),
             tenant: Some(tenant.to_string()),
         };
 
-        match client.drop_tenant_state(request).await {
+        match client.drop_tenant_holders(request).await {
             Ok(resp) => {
                 let resp = resp.into_inner();
                 Ok(DropTenantStats {

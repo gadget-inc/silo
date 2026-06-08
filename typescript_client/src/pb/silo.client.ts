@@ -47,8 +47,8 @@ import type { ExpediteJobResponse } from "./silo";
 import type { ExpediteJobRequest } from "./silo";
 import type { RestartJobResponse } from "./silo";
 import type { RestartJobRequest } from "./silo";
-import type { DropTenantStateResponse } from "./silo";
-import type { DropTenantStateRequest } from "./silo";
+import type { DropTenantHoldersResponse } from "./silo";
+import type { DropTenantHoldersRequest } from "./silo";
 import type { CancelJobResponse } from "./silo";
 import type { CancelJobRequest } from "./silo";
 import type { DeleteJobResponse } from "./silo";
@@ -124,9 +124,9 @@ export interface ISiloClient {
      * Forcibly drop all concurrency holders and in-flight run attempts for a
      * tenant on this shard. Admin action to clear stuck concurrency state.
      *
-     * @generated from protobuf rpc: DropTenantState
+     * @generated from protobuf rpc: DropTenantHolders
      */
-    dropTenantState(input: DropTenantStateRequest, options?: RpcOptions): UnaryCall<DropTenantStateRequest, DropTenantStateResponse>;
+    dropTenantHolders(input: DropTenantHoldersRequest, options?: RpcOptions): UnaryCall<DropTenantHoldersRequest, DropTenantHoldersResponse>;
     /**
      * Restart a cancelled or failed job for another attempt.
      * Returns FAILED_PRECONDITION if job is not in a restartable state.
@@ -382,11 +382,11 @@ export class SiloClient implements ISiloClient, ServiceInfo {
      * Forcibly drop all concurrency holders and in-flight run attempts for a
      * tenant on this shard. Admin action to clear stuck concurrency state.
      *
-     * @generated from protobuf rpc: DropTenantState
+     * @generated from protobuf rpc: DropTenantHolders
      */
-    dropTenantState(input: DropTenantStateRequest, options?: RpcOptions): UnaryCall<DropTenantStateRequest, DropTenantStateResponse> {
+    dropTenantHolders(input: DropTenantHoldersRequest, options?: RpcOptions): UnaryCall<DropTenantHoldersRequest, DropTenantHoldersResponse> {
         const method = this.methods[7], opt = this._transport.mergeOptions(options);
-        return stackIntercept<DropTenantStateRequest, DropTenantStateResponse>("unary", this._transport, method, opt, input);
+        return stackIntercept<DropTenantHoldersRequest, DropTenantHoldersResponse>("unary", this._transport, method, opt, input);
     }
     /**
      * Restart a cancelled or failed job for another attempt.

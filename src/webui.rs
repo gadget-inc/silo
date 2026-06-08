@@ -921,7 +921,7 @@ async fn cancel_job_handler(
 /// single shard (per the admin action's scope). If the tenant spans multiple
 /// shards, only the first is touched and the response notes the others were
 /// skipped.
-async fn drop_tenant_state_handler(
+async fn drop_tenant_holders_handler(
     State(state): State<AppState>,
     Query(params): Query<TenantParams>,
 ) -> impl IntoResponse {
@@ -973,7 +973,7 @@ async fn drop_tenant_state_handler(
 
     match state
         .cluster_client
-        .drop_tenant_state(&shard_id, &params.name)
+        .drop_tenant_holders(&shard_id, &params.name)
         .await
     {
         Ok(stats) => {
@@ -2183,7 +2183,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/queue", get(queue_handler))
         .route("/tenants", get(tenants_handler))
         .route("/tenant", get(tenant_handler))
-        .route("/tenant/drop-state", post(drop_tenant_state_handler))
+        .route("/tenant/drop-state", post(drop_tenant_holders_handler))
         .route("/cluster", get(cluster_handler))
         .route("/shard", get(shard_handler))
         .route("/shard/:id/split", post(shard_split_handler))
