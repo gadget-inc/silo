@@ -1083,6 +1083,24 @@ impl Silo for SiloService {
         Ok(Response::new(CancelJobResponse {}))
     }
 
+    async fn drop_tenant_holders(
+        &self,
+        req: Request<DropTenantHoldersRequest>,
+    ) -> Result<Response<DropTenantHoldersResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+        let stats = shard
+            .drop_tenant_holders_and_runattempts(&tenant)
+            .await
+            .map_err(map_err)?;
+        Ok(Response::new(DropTenantHoldersResponse {
+            holders_dropped: stats.holders_dropped as u64,
+            run_attempts_dropped: stats.run_attempts_dropped as u64,
+        }))
+    }
+
     async fn restart_job(
         &self,
         req: Request<RestartJobRequest>,

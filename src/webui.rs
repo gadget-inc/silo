@@ -915,6 +915,88 @@ async fn cancel_job_handler(
     }
 }
 
+/// Forcibly drop all concurrency holders and in-flight run attempts for a tenant.
+///
+/// Resolves the tenant's shard from the cluster query engine and operates on a
+/// single shard (per the admin action's scope). If the tenant spans multiple
+/// shards, only the first is touched and the response notes the others were
+/// skipped.
+async fn drop_tenant_holders_handler(
+    State(state): State<AppState>,
+    Query(params): Query<TenantParams>,
+) -> impl IntoResponse {
+    fn error_box(msg: &str) -> Html<String> {
+        Html(format!(
+            r#"<div class="bg-red-900/30 border border-red-700 p-4"><div class="text-red-400 text-sm font-medium">Error</div><pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{}</pre></div>"#,
+            msg
+        ))
+    }
+
+    let tenant_escaped = sql_string_literal(&params.name);
+    let sql = format!(
+        "SELECT DISTINCT shard_id FROM jobs WHERE tenant = '{}'",
+        tenant_escaped
+    );
+
+    // Resolve which shard(s) the tenant lives on.
+    let mut shard_ids: Vec<crate::shard_range::ShardId> = Vec::new();
+    match state.query_engine.sql(&sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                for batch in batches {
+                    let Some(col) = batch.column_by_name("shard_id").and_then(|c| {
+                        c.as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    }) else {
+                        continue;
+                    };
+                    for i in 0..batch.num_rows() {
+                        if col.is_null(i) {
+                            continue;
+                        }
+                        if let Ok(s) = crate::shard_range::ShardId::parse(col.value(i))
+                            && !shard_ids.contains(&s)
+                        {
+                            shard_ids.push(s);
+                        }
+                    }
+                }
+            }
+            Err(e) => return error_box(&format!("Failed to resolve tenant shard: {}", e)),
+        },
+        Err(e) => return error_box(&format!("Failed to resolve tenant shard: {}", e)),
+    }
+
+    let Some(shard_id) = shard_ids.first().copied() else {
+        return error_box("No data found for this tenant — nothing to drop.");
+    };
+
+    match state
+        .cluster_client
+        .drop_tenant_holders(&shard_id, &params.name)
+        .await
+    {
+        Ok(stats) => {
+            let mut body = format!(
+                "Dropped {} holders and {} run attempts on shard {}.",
+                stats.holders_dropped, stats.run_attempts_dropped, shard_id
+            );
+            if shard_ids.len() > 1 {
+                body.push_str(&format!(
+                    "\nNote: tenant spans {} shards; {} additional shard(s) were not touched.",
+                    shard_ids.len(),
+                    shard_ids.len() - 1
+                ));
+            }
+            Html(format!(
+                r#"<div class="bg-emerald-900/30 border border-emerald-700 p-4"><div class="text-emerald-400 text-sm font-medium">Done</div><pre class="text-emerald-300 text-xs mt-2 whitespace-pre-wrap">{}</pre></div>"#,
+                body
+            ))
+        }
+        Err(e) => error_box(&format!("{}", e)),
+    }
+}
+
 async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Key: queue_name -> (holders, waiters)
     let mut all_queues: HashMap<String, (usize, usize)> = HashMap::new();
@@ -2101,6 +2183,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/queue", get(queue_handler))
         .route("/tenants", get(tenants_handler))
         .route("/tenant", get(tenant_handler))
+        .route("/tenant/drop-state", post(drop_tenant_holders_handler))
         .route("/cluster", get(cluster_handler))
         .route("/shard", get(shard_handler))
         .route("/shard/:id/split", post(shard_split_handler))

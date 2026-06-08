@@ -97,6 +97,13 @@ impl Silo for CountingClusterInfoService {
         Self::unimplemented("cancel_job")
     }
 
+    async fn drop_tenant_holders(
+        &self,
+        _request: Request<DropTenantHoldersRequest>,
+    ) -> Result<Response<DropTenantHoldersResponse>, Status> {
+        Self::unimplemented("drop_tenant_holders")
+    }
+
     async fn restart_job(
         &self,
         _request: Request<RestartJobRequest>,

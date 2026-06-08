@@ -3,6 +3,7 @@ mod cancel;
 mod cleanup;
 pub(crate) mod counters;
 mod dequeue;
+mod drop_tenant_holders;
 mod enqueue;
 mod expedite;
 mod floating;
@@ -16,6 +17,7 @@ mod restart;
 mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
+pub use drop_tenant_holders::DropTenantStats;
 
 pub use counters::{
     JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
