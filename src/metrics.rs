@@ -40,7 +40,7 @@ use tower::{Layer, Service};
 use tracing::{debug, error};
 
 use crate::job_store_shard::counters::{
-    BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND, BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+    BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND, BACKGROUND_ACTION_IMPLICIT_QUEUE_KIND,
     BACKGROUND_ACTION_QUEUE_SIZE_BUCKET, BACKGROUND_ACTION_RUNNING_SIZE_BUCKET,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
@@ -95,7 +95,8 @@ impl GrantPath {
     }
 }
 
-type BackgroundActionMetricKey = (String, String, String, String);
+// (shard_id, tenant, task_group, queue, queue_kind)
+type BackgroundActionMetricKey = (String, String, String, String, String);
 type BackgroundActionLabelSet = Arc<Mutex<HashSet<BackgroundActionMetricKey>>>;
 
 /// Silo metrics handle containing all metric instruments.
@@ -181,8 +182,8 @@ pub struct Metrics {
 /// Computed status gauges for Gadget background actions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackgroundActionMetricSnapshot {
-    pub queue_size: HashMap<(String, String, String, String), u64>,
-    pub running_size: HashMap<(String, String, String, String), u64>,
+    pub queue_size: HashMap<BackgroundActionMetricKey, u64>,
+    pub running_size: HashMap<BackgroundActionMetricKey, u64>,
 }
 
 impl BackgroundActionMetricSnapshot {
@@ -198,10 +199,8 @@ impl BackgroundActionMetricSnapshot {
 
 #[derive(Debug, Default)]
 struct BackgroundActionStatusCounts {
-    explicit_by_queue: HashMap<(String, String, String, String), u64>,
-    platform_by_queue: HashMap<(String, String, String, String), u64>,
-    explicit_by_shard_tenant_task_group: HashMap<(String, String, String), u64>,
-    platform_by_shard_tenant_task_group: HashMap<(String, String, String), u64>,
+    // key: (shard, tenant, task_group, queue, queue_kind)
+    by_queue: HashMap<BackgroundActionMetricKey, u64>,
 }
 
 /// SlateDB per-shard metric instruments plus the previous-value map needed
@@ -323,28 +322,7 @@ impl Metrics {
         previous_labels: &BackgroundActionLabelSet,
         values: &HashMap<BackgroundActionMetricKey, u64>,
     ) {
-        // Zero out label combinations that disappeared since the last scrape.
-        // Prometheus GaugeVec retains label sets across scrapes, so we have to
-        // explicitly set them to 0 (and drop them from `previous`) for the
-        // series to ever go away from a graph.
-        let current: HashSet<BackgroundActionMetricKey> = values.keys().cloned().collect();
-        let stale: Vec<BackgroundActionMetricKey> = {
-            let mut previous = previous_labels.lock().unwrap();
-            let stale = previous.difference(&current).cloned().collect();
-            *previous = current;
-            stale
-        };
-
-        for (shard_id, tenant, task_group, queue) in &stale {
-            gauge
-                .with_label_values(&[shard_id, tenant, task_group, queue])
-                .set(0.0);
-        }
-        for ((shard_id, tenant, task_group, queue), value) in values {
-            gauge
-                .with_label_values(&[shard_id, tenant, task_group, queue])
-                .set(*value as f64);
-        }
+        record_background_action_gauge_inner(gauge, previous_labels, values);
     }
 
     /// Record a gRPC request.
@@ -628,87 +606,30 @@ impl BackgroundActionStatusCounts {
         if count == 0 {
             return;
         }
-
-        match queue_kind {
-            BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND => {
-                increment(
-                    &mut self.explicit_by_queue,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                        queue.to_string(),
-                    ),
-                    count,
-                );
-                increment(
-                    &mut self.explicit_by_shard_tenant_task_group,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                    ),
-                    count,
-                );
-            }
-            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND => {
-                increment(
-                    &mut self.platform_by_queue,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                        queue.to_string(),
-                    ),
-                    count,
-                );
-                increment(
-                    &mut self.platform_by_shard_tenant_task_group,
-                    (
-                        shard_id.to_string(),
-                        tenant.to_string(),
-                        task_group.to_string(),
-                    ),
-                    count,
-                );
-            }
-            _ => {}
+        // Reject unknown queue_kind values rather than silently bucketing them
+        // — the counter-side constants are the source of truth.
+        if queue_kind != BACKGROUND_ACTION_EXPLICIT_QUEUE_KIND
+            && queue_kind != BACKGROUND_ACTION_IMPLICIT_QUEUE_KIND
+        {
+            return;
         }
+
+        increment(
+            &mut self.by_queue,
+            (
+                shard_id.to_string(),
+                tenant.to_string(),
+                task_group.to_string(),
+                queue.to_string(),
+                queue_kind.to_string(),
+            ),
+            count,
+        );
     }
 
-    fn finish_into(self, output: &mut HashMap<(String, String, String, String), u64>) {
-        for (key, count) in self.explicit_by_queue {
+    fn finish_into(self, output: &mut HashMap<BackgroundActionMetricKey, u64>) {
+        for (key, count) in self.by_queue {
             increment(output, key, count);
-        }
-        for (key, count) in self.platform_by_queue {
-            increment(output, key, count);
-        }
-
-        let shard_tenant_task_groups: HashSet<(String, String, String)> = self
-            .platform_by_shard_tenant_task_group
-            .keys()
-            .chain(self.explicit_by_shard_tenant_task_group.keys())
-            .cloned()
-            .collect();
-        for (shard_id, tenant, task_group) in shard_tenant_task_groups {
-            let key = (shard_id.clone(), tenant.clone(), task_group.clone());
-            let platform = self
-                .platform_by_shard_tenant_task_group
-                .get(&key)
-                .copied()
-                .unwrap_or(0);
-            let explicit = self
-                .explicit_by_shard_tenant_task_group
-                .get(&key)
-                .copied()
-                .unwrap_or(0);
-            let unqueued = platform.saturating_sub(explicit);
-            if unqueued > 0 {
-                output.insert(
-                    (shard_id, tenant, task_group, "<no queue>".to_string()),
-                    unqueued,
-                );
-            }
         }
     }
 }
@@ -717,14 +638,65 @@ fn increment<K: Eq + std::hash::Hash>(map: &mut HashMap<K, u64>, key: K, amount:
     *map.entry(key).or_insert(0) += amount;
 }
 
+/// Set each `(shard, tenant, task_group, queue, queue_kind)` series in
+/// `values` and drop any series that was in `previous_labels` but is missing
+/// from `values`. Snapshotting + diffing on the caller side keeps stale
+/// series from sticking around once the in-memory counter dropped them at 0.
+fn record_background_action_gauge_inner(
+    gauge: &GaugeVec,
+    previous_labels: &BackgroundActionLabelSet,
+    values: &HashMap<BackgroundActionMetricKey, u64>,
+) {
+    let current: HashSet<BackgroundActionMetricKey> = values.keys().cloned().collect();
+    let stale: Vec<BackgroundActionMetricKey> = {
+        let mut previous = previous_labels.lock().unwrap();
+        let stale = previous.difference(&current).cloned().collect();
+        *previous = current;
+        stale
+    };
+
+    for (shard_id, tenant, task_group, queue, queue_kind) in &stale {
+        // `remove_label_values` returns Err if the series was never
+        // registered (e.g. process restart with stale `previous`); that's
+        // fine — the goal is "no series in the scrape" either way.
+        let _ = gauge.remove_label_values(&[shard_id, tenant, task_group, queue, queue_kind]);
+    }
+    for ((shard_id, tenant, task_group, queue, queue_kind), value) in values {
+        gauge
+            .with_label_values(&[shard_id, tenant, task_group, queue, queue_kind])
+            .set(*value as f64);
+    }
+}
+
 #[cfg(test)]
 mod background_action_metric_tests {
     use super::*;
 
+    fn key(
+        shard: &str,
+        tenant: &str,
+        task_group: &str,
+        queue: &str,
+        queue_kind: &str,
+    ) -> BackgroundActionMetricKey {
+        (
+            shard.to_string(),
+            tenant.to_string(),
+            task_group.to_string(),
+            queue.to_string(),
+            queue_kind.to_string(),
+        )
+    }
+
     #[test]
-    fn explicit_and_platform_queues_are_reported_with_synthetic_unqueued() {
+    fn explicit_and_implicit_queues_are_reported_with_queue_kind_label() {
         let mut counts = BackgroundActionStatusCounts::default();
 
+        // An app that opts into a user queue contributes to BOTH the explicit
+        // series (under its user queue name) and the implicit series (under
+        // the platform queue it still acquires). Dashboards reconstruct
+        // "actions without a user-specified queue" via
+        // sum(implicit) - sum(explicit).
         counts.add_counter(
             "shard-a",
             "env-env-1",
@@ -745,7 +717,7 @@ mod background_action_metric_tests {
             "shard-a",
             "env-env-1",
             "default",
-            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+            BACKGROUND_ACTION_IMPLICIT_QUEUE_KIND,
             "platform-a",
             3,
         );
@@ -753,7 +725,7 @@ mod background_action_metric_tests {
             "shard-b",
             "tenant-env-1",
             "background",
-            BACKGROUND_ACTION_PLATFORM_QUEUE_KIND,
+            BACKGROUND_ACTION_IMPLICIT_QUEUE_KIND,
             "x",
             1,
         );
@@ -761,54 +733,64 @@ mod background_action_metric_tests {
         counts.finish_into(&mut output);
 
         assert_eq!(
-            output.get(&(
-                "shard-a".to_string(),
-                "env-env-1".to_string(),
-                "default".to_string(),
-                "user-a".to_string()
+            output.get(&key(
+                "shard-a",
+                "env-env-1",
+                "default",
+                "user-a",
+                "explicit"
             )),
             Some(&1)
         );
         assert_eq!(
-            output.get(&(
-                "shard-a".to_string(),
-                "env-env-1".to_string(),
-                "default".to_string(),
-                "user-b".to_string()
+            output.get(&key(
+                "shard-a",
+                "env-env-1",
+                "default",
+                "user-b",
+                "explicit"
             )),
             Some(&1)
         );
         assert_eq!(
-            output.get(&(
-                "shard-a".to_string(),
-                "env-env-1".to_string(),
-                "default".to_string(),
-                "platform-a".to_string()
+            output.get(&key(
+                "shard-a",
+                "env-env-1",
+                "default",
+                "platform-a",
+                "implicit"
             )),
             Some(&3)
         );
         assert_eq!(
-            output.get(&(
-                "shard-a".to_string(),
-                "env-env-1".to_string(),
-                "default".to_string(),
-                "<no queue>".to_string()
+            output.get(&key(
+                "shard-b",
+                "tenant-env-1",
+                "background",
+                "x",
+                "implicit"
             )),
             Some(&1)
         );
-        assert_eq!(
-            output.get(&(
-                "shard-b".to_string(),
-                "tenant-env-1".to_string(),
-                "background".to_string(),
-                "x".to_string()
-            )),
-            Some(&1)
+        assert!(
+            output
+                .keys()
+                .all(|(_, _, _, queue, _)| queue != "<no queue>"),
+            "no `<no queue>` synthesis: {output:?}"
         );
     }
 
     #[test]
-    fn synthetic_unqueued_never_goes_negative() {
+    fn unknown_queue_kind_is_rejected() {
+        let mut counts = BackgroundActionStatusCounts::default();
+        counts.add_counter("shard-a", "env-env-1", "default", "bogus", "q", 5);
+        let mut output = HashMap::new();
+        counts.finish_into(&mut output);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn explicit_only_emits_only_explicit_series() {
         let mut counts = BackgroundActionStatusCounts::default();
 
         counts.add_counter(
@@ -824,20 +806,66 @@ mod background_action_metric_tests {
         counts.finish_into(&mut output);
 
         assert_eq!(
-            output.get(&(
-                "shard-a".to_string(),
-                "env-env-1".to_string(),
-                "default".to_string(),
-                "user-a".to_string()
+            output.get(&key(
+                "shard-a",
+                "env-env-1",
+                "default",
+                "user-a",
+                "explicit"
             )),
             Some(&1)
         );
-        assert!(!output.contains_key(&(
-            "shard-a".to_string(),
-            "env-env-1".to_string(),
-            "default".to_string(),
-            "<no queue>".to_string()
-        )));
+        assert_eq!(output.len(), 1);
+    }
+
+    #[test]
+    fn stale_labels_are_removed_from_the_gauge() {
+        let registry = Registry::new();
+        let gauge = GaugeVec::new(
+            Opts::new("test_bg_q", "test"),
+            &["shard", "tenant", "task_group", "queue", "queue_kind"],
+        )
+        .unwrap();
+        registry.register(Box::new(gauge.clone())).unwrap();
+        let previous: BackgroundActionLabelSet = Arc::new(Mutex::new(HashSet::new()));
+
+        let mut first = HashMap::new();
+        first.insert(key("shard-a", "env-1", "default", "user-a", "explicit"), 3);
+        first.insert(
+            key("shard-a", "env-1", "default", "platform-1", "implicit"),
+            3,
+        );
+        record_background_action_gauge_inner(&gauge, &previous, &first);
+        assert_eq!(
+            gauge
+                .with_label_values(&["shard-a", "env-1", "default", "user-a", "explicit"])
+                .get(),
+            3.0
+        );
+
+        // user-a drops to 0 (removed from in-memory map → absent from the
+        // next snapshot). The next record pass should remove the series
+        // entirely — not leave it at 0.
+        let mut second = HashMap::new();
+        second.insert(
+            key("shard-a", "env-1", "default", "platform-1", "implicit"),
+            2,
+        );
+        record_background_action_gauge_inner(&gauge, &previous, &second);
+
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(
+            !raw.contains("user-a"),
+            "stale user-a series should not be in the scrape output:\n{raw}"
+        );
+        assert!(
+            raw.contains("platform-1"),
+            "live series should remain:\n{raw}"
+        );
     }
 }
 
@@ -1397,7 +1425,7 @@ pub fn init() -> anyhow::Result<Metrics> {
                 "silo_background_actions_queue_size",
                 "Number of Silo background action jobs waiting or scheduled to run",
             ),
-            &["shard", "tenant", "task_group", "queue"],
+            &["shard", "tenant", "task_group", "queue", "queue_kind"],
         )?,
     );
     let silo_background_actions_running_size = register(
@@ -1407,7 +1435,7 @@ pub fn init() -> anyhow::Result<Metrics> {
                 "silo_background_actions_running_size",
                 "Number of Silo background action jobs currently running",
             ),
-            &["shard", "tenant", "task_group", "queue"],
+            &["shard", "tenant", "task_group", "queue", "queue_kind"],
         )?,
     );
 
