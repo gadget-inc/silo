@@ -5459,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "silo"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -5538,7 +5538,7 @@ dependencies = [
 
 [[package]]
 name = "silo-autoscaler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5558,7 +5558,7 @@ dependencies = [
 
 [[package]]
 name = "silo-compactor"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5590,7 +5590,7 @@ dependencies = [
 
 [[package]]
 name = "silo-macros"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5599,7 +5599,7 @@ dependencies = [
 
 [[package]]
 name = "siloctl"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
