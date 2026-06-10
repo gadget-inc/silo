@@ -2223,6 +2223,7 @@ where
                     if let Some(ref m) = metrics_for_scrape {
                         let mut background_action_snapshot =
                             crate::metrics::BackgroundActionMetricSnapshot::default();
+                        let mut failed_background_action_shards = std::collections::HashSet::new();
                         for (shard_id, shard) in metrics_factory.instances().iter() {
                             let shard_label = shard_id.to_string();
                             let recorder = shard.slatedb_metrics_recorder();
@@ -2239,6 +2240,7 @@ where
                             {
                                 Ok(snapshot) => background_action_snapshot.merge(snapshot),
                                 Err(e) => {
+                                    failed_background_action_shards.insert(shard_label.clone());
                                     warn!(
                                         shard = %shard_label,
                                         error = %e,
@@ -2247,7 +2249,10 @@ where
                                 }
                             }
                         }
-                        m.record_background_action_metrics(background_action_snapshot);
+                        m.record_background_action_metrics_except_shards(
+                            background_action_snapshot,
+                            &failed_background_action_shards,
+                        );
                     }
                 }
                 _ = metrics_tick_rx.recv() => { break; }
