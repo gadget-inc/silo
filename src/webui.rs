@@ -275,6 +275,9 @@ struct SortedRunView {
     id: u32,
     sst_count: usize,
     estimated_size: String,
+    /// Raw byte size, exposed to the client-side table sorter so the Size
+    /// column sorts numerically rather than by its formatted string.
+    estimated_size_bytes: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -283,6 +286,10 @@ pub struct TenantsParams {
     page: usize,
     #[serde(default = "default_per_page")]
     per_page: usize,
+    #[serde(default = "default_tenant_sort")]
+    sort: String,
+    #[serde(default = "default_tenant_dir")]
+    dir: String,
 }
 
 fn default_page() -> usize {
@@ -291,6 +298,103 @@ fn default_page() -> usize {
 
 fn default_per_page() -> usize {
     50
+}
+
+fn default_tenant_sort() -> String {
+    "scheduled".to_string()
+}
+
+fn default_tenant_dir() -> String {
+    "desc".to_string()
+}
+
+/// Canonical sortable columns for the tenants table: (query key, display label).
+const TENANT_SORT_COLUMNS: [(&str, &str); 5] = [
+    ("name", "Tenant"),
+    ("jobs", "Jobs"),
+    ("scheduled", "Scheduled"),
+    ("running", "Running"),
+    ("terminal", "Terminal"),
+];
+
+/// Normalize a requested sort key, falling back to the default ("scheduled")
+/// for anything unrecognized.
+fn normalize_tenant_sort(sort: &str) -> &'static str {
+    TENANT_SORT_COLUMNS
+        .iter()
+        .map(|(key, _)| *key)
+        .find(|key| *key == sort)
+        .unwrap_or("scheduled")
+}
+
+/// Whether a tenants column sorts numerically. Only the tenant name is textual;
+/// every other column is a count. This also drives the default click direction
+/// (numeric columns open descending, text columns open ascending), matching the
+/// client-side sorter used on the non-paginated tables.
+fn tenant_column_is_numeric(key: &str) -> bool {
+    key != "name"
+}
+
+/// Sort tenant rows in place by the given (already-normalized) column and
+/// direction, with a stable tiebreaker on the tenant name.
+fn sort_tenant_rows(rows: &mut [TenantSummaryRow], sort_key: &str, ascending: bool) {
+    rows.sort_by(|a, b| {
+        let primary = match sort_key {
+            "name" => a.name.cmp(&b.name),
+            "jobs" => a.job_count.cmp(&b.job_count),
+            "running" => a.running_count.cmp(&b.running_count),
+            "terminal" => a.terminal_count.cmp(&b.terminal_count),
+            // "scheduled" and any unexpected value land here.
+            _ => a.scheduled_count.cmp(&b.scheduled_count),
+        };
+        let primary = if ascending {
+            primary
+        } else {
+            primary.reverse()
+        };
+        primary.then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// Build the clickable column headers for the tenants table. The active column's
+/// link toggles its direction; an inactive column opens descending if numeric and
+/// ascending if textual (so the first click matches the client-side convention).
+fn build_tenant_sort_headers(sort_key: &str, ascending: bool, per_page: usize) -> Vec<SortHeader> {
+    TENANT_SORT_COLUMNS
+        .iter()
+        .map(|(key, label)| {
+            let is_active = *key == sort_key;
+            let next_dir = if is_active {
+                if ascending { "desc" } else { "asc" }
+            } else if tenant_column_is_numeric(key) {
+                "desc"
+            } else {
+                "asc"
+            };
+            let indicator = if ascending { "▲" } else { "▼" };
+            SortHeader {
+                label,
+                href: format!(
+                    "/tenants?sort={}&dir={}&per_page={}",
+                    key, next_dir, per_page
+                ),
+                is_active,
+                indicator,
+            }
+        })
+        .collect()
+}
+
+/// A clickable, sortable column header for the tenants table.
+#[derive(Clone)]
+pub struct SortHeader {
+    pub label: &'static str,
+    /// Link that applies this column's sort (toggling direction when already active).
+    pub href: String,
+    /// Whether this column is the one currently sorted by.
+    pub is_active: bool,
+    /// Direction arrow to show when active ("▲" for asc, "▼" for desc).
+    pub indicator: &'static str,
 }
 
 #[derive(Template)]
@@ -304,6 +408,9 @@ struct TenantsTemplate {
     page: usize,
     per_page: usize,
     total_pages: usize,
+    sort: String,
+    dir: String,
+    sort_headers: Vec<SortHeader>,
     unavailable_shards: Vec<String>,
     error: Option<String>,
 }
@@ -1272,12 +1379,11 @@ async fn tenants_handler(
         });
     }
 
-    tenants.sort_by(|a, b| {
-        b.scheduled_count
-            .cmp(&a.scheduled_count)
-            .then_with(|| b.job_count.cmp(&a.job_count))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    // Resolve the requested sort column/direction, falling back to the default
+    // (scheduled, descending) for unknown values, then sort.
+    let sort_key = normalize_tenant_sort(&params.sort);
+    let ascending = params.dir == "asc";
+    sort_tenant_rows(&mut tenants, sort_key, ascending);
 
     let total_jobs: usize = tenants.iter().map(|t| t.job_count).sum();
     let error = if errors.is_empty() {
@@ -1301,6 +1407,9 @@ async fn tenants_handler(
         Vec::new()
     };
 
+    // Build the clickable column headers (see build_tenant_sort_headers).
+    let sort_headers = build_tenant_sort_headers(sort_key, ascending, per_page);
+
     let template = TenantsTemplate {
         nav_active: "tenants",
         tenancy_enabled: true,
@@ -1310,6 +1419,13 @@ async fn tenants_handler(
         page,
         per_page,
         total_pages,
+        sort: sort_key.to_string(),
+        dir: if ascending {
+            "asc".to_string()
+        } else {
+            "desc".to_string()
+        },
+        sort_headers,
         unavailable_shards: partial_rows.unavailable_shards,
         error,
     };
@@ -2022,6 +2138,7 @@ async fn shard_handler(
                     id: sr.id,
                     sst_count: sr.sst_count as usize,
                     estimated_size: format_byte_size(sr.estimated_size),
+                    estimated_size_bytes: sr.estimated_size,
                 })
                 .collect(),
         }),
@@ -2241,4 +2358,155 @@ pub async fn run_webui(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tenant_row(
+        name: &str,
+        jobs: usize,
+        scheduled: usize,
+        running: usize,
+        terminal: usize,
+    ) -> TenantSummaryRow {
+        TenantSummaryRow {
+            name: name.to_string(),
+            name_url: name.to_string(),
+            job_count: jobs,
+            scheduled_count: scheduled,
+            running_count: running,
+            terminal_count: terminal,
+        }
+    }
+
+    fn names(rows: &[TenantSummaryRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn normalize_tenant_sort_accepts_known_columns() {
+        for key in ["name", "jobs", "scheduled", "running", "terminal"] {
+            assert_eq!(normalize_tenant_sort(key), key);
+        }
+    }
+
+    #[test]
+    fn normalize_tenant_sort_falls_back_to_scheduled() {
+        assert_eq!(normalize_tenant_sort(""), "scheduled");
+        assert_eq!(normalize_tenant_sort("bogus"), "scheduled");
+        // Guards against query-string injection picking an unexpected column.
+        assert_eq!(normalize_tenant_sort("name; DROP TABLE"), "scheduled");
+    }
+
+    #[test]
+    fn tenant_column_numeric_classification() {
+        assert!(!tenant_column_is_numeric("name"));
+        for key in ["jobs", "scheduled", "running", "terminal"] {
+            assert!(tenant_column_is_numeric(key));
+        }
+    }
+
+    #[test]
+    fn sort_by_jobs_respects_direction() {
+        let mut rows = vec![
+            tenant_row("a", 5, 0, 0, 0),
+            tenant_row("b", 20, 0, 0, 0),
+            tenant_row("c", 1, 0, 0, 0),
+        ];
+        sort_tenant_rows(&mut rows, "jobs", false); // descending
+        assert_eq!(names(&rows), ["b", "a", "c"]);
+        sort_tenant_rows(&mut rows, "jobs", true); // ascending
+        assert_eq!(names(&rows), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn sort_by_name_is_alphabetical() {
+        let mut rows = vec![
+            tenant_row("charlie", 1, 1, 1, 1),
+            tenant_row("alice", 2, 2, 2, 2),
+            tenant_row("bob", 3, 3, 3, 3),
+        ];
+        sort_tenant_rows(&mut rows, "name", true);
+        assert_eq!(names(&rows), ["alice", "bob", "charlie"]);
+        sort_tenant_rows(&mut rows, "name", false);
+        assert_eq!(names(&rows), ["charlie", "bob", "alice"]);
+    }
+
+    #[test]
+    fn sort_breaks_ties_by_name_ascending_regardless_of_direction() {
+        // Equal counts on the sort column: name is the stable tiebreaker, and it
+        // stays ascending even when the primary sort is descending.
+        let mut rows = vec![
+            tenant_row("zeta", 7, 0, 0, 0),
+            tenant_row("alpha", 7, 0, 0, 0),
+            tenant_row("mid", 7, 0, 0, 0),
+        ];
+        sort_tenant_rows(&mut rows, "jobs", false);
+        assert_eq!(names(&rows), ["alpha", "mid", "zeta"]);
+        sort_tenant_rows(&mut rows, "jobs", true);
+        assert_eq!(names(&rows), ["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn sort_columns_select_the_right_field() {
+        let mut rows = vec![
+            tenant_row("a", 0, 1, 30, 0),
+            tenant_row("b", 0, 3, 10, 0),
+            tenant_row("c", 0, 2, 20, 0),
+        ];
+        sort_tenant_rows(&mut rows, "scheduled", true);
+        assert_eq!(names(&rows), ["a", "c", "b"]);
+        sort_tenant_rows(&mut rows, "running", true);
+        assert_eq!(names(&rows), ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn headers_cover_all_columns_with_labels() {
+        let headers = build_tenant_sort_headers("scheduled", false, 50);
+        let labels: Vec<&str> = headers.iter().map(|h| h.label).collect();
+        assert_eq!(
+            labels,
+            ["Tenant", "Jobs", "Scheduled", "Running", "Terminal"]
+        );
+    }
+
+    #[test]
+    fn active_header_toggles_direction_and_shows_arrow() {
+        // Active descending column: arrow is ▼ and its link flips to ascending.
+        let headers = build_tenant_sort_headers("jobs", false, 25);
+        let jobs = headers.iter().find(|h| h.label == "Jobs").unwrap();
+        assert!(jobs.is_active);
+        assert_eq!(jobs.indicator, "▼");
+        assert!(jobs.href.contains("sort=jobs"));
+        assert!(jobs.href.contains("dir=asc"));
+        assert!(jobs.href.contains("per_page=25"));
+
+        // Active ascending column: arrow is ▲ and its link flips to descending.
+        let headers = build_tenant_sort_headers("jobs", true, 25);
+        let jobs = headers.iter().find(|h| h.label == "Jobs").unwrap();
+        assert_eq!(jobs.indicator, "▲");
+        assert!(jobs.href.contains("dir=desc"));
+    }
+
+    #[test]
+    fn inactive_header_default_direction_matches_client_convention() {
+        // Numeric columns open descending; the text column opens ascending.
+        let headers = build_tenant_sort_headers("name", true, 50);
+        let jobs = headers.iter().find(|h| h.label == "Jobs").unwrap();
+        assert!(!jobs.is_active);
+        assert!(
+            jobs.href.contains("dir=desc"),
+            "numeric column should default to desc"
+        );
+
+        let headers = build_tenant_sort_headers("jobs", true, 50);
+        let name = headers.iter().find(|h| h.label == "Tenant").unwrap();
+        assert!(!name.is_active);
+        assert!(
+            name.href.contains("dir=asc"),
+            "text column should default to asc"
+        );
+    }
 }
