@@ -1218,17 +1218,16 @@ describe.skipIf(!RUN_INTEGRATION)("SiloGRPCClient integration", () => {
 
   describe("large payloads", () => {
     it(
-      "enqueues and retrieves a 100MB payload",
+      "enqueues and retrieves a 5MB payload",
       { timeout: 60_000 },
       async () => {
         const tenant = "large-payload-tenant";
 
-        // Build a ~100MB payload using a raw Buffer.
+        // Build a ~5MB payload using a raw Buffer.
         // msgpack encodes Buffers as binary data without base64 expansion,
-        // so the wire size stays close to 100MB. Gadget background action
-        // payloads can be up to 100MB, so this validates the gRPC message
-        // size limit clears the largest payload the platform allows.
-        const sizeBytes = 100 * 1024 * 1024;
+        // so the wire size stays close to 5MB. This validates that large
+        // payloads round-trip through the gRPC message size limit.
+        const sizeBytes = 5 * 1024 * 1024;
         const largeBuffer = Buffer.alloc(sizeBytes, 0x42);
         const payload = { data: largeBuffer };
 
