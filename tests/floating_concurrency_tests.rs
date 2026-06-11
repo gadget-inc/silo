@@ -2237,3 +2237,90 @@ async fn fc_before_concurrency_wedges_floating_only_jobs_via_orphaned_holder() {
         completed,
     );
 }
+
+/// Tests that a floating concurrency limit whose metadata declares
+/// `kind: shopifyPid` is bypassed entirely: jobs are granted immediately
+/// without checking (or counting against) the limit, so more jobs than
+/// `max_concurrency` can run at once.
+#[silo::test]
+async fn floating_limit_with_shopify_pid_kind_bypasses_limit_check() {
+    tokio::time::pause();
+    let now = now_ms();
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-shopify-pid-q".to_string();
+    let limit = || {
+        vec![silo::job::Limit::FloatingConcurrency(
+            silo::job::FloatingConcurrencyLimit {
+                key: queue.clone(),
+                default_max_concurrency: 1,
+                refresh_interval_ms: 60_000,
+                metadata: vec![("kind".to_string(), "shopifyPid".to_string())],
+            },
+        )]
+    };
+
+    // Enqueue two jobs against the same key with max_concurrency=1. Without
+    // the bypass, the second job would wait for the first to complete.
+    let j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"n": 1})),
+            limit(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j1");
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"n": 2})),
+            limit(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue j2");
+
+    // Both jobs should be leasable at the same time, exceeding the limit.
+    let result = shard.dequeue("w1", "default", 10).await.expect("dequeue");
+    assert_eq!(
+        result.tasks.len(),
+        2,
+        "both jobs should run concurrently despite max_concurrency=1"
+    );
+    let mut leased: Vec<String> = result
+        .tasks
+        .iter()
+        .map(|t| t.job().id().to_string())
+        .collect();
+    leased.sort();
+    let mut expected = vec![j1.clone(), j2.clone()];
+    expected.sort();
+    assert_eq!(leased, expected);
+
+    // Completing both works even though no holder was ever reserved.
+    for t in &result.tasks {
+        let task_id = t.attempt().task_id().to_string();
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report success");
+    }
+    for j in [&j1, &j2] {
+        let status = shard
+            .get_job_status("-", j)
+            .await
+            .expect("get status")
+            .expect("job exists");
+        assert_eq!(status.kind, JobStatusKind::Succeeded);
+    }
+}

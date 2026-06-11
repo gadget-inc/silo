@@ -31,6 +31,17 @@ pub struct FloatingConcurrencyLimit {
     pub metadata: Vec<(String, String)>,
 }
 
+impl FloatingConcurrencyLimit {
+    /// Floating limits whose metadata declares `kind: shopifyPid` are granted
+    /// unconditionally: the limit chain walker skips the limit check entirely,
+    /// reserving no holder slot for the queue.
+    pub fn bypasses_limit_check(&self) -> bool {
+        self.metadata
+            .iter()
+            .any(|(k, v)| k == "kind" && v == "shopifyPid")
+    }
+}
+
 /// State of a floating concurrency limit stored in the DB
 #[derive(Debug, Clone)]
 pub struct FloatingLimitState {

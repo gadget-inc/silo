@@ -697,6 +697,17 @@ impl JobStoreShard {
                 }
 
                 Limit::FloatingConcurrency(fl) => {
+                    if fl.bypasses_limit_check() {
+                        // `kind: shopifyPid` floating limits grant unconditionally:
+                        // no holder is reserved (so there's nothing to release on
+                        // completion and the queue is never entered), no state is
+                        // created, and no refresh is scheduled. `skip_try_reserve`
+                        // is deliberately NOT consumed — it must stay armed for
+                        // the first limit that actually reserves a slot.
+                        current_index += 1;
+                        continue;
+                    }
+
                     // Get/create floating limit state and maybe schedule refresh
                     let state = self
                         .get_or_create_floating_limit_state(writer, tenant, fl)
