@@ -53,6 +53,11 @@ pub mod pb {
 #[cfg(feature = "server")]
 pub mod server;
 
+/// Max gRPC message size for all silo servers and clients (tonic defaults to 4MB).
+/// Gadget background action payloads can be up to 100MB (matching the bigtable-backed
+/// store's payload ceiling), so this must comfortably clear that plus request overhead.
+pub const MAX_GRPC_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+
 #[cfg(unix)]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
