@@ -22,12 +22,13 @@
 //! metrics.jobs_enqueued.with_label_values(&["0", "default"]).inc();
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use prometheus::{
@@ -67,6 +68,8 @@ const READY_TO_START_LATENCY_MS_BUCKETS: &[f64] = &[
     1800000.0, 3600000.0,
 ];
 
+const BACKGROUND_ACTION_ZERO_RETENTION: Duration = Duration::from_secs(5 * 60);
+
 // SlateDB's `instrumented_object_store::stats` module is `pub(crate)` upstream,
 // so we hardcode these names. Once https://github.com/slatedb/slatedb/pull/1628
 // lands and we upgrade, replace these with `slatedb::instrumented_object_store::stats::*`.
@@ -97,7 +100,13 @@ impl GrantPath {
 
 // (shard_id, tenant, task_group, queue, queue_kind)
 type BackgroundActionMetricKey = (String, String, String, String, String);
-type BackgroundActionLabelSet = Arc<Mutex<HashSet<BackgroundActionMetricKey>>>;
+type BackgroundActionGaugeState = Arc<Mutex<HashMap<BackgroundActionMetricKey, GaugeSeriesState>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GaugeSeriesState {
+    NonZero,
+    Zero { since: Instant },
+}
 
 /// Silo metrics handle containing all metric instruments.
 #[derive(Clone)]
@@ -112,8 +121,8 @@ pub struct Metrics {
     job_wait_time: HistogramVec,
     silo_background_actions_queue_size: GaugeVec,
     silo_background_actions_running_size: GaugeVec,
-    previous_background_actions_queue_labels: BackgroundActionLabelSet,
-    previous_background_actions_running_labels: BackgroundActionLabelSet,
+    background_actions_queue_state: BackgroundActionGaugeState,
+    background_actions_running_state: BackgroundActionGaugeState,
 
     // gRPC metrics
     grpc_requests: CounterVec,
@@ -304,25 +313,39 @@ impl Metrics {
 
     /// Record background action status gauge values for the current scrape.
     pub fn record_background_action_metrics(&self, snapshot: BackgroundActionMetricSnapshot) {
+        let failed_shards = HashSet::new();
+        self.record_background_action_metrics_except_shards(snapshot, &failed_shards);
+    }
+
+    /// Record background action status gauges while preserving previous values
+    /// for shards whose background-action collection failed on this scrape.
+    pub(crate) fn record_background_action_metrics_except_shards(
+        &self,
+        snapshot: BackgroundActionMetricSnapshot,
+        failed_shards: &HashSet<String>,
+    ) {
         self.record_background_action_gauge(
             &self.silo_background_actions_queue_size,
-            &self.previous_background_actions_queue_labels,
+            &self.background_actions_queue_state,
             &snapshot.queue_size,
+            failed_shards,
         );
         self.record_background_action_gauge(
             &self.silo_background_actions_running_size,
-            &self.previous_background_actions_running_labels,
+            &self.background_actions_running_state,
             &snapshot.running_size,
+            failed_shards,
         );
     }
 
     fn record_background_action_gauge(
         &self,
         gauge: &GaugeVec,
-        previous_labels: &BackgroundActionLabelSet,
+        state: &BackgroundActionGaugeState,
         values: &HashMap<BackgroundActionMetricKey, u64>,
+        failed_shards: &HashSet<String>,
     ) {
-        record_background_action_gauge_inner(gauge, previous_labels, values);
+        record_background_action_gauge_inner(gauge, state, values, failed_shards);
     }
 
     /// Record a gRPC request.
@@ -639,32 +662,117 @@ fn increment<K: Eq + std::hash::Hash>(map: &mut HashMap<K, u64>, key: K, amount:
 }
 
 /// Set each `(shard, tenant, task_group, queue, queue_kind)` series in
-/// `values` and drop any series that was in `previous_labels` but is missing
-/// from `values`. Snapshotting + diffing on the caller side keeps stale
-/// series from sticking around once the in-memory counter dropped them at 0.
+/// `values`. Series that disappear from `values` are kept at `0` for a short
+/// retention period before deletion so Prometheus sees drained queues report
+/// zero before the label set disappears.
 fn record_background_action_gauge_inner(
     gauge: &GaugeVec,
-    previous_labels: &BackgroundActionLabelSet,
+    state: &BackgroundActionGaugeState,
     values: &HashMap<BackgroundActionMetricKey, u64>,
+    failed_shards: &HashSet<String>,
 ) {
-    let current: HashSet<BackgroundActionMetricKey> = values.keys().cloned().collect();
-    let stale: Vec<BackgroundActionMetricKey> = {
-        let mut previous = previous_labels.lock().unwrap();
-        let stale = previous.difference(&current).cloned().collect();
-        *previous = current;
-        stale
-    };
+    record_background_action_gauge_inner_at(
+        gauge,
+        state,
+        values,
+        failed_shards,
+        Instant::now(),
+        BACKGROUND_ACTION_ZERO_RETENTION,
+    );
+}
 
-    for (shard_id, tenant, task_group, queue, queue_kind) in &stale {
+fn record_background_action_gauge_inner_at(
+    gauge: &GaugeVec,
+    state: &BackgroundActionGaugeState,
+    values: &HashMap<BackgroundActionMetricKey, u64>,
+    failed_shards: &HashSet<String>,
+    now: Instant,
+    zero_retention: Duration,
+) {
+    let mut to_remove = Vec::new();
+    let mut to_set = Vec::new();
+    {
+        let mut state = state.lock().unwrap();
+
+        for (key, value) in values {
+            if *value > 0 {
+                state.insert(key.clone(), GaugeSeriesState::NonZero);
+                to_set.push((key.clone(), *value as f64));
+            } else {
+                retain_zero_or_expire(
+                    &mut state,
+                    key.clone(),
+                    now,
+                    zero_retention,
+                    false,
+                    &mut to_set,
+                    &mut to_remove,
+                );
+            }
+        }
+
+        let missing: Vec<_> = state
+            .keys()
+            .filter(|key| !values.contains_key(*key) && !failed_shards.contains(&key.0))
+            .cloned()
+            .collect();
+        for key in missing {
+            retain_zero_or_expire(
+                &mut state,
+                key,
+                now,
+                zero_retention,
+                true,
+                &mut to_set,
+                &mut to_remove,
+            );
+        }
+    }
+
+    for (shard_id, tenant, task_group, queue, queue_kind) in &to_remove {
         // `remove_label_values` returns Err if the series was never
-        // registered (e.g. process restart with stale `previous`); that's
+        // registered (e.g. process restart with stale state); that's
         // fine — the goal is "no series in the scrape" either way.
         let _ = gauge.remove_label_values(&[shard_id, tenant, task_group, queue, queue_kind]);
     }
-    for ((shard_id, tenant, task_group, queue, queue_kind), value) in values {
+    for ((shard_id, tenant, task_group, queue, queue_kind), value) in &to_set {
         gauge
             .with_label_values(&[shard_id, tenant, task_group, queue, queue_kind])
-            .set(*value as f64);
+            .set(*value);
+    }
+}
+
+fn retain_zero_or_expire(
+    state: &mut HashMap<BackgroundActionMetricKey, GaugeSeriesState>,
+    key: BackgroundActionMetricKey,
+    now: Instant,
+    zero_retention: Duration,
+    remember_new_zero: bool,
+    to_set: &mut Vec<(BackgroundActionMetricKey, f64)>,
+    to_remove: &mut Vec<BackgroundActionMetricKey>,
+) {
+    let zero_since = match state.entry(key.clone()) {
+        Entry::Occupied(mut entry) => match *entry.get() {
+            GaugeSeriesState::Zero { since } => since,
+            GaugeSeriesState::NonZero => {
+                entry.insert(GaugeSeriesState::Zero { since: now });
+                now
+            }
+        },
+        Entry::Vacant(entry) => {
+            if !remember_new_zero {
+                return;
+            }
+            entry.insert(GaugeSeriesState::Zero { since: now });
+            now
+        }
+    };
+
+    if now.saturating_duration_since(zero_since) >= zero_retention {
+        state.remove(&key);
+        to_remove.push(key);
+    } else {
+        to_set.push((key, 0.0));
     }
 }
 
@@ -819,7 +927,7 @@ mod background_action_metric_tests {
     }
 
     #[test]
-    fn stale_labels_are_removed_from_the_gauge() {
+    fn drained_labels_emit_zero_until_retention_expires() {
         let registry = Registry::new();
         let gauge = GaugeVec::new(
             Opts::new("test_bg_q", "test"),
@@ -827,7 +935,10 @@ mod background_action_metric_tests {
         )
         .unwrap();
         registry.register(Box::new(gauge.clone())).unwrap();
-        let previous: BackgroundActionLabelSet = Arc::new(Mutex::new(HashSet::new()));
+        let state: BackgroundActionGaugeState = Arc::new(Mutex::new(HashMap::new()));
+        let failed_shards = HashSet::new();
+        let retention = Duration::from_secs(300);
+        let t0 = Instant::now();
 
         let mut first = HashMap::new();
         first.insert(key("shard-a", "env-1", "default", "user-a", "explicit"), 3);
@@ -835,7 +946,14 @@ mod background_action_metric_tests {
             key("shard-a", "env-1", "default", "platform-1", "implicit"),
             3,
         );
-        record_background_action_gauge_inner(&gauge, &previous, &first);
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &first,
+            &failed_shards,
+            t0,
+            retention,
+        );
         assert_eq!(
             gauge
                 .with_label_values(&["shard-a", "env-1", "default", "user-a", "explicit"])
@@ -843,15 +961,47 @@ mod background_action_metric_tests {
             3.0
         );
 
-        // user-a drops to 0 (removed from in-memory map → absent from the
-        // next snapshot). The next record pass should remove the series
-        // entirely — not leave it at 0.
+        // user-a drops to 0 (removed from in-memory map -> absent from the
+        // next snapshot). The next record pass should keep the series and
+        // export zero during the retention window.
         let mut second = HashMap::new();
         second.insert(
             key("shard-a", "env-1", "default", "platform-1", "implicit"),
             2,
         );
-        record_background_action_gauge_inner(&gauge, &previous, &second);
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &second,
+            &failed_shards,
+            t0 + Duration::from_secs(1),
+            retention,
+        );
+
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(
+            raw.contains(
+                "test_bg_q{queue=\"user-a\",queue_kind=\"explicit\",shard=\"shard-a\",task_group=\"default\",tenant=\"env-1\"} 0"
+            ),
+            "drained user-a series should be emitted as zero:\n{raw}"
+        );
+        assert!(
+            raw.contains("platform-1"),
+            "live series should remain:\n{raw}"
+        );
+
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &second,
+            &failed_shards,
+            t0 + retention + Duration::from_secs(1),
+            retention,
+        );
 
         let mut buf = Vec::new();
         TextEncoder::new()
@@ -860,11 +1010,179 @@ mod background_action_metric_tests {
         let raw = String::from_utf8(buf).unwrap();
         assert!(
             !raw.contains("user-a"),
-            "stale user-a series should not be in the scrape output:\n{raw}"
+            "user-a series should be removed after zero retention expires:\n{raw}"
         );
         assert!(
             raw.contains("platform-1"),
-            "live series should remain:\n{raw}"
+            "live series should remain after stale expiry:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn nonzero_values_reset_zero_retention() {
+        let registry = Registry::new();
+        let gauge = GaugeVec::new(
+            Opts::new("test_bg_reset", "test"),
+            &["shard", "tenant", "task_group", "queue", "queue_kind"],
+        )
+        .unwrap();
+        registry.register(Box::new(gauge.clone())).unwrap();
+        let state: BackgroundActionGaugeState = Arc::new(Mutex::new(HashMap::new()));
+        let failed_shards = HashSet::new();
+        let retention = Duration::from_secs(300);
+        let t0 = Instant::now();
+        let metric_key = key("shard-a", "env-1", "default", "user-a", "explicit");
+
+        let mut values = HashMap::new();
+        values.insert(metric_key.clone(), 3);
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &values,
+            &failed_shards,
+            t0,
+            retention,
+        );
+
+        values.clear();
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &values,
+            &failed_shards,
+            t0 + Duration::from_secs(60),
+            retention,
+        );
+
+        values.insert(metric_key.clone(), 2);
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &values,
+            &failed_shards,
+            t0 + Duration::from_secs(120),
+            retention,
+        );
+
+        values.clear();
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &values,
+            &failed_shards,
+            t0 + Duration::from_secs(360),
+            retention,
+        );
+
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(
+            raw.contains(
+                "test_bg_reset{queue=\"user-a\",queue_kind=\"explicit\",shard=\"shard-a\",task_group=\"default\",tenant=\"env-1\"} 0"
+            ),
+            "nonzero value should reset the zero-retention timer:\n{raw}"
+        );
+
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &values,
+            &failed_shards,
+            t0 + Duration::from_secs(661),
+            retention,
+        );
+
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(
+            !raw.contains("user-a"),
+            "series should expire five minutes after the reset zero observation:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn failed_shards_keep_previous_values() {
+        let registry = Registry::new();
+        let gauge = GaugeVec::new(
+            Opts::new("test_bg_failed", "test"),
+            &["shard", "tenant", "task_group", "queue", "queue_kind"],
+        )
+        .unwrap();
+        registry.register(Box::new(gauge.clone())).unwrap();
+        let state: BackgroundActionGaugeState = Arc::new(Mutex::new(HashMap::new()));
+        let failed_shards = HashSet::new();
+        let retention = Duration::from_secs(300);
+        let t0 = Instant::now();
+
+        let mut first = HashMap::new();
+        first.insert(key("shard-a", "env-1", "default", "user-a", "explicit"), 3);
+        first.insert(key("shard-b", "env-1", "default", "user-b", "explicit"), 4);
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &first,
+            &failed_shards,
+            t0,
+            retention,
+        );
+
+        let mut second = HashMap::new();
+        second.insert(key("shard-a", "env-1", "default", "user-a", "explicit"), 1);
+        let mut failed_shards = HashSet::new();
+        failed_shards.insert("shard-b".to_string());
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &second,
+            &failed_shards,
+            t0 + Duration::from_secs(1),
+            retention,
+        );
+
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(
+            raw.contains(
+                "test_bg_failed{queue=\"user-a\",queue_kind=\"explicit\",shard=\"shard-a\",task_group=\"default\",tenant=\"env-1\"} 1"
+            ),
+            "successfully collected shard should update:\n{raw}"
+        );
+        assert!(
+            raw.contains(
+                "test_bg_failed{queue=\"user-b\",queue_kind=\"explicit\",shard=\"shard-b\",task_group=\"default\",tenant=\"env-1\"} 4"
+            ),
+            "failed shard should keep its previous value:\n{raw}"
+        );
+
+        let failed_shards = HashSet::new();
+        record_background_action_gauge_inner_at(
+            &gauge,
+            &state,
+            &second,
+            &failed_shards,
+            t0 + Duration::from_secs(2),
+            retention,
+        );
+
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(
+            raw.contains(
+                "test_bg_failed{queue=\"user-b\",queue_kind=\"explicit\",shard=\"shard-b\",task_group=\"default\",tenant=\"env-1\"} 0"
+            ),
+            "once collection is no longer marked failed, omission should drain normally:\n{raw}"
         );
     }
 }
@@ -1782,8 +2100,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         job_wait_time,
         silo_background_actions_queue_size,
         silo_background_actions_running_size,
-        previous_background_actions_queue_labels: Arc::new(Mutex::new(HashSet::new())),
-        previous_background_actions_running_labels: Arc::new(Mutex::new(HashSet::new())),
+        background_actions_queue_state: Arc::new(Mutex::new(HashMap::new())),
+        background_actions_running_state: Arc::new(Mutex::new(HashMap::new())),
         grpc_requests,
         grpc_request_duration,
         shards_owned,
