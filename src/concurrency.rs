@@ -1076,7 +1076,10 @@ impl ConcurrencyManager {
                 queue: queue.clone(),
             }))
         } else {
-            // Job scheduled for future: queue as RequestTicket task. The
+            // [SILO-ENQ-CONC-7] Job scheduled for future: queue as
+            // RequestTicket task; the trial reservation above was rolled
+            // back, so no slot is held while the job waits for its start
+            // time. The
             // chain's `task_id` is persisted so when the ticket is granted
             // at dequeue time, the holder it creates joins the same task_id
             // as any prior holders accumulated by the chain (avoiding the
