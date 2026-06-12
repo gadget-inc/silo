@@ -4,7 +4,7 @@ use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 
 use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_holder, encode_lease};
-use crate::concurrency::ConcurrencyManager;
+use crate::concurrency::{ConcurrencyManager, append_request_edits};
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
@@ -37,6 +37,12 @@ struct DequeueIterationState {
     /// in-memory slot released + the grant scanner notified after commit.
     /// Format: (tenant, queue, task_id).
     holder_releases: Vec<(String, String, String)>,
+    /// (tenant, queue) pairs whose at-capacity RequestTicket was converted
+    /// into a deferred concurrency request in this iteration's batch. The
+    /// grant scanner is nudged for each after commit so a slot freed between
+    /// `try_reserve` failing and the batch committing is picked up
+    /// immediately instead of waiting for the periodic reconcile.
+    converted_requests: Vec<(String, String)>,
     processed_internal: bool,
 }
 
@@ -51,12 +57,9 @@ impl DequeueIterationState {
             leased_tasks_for_dst: Vec::new(),
             pending_attempts: Vec::new(),
             holder_releases: Vec::new(),
+            converted_requests: Vec::new(),
             processed_internal: false,
         }
-    }
-
-    fn ack_release(&mut self, key: &[u8]) {
-        self.release_keys.push(key.to_vec());
     }
 
     fn ack_deleted(&mut self, key: &[u8]) {
@@ -524,6 +527,24 @@ impl JobStoreShard {
                 self.concurrency.request_grant(&tenant, &queue);
             }
 
+            // Post-commit: nudge the grant scanner for every queue whose
+            // parked ticket we just converted into a deferred request.
+            // Closes the race where the gating slot
+            // freed between try_reserve failing and this batch committing;
+            // without the nudge the request waits for the periodic reconcile.
+            // No cancellation guard is needed (unlike holder_releases): a
+            // missed nudge self-heals via that same reconcile, and a spurious
+            // nudge is harmless (process_grants re-checks capacity). The
+            // metric is recorded here rather than in the handler so it only
+            // counts durable conversions.
+            let converted = state.converted_requests.len() as u64;
+            for (tenant, queue) in state.converted_requests.drain(..) {
+                self.concurrency.request_grant(&tenant, &queue);
+            }
+            if let Some(ref m) = self.metrics {
+                m.record_concurrency_tickets_converted(self.name(), converted);
+            }
+
             // Collect pending attempts from this iteration
             pending_attempts.append(&mut state.pending_attempts);
 
@@ -636,8 +657,10 @@ impl JobStoreShard {
     /// 1. Sanity-check that the job still exists (cheap status check; no
     ///    JobInfo fetch — the limits we need ride on the ticket itself).
     /// 2. Resolve the gating queue's capacity from the persisted limits.
-    /// 3. `try_reserve` the slot. If at capacity, leave the ticket in place
-    ///    (`ack_release`) so a later scan reattempts.
+    /// 3. `try_reserve` the slot. If at capacity, delete the ticket and
+    ///    convert it into a deferred concurrency request record (drained by
+    ///    the grant scanner; nudged post-commit) — leaving at-capacity
+    ///    tickets in place head-of-line-blocks the broker scan.
     /// 4. On grant: write the holder, delete the ticket, and call
     ///    `enqueue_limit_task_at_index` with `limit_index + 1` to write the
     ///    follow-up task. Use `now_ms` for the follow-up's task_key — the
@@ -750,8 +773,46 @@ impl JobStoreShard {
             .await?;
 
         if !reserved {
-            // Out of capacity — leave the ticket in place for a later scan.
-            state.ack_release(task_key);
+            // Out of capacity. Do NOT leave the ticket in
+            // the task keyspace — the broker rescans the group from the front
+            // every pass and claims in key order, so a pile of permanently
+            // unconsumable tickets head-of-line blocks every later-keyed task
+            // in the group (tests/broker_head_of_line_blocking_tests.rs).
+            // Convert it into a deferred concurrency request record instead:
+            // the same durable shape an at-capacity immediate enqueue writes
+            // ([SILO-ENQ-CONC-6]), drained by the grant scanner when a slot
+            // frees.
+            //
+            // The request keeps the ticket's ORIGINAL start_time_ms and
+            // priority: cancel/reimport locate request records by the narrow
+            // (tenant, queue, start_time, priority, job_id, attempt) prefix
+            // derived from job status, and process_grants grants in
+            // start-time order, so the job keeps its fair queue position.
+            //
+            // No rollback handling is needed: nothing was reserved in memory
+            // (try_reserve failed), and if the batch never commits the ticket
+            // survives durably and is re-converted on the next claim.
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
+            let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
+            append_request_edits(
+                &mut writer,
+                &tenant,
+                &queue,
+                rt.start_time_ms(),
+                rt.priority(),
+                &job_id,
+                attempt_number,
+                relative_attempt_number,
+                &req_task_group,
+                limit_index,
+                &stored_held_queues,
+                &task_id,
+                &limits,
+            )?;
+            state
+                .converted_requests
+                .push((tenant.clone(), queue.clone()));
             return Ok(());
         }
 
