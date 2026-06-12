@@ -893,6 +893,8 @@ impl ConcurrencyManager {
 
     fn chain_resumer(&self) -> Option<Arc<dyn LimitChainResumer>> {
         self.chain_resumer.lock().unwrap().clone()
+    }
+
     /// Notify handle used by the shard's startup hydration task to wake the
     /// grant scanner once `grants_enabled` flips to true.
     pub fn wake_grant_scanner(&self) {
