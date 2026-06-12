@@ -162,6 +162,7 @@ fn map_err(e: JobStoreShardError) -> Status {
         JobStoreShardError::JobNotExpediteable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::JobNotLeaseable(ref e) => Status::failed_precondition(e.to_string()),
         JobStoreShardError::InvalidArgument(ref msg) => Status::invalid_argument(msg.clone()),
+        JobStoreShardError::ShardHydrating => Status::unavailable("shard hydrating, try again"),
         other => Status::internal(other.to_string()),
     }
 }
