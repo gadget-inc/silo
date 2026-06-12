@@ -2188,3 +2188,234 @@ async fn future_scheduled_burst_into_quiet_queue_holds_zero_slots() {
         tasks.len(),
     );
 }
+
+/// A future-scheduled job's RequestTicket processed at an
+/// at-capacity queue must be converted into a deferred concurrency request
+/// (task deleted, request record + requester counter written) rather than
+/// left parked in the task keyspace, and the grant scanner must drain the
+/// converted request once the slot frees.
+#[silo::test]
+async fn at_capacity_ticket_converts_to_deferred_request() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+        let queue = "convert-q".to_string();
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let limits = vec![Limit::Concurrency(ConcurrencyLimit {
+            key: queue.clone(),
+            max_concurrency: 1,
+        })];
+
+        // Job 1: immediate, takes the only slot and is leased (held until we
+        // complete it).
+        let job1 = shard
+            .enqueue(
+                "-",
+                Some("convert-job-1".to_string()),
+                10u8,
+                now,
+                None,
+                payload.clone(),
+                limits.clone(),
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue job1");
+        let tasks = shard.dequeue("w", "default", 1).await.expect("deq1").tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].job().id(), job1);
+        let t1_id = tasks[0].attempt().task_id().to_string();
+
+        // Job 2: future-scheduled on the same queue → persisted RequestTicket.
+        let job2 = shard
+            .enqueue(
+                "-",
+                Some("convert-job-2".to_string()),
+                10u8,
+                now + 500,
+                None,
+                payload.clone(),
+                limits.clone(),
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue job2");
+        assert_eq!(
+            count_task_keys(shard.db()).await,
+            1,
+            "future job should be a parked RequestTicket task"
+        );
+        assert_eq!(
+            count_concurrency_requests(shard.db()).await,
+            0,
+            "no deferred request before the ticket is processed"
+        );
+
+        // Let the start time pass, then dequeue: the broker claims the
+        // ticket, try_reserve fails (job1 holds the slot), and the ticket is
+        // converted. The dequeue returns nothing leasable.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let converted = poll_until(
+            || async {
+                let r = shard.dequeue("w", "default", 1).await.expect("deq2");
+                assert!(r.tasks.is_empty(), "no slot available, nothing leasable");
+                (
+                    count_task_keys(shard.db()).await,
+                    count_concurrency_requests(shard.db()).await,
+                )
+            },
+            |(tasks, requests)| *tasks == 0 && *requests == 1,
+            5000,
+        )
+        .await;
+        assert_eq!(
+            converted,
+            (0, 1),
+            "at-capacity ticket should be deleted and replaced by exactly one \
+             deferred request (got (task_keys, requests) = {:?})",
+            converted
+        );
+        let requesters = shard
+            .get_concurrency_requester_count("-", &queue)
+            .await
+            .expect("requester count");
+        assert_eq!(requesters, 1, "converted job counts as a requester");
+
+        // Job 2 is still Scheduled and cannot have run.
+        let status2 = shard
+            .get_job_status("-", &job2)
+            .await
+            .expect("status job2")
+            .expect("job2 exists");
+        assert_eq!(status2.kind, silo::job::JobStatusKind::Scheduled);
+
+        // Complete job 1 → holder released → grant scanner drains the
+        // converted request → job 2 becomes leasable.
+        shard
+            .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report job1 success");
+        let tasks2 = poll_until(
+            || async {
+                shard
+                    .dequeue("w", "default", 1)
+                    .await
+                    .expect("deq job2")
+                    .tasks
+            },
+            |t| !t.is_empty(),
+            5000,
+        )
+        .await;
+        assert_eq!(tasks2.len(), 1, "converted request should grant and run");
+        assert_eq!(tasks2[0].job().id(), job2);
+        let final_requesters = shard
+            .get_concurrency_requester_count("-", &queue)
+            .await
+            .expect("requester count after grant");
+        assert_eq!(final_requesters, 0, "requester counter drains on grant");
+    });
+}
+
+/// Cancelling a job whose at-capacity ticket was converted to a deferred
+/// request must remove the request record and drain the requester counter,
+/// without disturbing the slot holder, and must not produce a phantom grant
+/// when the holder later releases.
+#[silo::test]
+async fn cancel_after_ticket_conversion_cleans_up_request() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let now = now_ms();
+        let queue = "convert-cancel-q".to_string();
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let limits = vec![Limit::Concurrency(ConcurrencyLimit {
+            key: queue.clone(),
+            max_concurrency: 1,
+        })];
+
+        let _job1 = shard
+            .enqueue(
+                "-",
+                Some("cc-job-1".to_string()),
+                10u8,
+                now,
+                None,
+                payload.clone(),
+                limits.clone(),
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue job1");
+        let tasks = shard.dequeue("w", "default", 1).await.expect("deq1").tasks;
+        assert_eq!(tasks.len(), 1);
+        let t1_id = tasks[0].attempt().task_id().to_string();
+
+        let job2 = shard
+            .enqueue(
+                "-",
+                Some("cc-job-2".to_string()),
+                10u8,
+                now + 500,
+                None,
+                payload.clone(),
+                limits.clone(),
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue job2");
+
+        // Drive the conversion.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let converted = poll_until(
+            || async {
+                let _ = shard.dequeue("w", "default", 1).await.expect("deq2");
+                count_concurrency_requests(shard.db()).await
+            },
+            |requests| *requests == 1,
+            5000,
+        )
+        .await;
+        assert_eq!(converted, 1, "ticket should convert to a deferred request");
+
+        // Cancel the waiting job: request record and requester counter must
+        // be cleaned up; job1's holder must be untouched.
+        shard.cancel_job("-", &job2).await.expect("cancel job2");
+        assert_eq!(
+            count_concurrency_requests(shard.db()).await,
+            0,
+            "cancel should delete the converted request record"
+        );
+        let requesters = shard
+            .get_concurrency_requester_count("-", &queue)
+            .await
+            .expect("requester count");
+        assert_eq!(requesters, 0, "cancel should drain the requester counter");
+        assert_eq!(
+            count_concurrency_holders(shard.db()).await,
+            1,
+            "job1's holder must survive the cancel"
+        );
+
+        // Releasing job1's slot must not grant anything (no phantom grant
+        // for the cancelled requester).
+        shard
+            .report_attempt_outcome(&t1_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("report job1 success");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let r = shard.dequeue("w", "default", 1).await.expect("deq final");
+        assert!(
+            r.tasks.is_empty(),
+            "cancelled job must not run after the slot frees"
+        );
+        assert_eq!(
+            count_concurrency_holders(shard.db()).await,
+            0,
+            "no phantom holder after cancelled requester's queue drains"
+        );
+    });
+}

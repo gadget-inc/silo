@@ -152,6 +152,7 @@ pub struct Metrics {
 
     // Concurrency metrics
     concurrency_tickets_granted: CounterVec,
+    concurrency_tickets_converted: CounterVec,
     concurrency_holders_cache_holders: GaugeVec,
     concurrency_holders_cache_queues: GaugeVec,
     concurrency_holders_cache_hydrated_queues: GaugeVec,
@@ -528,6 +529,17 @@ impl Metrics {
         }
         self.concurrency_tickets_granted
             .with_label_values(&[shard, path.as_str()])
+            .inc_by(n as f64);
+    }
+
+    /// Record `n` at-capacity RequestTicket tasks converted into deferred
+    /// concurrency request records at dequeue time on `shard`.
+    pub fn record_concurrency_tickets_converted(&self, shard: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.concurrency_tickets_converted
+            .with_label_values(&[shard])
             .inc_by(n as f64);
     }
 
@@ -1964,6 +1976,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_tickets_converted = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_tickets_converted_total",
+                "Total number of at-capacity RequestTicket tasks converted into deferred concurrency request records at dequeue time",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let concurrency_holders_cache_holders = register(
         &registry,
         GaugeVec::new(
@@ -2121,6 +2144,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
         concurrency_tickets_granted,
+        concurrency_tickets_converted,
         concurrency_holders_cache_holders,
         concurrency_holders_cache_queues,
         concurrency_holders_cache_hydrated_queues,

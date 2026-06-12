@@ -2040,8 +2040,19 @@ fn append_grant_edits<W: WriteBatcher>(
     Ok(())
 }
 
+/// Append a deferred concurrency request record (plus the +1 requester
+/// counter merge) for a chain parked at an at-capacity queue.
+///
+/// Two callers: the at-capacity immediate-enqueue path ([SILO-ENQ-CONC-6])
+/// and the dequeue-time ticket-conversion path in `job_store_shard::dequeue`
+/// (`handle_request_ticket`). Callers must pass the chain's ORIGINAL
+/// `start_time_ms` and `priority`: cancel/reimport locate request records by
+/// the narrow `(tenant, queue, start_time_ms, priority, job_id, attempt)`
+/// prefix derived from job status, and `process_grants` grants in
+/// start-time order, so a rewritten time would orphan the record from
+/// cleanup and forfeit the job's queue position.
 #[allow(clippy::too_many_arguments)]
-fn append_request_edits<W: WriteBatcher>(
+pub(crate) fn append_request_edits<W: WriteBatcher>(
     writer: &mut W,
     tenant: &str,
     queue: &str,

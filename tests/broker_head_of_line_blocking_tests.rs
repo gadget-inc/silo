@@ -116,11 +116,8 @@ async fn tenant_b_is_not_starved_by_tenant_a_parked_request_tickets() {
         );
 
         // Every tenant A job must be a parked RequestTicket in the task group.
-        let parked = count_with_binary_prefix(
-            shard.db(),
-            &silo::keys::task_group_prefix(TASK_GROUP),
-        )
-        .await;
+        let parked =
+            count_with_binary_prefix(shard.db(), &silo::keys::task_group_prefix(TASK_GROUP)).await;
         assert_eq!(
             parked, TENANT_A_JOBS,
             "expected one parked RequestTicket per tenant A job"
