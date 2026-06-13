@@ -695,14 +695,26 @@ async fn test_job_view_renders_limits_section() {
         !body.contains("No limits"),
         "Limits section should not be empty"
     );
-    assert!(body.contains("conc-key"), "should show concurrency limit key");
-    assert!(body.contains("float-key-a"), "should show first floating key");
-    assert!(body.contains("float-key-b"), "should show second floating key");
+    assert!(
+        body.contains("conc-key"),
+        "should show concurrency limit key"
+    );
+    assert!(
+        body.contains("float-key-a"),
+        "should show first floating key"
+    );
+    assert!(
+        body.contains("float-key-b"),
+        "should show second floating key"
+    );
     assert!(
         body.contains("Floating Concurrency"),
         "should label floating concurrency limits"
     );
-    assert!(body.contains("Concurrency"), "should label concurrency limits");
+    assert!(
+        body.contains("Concurrency"),
+        "should label concurrency limits"
+    );
 }
 
 #[silo::test]
