@@ -156,6 +156,127 @@ async fn drop_tenant_finalizes_running_job_instead_of_orphaning() {
     assert_eq!(shard.concurrency_holder_count("tenant-a", "qA"), 0);
 }
 
+/// Regression: dropping a tenant's *queued* (Scheduled, not yet leased) attempt
+/// must finalize the job to `Cancelled` — it must never be left orphaned in
+/// `Scheduled` with no task to run it. (Raw task-deletion left it stuck in
+/// `Scheduled` with nothing in the queue, invisible to every recovery path.)
+#[silo::test]
+async fn drop_tenant_cancels_queued_job_instead_of_orphaning() {
+    use silo::job::JobStatusKind;
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Enqueue but do NOT lease — the job stays Scheduled with a queued RunAttempt.
+    let job_id = enqueue_with_holder(&shard, "tenant-a", "qA", now).await;
+    let status = shard
+        .get_job_status("tenant-a", &job_id)
+        .await
+        .expect("status")
+        .expect("job exists");
+    assert_eq!(
+        status.kind,
+        JobStatusKind::Scheduled,
+        "job is Scheduled pre-drop"
+    );
+
+    // Act.
+    let stats = shard
+        .drop_tenant_holders_and_runattempts("tenant-a")
+        .await
+        .expect("drop tenant state");
+    assert_eq!(stats.run_attempts_dropped, 1);
+
+    // The queued job must be transitioned to Cancelled — not left orphaned in
+    // Scheduled — and its holder released.
+    let status = shard
+        .get_job_status("tenant-a", &job_id)
+        .await
+        .expect("status")
+        .expect("job exists");
+    assert_eq!(
+        status.kind,
+        JobStatusKind::Cancelled,
+        "queued job must be Cancelled after drop, got {:?}",
+        status.kind
+    );
+    assert_eq!(shard.concurrency_holder_count("tenant-a", "qA"), 0);
+}
+
+/// Dropping a *running* attempt whose job was already cancelled must finalize it
+/// as `Cancelled` (the `was_cancelled` branch), not as a `WORKER_CRASHED`
+/// failure. This mirrors what the lease reaper does for a cancelled job and
+/// preserves the user's intent through the forced drop.
+#[silo::test]
+async fn drop_tenant_finalizes_cancelled_running_job_as_cancelled() {
+    use silo::job::JobStatusKind;
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    let job_id = enqueue_with_holder(&shard, "tenant-a", "qA", now).await;
+
+    // Lease it so the job is Running, backed by a durable lease.
+    let leased = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(leased.len(), 1, "exactly one task leased");
+
+    // Cancel the running job: this only records the cancellation flag (the
+    // worker would normally ack it on heartbeat), leaving the job in Running
+    // with a live lease — exactly the state the drop must finalize correctly.
+    shard
+        .cancel_job("tenant-a", &job_id)
+        .await
+        .expect("cancel running job");
+    let status = shard
+        .get_job_status("tenant-a", &job_id)
+        .await
+        .expect("status")
+        .expect("job exists");
+    assert_eq!(
+        status.kind,
+        JobStatusKind::Running,
+        "cancel of a Running job only sets the flag; status stays Running"
+    );
+    assert!(
+        shard
+            .is_job_cancelled("tenant-a", &job_id)
+            .await
+            .expect("cancellation lookup"),
+        "cancellation flag is set pre-drop"
+    );
+
+    // Act.
+    let stats = shard
+        .drop_tenant_holders_and_runattempts("tenant-a")
+        .await
+        .expect("drop tenant state");
+    assert_eq!(stats.run_attempts_dropped, 1);
+
+    // Because the job was cancelled, the leased attempt must be finalized as
+    // Cancelled — NOT Failed (which is what the WORKER_CRASHED path produces).
+    let status = shard
+        .get_job_status("tenant-a", &job_id)
+        .await
+        .expect("status")
+        .expect("job exists");
+    assert_eq!(
+        status.kind,
+        JobStatusKind::Cancelled,
+        "cancelled running job must finalize as Cancelled, not {:?}",
+        status.kind
+    );
+    assert_eq!(
+        count_lease_keys(shard.db()).await,
+        0,
+        "no lease may be left behind"
+    );
+    assert_eq!(shard.concurrency_holder_count("tenant-a", "qA"), 0);
+}
+
 /// Dropping a tenant with no holders/run attempts is a no-op that returns zeros.
 #[silo::test]
 async fn drop_tenant_with_no_state_is_a_noop() {
