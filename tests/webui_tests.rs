@@ -644,6 +644,68 @@ async fn test_queues_page_shows_unavailable_shards_and_partial_results() {
 }
 
 #[silo::test]
+async fn test_job_view_renders_limits_section() {
+    use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, Limit};
+
+    let (_tmp, state, shard_map) = setup_multi_shard_state(1).await;
+
+    let shard_id = shard_map.shards()[0].id;
+    let shard = state.factory.get(&shard_id).expect("shard 0");
+    let job_id = shard
+        .enqueue(
+            "-",
+            Some("job-with-limits".to_string()),
+            30,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![
+                Limit::Concurrency(ConcurrencyLimit {
+                    key: "conc-key".to_string(),
+                    max_concurrency: 7,
+                }),
+                Limit::FloatingConcurrency(FloatingConcurrencyLimit {
+                    key: "float-key-a".to_string(),
+                    default_max_concurrency: 11,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+                Limit::FloatingConcurrency(FloatingConcurrencyLimit {
+                    key: "float-key-b".to_string(),
+                    default_max_concurrency: 13,
+                    refresh_interval_ms: 60_000,
+                    metadata: vec![],
+                }),
+            ],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue job with limits");
+
+    let (status, body) = make_request(
+        state,
+        "GET",
+        &format!("/job?shard={}&tenant=-&id={}", shard_id, job_id),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("No limits"),
+        "Limits section should not be empty"
+    );
+    assert!(body.contains("conc-key"), "should show concurrency limit key");
+    assert!(body.contains("float-key-a"), "should show first floating key");
+    assert!(body.contains("float-key-b"), "should show second floating key");
+    assert!(
+        body.contains("Floating Concurrency"),
+        "should label floating concurrency limits"
+    );
+    assert!(body.contains("Concurrency"), "should label concurrency limits");
+}
+
+#[silo::test]
 async fn test_job_view_with_correct_shard_and_tenant_hint() {
     // Test that providing correct shard and tenant makes job lookup work efficiently
     let (_tmp, state, shard_map) = setup_multi_shard_state(3).await;

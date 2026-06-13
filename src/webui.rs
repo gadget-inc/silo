@@ -85,7 +85,7 @@ pub struct TenantQueueRow {
     pub total: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 pub struct LimitRow {
     pub limit_type: String,
     pub key: String,
@@ -611,6 +611,7 @@ struct JobQueryResult {
     status_kind: String,
     status_changed_at_ms: i64,
     metadata: Vec<(String, String)>,
+    limits: Vec<LimitRow>,
 }
 
 async fn job_handler(
@@ -627,7 +628,7 @@ async fn job_handler(
         where_clauses.push(format!("tenant = '{}'", tenant.replace('\'', "''")));
     }
     let sql = format!(
-        "SELECT shard_id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata FROM jobs WHERE {} LIMIT 1",
+        "SELECT shard_id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata, limits FROM jobs WHERE {} LIMIT 1",
         where_clauses.join(" AND ")
     );
 
@@ -751,6 +752,18 @@ async fn job_handler(
                         })
                         .unwrap_or_default();
 
+                    // Limits are serialized as a JSON array of {limit_type, key, value}
+                    // objects by the jobs scanner (see query.rs `limits_to_json`).
+                    let limits = batch
+                        .column_by_name("limits")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                        })
+                        .filter(|a| !a.is_null(0))
+                        .and_then(|a| serde_json::from_str::<Vec<LimitRow>>(a.value(0)).ok())
+                        .unwrap_or_default();
+
                     result = Some(JobQueryResult {
                         shard_id,
                         priority,
@@ -759,6 +772,7 @@ async fn job_handler(
                         status_kind,
                         status_changed_at_ms,
                         metadata,
+                        limits,
                     });
                     break;
                 }
@@ -794,8 +808,7 @@ async fn job_handler(
         "Succeeded" | "Failed" | "Cancelled"
     );
 
-    // Limits are not available from the query engine - would need to be added to the jobs scanner
-    let limits: Vec<LimitRow> = Vec::new();
+    let limits = job.limits;
 
     // Pretty-print the payload JSON
     let payload_str = serde_json::from_str::<serde_json::Value>(&job.payload)
