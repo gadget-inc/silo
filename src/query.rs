@@ -610,6 +610,9 @@ impl JobsScanner {
                 ),
                 true,
             ),
+            // Job-level limits (concurrency/rate/floating) serialized as a JSON array
+            // of {limit_type, key, value} objects for display purposes.
+            Field::new("limits", DataType::Utf8, true),
         ]))
     }
 }
@@ -639,7 +642,7 @@ fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> Pr
     let need_job_info = projection.fields().iter().any(|f| {
         matches!(
             f.name().as_str(),
-            "priority" | "enqueue_time_ms" | "payload" | "task_group" | "metadata"
+            "priority" | "enqueue_time_ms" | "payload" | "task_group" | "metadata" | "limits"
         )
     });
     // status_kind and status_changed_at_ms are encoded in the status/time index key, so
@@ -1219,6 +1222,12 @@ fn build_job_pairs_batch(
                     .collect::<Vec<Option<i64>>>(),
             )),
             "metadata" => build_metadata_column(pairs, jobs_map)?,
+            "limits" => Arc::new(StringArray::from(
+                pairs
+                    .iter()
+                    .map(|p| jobs_map.get(&p.1).map(|v| limits_to_json(&v.limits())))
+                    .collect::<Vec<Option<String>>>(),
+            )),
             other => {
                 return Err(DataFusionError::Execution(format!(
                     "unknown column {}",
@@ -1230,6 +1239,33 @@ fn build_job_pairs_batch(
     }
     RecordBatch::try_new(Arc::clone(projection), cols)
         .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Serialize a job's limits into a JSON array of `{limit_type, key, value}` objects
+/// for display in the web UI. Each limit variant is flattened into a single display row.
+fn limits_to_json(limits: &[crate::job::Limit]) -> String {
+    use crate::job::Limit;
+    let rows: Vec<serde_json::Value> = limits
+        .iter()
+        .map(|limit| match limit {
+            Limit::Concurrency(c) => serde_json::json!({
+                "limit_type": "Concurrency",
+                "key": c.key,
+                "value": c.max_concurrency.to_string(),
+            }),
+            Limit::RateLimit(r) => serde_json::json!({
+                "limit_type": "Rate",
+                "key": r.unique_key,
+                "value": format!("{} per {}ms", r.limit, r.duration_ms),
+            }),
+            Limit::FloatingConcurrency(f) => serde_json::json!({
+                "limit_type": "Floating Concurrency",
+                "key": f.key,
+                "value": f.default_max_concurrency.to_string(),
+            }),
+        })
+        .collect();
+    serde_json::Value::Array(rows).to_string()
 }
 
 /// Build the Arrow `Map<Utf8, Utf8>` column for job metadata key/value pairs.
