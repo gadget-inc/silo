@@ -757,7 +757,8 @@ impl JobStoreShard {
         self.concurrency
             .cache_queue_limit(&tenant, &queue, max_allowed as u32, limit_type);
 
-        // Atomically reserve a slot (preserves the original TOCTOU invariant).
+        // [SILO-TICKET-GRANT-1] [SILO-TICKET-GRANT-2] Atomically reserve a
+        // slot (preserves the original TOCTOU invariant).
         let reserved = self
             .concurrency
             .counts()
@@ -773,7 +774,7 @@ impl JobStoreShard {
             .await?;
 
         if !reserved {
-            // Out of capacity. Do NOT leave the ticket in
+            // [SILO-TICKET-CONV-1] Out of capacity. Do NOT leave the ticket in
             // the task keyspace — the broker rescans the group from the front
             // every pass and claims in key order, so a pile of permanently
             // unconsumable tickets head-of-line blocks every later-keyed task
@@ -789,9 +790,13 @@ impl JobStoreShard {
             // derived from job status, and process_grants grants in
             // start-time order, so the job keeps its fair queue position.
             //
-            // No rollback handling is needed: nothing was reserved in memory
+            // [SILO-TICKET-CONV-4] No rollback handling is needed: nothing was
+            // reserved in memory
             // (try_reserve failed), and if the batch never commits the ticket
             // survives durably and is re-converted on the next claim.
+            //
+            // [SILO-TICKET-CONV-2] Delete the ticket; [SILO-TICKET-CONV-3]
+            // write the request record in the same batch.
             state.batch.delete(task_key);
             state.ack_deleted(task_key);
             let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
@@ -821,7 +826,7 @@ impl JobStoreShard {
             .grants_to_rollback
             .push((tenant.clone(), queue.clone(), task_id.clone()));
 
-        // Write the holder for the just-won queue.
+        // [SILO-TICKET-GRANT-3] Write the holder for the just-won queue.
         let holder_val = encode_holder(&HolderRecord {
             granted_at_ms: now_ms,
         });
@@ -830,7 +835,8 @@ impl JobStoreShard {
             &holder_val,
         );
 
-        // Delete the original ticket and continue the chain. The follow-up
+        // [SILO-TICKET-GRANT-4] Delete the original ticket and continue the
+        // chain. The follow-up
         // task is written at a fresh task_key (start_at_ms=now_ms) so the
         // broker tombstone for `task_key` doesn't suppress its re-pickup.
         state.batch.delete(task_key);

@@ -161,6 +161,39 @@ sig TicketHolder {
     th_time: one Time     -- Time when this holder exists
 }
 
+/**
+ * A future-scheduled RequestTicket task parked in the durable task keyspace.
+ *
+ * Written by a concurrency-gated enqueue whose start time is in the future
+ * ([SILO-ENQ-CONC-7]): the slot is NOT held while the job waits for its start
+ * time (the enqueue path's trial reservation is rolled back), so the parked
+ * ticket owns no holders. The broker surfaces the ticket like any other task
+ * once its start time arrives, and the dequeue handler
+ * (src/job_store_shard/dequeue.rs::handle_request_ticket) resolves the slot
+ * at claim time: granted -> holder + continuation task; at capacity ->
+ * converted into a TicketRequest (see handleRequestTicketAtCapacity).
+ *
+ * See src/task.rs::Task::RequestTicket.
+ */
+sig DbRequestTicketTask {
+    rtt_task: one TaskId,
+    rtt_job: one Job,
+    rtt_queue: one Queue,  -- the gating queue the ticket reserves at claim time
+    rtt_time: one Time
+}
+
+/**
+ * A RequestTicket task pulled from DB into the broker buffer. Same role as
+ * BufferedTask but for RequestTicket tasks (which the dequeue handler
+ * processes internally without returning to a worker).
+ */
+sig BufferedRequestTicketTask {
+    brtt_task: one TaskId,
+    brtt_job: one Job,
+    brtt_queue: one Queue,
+    brtt_time: one Time
+}
+
 fact wellFormed {
     -- Each existing job has exactly one status at each time
     all j: Job, t: Time | j in jobExistsAt[t] implies (one js: JobState | js.job = j and js.time = t)
@@ -185,6 +218,10 @@ fact wellFormed {
     -- A task can be a CheckRateLimit Buffer row for at most one job at each time
     all taskid: TaskId, t: Time | lone bct: BufferedCheckRateLimitTask | bct.bcrl_task = taskid and bct.bcrl_time = t
 
+    -- A task can be a RequestTicket DB/Buffer row for at most one (job, queue) at each time
+    all taskid: TaskId, t: Time | lone rt: DbRequestTicketTask | rt.rtt_task = taskid and rt.rtt_time = t
+    all taskid: TaskId, t: Time | lone brt: BufferedRequestTicketTask | brt.brtt_task = taskid and brt.brtt_time = t
+
     -- A task is either a RunAttempt OR a CheckRateLimit at any given time, not both.
     -- (handle_check_rate_limit advances the task to a RunAttempt by clearing the CRL row
     --  and inserting a DbQueuedTask in the same batch.)
@@ -192,6 +229,18 @@ fact wellFormed {
         not (some dbQueuedAt[taskid, t] and some dbCheckRateLimitAt[taskid, t])
     all taskid: TaskId, t: Time |
         not (some bufferedAt[taskid, t] and some bufferedCheckRateLimitAt[taskid, t])
+
+    -- A RequestTicket task likewise excludes the other task kinds: the granted
+    -- branch of handle_request_ticket clears the ticket row and inserts the
+    -- continuation task in the same batch.
+    all taskid: TaskId, t: Time |
+        not (some dbRequestTicketAt[taskid, t] and some dbQueuedAt[taskid, t])
+    all taskid: TaskId, t: Time |
+        not (some dbRequestTicketAt[taskid, t] and some dbCheckRateLimitAt[taskid, t])
+    all taskid: TaskId, t: Time |
+        not (some bufferedRequestTicketAt[taskid, t] and some bufferedAt[taskid, t])
+    all taskid: TaskId, t: Time |
+        not (some bufferedRequestTicketAt[taskid, t] and some bufferedCheckRateLimitAt[taskid, t])
 
     -- A task can be leased to at most one worker at each time
     all taskid: TaskId, t: Time | lone l: Lease | l.ltask = taskid and l.ltime = t
@@ -206,6 +255,8 @@ fact wellFormed {
         (some t: Time | some leaseJobAt[taskid, t] and leaseJobAt[taskid, t] = j) or
         (some t: Time | some dbCheckRateLimitAt[taskid, t] and dbCheckRateLimitAt[taskid, t] = j) or
         (some t: Time | some bufferedCheckRateLimitAt[taskid, t] and bufferedCheckRateLimitAt[taskid, t] = j) or
+        (some t: Time | some dbRequestTicketAt[taskid, t] and dbRequestTicketAt[taskid, t] = j) or
+        (some t: Time | some bufferedRequestTicketAt[taskid, t] and bufferedRequestTicketAt[taskid, t] = j) or
         (some r: TicketRequest | r.tr_task = taskid and r.tr_job = j)
     
     -- Existential tracking: one tracker per time
@@ -247,9 +298,16 @@ fact wellFormed {
     
     -- Requests are only for existing jobs
     all r: TicketRequest | r.tr_job in jobExistsAt[r.tr_time]
-    
+
     -- Requests are only for queues the job requires
     all r: TicketRequest | r.tr_queue in jobQueues[r.tr_job]
+
+    -- Parked RequestTickets are only for existing jobs, and only gate queues
+    -- the job requires
+    all rt: DbRequestTicketTask | rt.rtt_job in jobExistsAt[rt.rtt_time]
+    all rt: DbRequestTicketTask | rt.rtt_queue in jobQueues[rt.rtt_job]
+    all brt: BufferedRequestTicketTask | brt.brtt_job in jobExistsAt[brt.brtt_time]
+    all brt: BufferedRequestTicketTask | brt.brtt_queue in jobQueues[brt.brtt_job]
     
     -- The holder/active-task invariant lives in `assert holdersRequireActiveTask`
     -- (below), NOT here. Keeping it as a fact makes the assertion trivially
@@ -306,6 +364,26 @@ fun dbCheckRateLimitAt[taskid: TaskId, t: Time]: set Job {
 /** A CheckRateLimit task in the buffer at time t (returns the job it belongs to). */
 fun bufferedCheckRateLimitAt[taskid: TaskId, t: Time]: set Job {
     ((bcrl_task.taskid) & (bcrl_time.t)).bcrl_job
+}
+
+/** A parked RequestTicket task in DB at time t (returns the job it belongs to). */
+fun dbRequestTicketAt[taskid: TaskId, t: Time]: set Job {
+    ((rtt_task.taskid) & (rtt_time.t)).rtt_job
+}
+
+/** The gating queue of a parked RequestTicket task in DB at time t. */
+fun dbRequestTicketQueueAt[taskid: TaskId, t: Time]: set Queue {
+    ((rtt_task.taskid) & (rtt_time.t)).rtt_queue
+}
+
+/** A RequestTicket task in the buffer at time t (returns the job it belongs to). */
+fun bufferedRequestTicketAt[taskid: TaskId, t: Time]: set Job {
+    ((brtt_task.taskid) & (brtt_time.t)).brtt_job
+}
+
+/** The gating queue of a buffered RequestTicket task at time t. */
+fun bufferedRequestTicketQueueAt[taskid: TaskId, t: Time]: set Queue {
+    ((brtt_task.taskid) & (brtt_time.t)).brtt_queue
 }
 
 fun leaseAt[taskid: TaskId, t: Time]: set Worker {
@@ -419,6 +497,11 @@ pred concurrencyUnchanged[t: Time, tnext: Time] {
     -- a phantom orphan rather than a real bug.
     all tid: TaskId | dbCheckRateLimitAt[tid, tnext] = dbCheckRateLimitAt[tid, t]
     all tid: TaskId | bufferedCheckRateLimitAt[tid, tnext] = bufferedCheckRateLimitAt[tid, t]
+    -- Parked RequestTicket state is likewise frozen, for the same reason.
+    all tid: TaskId | dbRequestTicketAt[tid, tnext] = dbRequestTicketAt[tid, t]
+    all tid: TaskId | dbRequestTicketQueueAt[tid, tnext] = dbRequestTicketQueueAt[tid, t]
+    all tid: TaskId | bufferedRequestTicketAt[tid, tnext] = bufferedRequestTicketAt[tid, t]
+    all tid: TaskId | bufferedRequestTicketQueueAt[tid, tnext] = bufferedRequestTicketQueueAt[tid, t]
 }
 
 /** Frame condition: requests unchanged, only specific holder changes */
@@ -453,6 +536,8 @@ pred init[t: Time] {
     no bt: BufferedTask | bt.buf_qtime = t
     no ct: DbCheckRateLimitTask | ct.crl_time = t
     no bct: BufferedCheckRateLimitTask | bct.bcrl_time = t
+    no rt: DbRequestTicketTask | rt.rtt_time = t
+    no brt: BufferedRequestTicketTask | brt.brtt_time = t
     no l: Lease | l.ltime = t
     no attemptExistsAt[t] -- No attempts exist initially
     -- No concurrency state initially
@@ -470,6 +555,8 @@ pred enqueuePreConditions[tid: TaskId, j: Job, t: Time] {
     no leaseAt[tid, t]
     no dbCheckRateLimitAt[tid, t]
     no bufferedCheckRateLimitAt[tid, t]
+    no dbRequestTicketAt[tid, t]
+    no bufferedRequestTicketAt[tid, t]
 }
 
 /** Common postconditions for job creation (all enqueue variants) */
@@ -563,6 +650,49 @@ pred enqueueWithConcurrencyQueued[tid: TaskId, j: Job, q: Queue, t: Time, tnext:
     requestTasksAt[q, tnext] = requestTasksAt[q, t] + tid
     all q2: Queue | q2 != q implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
     holdersUnchanged[t, tnext]
+}
+
+-- Transition: ENQUEUE_WITH_CONCURRENCY_FUTURE_SCHEDULED - Job requires queue,
+-- start time is in the future. Regardless of current capacity the slot is NOT
+-- taken now: the enqueue path's trial reservation is rolled back, because
+-- holding the slot from enqueue until the start time would starve
+-- present-time work. Instead a Task::RequestTicket is parked in the durable
+-- task keyspace at the scheduled time; the broker surfaces it once ready and
+-- handle_request_ticket resolves the slot at claim time
+-- (handleRequestTicketGranted / handleRequestTicketAtCapacity).
+-- See src/concurrency.rs (the future-scheduled branch of the limit walker).
+pred enqueueWithConcurrencyFutureScheduled[tid: TaskId, j: Job, q: Queue, t: Time, tnext: Time] {
+    enqueuePreConditions[tid, j, t]
+    enqueueJobCreated[j, t, tnext]
+    enqueueFrameConditions[tid, t, tnext]
+
+    -- Pre: Job requires this queue
+    q in jobQueues[j]
+
+    -- [SILO-ENQ-CONC-7] Post: parked RequestTicket task written; no holder,
+    -- no request record, no RunAttempt task. Capacity is deliberately NOT a
+    -- precondition: the trial reservation is rolled back either way, so this
+    -- transition fires whether or not q currently has capacity.
+    one rt: DbRequestTicketTask |
+        rt.rtt_task = tid and rt.rtt_job = j and rt.rtt_queue = q and rt.rtt_time = tnext
+    all tid2: TaskId | tid2 != tid implies {
+        dbRequestTicketAt[tid2, tnext] = dbRequestTicketAt[tid2, t]
+        dbRequestTicketQueueAt[tid2, tnext] = dbRequestTicketQueueAt[tid2, t]
+    }
+    all tid2: TaskId | {
+        bufferedRequestTicketAt[tid2, tnext] = bufferedRequestTicketAt[tid2, t]
+        bufferedRequestTicketQueueAt[tid2, tnext] = bufferedRequestTicketQueueAt[tid2, t]
+    }
+
+    -- Post: NO RunAttempt task in DB queue
+    no qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qtime = tnext
+    all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+
+    -- Frame: holders, requests, CRL state unchanged
+    holdersUnchanged[t, tnext]
+    requestsUnchanged[t, tnext]
+    all tid2: TaskId | dbCheckRateLimitAt[tid2, tnext] = dbCheckRateLimitAt[tid2, t]
+    all tid2: TaskId | bufferedCheckRateLimitAt[tid2, tnext] = bufferedCheckRateLimitAt[tid2, t]
 }
 
 -- Transition: BROKER_SCAN - Read from DB to Buffer
@@ -916,6 +1046,13 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
     no dbQueuedAt[newTid, t]
     no bufferedAt[newTid, t]
     no leaseAt[newTid, t]
+    -- Fresh task ids are ULIDs in the implementation and are never reused, so
+    -- a new id can't collide with a parked RequestTicket row (in particular a
+    -- stale buffered copy surviving a cancel). Without this, a reused id lets
+    -- reimport/grant mint a holder for a task that still looks parked,
+    -- breaking parkedTicketsHoldNothing.
+    no dbRequestTicketAt[newTid, t]
+    no bufferedRequestTicketAt[newTid, t]
     
     let j = leaseJobAt[tid, t], a = leaseAttemptAt[tid, t] | {
         one j
@@ -970,6 +1107,13 @@ pred completeFailureRetryReleaseTicket[tid: TaskId, w: Worker, q: Queue, newTid:
     no dbQueuedAt[newTid, t]
     no bufferedAt[newTid, t]
     no leaseAt[newTid, t]
+    -- Fresh task ids are ULIDs in the implementation and are never reused, so
+    -- a new id can't collide with a parked RequestTicket row (in particular a
+    -- stale buffered copy surviving a cancel). Without this, a reused id lets
+    -- reimport/grant mint a holder for a task that still looks parked,
+    -- breaking parkedTicketsHoldNothing.
+    no dbRequestTicketAt[newTid, t]
+    no bufferedRequestTicketAt[newTid, t]
     
     -- Pre: Task holds a ticket for this queue
     some h: TicketHolder | h.th_task = tid and h.th_queue = q and h.th_time = t
@@ -1047,6 +1191,21 @@ pred cancelJob[j: Job, t: Time, tnext: Time] {
     -- Buffer unchanged (evict_keys is post-commit best-effort, may miss stale entries)
     all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
 
+    -- Parked RequestTicket tasks for this job are eagerly removed from the DB
+    -- in the same transaction (cancel.rs locates the pending task by identity
+    -- and deletes it whatever its kind). Buffered copies may linger, same as
+    -- RunAttempt buffer rows; a stale buffered ticket processed later targets
+    -- a job whose request the grant scanner will drop as stale.
+    all tid: TaskId | dbRequestTicketAt[tid, t] = j implies no dbRequestTicketAt[tid, tnext]
+    all tid: TaskId | dbRequestTicketAt[tid, t] != j implies {
+        dbRequestTicketAt[tid, tnext] = dbRequestTicketAt[tid, t]
+        dbRequestTicketQueueAt[tid, tnext] = dbRequestTicketQueueAt[tid, t]
+    }
+    all tid: TaskId | {
+        bufferedRequestTicketAt[tid, tnext] = bufferedRequestTicketAt[tid, t]
+        bufferedRequestTicketQueueAt[tid, tnext] = bufferedRequestTicketQueueAt[tid, t]
+    }
+
     -- Leases unchanged - worker will discover cancellation on heartbeat
     all tid: TaskId | {
         leaseAt[tid, tnext] = leaseAt[tid, t]
@@ -1091,6 +1250,13 @@ pred restartCancelledJob[j: Job, newTid: TaskId, t: Time, tnext: Time] {
     no dbQueuedAt[newTid, t]
     no bufferedAt[newTid, t]
     no leaseAt[newTid, t]
+    -- Fresh task ids are ULIDs in the implementation and are never reused, so
+    -- a new id can't collide with a parked RequestTicket row (in particular a
+    -- stale buffered copy surviving a cancel). Without this, a reused id lets
+    -- reimport/grant mint a holder for a task that still looks parked,
+    -- breaking parkedTicketsHoldNothing.
+    no dbRequestTicketAt[newTid, t]
+    no bufferedRequestTicketAt[newTid, t]
     
     -- [SILO-RESTART-4] Post: Clear cancellation (remove cancellation record)
     not isCancelledAt[j, tnext]
@@ -1222,6 +1388,13 @@ pred restartFailedJob[j: Job, newTid: TaskId, t: Time, tnext: Time] {
     no dbQueuedAt[newTid, t]
     no bufferedAt[newTid, t]
     no leaseAt[newTid, t]
+    -- Fresh task ids are ULIDs in the implementation and are never reused, so
+    -- a new id can't collide with a parked RequestTicket row (in particular a
+    -- stale buffered copy surviving a cancel). Without this, a reused id lets
+    -- reimport/grant mint a holder for a task that still looks parked,
+    -- breaking parkedTicketsHoldNothing.
+    no dbRequestTicketAt[newTid, t]
+    no bufferedRequestTicketAt[newTid, t]
     
     -- [SILO-RESTART-4] Post: Clear cancellation if it was cancelled
     -- (A job can be both Failed and cancelled if worker finished with failure after cancellation)
@@ -1603,6 +1776,13 @@ pred reimportNonTerminal[newTid: TaskId, j: Job, t: Time, tnext: Time] {
     no dbQueuedAt[newTid, t]
     no bufferedAt[newTid, t]
     no leaseAt[newTid, t]
+    -- Fresh task ids are ULIDs in the implementation and are never reused, so
+    -- a new id can't collide with a parked RequestTicket row (in particular a
+    -- stale buffered copy surviving a cancel). Without this, a reused id lets
+    -- reimport/grant mint a holder for a task that still looks parked,
+    -- breaking parkedTicketsHoldNothing.
+    no dbRequestTicketAt[newTid, t]
+    no bufferedRequestTicketAt[newTid, t]
 
     -- Pre: Job does NOT require any concurrency queues
     no jobQueues[j]
@@ -1632,6 +1812,13 @@ pred reimportNonTerminalConcurrencyGranted[newTid: TaskId, j: Job, q: Queue, t: 
     no dbQueuedAt[newTid, t]
     no bufferedAt[newTid, t]
     no leaseAt[newTid, t]
+    -- Fresh task ids are ULIDs in the implementation and are never reused, so
+    -- a new id can't collide with a parked RequestTicket row (in particular a
+    -- stale buffered copy surviving a cancel). Without this, a reused id lets
+    -- reimport/grant mint a holder for a task that still looks parked,
+    -- breaking parkedTicketsHoldNothing.
+    no dbRequestTicketAt[newTid, t]
+    no bufferedRequestTicketAt[newTid, t]
 
     -- Pre: Job requires this queue
     q in jobQueues[j]
@@ -1681,6 +1868,13 @@ pred reimportNonTerminalConcurrencyQueued[newTid: TaskId, j: Job, q: Queue, t: T
     no dbQueuedAt[newTid, t]
     no bufferedAt[newTid, t]
     no leaseAt[newTid, t]
+    -- Fresh task ids are ULIDs in the implementation and are never reused, so
+    -- a new id can't collide with a parked RequestTicket row (in particular a
+    -- stale buffered copy surviving a cancel). Without this, a reused id lets
+    -- reimport/grant mint a holder for a task that still looks parked,
+    -- breaking parkedTicketsHoldNothing.
+    no dbRequestTicketAt[newTid, t]
+    no bufferedRequestTicketAt[newTid, t]
 
     -- Pre: Job requires this queue
     q in jobQueues[j]
@@ -1902,6 +2096,199 @@ pred dequeueDropCheckRateLimit[tid: TaskId, t: Time, tnext: Time] {
     requestsUnchanged[t, tnext]
 }
 
+-- Transition: BROKER_SCAN_REQUEST_TICKET
+-- Mirror of brokerScan but for parked RequestTicket DB rows whose start time
+-- has arrived. (Start-time readiness and key order are abstracted away: the
+-- broker's key-ordered scan is what made parked at-capacity tickets
+-- head-of-line-block the task group before the conversion fix — a liveness
+-- property this safety model cannot express. What it does verify is that the
+-- fixed handler below never wedges state: an at-capacity claim is a one-way
+-- ticket -> TicketRequest conversion, never a parked retry.)
+pred brokerScanRequestTicket[t: Time, tnext: Time] {
+    -- Pre: a RequestTicket task in DB is not yet in the buffer
+    some tid: TaskId | some dbRequestTicketAt[tid, t] and no bufferedRequestTicketAt[tid, t]
+
+    -- Effect: copy (some) RequestTicket tasks from DB to buffer, preserving
+    -- the (job, queue) annotations
+    all tid: TaskId | {
+        some bufferedRequestTicketAt[tid, t] implies {
+            bufferedRequestTicketAt[tid, tnext] = bufferedRequestTicketAt[tid, t]
+            bufferedRequestTicketQueueAt[tid, tnext] = bufferedRequestTicketQueueAt[tid, t]
+        }
+        no bufferedRequestTicketAt[tid, t] implies {
+            bufferedRequestTicketAt[tid, tnext] in dbRequestTicketAt[tid, t]
+            bufferedRequestTicketQueueAt[tid, tnext] in dbRequestTicketQueueAt[tid, t]
+        }
+    }
+    -- Progress: at least one task moves
+    some tid: TaskId | no bufferedRequestTicketAt[tid, t] and some bufferedRequestTicketAt[tid, tnext]
+
+    -- Frame: DB RequestTicket state unchanged
+    all tid: TaskId | dbRequestTicketAt[tid, tnext] = dbRequestTicketAt[tid, t]
+    all tid: TaskId | dbRequestTicketQueueAt[tid, tnext] = dbRequestTicketQueueAt[tid, t]
+
+    -- Frame: RunAttempt DB/buffer, CRL DB/buffer, leases, jobs, attempts,
+    -- holders, requests unchanged
+    all tid: TaskId | dbQueuedAt[tid, tnext] = dbQueuedAt[tid, t]
+    all tid: TaskId | bufferedAt[tid, tnext] = bufferedAt[tid, t]
+    all tid: TaskId | dbCheckRateLimitAt[tid, tnext] = dbCheckRateLimitAt[tid, t]
+    all tid: TaskId | bufferedCheckRateLimitAt[tid, tnext] = bufferedCheckRateLimitAt[tid, t]
+    all tid: TaskId | {
+        leaseAt[tid, tnext] = leaseAt[tid, t]
+        leaseJobAt[tid, tnext] = leaseJobAt[tid, t]
+        leaseAttemptAt[tid, tnext] = leaseAttemptAt[tid, t]
+    }
+    all j: Job | statusAt[j, tnext] = statusAt[j, t]
+    all j: Job | isCancelledAt[j, tnext] iff isCancelledAt[j, t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+    all q: Queue | requestTasksAt[q, tnext] = requestTasksAt[q, t]
+    all q: Queue | holdersAt[q, tnext] = holdersAt[q, t]
+}
+
+-- Transition: HANDLE_REQUEST_TICKET_GRANTED
+-- The broker claimed a parked RequestTicket and the gating queue has
+-- capacity: the slot is reserved, and one batch deletes the ticket, writes
+-- the holder, and writes the continuation RunAttempt task (carrying the
+-- chain's task_id so the holder and task stay joined).
+-- See dequeue.rs::handle_request_ticket (the `reserved` branch).
+-- Note: the terminal/missing-status drop branch (drop_ticket_and_release) is
+-- not modeled; parked tickets hold no slots here (parkedTicketsHoldNothing),
+-- so that drop has no holder-release obligation at this abstraction.
+pred handleRequestTicketGranted[tid: TaskId, q: Queue, t: Time, tnext: Time] {
+    -- [SILO-TICKET-GRANT-1] Pre: ticket is buffered and q is its gating queue.
+    -- (Cancellation is deliberately NOT checked, matching the handler: cancel
+    -- eagerly removes the DB row, but a stale buffered copy may still be
+    -- processed — the worker discovers cancellation via heartbeat.)
+    some bufferedRequestTicketAt[tid, t]
+    q in bufferedRequestTicketQueueAt[tid, t]
+    let j = bufferedRequestTicketAt[tid, t] | {
+        one j
+        -- Pre: job exists and is currently Scheduled (terminal/missing status
+        -- takes the unmodeled drop branch instead)
+        j in jobExistsAt[t]
+        statusAt[j, t] = Scheduled
+
+        -- [SILO-TICKET-GRANT-2] Pre: queue has capacity (try_reserve succeeded)
+        queueHasCapacity[q, t]
+
+        -- [SILO-TICKET-GRANT-3] Post: holder created for the chain's task id
+        holdersAt[q, tnext] = tid
+
+        -- [SILO-TICKET-GRANT-4] Post: continuation task written in the same
+        -- batch (at a fresh task_key epoch so the deleted ticket's broker
+        -- tombstone does not suppress it)
+        one qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qjob = j and qt.db_qtime = tnext
+    }
+
+    -- Post: ticket rows removed (DB row and buffered copy)
+    no dbRequestTicketAt[tid, tnext]
+    no bufferedRequestTicketAt[tid, tnext]
+    all tid2: TaskId | tid2 != tid implies {
+        dbRequestTicketAt[tid2, tnext] = dbRequestTicketAt[tid2, t]
+        dbRequestTicketQueueAt[tid2, tnext] = dbRequestTicketQueueAt[tid2, t]
+        bufferedRequestTicketAt[tid2, tnext] = bufferedRequestTicketAt[tid2, t]
+        bufferedRequestTicketQueueAt[tid2, tnext] = bufferedRequestTicketQueueAt[tid2, t]
+    }
+
+    -- Frame: other DB queue entries unchanged; RunAttempt buffer unchanged
+    -- (the continuation waits for a later brokerScan)
+    all tid2: TaskId | tid2 != tid implies dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
+
+    -- Frame: other holders unchanged, requests unchanged, CRL unchanged
+    all q2: Queue | q2 != q implies holdersAt[q2, tnext] = holdersAt[q2, t]
+    requestsUnchanged[t, tnext]
+    all tid2: TaskId | dbCheckRateLimitAt[tid2, tnext] = dbCheckRateLimitAt[tid2, t]
+    all tid2: TaskId | bufferedCheckRateLimitAt[tid2, tnext] = bufferedCheckRateLimitAt[tid2, t]
+
+    -- Frame: leases, jobs, attempts unchanged
+    all tid2: TaskId | {
+        leaseAt[tid2, tnext] = leaseAt[tid2, t]
+        leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
+        leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
+    }
+    all j2: Job | statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | isCancelledAt[j2, tnext] iff isCancelledAt[j2, t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+}
+
+-- Transition: HANDLE_REQUEST_TICKET_AT_CAPACITY - convert the parked ticket
+-- into a deferred concurrency request (PR #362).
+--
+-- Previously the at-capacity branch left the ticket parked in the task
+-- keyspace (ack_release) to be retried by a later scan. The broker rescans
+-- each task group from the front of its key range and claims in key order,
+-- so more than one scan batch of permanently-unconsumable tickets
+-- head-of-line-blocked every later-keyed task in the (shard, task_group) —
+-- the 2026-06 staging starvation incident
+-- (tests/broker_head_of_line_blocking_tests.rs).
+--
+-- The fixed behavior modeled here: the at-capacity claim atomically deletes
+-- the ticket and writes a TicketRequest — the same durable shape the
+-- at-capacity immediate enqueue writes ([SILO-ENQ-CONC-6]) — which the grant
+-- scanner drains when a slot frees (grantNextRequest). A one-way conversion:
+-- no transition puts a ticket back. Nothing was reserved in memory
+-- (try_reserve failed), so no holder appears and no rollback path exists.
+-- The request keeps the ticket's original start_time/priority identity so
+-- cancel/reimport can still locate it and the job keeps its queue position
+-- (identity components other than (job, queue, task) are abstracted away).
+pred handleRequestTicketAtCapacity[tid: TaskId, q: Queue, t: Time, tnext: Time] {
+    -- [SILO-TICKET-CONV-1] Pre: ticket is buffered, q is its gating queue,
+    -- and q is at capacity (try_reserve failed)
+    some bufferedRequestTicketAt[tid, t]
+    q in bufferedRequestTicketQueueAt[tid, t]
+    let j = bufferedRequestTicketAt[tid, t] | {
+        one j
+        j in jobExistsAt[t]
+        statusAt[j, t] = Scheduled
+        not queueHasCapacity[q, t]
+
+        -- [SILO-TICKET-CONV-3] Post: deferred request record written in the
+        -- same batch, with the ticket's identity
+        one r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = tnext
+    }
+
+    -- [SILO-TICKET-CONV-2] Post: ticket deleted — NOT left parked in the
+    -- task keyspace
+    no dbRequestTicketAt[tid, tnext]
+    no bufferedRequestTicketAt[tid, tnext]
+    all tid2: TaskId | tid2 != tid implies {
+        dbRequestTicketAt[tid2, tnext] = dbRequestTicketAt[tid2, t]
+        dbRequestTicketQueueAt[tid2, tnext] = dbRequestTicketQueueAt[tid2, t]
+        bufferedRequestTicketAt[tid2, tnext] = bufferedRequestTicketAt[tid2, t]
+        bufferedRequestTicketQueueAt[tid2, tnext] = bufferedRequestTicketQueueAt[tid2, t]
+    }
+
+    -- Request added for q; other queues' requests unchanged
+    requestTasksAt[q, tnext] = requestTasksAt[q, t] + tid
+    all q2: Queue | q2 != q implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
+
+    -- [SILO-TICKET-CONV-4] Post: no slot reserved — holders unchanged — and
+    -- no RunAttempt task written
+    holdersUnchanged[t, tnext]
+    no qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qtime = tnext
+    all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+    all tid2: TaskId | bufferedAt[tid2, tnext] = bufferedAt[tid2, t]
+
+    -- Frame: CRL, leases, jobs, attempts unchanged
+    all tid2: TaskId | dbCheckRateLimitAt[tid2, tnext] = dbCheckRateLimitAt[tid2, t]
+    all tid2: TaskId | bufferedCheckRateLimitAt[tid2, tnext] = bufferedCheckRateLimitAt[tid2, t]
+    all tid2: TaskId | {
+        leaseAt[tid2, tnext] = leaseAt[tid2, t]
+        leaseJobAt[tid2, tnext] = leaseJobAt[tid2, t]
+        leaseAttemptAt[tid2, tnext] = leaseAttemptAt[tid2, t]
+    }
+    all j2: Job | statusAt[j2, tnext] = statusAt[j2, t]
+    all j2: Job | isCancelledAt[j2, tnext] iff isCancelledAt[j2, t]
+    attemptExistsAt[tnext] = attemptExistsAt[t]
+    all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
+    jobExistsAt[tnext] = jobExistsAt[t]
+}
+
 -- System Trace
 pred step[t: Time, tnext: Time] {
     -- Job lifecycle (no concurrency)
@@ -1941,6 +2328,12 @@ pred step[t: Time, tnext: Time] {
     or (brokerScanCheckRateLimit[t, tnext])
     or (some tid: TaskId | dequeueDropRunAttempt[tid, t, tnext])
     or (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
+    -- RequestTicket lifecycle (future-scheduled concurrency gate; the
+    -- at-capacity claim converts the ticket into a deferred request)
+    or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyFutureScheduled[tid, j, q, t, tnext])
+    or (brokerScanRequestTicket[t, tnext])
+    or (some tid: TaskId, q: Queue | handleRequestTicketGranted[tid, q, t, tnext])
+    or (some tid: TaskId, q: Queue | handleRequestTicketAtCapacity[tid, q, t, tnext])
     -- Stutter
     or stutter[t, tnext]
 }
@@ -1970,6 +2363,36 @@ fact crlStateChangesOnlyViaCrlTransitions {
             implies (
                 brokerScanCheckRateLimit[t, tnext] or
                 (some tid: TaskId | dequeueDropCheckRateLimit[tid, t, tnext])
+            )
+    }
+}
+
+/**
+ * RequestTicket state changes only when a ticket transition (or cancel's
+ * eager DB cleanup) fires — the same anti-phantom device as
+ * crlStateChangesOnlyViaCrlTransitions above. Without it, transitions that
+ * bypass `concurrencyUnchanged` leave the ticket sigs unconstrained and
+ * Alloy can fabricate parked tickets appearing or vanishing mid-trace.
+ */
+fact requestTicketStateChangesOnlyViaTicketTransitions {
+    all t: Time - last | let tnext = t.next | {
+        (some tid: TaskId |
+            dbRequestTicketAt[tid, tnext] != dbRequestTicketAt[tid, t] or
+            dbRequestTicketQueueAt[tid, tnext] != dbRequestTicketQueueAt[tid, t])
+            implies (
+                (some tid: TaskId, j: Job, q: Queue |
+                    enqueueWithConcurrencyFutureScheduled[tid, j, q, t, tnext]) or
+                (some tid: TaskId, q: Queue | handleRequestTicketGranted[tid, q, t, tnext]) or
+                (some tid: TaskId, q: Queue | handleRequestTicketAtCapacity[tid, q, t, tnext]) or
+                (some j: Job | cancelJob[j, t, tnext])
+            )
+        (some tid: TaskId |
+            bufferedRequestTicketAt[tid, tnext] != bufferedRequestTicketAt[tid, t] or
+            bufferedRequestTicketQueueAt[tid, tnext] != bufferedRequestTicketQueueAt[tid, t])
+            implies (
+                brokerScanRequestTicket[t, tnext] or
+                (some tid: TaskId, q: Queue | handleRequestTicketGranted[tid, q, t, tnext]) or
+                (some tid: TaskId, q: Queue | handleRequestTicketAtCapacity[tid, q, t, tnext])
             )
     }
 }
@@ -2110,6 +2533,10 @@ assert queueLimitEnforced {
  * and on branches kirin/fix-rate-limit-holder-leak,
  * kirin/dst-holder-leak-coverage.
  *
+ * Parked RequestTicket tasks are deliberately absent from the disjunction:
+ * a parked ticket never holds a slot (see parkedTicketsHoldNothing), so it
+ * can never be the justification for a holder.
+ *
  * See: [SILO-ENQ-CONC-2], [SILO-GRANT-3], [SILO-REL-1], [SILO-CXL-3]
  */
 assert holdersRequireActiveTask {
@@ -2145,6 +2572,43 @@ assert noHoldersForTerminal {
 assert grantedMeansNoRequest {
     all t: Time, h: TicketHolder | h.th_time = t implies
         no r: TicketRequest | r.tr_task = h.th_task and r.tr_queue = h.th_queue and r.tr_time = t
+}
+
+/**
+ * Parked RequestTickets hold no concurrency slots.
+ *
+ * The future-scheduled enqueue path rolls back its trial reservation instead
+ * of holding the slot until the start time ([SILO-ENQ-CONC-7]), and the
+ * at-capacity claim converts the ticket WITHOUT reserving anything
+ * ([SILO-TICKET-CONV-4]) — so a ticket's task id must never own a holder
+ * while the ticket is parked (in DB or buffered). A counterexample means
+ * some transition granted a slot to waiting work, which is exactly the
+ * future-burst slot-hoarding bug the rollback exists to prevent, or that a
+ * conversion leaked a reservation.
+ */
+assert parkedTicketsHoldNothing {
+    all rt: DbRequestTicketTask | no taskHeldQueuesAt[rt.rtt_task, rt.rtt_time]
+    all brt: BufferedRequestTicketTask | no taskHeldQueuesAt[brt.brtt_task, brt.brtt_time]
+}
+
+/**
+ * The at-capacity claim of a parked ticket is a complete, side-effect-free
+ * conversion (PR #362): the ticket leaves the task keyspace, the request
+ * record exists, no slot was taken, and no runnable task was written.
+ *
+ * Restated trace-level so a future edit that weakens the transition — e.g.
+ * reintroducing the parked-retry behavior that head-of-line-blocked the
+ * broker, or reserving a slot on the failure path — fails verification.
+ */
+assert convertedTicketBecomesRequest {
+    all t: Time - last, tid: TaskId, q: Queue |
+        handleRequestTicketAtCapacity[tid, q, t, t.next] implies {
+            no dbRequestTicketAt[tid, t.next]
+            no bufferedRequestTicketAt[tid, t.next]
+            tid in requestTasksAt[q, t.next]
+            holdersAt[q, t.next] = holdersAt[q, t]
+            no dbQueuedAt[tid, t.next]
+        }
 }
 
 /**
@@ -2361,6 +2825,43 @@ pred exampleConcurrencyWaitsInQueue {
         no h: TicketHolder | h.th_task = tid1 and h.th_time = t2
         -- t3: j2 is granted (holder created)
         some h: TicketHolder | h.th_task = tid2 and h.th_queue = q and h.th_time = t3
+    }
+}
+
+/**
+ * Scenario (PR #362, the broker head-of-line-blocking fix): job A holds q's
+ * only slot and is running; job B was future-scheduled on q, so a
+ * RequestTicket is parked in the task keyspace. When B's ticket is claimed
+ * the queue is at capacity, so the ticket converts into a deferred
+ * TicketRequest — it does NOT stay parked recycling through the broker scan.
+ * When A completes and releases the slot, the grant scanner grants B's
+ * request and B gets a runnable task, having waited its turn.
+ *
+ * Witnesses every new RequestTicket transition (future-scheduled enqueue,
+ * ticket broker scan, at-capacity conversion) plus the existing grant path
+ * draining the converted request. Must be SAT — UNSAT means the ticket
+ * machinery is over-constrained somewhere.
+ */
+pred exampleAtCapacityTicketConversion {
+    some disj tidA, tidB: TaskId, disj jA, jB: Job, q: Queue, t1, t2, t3: Time | {
+        lt[t1, t2] and lt[t2, t3]
+        -- t1: A holds the slot; B's ticket is parked in the task keyspace,
+        -- with no request and no holder for B
+        tidA in holdersAt[q, t1]
+        dbRequestTicketAt[tidB, t1] = jB
+        no r: TicketRequest | r.tr_task = tidB and r.tr_time = t1
+        -- t2: B's ticket has been claimed at capacity and converted: ticket
+        -- gone from the task keyspace, request record exists, A's holder
+        -- undisturbed, B got no slot and no runnable task
+        no dbRequestTicketAt[tidB, t2]
+        no bufferedRequestTicketAt[tidB, t2]
+        tidB in requestTasksAt[q, t2]
+        tidA in holdersAt[q, t2]
+        no dbQueuedAt[tidB, t2]
+        -- t3: A completed and released; the grant scanner granted B's request
+        statusAt[jA, t3] = Succeeded
+        tidB in holdersAt[q, t3]
+        no r: TicketRequest | r.tr_task = tidB and r.tr_time = t3
     }
 }
 
@@ -3212,6 +3713,15 @@ run exampleConcurrencyWaitsInQueue for 4 but exactly 2 Job, 1 Worker, 3 TaskId, 
     20 JobState, 10 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 10 AttemptExists, 10 JobExists, 3 JobAttemptRelation, 20 JobCancelled,
     2 JobQueueRequirement, 10 TicketRequest, 10 TicketHolder
 
+-- Ticket-conversion witness (PR #362). Minimal trace is 8 transitions:
+-- enqueue A granted -> scan A -> dequeue A -> enqueue B future-scheduled ->
+-- ticket scan -> at-capacity conversion -> complete A (release) -> grant B.
+run exampleAtCapacityTicketConversion for 4 but exactly 2 Job, 1 Worker, 2 TaskId, 2 Attempt, 10 Time, 1 Queue,
+    20 JobState, 10 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    4 DbRequestTicketTask, 4 BufferedRequestTicketTask,
+    10 AttemptExists, 10 JobExists, 2 JobAttemptRelation, 20 JobCancelled,
+    2 JobQueueRequirement, 10 TicketRequest, 10 TicketHolder
+
 run exampleCancelledRequestCleanup for 4 but exactly 2 Job, 1 Worker, 3 TaskId, 3 Attempt, 8 Time, 1 Queue,
     16 JobState, 8 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled,
     2 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
@@ -3273,35 +3783,57 @@ check restartedJobIsScheduledWithTask for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Att
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 16 JobCancelled
 
 -- Concurrency ticket assertions (with Queue, TicketRequest, TicketHolder, JobQueueRequirement bounds).
--- Scopes admit DbCheckRateLimitTask / BufferedCheckRateLimitTask so the new
--- CheckRateLimit transitions can produce witnesses.
+-- Scopes admit DbCheckRateLimitTask / BufferedCheckRateLimitTask and
+-- DbRequestTicketTask / BufferedRequestTicketTask so the CheckRateLimit and
+-- RequestTicket transitions can produce witnesses.
 check queueLimitEnforced for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
     6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    6 DbRequestTicketTask, 6 BufferedRequestTicketTask,
     8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check holdersRequireActiveTask for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
     6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    6 DbRequestTicketTask, 6 BufferedRequestTicketTask,
     8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check grantedMeansNoRequest for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
     6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    6 DbRequestTicketTask, 6 BufferedRequestTicketTask,
     8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check noHoldersForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
     6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    6 DbRequestTicketTask, 6 BufferedRequestTicketTask,
     8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 check omittedQueuesAreSafe for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
     6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    6 DbRequestTicketTask, 6 BufferedRequestTicketTask,
+    8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
+
+-- RequestTicket assertions (PR #362: at-capacity tickets convert into
+-- deferred requests instead of staying parked in the task keyspace)
+check parkedTicketsHoldNothing for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    6 DbRequestTicketTask, 6 BufferedRequestTicketTask,
+    8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
+    4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
+
+check convertedTicketBecomesRequest for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time, 2 Queue,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease,
+    6 DbCheckRateLimitTask, 6 BufferedCheckRateLimitTask,
+    6 DbRequestTicketTask, 6 BufferedRequestTicketTask,
     8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled,
     4 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
