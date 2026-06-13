@@ -227,6 +227,20 @@ message DropTenantHoldersResponse {
   uint64 run_attempts_dropped = 2; // Number of in-flight run attempts deleted.
 }
 
+// Finalize a tenant's orphaned `Running` jobs (Running status with no lease
+// record) by force-transitioning them to terminal `Failed`. Admin/operator
+// action that recovers jobs the lease reaper can't see, and a backstop against
+// future orphan sources.
+message ReconcileTenantRequest {
+  string shard = 1;           // Shard ID (UUID) to operate on.
+  optional string tenant = 2; // Tenant ID if multi-tenancy is enabled.
+}
+
+// Response reporting what was reconciled.
+message ReconcileTenantResponse {
+  uint64 orphaned_running_failed = 1; // Running jobs with no lease force-failed.
+}
+
 // Restart a cancelled or failed job, allowing it to be processed again.
 // The job will get a fresh set of retries according to its retry policy.
 message RestartJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
@@ -686,7 +700,11 @@ service Silo {
   // Forcibly drop all concurrency holders and in-flight run attempts for a
   // tenant on this shard. Admin action to clear stuck concurrency state.
   rpc DropTenantHolders(DropTenantHoldersRequest) returns (DropTenantHoldersResponse);
-  
+
+  // Finalize a tenant's orphaned `Running` jobs (Running with no lease) by
+  // force-failing them. Recovers jobs the lease reaper can't see.
+  rpc ReconcileTenant(ReconcileTenantRequest) returns (ReconcileTenantResponse);
+
   // Restart a cancelled or failed job for another attempt.
   // Returns FAILED_PRECONDITION if job is not in a restartable state.
   // Returns NOT_FOUND if the job doesn't exist.

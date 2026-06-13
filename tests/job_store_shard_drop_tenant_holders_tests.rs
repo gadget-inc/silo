@@ -1,6 +1,6 @@
 mod test_helpers;
 
-use silo::job::{ConcurrencyLimit, Limit};
+use silo::job::{ConcurrencyLimit, JobStatusKind, Limit};
 use test_helpers::*;
 
 /// Enqueue a job for `tenant` with a concurrency limit on `queue` (max 1). The
@@ -104,4 +104,111 @@ async fn drop_tenant_with_no_state_is_a_noop() {
 
     assert_eq!(stats.holders_dropped, 0);
     assert_eq!(stats.run_attempts_dropped, 0);
+}
+
+/// A `Running` job whose lease was raw-deleted (the old admin-action bug) is an
+/// orphan: invisible to the lease reaper. `reconcile_orphaned_running_jobs`
+/// force-transitions it to terminal `Failed`.
+#[silo::test]
+async fn reconcile_fails_orphaned_running_job() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    let job_id = enqueue_with_holder(&shard, "tenant-a", "qA", now).await;
+
+    // Dequeue → the job is Running with a lease.
+    let leased = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(leased.len(), 1, "exactly one task leased");
+    let task_id = leased[0].attempt().task_id().to_string();
+
+    // Simulate the old bug: raw-delete the lease without a status transition,
+    // leaving JOB_STATUS = Running with no lease.
+    shard
+        .db()
+        .delete(&silo::keys::leased_task_key(&task_id))
+        .await
+        .expect("delete lease");
+    assert_eq!(count_lease_keys(shard.db()).await, 0, "lease removed");
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &job_id)
+            .await
+            .expect("status")
+            .expect("job exists")
+            .kind,
+        JobStatusKind::Running,
+        "job is orphaned Running"
+    );
+
+    // Reconcile finalizes the orphan.
+    let stats = shard
+        .reconcile_orphaned_running_jobs("tenant-a")
+        .await
+        .expect("reconcile");
+    assert_eq!(stats.orphaned_running_failed, 1);
+
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &job_id)
+            .await
+            .expect("status")
+            .expect("job exists")
+            .kind,
+        JobStatusKind::Failed,
+        "orphan transitioned to terminal Failed"
+    );
+    assert_eq!(count_lease_keys(shard.db()).await, 0);
+}
+
+/// A `Running` job with its lease intact may have a worker actively running it,
+/// so reconcile must never touch it.
+#[silo::test]
+async fn reconcile_leaves_live_leased_running_job_untouched() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    let job_id = enqueue_with_holder(&shard, "tenant-a", "qA", now).await;
+
+    // Dequeue → Running WITH lease intact (no bug simulated).
+    let leased = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(leased.len(), 1);
+    assert!(count_lease_keys(shard.db()).await >= 1, "lease present");
+
+    let stats = shard
+        .reconcile_orphaned_running_jobs("tenant-a")
+        .await
+        .expect("reconcile");
+    assert_eq!(stats.orphaned_running_failed, 0, "live lease untouched");
+
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &job_id)
+            .await
+            .expect("status")
+            .expect("job exists")
+            .kind,
+        JobStatusKind::Running,
+        "still Running — a worker may be running it",
+    );
+}
+
+/// Reconciling a tenant with no orphaned Running jobs is a no-op returning zero.
+#[silo::test]
+async fn reconcile_with_no_orphans_is_noop() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    let stats = shard
+        .reconcile_orphaned_running_jobs("ghost")
+        .await
+        .expect("reconcile");
+
+    assert_eq!(stats.orphaned_running_failed, 0);
 }

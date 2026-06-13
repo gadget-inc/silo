@@ -1101,6 +1101,23 @@ impl Silo for SiloService {
         }))
     }
 
+    async fn reconcile_tenant(
+        &self,
+        req: Request<ReconcileTenantRequest>,
+    ) -> Result<Response<ReconcileTenantResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+        let stats = shard
+            .reconcile_orphaned_running_jobs(&tenant)
+            .await
+            .map_err(map_err)?;
+        Ok(Response::new(ReconcileTenantResponse {
+            orphaned_running_failed: stats.orphaned_running_failed as u64,
+        }))
+    }
+
     async fn restart_job(
         &self,
         req: Request<RestartJobRequest>,

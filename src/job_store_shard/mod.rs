@@ -17,7 +17,7 @@ mod restart;
 mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
-pub use drop_tenant_holders::DropTenantStats;
+pub use drop_tenant_holders::{DropTenantStats, ReconcileTenantStats};
 
 pub use counters::{
     JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,

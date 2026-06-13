@@ -4,10 +4,15 @@
 //! forcibly clears a tenant's stuck concurrency state on a single shard so the
 //! tenant returns to a consistent, runnable state.
 
+use std::collections::HashSet;
+
 use slatedb::WriteBatch;
+use slatedb::config::WriteOptions;
 use tracing::warn;
 
 use crate::codec::{decode_lease, decode_task};
+use crate::job::{JobStatus, JobStatusKind};
+use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     concurrency_holders_tenant_prefix, end_bound, leases_prefix, parse_concurrency_holder_key,
@@ -28,6 +33,13 @@ pub struct DropTenantStats {
     /// Number of in-flight `RunAttempt`s deleted — both queued task-queue
     /// entries and running (leased) attempts.
     pub run_attempts_dropped: usize,
+}
+
+/// Counts of what `reconcile_orphaned_running_jobs` finalized.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileTenantStats {
+    /// `Running` jobs that had no lease and were force-failed.
+    pub orphaned_running_failed: usize,
 }
 
 impl JobStoreShard {
@@ -176,6 +188,150 @@ impl JobStoreShard {
         Ok(DropTenantStats {
             holders_dropped: holder_keys.len(),
             run_attempts_dropped: deleted_task_keys.len() + deleted_lease_keys.len(),
+        })
+    }
+
+    /// Finalize a tenant's orphaned `Running` jobs — jobs stuck in `Running`
+    /// status with **no lease record** — by force-transitioning them to
+    /// terminal `Failed`.
+    ///
+    /// ## Why this exists
+    ///
+    /// The lease reaper is lease-driven: it finalizes a `Running` job by acting
+    /// on its (expired) lease. A `Running` job whose lease was raw-deleted
+    /// without a status transition — e.g. by the old "Drop holders & run
+    /// attempts" admin action before PR #365 — is therefore invisible to the
+    /// reaper and never cleaned up. No other tool recovers it either: `delete`
+    /// rejects non-terminal jobs, `cancel` on `Running` only writes a marker an
+    /// absent worker must ack, and `restart`/`expedite` reject `Running`. This
+    /// reconcile is the recovery path, and a permanent backstop against any
+    /// future orphan source.
+    ///
+    /// ## Semantics
+    ///
+    /// - **Orphan = `Running` with no lease.** We scan the whole LEASE keyspace
+    ///   and collect *every* lease for the tenant regardless of expiry: if a
+    ///   lease exists at all, the reaper owns that job and we must not race it.
+    ///   Only `Running` jobs with no lease are finalized.
+    /// - **No synthetic ATTEMPT row.** We have no lease/attempt context, so we
+    ///   write no new attempt. The job becomes `Failed` terminal;
+    ///   `expire_terminal_job_records` re-puts the existing (stale `Running`)
+    ///   attempt row with the terminal TTL so all records age out together.
+    /// - **Idempotent / partial-progress-safe.** Each job is finalized in its
+    ///   own durable batch and re-reads status first, so re-running skips
+    ///   already-`Failed` jobs and a crash mid-run loses no correctness.
+    /// - **Best-effort, like the reaper.** A per-job failure is logged, its
+    ///   in-memory queue-counter side effect rolled back, and the scan
+    ///   continues.
+    ///
+    /// ## Non-goal
+    ///
+    /// Orphaned `Scheduled` jobs are intentionally out of scope: a `Scheduled`
+    /// job legitimately has either a queued task or a pending concurrency
+    /// request, so classifying it as orphaned is ambiguous. A future extension
+    /// could handle that with a more careful definition.
+    #[tracing::instrument(skip_all, fields(shard = %self.name, tenant))]
+    pub async fn reconcile_orphaned_running_jobs(
+        &self,
+        tenant: &str,
+    ) -> Result<ReconcileTenantStats, JobStoreShardError> {
+        // ---- 1. Build the leased-job set (any lease, regardless of expiry) ----
+        let mut leased_job_ids: HashSet<String> = HashSet::new();
+        {
+            let start = leases_prefix();
+            let end = end_bound(&start);
+            let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+            while let Some(kv) = iter.next().await? {
+                let decoded = match decode_lease(kv.value.clone()) {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        warn!(error = %e, "skipping undecodable lease during reconcile");
+                        continue;
+                    }
+                };
+                if decoded.tenant() == tenant {
+                    leased_job_ids.insert(decoded.job_id().to_string());
+                }
+            }
+        }
+
+        // ---- 2. List the tenant's Running jobs ----
+        let running_job_ids = self
+            .scan_jobs_by_status(tenant, JobStatusKind::Running, None)
+            .await?;
+
+        // ---- 3. Finalize each orphan in its own durable, atomic batch ----
+        let mut orphaned_running_failed = 0usize;
+        for job_id in running_job_ids {
+            if leased_job_ids.contains(&job_id) {
+                continue;
+            }
+
+            let now_ms = now_epoch_ms();
+
+            // Re-read status: skip unless still Running (guards against a
+            // concurrent transition and makes re-runs idempotent).
+            match self.get_job_status(tenant, &job_id).await? {
+                Some(status) if status.kind == JobStatusKind::Running => {}
+                _ => continue,
+            }
+
+            let expire_ts = self.terminal_expire_ts(JobStatusKind::Failed, now_ms);
+            let mut batch = WriteBatch::new();
+
+            // JOB_STATUS + IDX_STATUS_TIME + Running->Failed counter swap +
+            // background-action queue counters.
+            let transition = self
+                .set_job_status_with_index_opts(
+                    &mut DbWriteBatcher::new(&self.db, &mut batch),
+                    tenant,
+                    &job_id,
+                    JobStatus::failed(now_ms),
+                    expire_ts,
+                    None,
+                )
+                .await?;
+
+            // Terminal completion counter.
+            self.increment_completed_jobs_counter(&mut DbWriteBatcher::new(&self.db, &mut batch))?;
+
+            // TTL the job's records (JOB_INFO / IDX_METADATA / ATTEMPT /
+            // JOB_CANCELLED), including the stale Running attempt row.
+            if let Some(ts) = expire_ts {
+                self.expire_terminal_job_records(
+                    &mut DbWriteBatcher::new(&self.db, &mut batch),
+                    tenant,
+                    &job_id,
+                    ts,
+                )
+                .await?;
+            }
+
+            // Commit durably; on failure roll back the in-memory queue-counter
+            // side effect and continue (best-effort, like the reaper).
+            match self
+                .db
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => orphaned_running_failed += 1,
+                Err(e) => {
+                    if let Some(transition) = &transition {
+                        self.rollback_background_action_metric_gauge_transition(transition);
+                    }
+                    warn!(error = %e, %job_id, "failed to finalize orphaned Running job; continuing");
+                }
+            }
+        }
+
+        Ok(ReconcileTenantStats {
+            orphaned_running_failed,
         })
     }
 }

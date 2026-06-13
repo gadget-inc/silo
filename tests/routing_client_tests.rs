@@ -104,6 +104,13 @@ impl Silo for CountingClusterInfoService {
         Self::unimplemented("drop_tenant_holders")
     }
 
+    async fn reconcile_tenant(
+        &self,
+        _request: Request<ReconcileTenantRequest>,
+    ) -> Result<Response<ReconcileTenantResponse>, Status> {
+        Self::unimplemented("reconcile_tenant")
+    }
+
     async fn restart_job(
         &self,
         _request: Request<RestartJobRequest>,
