@@ -160,6 +160,12 @@ async fn test_job_view_renders() {
     assert!(body.contains("P25"), "expected priority in body");
     assert!(body.contains("key1"), "expected metadata key in body");
     assert!(body.contains("value1"), "expected metadata value in body");
+    // The cancel form must carry the tenant so cancellation uses the direct,
+    // tenant-keyed lookup rather than the tenant-less fallback scan.
+    assert!(
+        body.contains("/job/cancel?shard=") && body.contains("tenant=-"),
+        "expected cancel form to include the tenant param"
+    );
 }
 
 #[silo::test]
