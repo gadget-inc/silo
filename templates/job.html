@@ -12,7 +12,7 @@
         </div>
         <div class="flex items-center gap-2">
             {% if !is_terminal %}
-            <form hx-post="/job/cancel?shard={{ shard }}&id={{ job_id }}" hx-swap="outerHTML" hx-target="#job-status" class="inline">
+            <form hx-post="/job/cancel?shard={{ shard }}&tenant={{ tenant }}&id={{ job_id }}" hx-swap="outerHTML" hx-target="#job-status" class="inline">
                 <button type="submit" class="px-3 py-1 text-sm bg-red-900/50 border border-red-700 text-red-400  hover:bg-red-900 transition-colors">
                     Cancel Job
                 </button>

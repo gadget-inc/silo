@@ -139,6 +139,7 @@ struct JobTemplate {
     tenancy_enabled: bool,
     job_id: String,
     shard: String,
+    tenant: String,
     status: String,
     is_terminal: bool,
     priority: u8,
@@ -605,6 +606,7 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// Job data fetched from the cluster query engine
 struct JobQueryResult {
     shard_id: String,
+    tenant: String,
     priority: u8,
     enqueue_time_ms: i64,
     payload: String,
@@ -628,7 +630,7 @@ async fn job_handler(
         where_clauses.push(format!("tenant = '{}'", tenant.replace('\'', "''")));
     }
     let sql = format!(
-        "SELECT shard_id, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata, limits FROM jobs WHERE {} LIMIT 1",
+        "SELECT shard_id, tenant, priority, enqueue_time_ms, payload, status_kind, status_changed_at_ms, metadata, limits FROM jobs WHERE {} LIMIT 1",
         where_clauses.join(" AND ")
     );
 
@@ -643,6 +645,15 @@ async fn job_handler(
 
                     let shard_id = batch
                         .column_by_name("shard_id")
+                        .and_then(|c| {
+                            c.as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                        })
+                        .map(|a| a.value(0).to_string())
+                        .unwrap_or_default();
+
+                    let tenant = batch
+                        .column_by_name("tenant")
                         .and_then(|c| {
                             c.as_any()
                                 .downcast_ref::<datafusion::arrow::array::StringArray>()
@@ -766,6 +777,7 @@ async fn job_handler(
 
                     result = Some(JobQueryResult {
                         shard_id,
+                        tenant,
                         priority,
                         enqueue_time_ms,
                         payload,
@@ -820,6 +832,7 @@ async fn job_handler(
         tenancy_enabled: state.config.tenancy.enabled,
         job_id: params.id,
         shard: job.shard_id.to_string(),
+        tenant: urlencoding::encode(&job.tenant).into_owned(),
         status: job.status_kind,
         is_terminal,
         priority: job.priority,
