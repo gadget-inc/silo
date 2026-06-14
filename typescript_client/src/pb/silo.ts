@@ -562,6 +562,35 @@ export interface DropTenantHoldersResponse {
     runAttemptsDropped: bigint; // Number of in-flight run attempts deleted.
 }
 /**
+ * Finalize a tenant's orphaned `Running` jobs (Running status with no lease
+ * record) by force-transitioning them to terminal `Failed`. Admin/operator
+ * action that recovers jobs the lease reaper can't see, and a backstop against
+ * future orphan sources.
+ *
+ * @generated from protobuf message silo.v1.ReconcileTenantRequest
+ */
+export interface ReconcileTenantRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // Shard ID (UUID) to operate on.
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
+}
+/**
+ * Response reporting what was reconciled.
+ *
+ * @generated from protobuf message silo.v1.ReconcileTenantResponse
+ */
+export interface ReconcileTenantResponse {
+    /**
+     * @generated from protobuf field: uint64 orphaned_running_failed = 1
+     */
+    orphanedRunningFailed: bigint; // Running jobs with no lease force-failed.
+}
+/**
  * Restart a cancelled or failed job, allowing it to be processed again.
  * The job will get a fresh set of retries according to its retry policy.
  *
@@ -3473,6 +3502,107 @@ class DropTenantHoldersResponse$Type extends MessageType<DropTenantHoldersRespon
  * @generated MessageType for protobuf message silo.v1.DropTenantHoldersResponse
  */
 export const DropTenantHoldersResponse = new DropTenantHoldersResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ReconcileTenantRequest$Type extends MessageType<ReconcileTenantRequest> {
+    constructor() {
+        super("silo.v1.ReconcileTenantRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ReconcileTenantRequest>): ReconcileTenantRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<ReconcileTenantRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ReconcileTenantRequest): ReconcileTenantRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ReconcileTenantRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ReconcileTenantRequest
+ */
+export const ReconcileTenantRequest = new ReconcileTenantRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class ReconcileTenantResponse$Type extends MessageType<ReconcileTenantResponse> {
+    constructor() {
+        super("silo.v1.ReconcileTenantResponse", [
+            { no: 1, name: "orphaned_running_failed", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<ReconcileTenantResponse>): ReconcileTenantResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.orphanedRunningFailed = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<ReconcileTenantResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: ReconcileTenantResponse): ReconcileTenantResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint64 orphaned_running_failed */ 1:
+                    message.orphanedRunningFailed = reader.uint64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: ReconcileTenantResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint64 orphaned_running_failed = 1; */
+        if (message.orphanedRunningFailed !== 0n)
+            writer.tag(1, WireType.Varint).uint64(message.orphanedRunningFailed);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.ReconcileTenantResponse
+ */
+export const ReconcileTenantResponse = new ReconcileTenantResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class RestartJobRequest$Type extends MessageType<RestartJobRequest> {
     constructor() {
@@ -7327,6 +7457,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "DeleteJob", options: {}, I: DeleteJobRequest, O: DeleteJobResponse },
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
     { name: "DropTenantHolders", options: {}, I: DropTenantHoldersRequest, O: DropTenantHoldersResponse },
+    { name: "ReconcileTenant", options: {}, I: ReconcileTenantRequest, O: ReconcileTenantResponse },
     { name: "RestartJob", options: {}, I: RestartJobRequest, O: RestartJobResponse },
     { name: "ExpediteJob", options: {}, I: ExpediteJobRequest, O: ExpediteJobResponse },
     { name: "LeaseTask", options: {}, I: LeaseTaskRequest, O: LeaseTaskResponse },
