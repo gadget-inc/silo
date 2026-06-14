@@ -238,7 +238,8 @@ message ReconcileTenantRequest {
 
 // Response reporting what was reconciled.
 message ReconcileTenantResponse {
-  uint64 orphaned_running_failed = 1; // Running jobs with no lease force-failed.
+  uint64 orphaned_running_failed = 1;     // Running jobs with no lease force-failed.
+  uint64 orphaned_scheduled_redriven = 2; // Scheduled jobs with no task/request re-injected into the limit chain.
 }
 
 // Restart a cancelled or failed job, allowing it to be processed again.

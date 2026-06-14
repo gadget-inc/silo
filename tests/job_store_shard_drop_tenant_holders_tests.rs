@@ -107,7 +107,7 @@ async fn drop_tenant_with_no_state_is_a_noop() {
 }
 
 /// A `Running` job whose lease was raw-deleted (the old admin-action bug) is an
-/// orphan: invisible to the lease reaper. `reconcile_orphaned_running_jobs`
+/// orphan: invisible to the lease reaper. `reconcile_orphaned_jobs`
 /// force-transitions it to terminal `Failed`.
 #[silo::test]
 async fn reconcile_fails_orphaned_running_job() {
@@ -146,7 +146,7 @@ async fn reconcile_fails_orphaned_running_job() {
 
     // Reconcile finalizes the orphan.
     let stats = shard
-        .reconcile_orphaned_running_jobs("tenant-a")
+        .reconcile_orphaned_jobs("tenant-a")
         .await
         .expect("reconcile");
     assert_eq!(stats.orphaned_running_failed, 1);
@@ -183,7 +183,7 @@ async fn reconcile_leaves_live_leased_running_job_untouched() {
     assert!(count_lease_keys(shard.db()).await >= 1, "lease present");
 
     let stats = shard
-        .reconcile_orphaned_running_jobs("tenant-a")
+        .reconcile_orphaned_jobs("tenant-a")
         .await
         .expect("reconcile");
     assert_eq!(stats.orphaned_running_failed, 0, "live lease untouched");
@@ -200,15 +200,220 @@ async fn reconcile_leaves_live_leased_running_job_untouched() {
     );
 }
 
-/// Reconciling a tenant with no orphaned Running jobs is a no-op returning zero.
+/// Reconciling a tenant with no orphaned jobs is a no-op returning zeros.
 #[silo::test]
 async fn reconcile_with_no_orphans_is_noop() {
     let (_tmp, shard) = open_temp_shard().await;
 
     let stats = shard
-        .reconcile_orphaned_running_jobs("ghost")
+        .reconcile_orphaned_jobs("ghost")
         .await
         .expect("reconcile");
 
     assert_eq!(stats.orphaned_running_failed, 0);
+    assert_eq!(stats.orphaned_scheduled_redriven, 0);
+}
+
+/// Enqueue a job with no limits → status `Scheduled` + a single `RunAttempt`
+/// task in the TASK queue. Returns the job id.
+async fn enqueue_no_limits(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    now: i64,
+) -> String {
+    let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+    shard
+        .enqueue(
+            tenant,
+            None,
+            10u8,
+            now,
+            None,
+            payload,
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue")
+}
+
+/// A `Scheduled` job whose queued `RunAttempt` task was raw-deleted (the old
+/// admin-action bug) — with no concurrency request either — is an orphan that
+/// nothing will dispatch. `reconcile_orphaned_jobs` redrives it back into the
+/// limit chain so it runs again.
+#[silo::test]
+async fn reconcile_redrives_task_less_scheduled_orphan() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    let job_id = enqueue_no_limits(&shard, "tenant-a", now).await;
+    assert_eq!(count_task_keys(shard.db()).await, 1, "one task enqueued");
+
+    // Simulate the old bug: raw-delete the queued task, leaving JOB_STATUS =
+    // Scheduled with nothing in the pipeline.
+    let (task_key, _) = first_task_kv(shard.db()).await.expect("task exists");
+    shard.db().delete(&task_key).await.expect("delete task");
+    assert_eq!(count_task_keys(shard.db()).await, 0, "task removed");
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &job_id)
+            .await
+            .expect("status")
+            .expect("job exists")
+            .kind,
+        JobStatusKind::Scheduled,
+        "job is orphaned Scheduled"
+    );
+
+    // Reconcile redrives the orphan.
+    let stats = shard
+        .reconcile_orphaned_jobs("tenant-a")
+        .await
+        .expect("reconcile");
+    assert_eq!(stats.orphaned_scheduled_redriven, 1);
+    assert_eq!(stats.orphaned_running_failed, 0);
+
+    // A fresh RunAttempt task exists and the job dequeues + runs again.
+    assert_eq!(count_task_keys(shard.db()).await, 1, "task re-created");
+    let leased = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(leased.len(), 1, "redriven job dequeues");
+    assert_eq!(leased[0].job().id(), job_id);
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &job_id)
+            .await
+            .expect("status")
+            .expect("job exists")
+            .kind,
+        JobStatusKind::Running,
+    );
+}
+
+/// A `Scheduled` job that still has its queued task is healthy — reconcile must
+/// not touch it or write a duplicate task.
+#[silo::test]
+async fn reconcile_leaves_scheduled_with_task_untouched() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    let job_id = enqueue_no_limits(&shard, "tenant-a", now).await;
+    assert_eq!(count_task_keys(shard.db()).await, 1);
+
+    let stats = shard
+        .reconcile_orphaned_jobs("tenant-a")
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        stats.orphaned_scheduled_redriven, 0,
+        "healthy job untouched"
+    );
+
+    // No duplicate task, status unchanged.
+    assert_eq!(count_task_keys(shard.db()).await, 1, "no duplicate task");
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &job_id)
+            .await
+            .expect("status")
+            .expect("job exists")
+            .kind,
+        JobStatusKind::Scheduled,
+    );
+}
+
+/// A `Scheduled` job parked on a full concurrency queue has a pending request
+/// (not a task) and is legitimately waiting — reconcile must never redrive it.
+#[silo::test]
+async fn reconcile_leaves_scheduled_waiting_on_concurrency_untouched() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // First job grabs the only slot (holder + RunAttempt task). Second job is
+    // parked as a concurrency request (Scheduled, no task).
+    enqueue_with_holder(&shard, "tenant-a", "qA", now).await;
+    enqueue_with_holder(&shard, "tenant-a", "qA", now).await;
+    assert_eq!(
+        count_task_keys(shard.db()).await,
+        1,
+        "only first has a task"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "second parked as a request"
+    );
+
+    let stats = shard
+        .reconcile_orphaned_jobs("tenant-a")
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        stats.orphaned_scheduled_redriven, 0,
+        "neither the task-holding nor the request-waiting job is an orphan"
+    );
+
+    // Nothing duplicated.
+    assert_eq!(count_task_keys(shard.db()).await, 1);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+}
+
+/// Running and Scheduled orphans for the same tenant are both recovered in one
+/// reconcile pass.
+#[silo::test]
+async fn reconcile_handles_running_and_scheduled_orphans_together() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Running orphan: enqueue → dequeue (Running + lease) → delete the lease.
+    let running_id = enqueue_no_limits(&shard, "tenant-a", now).await;
+    let leased = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].job().id(), running_id);
+    let task_id = leased[0].attempt().task_id().to_string();
+    shard
+        .db()
+        .delete(&silo::keys::leased_task_key(&task_id))
+        .await
+        .expect("delete lease");
+
+    // Scheduled orphan: enqueue (now in TASK queue) → delete its task.
+    let scheduled_id = enqueue_no_limits(&shard, "tenant-a", now).await;
+    let (task_key, _) = first_task_kv(shard.db()).await.expect("scheduled task");
+    shard.db().delete(&task_key).await.expect("delete task");
+
+    let stats = shard
+        .reconcile_orphaned_jobs("tenant-a")
+        .await
+        .expect("reconcile");
+    assert_eq!(stats.orphaned_running_failed, 1);
+    assert_eq!(stats.orphaned_scheduled_redriven, 1);
+
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &running_id)
+            .await
+            .expect("status")
+            .expect("job")
+            .kind,
+        JobStatusKind::Failed,
+    );
+    assert_eq!(
+        shard
+            .get_job_status("tenant-a", &scheduled_id)
+            .await
+            .expect("status")
+            .expect("job")
+            .kind,
+        JobStatusKind::Scheduled,
+        "redriven job stays Scheduled until a worker leases its new task"
+    );
 }

@@ -589,6 +589,10 @@ export interface ReconcileTenantResponse {
      * @generated from protobuf field: uint64 orphaned_running_failed = 1
      */
     orphanedRunningFailed: bigint; // Running jobs with no lease force-failed.
+    /**
+     * @generated from protobuf field: uint64 orphaned_scheduled_redriven = 2
+     */
+    orphanedScheduledRedriven: bigint; // Scheduled jobs with no task/request re-injected into the limit chain.
 }
 /**
  * Restart a cancelled or failed job, allowing it to be processed again.
@@ -3560,12 +3564,14 @@ export const ReconcileTenantRequest = new ReconcileTenantRequest$Type();
 class ReconcileTenantResponse$Type extends MessageType<ReconcileTenantResponse> {
     constructor() {
         super("silo.v1.ReconcileTenantResponse", [
-            { no: 1, name: "orphaned_running_failed", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
+            { no: 1, name: "orphaned_running_failed", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 2, name: "orphaned_scheduled_redriven", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<ReconcileTenantResponse>): ReconcileTenantResponse {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.orphanedRunningFailed = 0n;
+        message.orphanedScheduledRedriven = 0n;
         if (value !== undefined)
             reflectionMergePartial<ReconcileTenantResponse>(this, message, value);
         return message;
@@ -3577,6 +3583,9 @@ class ReconcileTenantResponse$Type extends MessageType<ReconcileTenantResponse> 
             switch (fieldNo) {
                 case /* uint64 orphaned_running_failed */ 1:
                     message.orphanedRunningFailed = reader.uint64().toBigInt();
+                    break;
+                case /* uint64 orphaned_scheduled_redriven */ 2:
+                    message.orphanedScheduledRedriven = reader.uint64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3593,6 +3602,9 @@ class ReconcileTenantResponse$Type extends MessageType<ReconcileTenantResponse> 
         /* uint64 orphaned_running_failed = 1; */
         if (message.orphanedRunningFailed !== 0n)
             writer.tag(1, WireType.Varint).uint64(message.orphanedRunningFailed);
+        /* uint64 orphaned_scheduled_redriven = 2; */
+        if (message.orphanedScheduledRedriven !== 0n)
+            writer.tag(2, WireType.Varint).uint64(message.orphanedScheduledRedriven);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

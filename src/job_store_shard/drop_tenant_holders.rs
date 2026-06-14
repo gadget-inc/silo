@@ -9,13 +9,15 @@ use std::collections::HashSet;
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::codec::{decode_lease, decode_task};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{DbWriteBatcher, now_epoch_ms};
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    concurrency_holders_tenant_prefix, end_bound, leases_prefix, parse_concurrency_holder_key,
+    concurrency_holders_tenant_prefix, concurrency_request_tenant_prefix, end_bound, leases_prefix,
+    parse_concurrency_holder_key, parse_concurrency_request_key, task_key_lookup_prefix,
     tasks_prefix,
 };
 use crate::task::Task;
@@ -35,11 +37,14 @@ pub struct DropTenantStats {
     pub run_attempts_dropped: usize,
 }
 
-/// Counts of what `reconcile_orphaned_running_jobs` finalized.
+/// Counts of what `reconcile_orphaned_jobs` finalized.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReconcileTenantStats {
     /// `Running` jobs that had no lease and were force-failed.
     pub orphaned_running_failed: usize,
+    /// `Scheduled` jobs that had no task and no concurrency request, and were
+    /// re-injected into the limit chain so they dispatch again.
+    pub orphaned_scheduled_redriven: usize,
 }
 
 impl JobStoreShard {
@@ -191,51 +196,61 @@ impl JobStoreShard {
         })
     }
 
-    /// Finalize a tenant's orphaned `Running` jobs — jobs stuck in `Running`
-    /// status with **no lease record** — by force-transitioning them to
-    /// terminal `Failed`.
+    /// Recover a tenant's orphaned jobs — jobs that no longer have anything in
+    /// the pipeline to advance them — on this shard.
     ///
-    /// ## Why this exists
+    /// Two orphan classes are handled, both produced by the old "Drop holders &
+    /// run attempts" admin action, which raw-deleted leases and queued
+    /// `RunAttempt` tasks without touching job status (see
+    /// [`drop_tenant_holders_and_runattempts`]):
     ///
-    /// The lease reaper is lease-driven: it finalizes a `Running` job by acting
-    /// on its (expired) lease. A `Running` job whose lease was raw-deleted
-    /// without a status transition — e.g. by the old "Drop holders & run
-    /// attempts" admin action before PR #365 — is therefore invisible to the
-    /// reaper and never cleaned up. No other tool recovers it either: `delete`
-    /// rejects non-terminal jobs, `cancel` on `Running` only writes a marker an
-    /// absent worker must ack, and `restart`/`expedite` reject `Running`. This
-    /// reconcile is the recovery path, and a permanent backstop against any
-    /// future orphan source.
+    /// 1. **`Running` with no lease → force-`Failed`.** The lease reaper is
+    ///    lease-driven, so a `Running` job whose lease was deleted is invisible
+    ///    to it and never cleaned up. No other tool recovers it either: `delete`
+    ///    rejects non-terminal jobs, `cancel` on `Running` only writes a marker
+    ///    an absent worker must ack, and `restart`/`expedite` reject `Running`.
+    ///    Its attempt is lost (the worker is gone), so we finalize it terminal.
+    /// 2. **`Scheduled` with no task and no concurrency request → redrive.** A
+    ///    `Scheduled` job always gets a pipeline entry at enqueue — a queued
+    ///    task, or (at capacity) a deferred concurrency request. If *both* are
+    ///    gone nothing will ever dispatch it. It never started, so rather than
+    ///    fail it we re-inject it into the limit chain exactly as a fresh
+    ///    enqueue would (via [`enqueue_limit_task_at_index`]), re-applying its
+    ///    concurrency/rate limits — at capacity it re-parks as a request, never
+    ///    bypassing the tenant's concurrency cap.
+    ///
+    /// This is the recovery path for already-orphaned jobs and a permanent
+    /// backstop against any future orphan source.
     ///
     /// ## Semantics
     ///
-    /// - **Orphan = `Running` with no lease.** We scan the whole LEASE keyspace
-    ///   and collect *every* lease for the tenant regardless of expiry: if a
-    ///   lease exists at all, the reaper owns that job and we must not race it.
-    ///   Only `Running` jobs with no lease are finalized.
-    /// - **No synthetic ATTEMPT row.** We have no lease/attempt context, so we
-    ///   write no new attempt. The job becomes `Failed` terminal;
-    ///   `expire_terminal_job_records` re-puts the existing (stale `Running`)
-    ///   attempt row with the terminal TTL so all records age out together.
-    /// - **Idempotent / partial-progress-safe.** Each job is finalized in its
-    ///   own durable batch and re-reads status first, so re-running skips
-    ///   already-`Failed` jobs and a crash mid-run loses no correctness.
+    /// - **Lease/request sets collected up front.** We scan the whole LEASE
+    ///   keyspace (any lease, regardless of expiry — if one exists the reaper
+    ///   owns the job and we must not race it) and the tenant's concurrency
+    ///   REQUEST keyspace once each, so a `Running` job with any lease and a
+    ///   `Scheduled` job with any pending request are left untouched.
+    /// - **No synthetic ATTEMPT row** on the `Failed` path: we have no
+    ///   lease/attempt context, so `expire_terminal_job_records` just re-puts
+    ///   the existing (stale `Running`) attempt with the terminal TTL.
+    /// - **Redrive preserves the attempt and schedule.** The new chain head
+    ///   keeps the job's `current_attempt` and `next_attempt_starts_after_ms`,
+    ///   so a future-scheduled orphan re-lands at its original time and the
+    ///   broker picks it up then. We do **not** re-apply the background-action
+    ///   queue counter: the job has been continuously `Scheduled` (the drop
+    ///   deleted only the task, never decremented the status gauge), so
+    ///   re-applying would double-count.
+    /// - **Idempotent / partial-progress-safe.** Each job is handled in its own
+    ///   durable batch and re-reads status first; a pre-write point-check skips
+    ///   any `Scheduled` job that already has a task (so a re-run never writes a
+    ///   duplicate `RunAttempt`).
     /// - **Best-effort, like the reaper.** A per-job failure is logged, its
-    ///   in-memory queue-counter side effect rolled back, and the scan
-    ///   continues.
-    ///
-    /// ## Non-goal
-    ///
-    /// Orphaned `Scheduled` jobs are intentionally out of scope: a `Scheduled`
-    /// job legitimately has either a queued task or a pending concurrency
-    /// request, so classifying it as orphaned is ambiguous. A future extension
-    /// could handle that with a more careful definition.
+    ///   in-memory side effects rolled back, and the scan continues.
     #[tracing::instrument(skip_all, fields(shard = %self.name, tenant))]
-    pub async fn reconcile_orphaned_running_jobs(
+    pub async fn reconcile_orphaned_jobs(
         &self,
         tenant: &str,
     ) -> Result<ReconcileTenantStats, JobStoreShardError> {
-        // ---- 1. Build the leased-job set (any lease, regardless of expiry) ----
+        // ---- Build the leased-job set (any lease, regardless of expiry) ----
         let mut leased_job_ids: HashSet<String> = HashSet::new();
         {
             let start = leases_prefix();
@@ -255,12 +270,46 @@ impl JobStoreShard {
             }
         }
 
-        // ---- 2. List the tenant's Running jobs ----
+        // ---- Build the pending-concurrency-request set for the tenant ----
+        // A Scheduled job with a request is legitimately waiting on a slot and
+        // must never be redriven. Requests are keyed (tenant, queue, ...), so a
+        // single tenant-prefix scan captures all of them.
+        let mut requested_job_ids: HashSet<String> = HashSet::new();
+        {
+            let start = concurrency_request_tenant_prefix(tenant);
+            let end = end_bound(&start);
+            let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+            while let Some(kv) = iter.next().await? {
+                if let Some(parsed) = parse_concurrency_request_key(&kv.key) {
+                    requested_job_ids.insert(parsed.job_id);
+                }
+            }
+        }
+
+        let orphaned_running_failed = self
+            .reconcile_running_orphans(tenant, &leased_job_ids)
+            .await?;
+        let orphaned_scheduled_redriven = self
+            .reconcile_scheduled_orphans(tenant, &requested_job_ids)
+            .await?;
+
+        Ok(ReconcileTenantStats {
+            orphaned_running_failed,
+            orphaned_scheduled_redriven,
+        })
+    }
+
+    /// Force-`Failed` every `Running` job of `tenant` whose id is not in
+    /// `leased_job_ids`. See [`reconcile_orphaned_jobs`].
+    async fn reconcile_running_orphans(
+        &self,
+        tenant: &str,
+        leased_job_ids: &HashSet<String>,
+    ) -> Result<usize, JobStoreShardError> {
         let running_job_ids = self
             .scan_jobs_by_status(tenant, JobStatusKind::Running, None)
             .await?;
 
-        // ---- 3. Finalize each orphan in its own durable, atomic batch ----
         let mut orphaned_running_failed = 0usize;
         for job_id in running_job_ids {
             if leased_job_ids.contains(&job_id) {
@@ -330,8 +379,138 @@ impl JobStoreShard {
             }
         }
 
-        Ok(ReconcileTenantStats {
-            orphaned_running_failed,
-        })
+        Ok(orphaned_running_failed)
+    }
+
+    /// Redrive every `Scheduled` job of `tenant` that has neither a queued task
+    /// nor a pending concurrency request (id not in `requested_job_ids`). See
+    /// [`reconcile_orphaned_jobs`].
+    async fn reconcile_scheduled_orphans(
+        &self,
+        tenant: &str,
+        requested_job_ids: &HashSet<String>,
+    ) -> Result<usize, JobStoreShardError> {
+        let scheduled_job_ids = self
+            .scan_jobs_by_status(tenant, JobStatusKind::Scheduled, None)
+            .await?;
+
+        let mut orphaned_scheduled_redriven = 0usize;
+        for job_id in scheduled_job_ids {
+            // A pending concurrency request means the job is legitimately
+            // waiting on a slot — not an orphan.
+            if requested_job_ids.contains(&job_id) {
+                continue;
+            }
+
+            let now_ms = now_epoch_ms();
+
+            // Re-read status: skip unless still Scheduled, and capture the
+            // attempt number + scheduled start the redriven task must preserve.
+            let (attempt, start_ms) = match self.get_job_status(tenant, &job_id).await? {
+                Some(status) if status.kind == JobStatusKind::Scheduled => {
+                    match (status.current_attempt, status.next_attempt_starts_after_ms) {
+                        (Some(attempt), Some(start_ms)) => (attempt, start_ms),
+                        // A Scheduled status always carries both fields; if not,
+                        // skip rather than guess.
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+
+            // Recover the job's task_group / priority / limits to rebuild the
+            // chain head identically to a fresh enqueue.
+            let Some(info_raw) = self
+                .db
+                .get(&crate::keys::job_info_key(tenant, &job_id))
+                .await?
+            else {
+                continue;
+            };
+            let view = crate::job::JobView::new(info_raw)?;
+            let task_group = view.task_group().to_string();
+            let priority = view.priority();
+            let limits = view.limits();
+
+            // Point-check: skip if a task already exists for this identity, so a
+            // re-run can never write a duplicate RunAttempt (double-execution).
+            if self
+                .job_has_queued_task(&task_group, start_ms, priority, &job_id, attempt)
+                .await?
+            {
+                continue;
+            }
+
+            let mut batch = WriteBatch::new();
+            let task_id = Uuid::new_v4().to_string();
+
+            // Re-inject into the limit chain from index 0 with no held queues,
+            // mirroring a fresh enqueue (and the retry path in lease.rs). At
+            // capacity this writes a deferred request instead of a RunAttempt.
+            let res = self
+                .enqueue_limit_task_at_index(
+                    &mut DbWriteBatcher::new(&self.db, &mut batch),
+                    LimitTaskParams {
+                        tenant,
+                        task_id: &task_id,
+                        job_id: &job_id,
+                        attempt_number: attempt,
+                        relative_attempt_number: 1,
+                        limit_index: 0,
+                        limits: &limits,
+                        priority,
+                        scheduled_at_ms: start_ms,
+                        task_key_epoch_ms: now_ms,
+                        now_ms,
+                        held_queues: Vec::new(),
+                        task_group: &task_group,
+                        skip_try_reserve: false,
+                    },
+                )
+                .await?;
+
+            // Commit durably; mirror enqueue's grant lifecycle: confirm + wake
+            // the broker on success, roll back the in-memory grants on failure.
+            match self
+                .db
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    self.finish_enqueue(&job_id, &task_group, start_ms, &res.grants)
+                        .await?;
+                    orphaned_scheduled_redriven += 1;
+                }
+                Err(e) => {
+                    self.rollback_grants(tenant, &res.grants);
+                    warn!(error = %e, %job_id, "failed to redrive orphaned Scheduled job; continuing");
+                }
+            }
+        }
+
+        Ok(orphaned_scheduled_redriven)
+    }
+
+    /// True if a task for `(task_group, start_ms, priority, job_id, attempt)`
+    /// exists in the TASK keyspace. Used to avoid redriving a Scheduled job that
+    /// already has a queued task.
+    async fn job_has_queued_task(
+        &self,
+        task_group: &str,
+        start_ms: i64,
+        priority: u8,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<bool, JobStoreShardError> {
+        let prefix = task_key_lookup_prefix(task_group, start_ms, priority, job_id, attempt);
+        let end = end_bound(&prefix);
+        let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        Ok(iter.next().await?.is_some())
     }
 }
