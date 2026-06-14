@@ -142,6 +142,10 @@ pub struct Metrics {
     polls_total: CounterVec,
     poll_duration: HistogramVec,
 
+    // Shard lifecycle metrics
+    shard_open_duration: HistogramVec,
+    shard_close_duration: HistogramVec,
+
     // Lease metrics
     task_leases_active: GaugeVec,
     ready_to_start_latency_ms: HistogramVec,
@@ -496,6 +500,22 @@ impl Metrics {
         self.ready_to_start_latency_ms
             .with_label_values(&[shard, task_group])
             .observe(latency_ms);
+    }
+
+    /// Record the duration of a shard open phase (e.g. `db_build`, `hydrate`,
+    /// `rebuild_counters`, `set_created_at`, `total`) in seconds.
+    pub fn record_shard_open_phase(&self, shard: &str, phase: &str, duration_secs: f64) {
+        self.shard_open_duration
+            .with_label_values(&[shard, phase])
+            .observe(duration_secs);
+    }
+
+    /// Record the duration of a shard close phase (e.g. `flush`, `db_close`,
+    /// `wal_cleanup`, `total`) in seconds.
+    pub fn record_shard_close_phase(&self, shard: &str, phase: &str, duration_secs: f64) {
+        self.shard_close_duration
+            .with_label_values(&[shard, phase])
+            .observe(duration_secs);
     }
 
     /// Record lease reaper duration in seconds.
@@ -1931,6 +1951,32 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    // Shard lifecycle metrics. Reuses WAIT_TIME_BUCKETS (up to 3600s) because
+    // shard opens have been observed to take minutes in staging.
+    let shard_open_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_shard_open_duration_seconds",
+                "Duration of shard open, broken down by phase",
+            )
+            .buckets(WAIT_TIME_BUCKETS.to_vec()),
+            &["shard", "phase"],
+        )?,
+    );
+
+    let shard_close_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_shard_close_duration_seconds",
+                "Duration of shard close, broken down by phase",
+            )
+            .buckets(WAIT_TIME_BUCKETS.to_vec()),
+            &["shard", "phase"],
+        )?,
+    );
+
     let lease_reaper_scans_total = register(
         &registry,
         CounterVec::new(
@@ -2137,6 +2183,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_tombstone_count,
         polls_total,
         poll_duration,
+        shard_open_duration,
+        shard_close_duration,
         task_leases_active,
         ready_to_start_latency_ms,
         lease_reaper_duration,

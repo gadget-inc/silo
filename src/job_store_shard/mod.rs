@@ -443,6 +443,12 @@ impl JobStoreShard {
             terminal_job_expire_s,
         } = options;
 
+        // Time each blocking phase of shard open so that slow opens (observed to
+        // take minutes in staging) are self-diagnosing from logs and trendable
+        // from Prometheus. The spawn_* calls below are just tokio::spawn and do
+        // not block open, so they are not timed individually.
+        let open_start = std::time::Instant::now();
+
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
         let mut db_builder = slatedb::DbBuilder::new(db_path, store.clone())
             .with_merge_operator(counters::counter_merge_operator())
@@ -492,6 +498,18 @@ impl JobStoreShard {
         let shard_span = info_span!("shard", shard = %name);
         let db = db_builder.build().instrument(shard_span.clone()).await?;
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
+
+        let db_build_elapsed = open_start.elapsed();
+        tracing::info!(
+            shard = %name,
+            phase = "db_build",
+            elapsed_ms = db_build_elapsed.as_millis() as u64,
+            "shard open phase"
+        );
+        if let Some(m) = &metrics {
+            m.record_shard_open_phase(&name, "db_build", db_build_elapsed.as_secs_f64());
+        }
+
         let concurrency = Arc::new(ConcurrencyManager::new(
             name.clone(),
             metrics.clone(),
@@ -510,7 +528,18 @@ impl JobStoreShard {
         // singleflighted JIT `ensure_hydrated` path covers each queue on
         // first access.
         if hydrate_all_at_startup {
+            let hydrate_start = std::time::Instant::now();
             concurrency.counts().hydrate_all(&db, &range).await?;
+            let hydrate_elapsed = hydrate_start.elapsed();
+            tracing::info!(
+                shard = %name,
+                phase = "hydrate",
+                elapsed_ms = hydrate_elapsed.as_millis() as u64,
+                "shard open phase"
+            );
+            if let Some(m) = &metrics {
+                m.record_shard_open_phase(&name, "hydrate", hydrate_elapsed.as_secs_f64());
+            }
         }
 
         let brokers = TaskBrokerRegistry::new(
@@ -549,9 +578,20 @@ impl JobStoreShard {
             .concurrency
             .set_chain_resumer(limit_chain::ShardChainResumer::install(&shard));
 
+        let rebuild_start = std::time::Instant::now();
         shard
             .rebuild_background_action_queue_counters(&range)
             .await?;
+        let rebuild_elapsed = rebuild_start.elapsed();
+        tracing::info!(
+            shard = %shard.name,
+            phase = "rebuild_counters",
+            elapsed_ms = rebuild_elapsed.as_millis() as u64,
+            "shard open phase"
+        );
+        if let Some(m) = &shard.metrics {
+            m.record_shard_open_phase(&shard.name, "rebuild_counters", rebuild_elapsed.as_secs_f64());
+        }
 
         // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready,
         // and after the chain resumer is installed. It takes the instrumented db so its writes
@@ -589,7 +629,33 @@ impl JobStoreShard {
         }
 
         // Set the shard creation timestamp if this is the first time opening
+        let set_created_start = std::time::Instant::now();
         shard.set_created_at_ms_if_unset().await?;
+        let set_created_elapsed = set_created_start.elapsed();
+        tracing::info!(
+            shard = %shard.name,
+            phase = "set_created_at",
+            elapsed_ms = set_created_elapsed.as_millis() as u64,
+            "shard open phase"
+        );
+        if let Some(m) = &shard.metrics {
+            m.record_shard_open_phase(
+                &shard.name,
+                "set_created_at",
+                set_created_elapsed.as_secs_f64(),
+            );
+        }
+
+        let total_elapsed = open_start.elapsed();
+        tracing::info!(
+            shard = %shard.name,
+            phase = "total",
+            elapsed_ms = total_elapsed.as_millis() as u64,
+            "shard open phase"
+        );
+        if let Some(m) = &shard.metrics {
+            m.record_shard_open_phase(&shard.name, "total", total_elapsed.as_secs_f64());
+        }
 
         Ok(shard)
     }
@@ -615,6 +681,10 @@ impl JobStoreShard {
     /// This ensures all data is durably stored in object storage before closing,
     /// allowing the shard to be safely reopened elsewhere (e.g., on a different node).
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
+        // Time each blocking phase of close so slow closes are diagnosable from
+        // logs and trendable from Prometheus, mirroring the open-phase timings.
+        let close_start = std::time::Instant::now();
+
         self.cancellation.cancel();
         self.brokers.stop();
         self.concurrency.stop_grant_scanner();
@@ -631,6 +701,7 @@ impl JobStoreShard {
 
             // Flush memtable to SST to ensure all data is in object storage
             // This converts all in-memory data (and WAL data) to SSTs
+            let flush_start = std::time::Instant::now();
             self.db
                 .flush_with_options(slatedb::config::FlushOptions {
                     flush_type: slatedb::config::FlushType::MemTable,
@@ -638,16 +709,31 @@ impl JobStoreShard {
                 .await
                 .map_err(JobStoreShardError::from)?;
 
-            tracing::debug!(
+            let flush_elapsed = flush_start.elapsed();
+            tracing::info!(
                 shard = %self.name,
-                "memtable flushed to SST, closing database"
+                phase = "flush",
+                elapsed_ms = flush_elapsed.as_millis() as u64,
+                "shard close phase: memtable flushed to SST"
             );
+            if let Some(m) = &self.metrics {
+                m.record_shard_close_phase(&self.name, "flush", flush_elapsed.as_secs_f64());
+            }
         }
 
         // Close the database
-        tracing::trace!(shard = %self.name, "shard.close: calling db.close()");
+        let db_close_start = std::time::Instant::now();
         self.db.close().await.map_err(JobStoreShardError::from)?;
-        tracing::trace!(shard = %self.name, "shard.close: db.close() completed");
+        let db_close_elapsed = db_close_start.elapsed();
+        tracing::info!(
+            shard = %self.name,
+            phase = "db_close",
+            elapsed_ms = db_close_elapsed.as_millis() as u64,
+            "shard close phase: db closed"
+        );
+        if let Some(m) = &self.metrics {
+            m.record_shard_close_phase(&self.name, "db_close", db_close_elapsed.as_secs_f64());
+        }
 
         // After closing, clean up the local WAL directory if configured
         if let Some(ref wal_config) = self.wal_close_config
@@ -659,6 +745,7 @@ impl JobStoreShard {
                 "removing local WAL directory after successful close"
             );
 
+            let wal_cleanup_start = std::time::Instant::now();
             if let Err(e) = tokio::fs::remove_dir_all(&wal_config.path).await {
                 // Log but don't fail if WAL directory removal fails
                 // The data is already durably in object storage
@@ -677,6 +764,31 @@ impl JobStoreShard {
                     "local WAL directory removed successfully"
                 );
             }
+            let wal_cleanup_elapsed = wal_cleanup_start.elapsed();
+            tracing::info!(
+                shard = %self.name,
+                phase = "wal_cleanup",
+                elapsed_ms = wal_cleanup_elapsed.as_millis() as u64,
+                "shard close phase: local WAL cleaned up"
+            );
+            if let Some(m) = &self.metrics {
+                m.record_shard_close_phase(
+                    &self.name,
+                    "wal_cleanup",
+                    wal_cleanup_elapsed.as_secs_f64(),
+                );
+            }
+        }
+
+        let total_elapsed = close_start.elapsed();
+        tracing::info!(
+            shard = %self.name,
+            phase = "total",
+            elapsed_ms = total_elapsed.as_millis() as u64,
+            "shard close phase"
+        );
+        if let Some(m) = &self.metrics {
+            m.record_shard_close_phase(&self.name, "total", total_elapsed.as_secs_f64());
         }
 
         Ok(())

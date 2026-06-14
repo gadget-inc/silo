@@ -147,6 +147,11 @@ impl ShardFactory {
         let rate_limiter = Arc::clone(&self.rate_limiter);
         let metrics = self.metrics.clone();
 
+        // Time the full open including any wait on the per-shard OnceCell, so the
+        // factory-level log captures contention when a second caller blocks on a
+        // concurrent open (which the inner open_with_resolved_store timer misses).
+        let factory_open_start = std::time::Instant::now();
+
         entry
             .get_or_try_init(|| async {
                 // For Backend::Fs, we need to open at the storage root level so that
@@ -202,7 +207,12 @@ impl ShardFactory {
                 )
                 .await?;
 
-                tracing::info!(shard_id = %shard_id, range = %range, "opened shard");
+                tracing::info!(
+                    shard_id = %shard_id,
+                    range = %range,
+                    elapsed_ms = factory_open_start.elapsed().as_millis() as u64,
+                    "opened shard"
+                );
                 Ok(shard_arc)
             })
             .await
