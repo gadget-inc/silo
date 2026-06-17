@@ -197,6 +197,9 @@ impl ShardFactory {
                         grant_scanner_buffer_size: template.grant_scanner_buffer_size,
                         completed_job_expire_s: template.completed_job_expire_s,
                         terminal_job_expire_s: template.terminal_job_expire_s,
+                        startup_hydration_timeout: template
+                            .startup_hydration_timeout_ms
+                            .map(Duration::from_millis),
                     },
                     range.clone(),
                 )

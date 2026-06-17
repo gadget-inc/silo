@@ -158,6 +158,9 @@ impl JobStoreShard {
         metadata: Option<Vec<(String, String)>>,
         task_group: &str,
     ) -> Result<String, JobStoreShardError> {
+        if !self.is_accepting_enqueues() {
+            return Err(JobStoreShardError::ShardHydrating);
+        }
         if let Some(user_id) = id {
             self.enqueue_with_dedup(
                 tenant,

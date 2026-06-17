@@ -2167,6 +2167,27 @@ assert omittedQueuesAreSafe {
             (queueFirstObservedAt[q, t] or no holdersAt[q, first])
 }
 
+-- ============================================================================
+-- Grant Gate (implementation note)
+-- ============================================================================
+-- The shard may also operate in a "hydrating" mode where the in-memory
+-- holders cache is intentionally incomplete and ticket granting is disabled.
+-- A configurable startup timer opens the shard to enqueues; ticket granting
+-- stays off until startup hydration completes. Concurrency-limited enqueues
+-- during that window are written as durable TicketRequests rather than
+-- becoming TicketHolders, and the grant scanner drains the backlog after
+-- hydration finishes.
+--
+-- This mode is NOT modeled explicitly in Alloy (it would require splitting
+-- in-memory from durable state, which expands the state space significantly).
+-- The engineering invariant is: while `grants_enabled = false`, no transition
+-- creates a new TicketHolder; only TicketRequests are produced. Once
+-- `grants_enabled = true` the existing grant transitions resume, and from
+-- that point on every existing concurrency assertion in this spec
+-- (queueLimitEnforced, holdersRequireActiveTask, grantedMeansNoRequest,
+-- noHoldersForTerminal, omittedQueuesAreSafe) describes steady-state
+-- correctness.
+
 /**
  * Expedite doesn't change job status.
  * After expediting, the job remains in the same status (Scheduled).
