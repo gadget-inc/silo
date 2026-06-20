@@ -650,6 +650,10 @@ impl JobStoreShard {
     /// This ensures all data is durably stored in object storage before closing,
     /// allowing the shard to be safely reopened elsewhere (e.g., on a different node).
     pub async fn close(&self) -> Result<(), JobStoreShardError> {
+        // Wall-clock timer for the whole close, used to emit per-phase debug
+        // timings so slow shard closes can be attributed without a profiler.
+        let close_started = std::time::Instant::now();
+
         self.cancellation.cancel();
         self.brokers.stop();
         self.concurrency.stop_grant_scanner();
@@ -666,6 +670,7 @@ impl JobStoreShard {
 
             // Flush memtable to SST to ensure all data is in object storage
             // This converts all in-memory data (and WAL data) to SSTs
+            let flush_started = std::time::Instant::now();
             self.db
                 .flush_with_options(slatedb::config::FlushOptions {
                     flush_type: slatedb::config::FlushType::MemTable,
@@ -675,14 +680,20 @@ impl JobStoreShard {
 
             tracing::debug!(
                 shard = %self.name,
-                "memtable flushed to SST, closing database"
+                elapsed_ms = flush_started.elapsed().as_millis() as u64,
+                "shard close: flush memtable"
             );
         }
 
         // Close the database
         tracing::trace!(shard = %self.name, "shard.close: calling db.close()");
+        let db_close_started = std::time::Instant::now();
         self.db.close().await.map_err(JobStoreShardError::from)?;
-        tracing::trace!(shard = %self.name, "shard.close: db.close() completed");
+        tracing::debug!(
+            shard = %self.name,
+            elapsed_ms = db_close_started.elapsed().as_millis() as u64,
+            "shard close: db close"
+        );
 
         // After closing, clean up the local WAL directory if configured
         if let Some(ref wal_config) = self.wal_close_config
@@ -694,6 +705,7 @@ impl JobStoreShard {
                 "removing local WAL directory after successful close"
             );
 
+            let wal_remove_started = std::time::Instant::now();
             if let Err(e) = tokio::fs::remove_dir_all(&wal_config.path).await {
                 // Log but don't fail if WAL directory removal fails
                 // The data is already durably in object storage
@@ -709,10 +721,17 @@ impl JobStoreShard {
                 tracing::debug!(
                     shard = %self.name,
                     wal_path = %wal_config.path,
-                    "local WAL directory removed successfully"
+                    elapsed_ms = wal_remove_started.elapsed().as_millis() as u64,
+                    "shard close: remove local WAL directory"
                 );
             }
         }
+
+        tracing::debug!(
+            shard = %self.name,
+            total_ms = close_started.elapsed().as_millis() as u64,
+            "shard close: complete"
+        );
 
         Ok(())
     }

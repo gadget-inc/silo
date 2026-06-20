@@ -338,14 +338,23 @@ impl ShardFactory {
     ///
     /// A timeout is applied because SlateDB's internal retrying_object_store retries indefinitely on transient errors, which would cause close to hang forever if the object store is unreachable.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
+        // Wall-clock timer for the whole close call, including the timeout-guarded
+        // wait, so slow closes can be attributed without a profiler.
+        let call_started = std::time::Instant::now();
+
         tracing::trace!(shard_id = %shard_id, "factory.close: removing from instances");
         if let Some((id, entry)) = self.instances.remove(shard_id) {
             if let Some(shard) = entry.get() {
                 tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
+                let close_started = std::time::Instant::now();
                 let close_result = tokio::time::timeout(self.close_timeout, shard.close()).await;
                 match close_result {
                     Ok(Ok(())) => {
-                        tracing::info!(shard_id = %shard_id, "closed shard");
+                        tracing::info!(
+                            shard_id = %shard_id,
+                            close_ms = close_started.elapsed().as_millis() as u64,
+                            "closed shard"
+                        );
                     }
                     Ok(Err(e)) => {
                         // If the DB is already closed (e.g. a previous timed-out close
@@ -382,6 +391,13 @@ impl ShardFactory {
         } else {
             tracing::trace!(shard_id = %shard_id, "factory.close: shard not found in instances");
         }
+
+        tracing::debug!(
+            shard_id = %shard_id,
+            total_ms = call_started.elapsed().as_millis() as u64,
+            "factory: close returned"
+        );
+
         Ok(())
     }
 

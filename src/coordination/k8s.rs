@@ -1846,9 +1846,16 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                     };
 
                     if !cancelled {
+                        let release_started = std::time::Instant::now();
                         // Close the shard before releasing the lease
+                        let factory_close_started = std::time::Instant::now();
                         match factory.close(&self.ctx.shard_id).await {
                             Ok(()) => {
+                                debug!(
+                                    shard_id = %self.ctx.shard_id,
+                                    elapsed_ms = factory_close_started.elapsed().as_millis() as u64,
+                                    "k8s release: factory.close"
+                                );
                                 dst_events::emit(DstEvent::ShardClosed {
                                     node_id: self.node_id.clone(),
                                     shard_id: self.ctx.shard_id.to_string(),
@@ -1862,6 +1869,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
                                 if has_token {
                                     let release_timeout = Duration::from_secs(5);
+                                    let release_cas_started = std::time::Instant::now();
                                     match tokio::time::timeout(
                                         release_timeout,
                                         self.release_lease_cas(&lease_name),
@@ -1871,6 +1879,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                         Ok(Ok(_)) => {
                                             debug!(
                                                 shard_id = %self.ctx.shard_id,
+                                                elapsed_ms = release_cas_started.elapsed().as_millis() as u64,
                                                 "k8s shard: released with CAS"
                                             );
                                         }
@@ -1895,7 +1904,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                     node_id: self.node_id.clone(),
                                     shard_id: self.ctx.shard_id.to_string(),
                                 });
-                                debug!(shard_id = %self.ctx.shard_id, "k8s shard: released");
+                                debug!(
+                                    shard_id = %self.ctx.shard_id,
+                                    total_ms = release_started.elapsed().as_millis() as u64,
+                                    "k8s shard: released"
+                                );
                             }
                             Err(e) => {
                                 // Close failed - revert to Held so reconciliation retries
@@ -1913,11 +1926,18 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                 ShardPhase::ShuttingDown => {
                     // Debug: log entry into shutdown processing
                     tracing::trace!(shard_id = %self.ctx.shard_id, "guard entering ShuttingDown processing");
+                    let shutdown_started = std::time::Instant::now();
 
                     // Close the shard before releasing the lease
                     tracing::trace!(shard_id = %self.ctx.shard_id, "guard calling factory.close");
+                    let factory_close_started = std::time::Instant::now();
                     let close_succeeded = match factory.close(&self.ctx.shard_id).await {
                         Ok(()) => {
+                            debug!(
+                                shard_id = %self.ctx.shard_id,
+                                elapsed_ms = factory_close_started.elapsed().as_millis() as u64,
+                                "k8s shutdown: factory.close"
+                            );
                             dst_events::emit(DstEvent::ShardClosed {
                                 node_id: self.node_id.clone(),
                                 shard_id: self.ctx.shard_id.to_string(),
@@ -1949,6 +1969,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         if has_token {
                             tracing::trace!(shard_id = %self.ctx.shard_id, "guard releasing lease");
                             let release_timeout = Duration::from_secs(5);
+                            let release_cas_started = std::time::Instant::now();
                             match tokio::time::timeout(
                                 release_timeout,
                                 self.release_lease_cas(&lease_name),
@@ -1956,7 +1977,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                             .await
                             {
                                 Ok(_) => {
-                                    tracing::trace!(shard_id = %self.ctx.shard_id, "guard lease released");
+                                    debug!(
+                                        shard_id = %self.ctx.shard_id,
+                                        elapsed_ms = release_cas_started.elapsed().as_millis() as u64,
+                                        "k8s shutdown: lease released"
+                                    );
                                 }
                                 Err(_) => {
                                     warn!(shard_id = %self.ctx.shard_id, "timed out releasing shard lease during shutdown");
@@ -1980,7 +2005,12 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         let mut st = self.ctx.state.lock().await;
                         st.phase = ShardPhase::ShutDown;
                     }
-                    tracing::trace!(shard_id = %self.ctx.shard_id, "guard shutdown complete");
+                    debug!(
+                        shard_id = %self.ctx.shard_id,
+                        close_succeeded,
+                        total_ms = shutdown_started.elapsed().as_millis() as u64,
+                        "k8s shard: shutdown complete"
+                    );
                     break;
                 }
                 ShardPhase::Idle | ShardPhase::Held => {
