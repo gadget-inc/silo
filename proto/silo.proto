@@ -214,8 +214,9 @@ message CancelJobRequest {
 // Response confirming cancellation was requested.
 message CancelJobResponse {}
 
-// Forcibly drop all concurrency holders and in-flight run attempts for a tenant
-// on a single shard. Admin/operator action used to clear stuck concurrency state.
+// Forcibly drop all concurrency holders for a tenant on a single shard, freeing
+// held slots so stuck jobs can be re-granted. Emergency admin/operator action;
+// in-flight run attempts are left running (and may briefly double-run).
 message DropTenantHoldersRequest {
   string shard = 1;           // Shard ID (UUID) to operate on.
   optional string tenant = 2; // Tenant ID if multi-tenancy is enabled.
@@ -223,8 +224,9 @@ message DropTenantHoldersRequest {
 
 // Response reporting what was dropped.
 message DropTenantHoldersResponse {
-  uint64 holders_dropped = 1;      // Number of concurrency holders deleted.
-  uint64 run_attempts_dropped = 2; // Number of in-flight run attempts deleted.
+  reserved 2;
+  reserved "run_attempts_dropped";
+  uint64 holders_dropped = 1; // Number of concurrency holders deleted.
 }
 
 // Restart a cancelled or failed job, allowing it to be processed again.

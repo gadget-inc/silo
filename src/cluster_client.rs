@@ -909,8 +909,9 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// Drop all concurrency holders and in-flight run attempts for a tenant on a
-    /// shard (local or remote).
+    /// Forcibly drop all concurrency holders for a tenant on a shard (local or
+    /// remote), freeing held slots so stuck jobs can be re-granted. In-flight run
+    /// attempts are left running.
     pub async fn drop_tenant_holders(
         &self,
         shard_id: &ShardId,
@@ -920,7 +921,7 @@ impl ClusterClient {
         if let Some(shard) = self.factory.get(shard_id) {
             debug!(shard_id = %shard_id, tenant, "dropping tenant state on local shard");
             return shard
-                .drop_tenant_holders_and_runattempts(tenant)
+                .drop_tenant_holders(tenant)
                 .await
                 .map_err(|e| ClusterClientError::QueryFailed(e.to_string()));
         }
@@ -940,7 +941,6 @@ impl ClusterClient {
                 let resp = resp.into_inner();
                 Ok(DropTenantStats {
                     holders_dropped: resp.holders_dropped as usize,
-                    run_attempts_dropped: resp.run_attempts_dropped as usize,
                 })
             }
             Err(e) => {
