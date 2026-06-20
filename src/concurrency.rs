@@ -50,7 +50,7 @@ use slatedb::config::WriteOptions;
 
 use crate::instrumented_db::InstrumentedDb;
 
-use crate::job_store_shard::counters::encode_counter;
+use crate::job_store_shard::counters::{decode_counter, encode_counter};
 use crate::job_store_shard::helpers::WriteBatcher;
 
 use crate::codec::{
@@ -63,9 +63,9 @@ use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
     concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
-    concurrency_requester_counter_key, concurrency_requests_prefix, end_bound,
-    floating_limit_state_key, job_info_key, job_status_key, parse_concurrency_holder_key,
-    parse_concurrency_request_key, task_key,
+    concurrency_requester_counter_key, end_bound, floating_limit_state_key, job_info_key,
+    job_status_key, parse_concurrency_holder_key, parse_concurrency_request_key,
+    parse_concurrency_requester_counter_key, task_key,
 };
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
@@ -640,6 +640,30 @@ impl ConcurrencyCounts {
                 tenant_arc.to_string(),
                 queue_arc.to_string(),
                 entry.holders.len(),
+            ));
+        }
+        out
+    }
+
+    /// Snapshot every hydrated (tenant, queue) and the full set of in-memory
+    /// holder task_ids. Used by the self-healing drift pass to compute the
+    /// exact ghost set (in-memory holders with no durable row) rather than
+    /// just a count delta.
+    ///
+    /// Same hydration filter as `hydrated_queue_holders_snapshot`. The
+    /// DashMap entry guard is dropped before the caller does any `.await`
+    /// (the returned `HashSet`s are owned clones).
+    pub fn hydrated_queue_holders_with_ids(&self) -> Vec<(String, String, HashSet<String>)> {
+        let mut out = Vec::new();
+        for entry in self.queues.iter() {
+            if !matches!(entry.state, HydrationState::Hydrated) {
+                continue;
+            }
+            let (tenant_arc, queue_arc) = entry.key();
+            out.push((
+                tenant_arc.to_string(),
+                queue_arc.to_string(),
+                entry.holders.clone(),
             ));
         }
         out
@@ -1286,25 +1310,32 @@ impl ConcurrencyManager {
     }
 
     /// Walk every hydrated (tenant, queue) in this shard, compare the
-    /// in-memory holder count to the durable holder count (one ranged scan
-    /// per queue), and publish:
+    /// in-memory holder set to the durable holder set (one ranged scan per
+    /// queue), and:
     ///
-    /// * `silo_concurrency_holder_drift` — Σ |in_mem - durable| across hydrated queues
-    /// * `silo_concurrency_reconciliation_pending` — current size of the
-    ///   per-task_id reconciliation queue (stuck-reconciler signal)
+    /// 1. **Self-heal ghosts.** Any in-memory holder with no durable row is a
+    ///    ghost (the wedge bug — an in-memory reservation that survived after
+    ///    its durable holder was deleted). Each such `task_id` is enqueued via
+    ///    `request_reconciliation`, which routes it through
+    ///    `reconcile_pending_holders`. That path re-checks the durable row for
+    ///    that specific `task_id` immediately before releasing, so a
+    ///    reservation that is committed-but-not-yet-durable (durable write in
+    ///    flight) is left untouched — that re-check IS the false-positive
+    ///    guard, no separate multi-tick counter needed. This recovers ghosts
+    ///    regardless of how they formed (e.g. a handler that releases in-memory
+    ///    state outside a `PendingHolderReleaseGuard`).
+    /// 2. **Publish metrics** (only when metrics are enabled):
+    ///    * `silo_concurrency_holder_drift` — Σ |in_mem - durable| across hydrated queues
+    ///    * `silo_concurrency_reconciliation_pending` — current size of the
+    ///      per-task_id reconciliation queue (stuck-reconciler signal)
     ///
     /// Called from the periodic reconciler's tick (NOT from the reactive
     /// sub-tick wake) — keeps the cost amortized at the deployment-configured
     /// `concurrency_reconcile_interval` rather than firing on every dropped
-    /// dequeue future. Noop if metrics are disabled.
+    /// dequeue future. Self-healing runs even when metrics are disabled.
     pub async fn report_holder_drift(&self, db: &Arc<InstrumentedDb>, range: &ShardRange) {
-        let Some(metrics) = self.metrics.as_ref() else {
-            // Always publish the pending gauge if metrics are present; if not, skip everything.
-            return;
-        };
-
         let mut drift_total: u64 = 0;
-        for (tenant, queue, in_mem_count) in self.counts.hydrated_queue_holders_snapshot() {
+        for (tenant, queue, in_mem_holders) in self.counts.hydrated_queue_holders_with_ids() {
             if !range.contains_tenant(&tenant) {
                 continue;
             }
@@ -1327,10 +1358,14 @@ impl ConcurrencyManager {
                     continue;
                 }
             };
-            let mut durable_count: usize = 0;
+            let mut durable_ids: HashSet<String> = HashSet::new();
             loop {
                 match iter.next().await {
-                    Ok(Some(_)) => durable_count += 1,
+                    Ok(Some(kv)) => {
+                        if let Some(parsed) = parse_concurrency_holder_key(&kv.key) {
+                            durable_ids.insert(parsed.task_id);
+                        }
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         tracing::debug!(
@@ -1343,14 +1378,25 @@ impl ConcurrencyManager {
                     }
                 }
             }
-            drift_total += (in_mem_count as i64 - durable_count as i64).unsigned_abs();
+
+            drift_total += (in_mem_holders.len() as i64 - durable_ids.len() as i64).unsigned_abs();
+
+            // Ghosts: in-memory holders with no durable row. Enqueue each for
+            // reconciliation; `reconcile_pending_holders` re-checks durable
+            // presence per task_id before releasing, so this is safe even if
+            // the scan raced an in-flight durable write.
+            for task_id in in_mem_holders.difference(&durable_ids) {
+                self.request_reconciliation(tenant.clone(), queue.clone(), task_id.clone());
+            }
         }
 
-        let pending = self.counts.pending_reconciliations_len() as u64;
-        metrics.set_concurrency_reconciler_signals(&self.shard, drift_total, pending);
+        if let Some(metrics) = self.metrics.as_ref() {
+            let pending = self.counts.pending_reconciliations_len() as u64;
+            metrics.set_concurrency_reconciler_signals(&self.shard, drift_total, pending);
+        }
     }
 
-    fn request_grant_count(&self, tenant: &str, queue: &str, count: u32) {
+    pub(crate) fn request_grant_count(&self, tenant: &str, queue: &str, count: u32) {
         let key = concurrency_counts_key(tenant, queue);
         {
             let mut pending = self.pending_grants.lock().unwrap();
@@ -1426,12 +1472,24 @@ impl ConcurrencyManager {
         self.grant_notify.notify_one();
     }
 
-    /// Scan all pending concurrency requests and trigger grants for each queue.
+    /// Scan the per-queue requester counters and trigger grants for each queue
+    /// that has pending concurrency requests.
     ///
     /// This is used at grant-scanner startup and by the shard's periodic
     /// reconciliation task to self-heal from missed notifications.
+    ///
+    /// Rather than scanning the entire `CONCURRENCY_REQUEST` keyspace (tens of
+    /// millions of keys on a busy shard) we iterate the
+    /// `COUNTER_CONCURRENCY_REQUESTERS` counters, which are maintained
+    /// co-committed with request creation (`append_request_edits`) and
+    /// decremented on grant/cancel — a bounded set of ~one row per active
+    /// (tenant, queue). The counter is a safe over-estimate: `process_grants`
+    /// re-validates the real pending requests, so a stale-positive counter just
+    /// wakes the scanner for a queue that grants nothing. It will not
+    /// under-report newly created work because the increment lands in the same
+    /// write batch as the request row.
     pub async fn reconcile_pending_requests(&self, db: &InstrumentedDb, range: &ShardRange) {
-        let start = concurrency_requests_prefix();
+        let start = vec![crate::keys::prefix::COUNTER_CONCURRENCY_REQUESTERS];
         let end = end_bound(&start);
         let mut iter = match db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options_uncached())
@@ -1441,14 +1499,12 @@ impl ConcurrencyManager {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "grant scanner: failed to scan requests during reconciliation"
+                    "grant scanner: failed to scan requester counters during reconciliation"
                 );
                 return;
             }
         };
 
-        // Count pending requests per (tenant, queue)
-        let mut queue_counts: BTreeMap<Vec<u8>, (String, String, u32)> = BTreeMap::new();
         loop {
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
@@ -1462,7 +1518,7 @@ impl ConcurrencyManager {
                 }
             };
 
-            let Some(parsed) = parse_concurrency_request_key(&kv.key) else {
+            let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key) else {
                 continue;
             };
 
@@ -1471,16 +1527,10 @@ impl ConcurrencyManager {
                 continue;
             }
 
-            let key = concurrency_counts_key(&parsed.tenant, &parsed.queue);
-            let entry = queue_counts
-                .entry(key)
-                .or_insert_with(|| (parsed.tenant.clone(), parsed.queue.clone(), 0));
-            entry.2 += 1;
-        }
-
-        // Trigger grants for each queue with pending requests
-        for (_key, (tenant, queue, count)) in queue_counts {
-            self.request_grant_count(&tenant, &queue, count);
+            let count = decode_counter(&kv.value);
+            if count > 0 {
+                self.request_grant_count(&parsed.tenant, &parsed.queue, count as u32);
+            }
         }
     }
 

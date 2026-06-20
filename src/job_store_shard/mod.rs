@@ -8,6 +8,7 @@ mod enqueue;
 mod expedite;
 mod floating;
 pub(crate) mod helpers;
+pub(crate) mod holder_release_guard;
 pub mod import;
 mod lease;
 mod lease_task;
@@ -1160,6 +1161,16 @@ impl JobStoreShard {
         self.concurrency
             .reconcile_pending_holders(&self.db, &range)
             .await
+    }
+
+    /// Test-only: run one self-healing drift pass. Walks hydrated queues,
+    /// compares the in-memory holder set to durable rows, and enqueues any
+    /// ghosts (in-memory holders with no durable row) for reconciliation.
+    /// Callers typically follow with `reconcile_pending_holders_for_test` to
+    /// drive the actual release.
+    pub async fn report_holder_drift_for_test(&self) {
+        let range = self.get_range();
+        self.concurrency.report_holder_drift(&self.db, &range).await
     }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.

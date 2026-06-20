@@ -1892,3 +1892,128 @@ async fn reconcile_pending_holders_kicks_grant_per_release() {
          the immediate grant pass at 1 in production-scale wedges (300 ghosts → 1 grant)"
     );
 }
+
+/// Fix 1 (self-healing drift): `report_holder_drift` must discover ghosts
+/// (in-memory holders with no durable row) and route them through the
+/// reconciler for release — even when the ghost never passed through a
+/// `PendingHolderReleaseGuard`. A holder that IS durable-backed must be left
+/// untouched (the per-task_id durable re-check in `reconcile_pending_holders`
+/// is the false-positive guard).
+#[tokio::test]
+async fn report_holder_drift_self_heals_ghost() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "drift-q";
+
+    // Seed a durable holder so the queue hydrates with one legitimate, durable-
+    // backed holder ("keep").
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            &concurrency_holder_key(tenant, queue, "keep"),
+            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+        );
+        shard.db().write(batch).await.expect("durable write");
+        shard.db().flush().await.expect("flush");
+    }
+
+    // Force the queue into the Hydrated state (so `report_holder_drift`'s
+    // hydrated-only snapshot sees it) by running a reconcile pass; this calls
+    // `ensure_hydrated`, which scans "keep" into the in-memory holder set.
+    shard.request_concurrency_reconciliation(
+        tenant.to_string(),
+        queue.to_string(),
+        "keep".to_string(),
+    );
+    shard.reconcile_pending_holders_for_test().await;
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, "keep"),
+        "durable-backed holder must be present in-memory after hydration"
+    );
+
+    // Inject a ghost: in-memory holder with no durable row. It is NOT enqueued
+    // for reconciliation — only `report_holder_drift` can discover it.
+    shard.concurrency_insert_holder(tenant, queue, "ghost");
+
+    // Drift pass discovers the ghost (in_mem − durable) and enqueues it.
+    shard.report_holder_drift_for_test().await;
+    // Reconciler re-checks durable per task_id and releases the true ghost.
+    shard.reconcile_pending_holders_for_test().await;
+
+    assert!(
+        !shard.concurrency_contains_holder(tenant, queue, "ghost"),
+        "ghost (durable=N, in_mem=Y) must be self-healed by the drift pass"
+    );
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, "keep"),
+        "durable-backed holder must NOT be released — it is in both sets"
+    );
+}
+
+/// Fix 0 (counter-based request reconciliation): `reconcile_pending_requests`
+/// must find queues with pending work by reading the per-queue requester
+/// counters rather than scanning the entire CONCURRENCY_REQUEST keyspace.
+/// Given a requester counter of N for a queue, the reconcile pass kicks N
+/// grants.
+#[tokio::test]
+async fn reconcile_pending_requests_uses_requester_counters() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "fix0-q";
+
+    // Suspend the grant scanner so accumulated `pending_grants` are observable
+    // rather than drained by the background loop.
+    shard.stop_grant_scanner();
+
+    // First job takes the single slot (becomes a holder, not a requester).
+    shard
+        .enqueue(
+            tenant,
+            Some("job-1".to_string()),
+            10,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![conc_limit(queue, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue1");
+    let deq = shard.dequeue("w", "default", 1).await.expect("deq1").tasks;
+    assert_eq!(deq.len(), 1, "first job dequeued into the only slot");
+
+    // Second job becomes a requester (queue full) → requester counter = 1.
+    shard
+        .enqueue(
+            tenant,
+            Some("job-2".to_string()),
+            10,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![conc_limit(queue, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue2");
+
+    let counter = shard
+        .get_concurrency_requester_count(tenant, queue)
+        .await
+        .expect("get counter");
+    assert_eq!(counter, 1, "second job registered as a requester");
+
+    // Baseline absorbs whatever the enqueue path itself kicked, isolating the
+    // delta attributable to the counter-driven reconcile pass.
+    let baseline = shard.pending_grant_count_for_test(tenant, queue);
+    shard.reconcile_pending_concurrency_requests_once().await;
+    let after = shard.pending_grant_count_for_test(tenant, queue);
+
+    assert_eq!(
+        after - baseline,
+        1,
+        "reconcile_pending_requests read the requester counter (=1) and kicked exactly one grant"
+    );
+}

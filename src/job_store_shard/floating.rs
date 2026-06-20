@@ -191,6 +191,7 @@ impl JobStoreShard {
             )));
         };
         let decoded_state = decode_floating_limit_state(raw)?;
+        let old_max_concurrency = decoded_state.current_max_concurrency();
 
         let new_state = FloatingLimitState {
             current_max_concurrency: new_max_concurrency,
@@ -215,6 +216,17 @@ impl JobStoreShard {
             new_max_concurrency,
             crate::concurrency::ConcurrencyLimitType::Floating,
         );
+
+        // Nudge the grant scanner by the capacity delta so requests waiting on
+        // a raised floating cap (including the 0->N bootstrap) are granted
+        // immediately rather than waiting for the periodic reconcile scan.
+        // `process_grants` re-validates real capacity, so passing the delta is a
+        // safe upper bound on how many pending requests to consider.
+        let delta = new_max_concurrency.saturating_sub(old_max_concurrency);
+        if delta > 0 {
+            self.concurrency
+                .request_grant_count(tenant, queue_key, delta);
+        }
 
         tracing::debug!(
             queue_key = %queue_key,
