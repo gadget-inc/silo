@@ -1897,8 +1897,8 @@ async fn reconcile_pending_holders_kicks_grant_per_release() {
 /// (in-memory holders with no durable row) and route them through the
 /// reconciler for release — even when the ghost never passed through a
 /// `PendingHolderReleaseGuard`. A holder that IS durable-backed must be left
-/// untouched (the per-task_id durable re-check in `reconcile_pending_holders`
-/// is the false-positive guard).
+/// untouched. A ghost is only enqueued after surviving `GHOST_CONFIRM_PASSES`
+/// (=2) consecutive drift passes, so the test runs the drift pass twice.
 #[tokio::test]
 async fn report_holder_drift_self_heals_ghost() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -1935,7 +1935,9 @@ async fn report_holder_drift_self_heals_ghost() {
     // for reconciliation — only `report_holder_drift` can discover it.
     shard.concurrency_insert_holder(tenant, queue, "ghost");
 
-    // Drift pass discovers the ghost (in_mem − durable) and enqueues it.
+    // First drift pass only arms the candidate (count 1 < GHOST_CONFIRM_PASSES);
+    // the second confirms it (count 2) and enqueues it for reconciliation.
+    shard.report_holder_drift_for_test().await;
     shard.report_holder_drift_for_test().await;
     // Reconciler re-checks durable per task_id and releases the true ghost.
     shard.reconcile_pending_holders_for_test().await;
@@ -1947,6 +1949,76 @@ async fn report_holder_drift_self_heals_ghost() {
     assert!(
         shard.concurrency_contains_holder(tenant, queue, "keep"),
         "durable-backed holder must NOT be released — it is in both sets"
+    );
+}
+
+/// Fix 1 (Option B — consecutive-pass debounce): an in-memory holder with no
+/// durable row that is actually an *in-flight reservation* (durable write not
+/// yet committed) must NOT be released. `try_reserve_internal` inserts into the
+/// in-memory holder set before the durable holder write commits, so for a
+/// window such a slot is indistinguishable from a ghost by a point-in-time
+/// durable lookup. Requiring `GHOST_CONFIRM_PASSES` (=2) consecutive drift
+/// observations excludes it: the durable row lands between passes, so the
+/// candidate is never enqueued and the slot is preserved (no over-grant).
+#[tokio::test]
+async fn report_holder_drift_skips_unconfirmed_inflight_reservation() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "inflight-q";
+
+    // Seed a durable holder + hydrate so the queue is in the Hydrated state
+    // that `report_holder_drift` snapshots.
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            &concurrency_holder_key(tenant, queue, "keep"),
+            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+        );
+        shard.db().write(batch).await.expect("durable write");
+        shard.db().flush().await.expect("flush");
+    }
+    shard.request_concurrency_reconciliation(
+        tenant.to_string(),
+        queue.to_string(),
+        "keep".to_string(),
+    );
+    shard.reconcile_pending_holders_for_test().await;
+
+    // Simulate an in-flight reservation: in-memory holder present, durable
+    // write not yet committed.
+    shard.concurrency_insert_holder(tenant, queue, "inflight");
+
+    // Pass 1 only arms the candidate (count 1 < threshold) — nothing enqueued.
+    shard.report_holder_drift_for_test().await;
+    shard.reconcile_pending_holders_for_test().await;
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, "inflight"),
+        "a single-pass candidate must NOT be released (debounce)"
+    );
+
+    // The in-flight durable write lands before the next drift pass.
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            &concurrency_holder_key(tenant, queue, "inflight"),
+            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+        );
+        shard.db().write(batch).await.expect("durable write");
+        shard.db().flush().await.expect("flush");
+    }
+
+    // Pass 2 now sees a durable row, so "inflight" is no longer a ghost
+    // candidate — it is dropped, never enqueued.
+    shard.report_holder_drift_for_test().await;
+    shard.reconcile_pending_holders_for_test().await;
+
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, "inflight"),
+        "an in-flight reservation that committed before the 2nd pass must NOT be released"
+    );
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, "keep"),
+        "durable-backed holder must remain untouched"
     );
 }
 

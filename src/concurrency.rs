@@ -856,7 +856,23 @@ pub struct ConcurrencyManager {
     /// Configurable via `grant_scanner_buffer_size` (default 64); stored
     /// already clamped to `>= 1`.
     grant_scanner_buffer_size: usize,
+    /// Consecutive-pass observation counts for drift-detected ghost
+    /// candidates, keyed by (tenant, queue, task_id). Maintained only by
+    /// `report_holder_drift` (a single periodic task). Rebuilt each pass from
+    /// the current ghost set, so it is bounded by the current ghost +
+    /// in-flight-reservation count and self-prunes when a candidate gains a
+    /// durable row or is released. See `GHOST_CONFIRM_PASSES`.
+    ghost_candidates: Mutex<HashMap<(String, String, String), u32>>,
 }
+
+/// A drift-detected ghost must be observed as a ghost in this many
+/// *consecutive* `report_holder_drift` passes before it is enqueued for
+/// release. A true ghost (a dropped-future leak) is permanent and survives
+/// every pass; an in-flight reservation (`try_reserve_internal` inserts into
+/// the in-memory holder set before its durable write commits) clears within
+/// one reconcile interval, so a value of 2 excludes those false positives.
+/// Bump to debounce harder.
+const GHOST_CONFIRM_PASSES: u32 = 2;
 
 impl ConcurrencyManager {
     pub fn new(
@@ -880,6 +896,7 @@ impl ConcurrencyManager {
             // `.buffered(0)` is invalid.
             grant_scanner_batch_size: grant_scanner_batch_size.max(1),
             grant_scanner_buffer_size: grant_scanner_buffer_size.max(1),
+            ghost_candidates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1313,17 +1330,27 @@ impl ConcurrencyManager {
     /// in-memory holder set to the durable holder set (one ranged scan per
     /// queue), and:
     ///
-    /// 1. **Self-heal ghosts.** Any in-memory holder with no durable row is a
-    ///    ghost (the wedge bug — an in-memory reservation that survived after
-    ///    its durable holder was deleted). Each such `task_id` is enqueued via
-    ///    `request_reconciliation`, which routes it through
-    ///    `reconcile_pending_holders`. That path re-checks the durable row for
-    ///    that specific `task_id` immediately before releasing, so a
-    ///    reservation that is committed-but-not-yet-durable (durable write in
-    ///    flight) is left untouched — that re-check IS the false-positive
-    ///    guard, no separate multi-tick counter needed. This recovers ghosts
-    ///    regardless of how they formed (e.g. a handler that releases in-memory
-    ///    state outside a `PendingHolderReleaseGuard`).
+    /// 1. **Self-heal ghosts.** An in-memory holder with no durable row is a
+    ///    ghost candidate (the wedge bug — an in-memory reservation that
+    ///    survived after its durable holder was deleted). Candidates must be
+    ///    observed in `GHOST_CONFIRM_PASSES` *consecutive* passes (tracked in
+    ///    `ghost_candidates`) before being enqueued via `request_reconciliation`
+    ///    / `reconcile_pending_holders`. This recovers ghosts regardless of how
+    ///    they formed (e.g. a handler that releases in-memory state outside a
+    ///    `PendingHolderReleaseGuard`).
+    ///
+    ///    **Two-stage false-positive guard.** The per-`task_id` durable
+    ///    re-check in `reconcile_pending_holders` guards against the snapshot
+    ///    racing a holder *delete* (the original ghost case). But it cannot
+    ///    distinguish a true ghost from an in-flight reservation:
+    ///    `process_grants` calls `try_reserve_internal` (which inserts into the
+    ///    in-memory holder set) *before* its durable holder write commits, so a
+    ///    just-reserved-not-yet-durable slot looks identical to a ghost to a
+    ///    point-in-time `db.get`. Releasing it would over-grant the queue. The
+    ///    consecutive-pass requirement closes that gap: an in-flight reservation
+    ///    commits within milliseconds — far inside one `concurrency_reconcile_interval`
+    ///    — so it never survives to a second pass, whereas a real ghost is
+    ///    permanent and survives every pass.
     /// 2. **Publish metrics** (only when metrics are enabled):
     ///    * `silo_concurrency_holder_drift` — Σ |in_mem - durable| across hydrated queues
     ///    * `silo_concurrency_reconciliation_pending` — current size of the
@@ -1334,6 +1361,16 @@ impl ConcurrencyManager {
     /// `concurrency_reconcile_interval` rather than firing on every dropped
     /// dequeue future. Self-healing runs even when metrics are disabled.
     pub async fn report_holder_drift(&self, db: &Arc<InstrumentedDb>, range: &ShardRange) {
+        // Take the previous pass's ghost-candidate counts and rebuild a fresh
+        // map from this pass. Held outside the per-queue `.await` scans below
+        // (the lock must never span an await). A candidate absent from this
+        // pass (durable row appeared, or it was released) simply drops out.
+        let prev_candidates = {
+            let mut g = self.ghost_candidates.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
+        let mut next_candidates: HashMap<(String, String, String), u32> = HashMap::new();
+
         let mut drift_total: u64 = 0;
         for (tenant, queue, in_mem_holders) in self.counts.hydrated_queue_holders_with_ids() {
             if !range.contains_tenant(&tenant) {
@@ -1381,13 +1418,33 @@ impl ConcurrencyManager {
 
             drift_total += (in_mem_holders.len() as i64 - durable_ids.len() as i64).unsigned_abs();
 
-            // Ghosts: in-memory holders with no durable row. Enqueue each for
-            // reconciliation; `reconcile_pending_holders` re-checks durable
-            // presence per task_id before releasing, so this is safe even if
-            // the scan raced an in-flight durable write.
+            // Ghost candidates: in-memory holders with no durable row. Only
+            // enqueue for reconciliation once a candidate has survived
+            // `GHOST_CONFIRM_PASSES` consecutive passes — an in-flight
+            // reservation (durable write not yet committed) clears within one
+            // interval and so never reaches the threshold, while a real ghost
+            // is permanent. See this fn's doc comment for the full rationale.
             for task_id in in_mem_holders.difference(&durable_ids) {
-                self.request_reconciliation(tenant.clone(), queue.clone(), task_id.clone());
+                let key = (tenant.clone(), queue.clone(), task_id.clone());
+                let seen = prev_candidates
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                if seen >= GHOST_CONFIRM_PASSES {
+                    self.request_reconciliation(tenant.clone(), queue.clone(), task_id.clone());
+                }
+                // Saturate at the threshold so a long-lived ghost the
+                // reconciler keeps re-queueing doesn't grow the count
+                // unboundedly; re-enqueuing each pass is harmless
+                // (`pending_reconciliations` dedups and release is idempotent).
+                next_candidates.insert(key, seen.min(GHOST_CONFIRM_PASSES));
             }
+        }
+
+        {
+            let mut g = self.ghost_candidates.lock().unwrap();
+            *g = next_candidates;
         }
 
         if let Some(metrics) = self.metrics.as_ref() {
