@@ -787,10 +787,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
     }
 
     async fn reconcile_shards(&self) -> Result<(), CoordinationError> {
+        let started = std::time::Instant::now();
         let members = {
             let cache = self.members_cache.lock().await;
             cache.clone()
         };
+        let member_count = members.len();
 
         let guard_shard_ids: HashSet<ShardId> = {
             let guards = self.shard_guards.lock().await;
@@ -806,6 +808,9 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             None => return Ok(()),
         };
 
+        let to_cancel = actions.to_cancel.len();
+        let to_acquire = actions.to_acquire.len();
+
         for sid in actions.to_cancel {
             self.ensure_shard_guard(sid)
                 .await
@@ -820,6 +825,14 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                 .set_desired(true)
                 .await;
         }
+
+        debug!(
+            members = member_count,
+            to_acquire,
+            to_cancel,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "k8s reconcile pass"
+        );
 
         Ok(())
     }
@@ -1633,6 +1646,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                 ShardPhase::ShutDown => break,
                 ShardPhase::Acquiring => {
                     debug!(shard_id = %self.ctx.shard_id, "k8s shard: starting acquisition");
+                    let acquire_started = std::time::Instant::now();
                     let mut attempt: u32 = 0;
                     let initial_jitter_ms =
                         (self.ctx.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(13)) % 80;
@@ -1654,6 +1668,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         // the guard indefinitely. If the API call hangs (e.g., due to
                         // K8s API server overload), we retry after a short wait.
                         let acquire_timeout = Duration::from_secs(5);
+                        let lease_cas_started = std::time::Instant::now();
                         let acquire_result = tokio::time::timeout(
                             acquire_timeout,
                             self.try_acquire_lease_cas(&lease_name),
@@ -1670,6 +1685,12 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         };
                         match acquire_result {
                             Ok((rv, uid)) => {
+                                debug!(
+                                    shard_id = %self.ctx.shard_id,
+                                    attempt,
+                                    elapsed_ms = lease_cas_started.elapsed().as_millis() as u64,
+                                    "k8s acquire: lease CAS"
+                                );
                                 // Look up the shard's range from the shard map
                                 let range = {
                                     let map = shard_map.lock().await;
@@ -1684,8 +1705,16 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                 };
                                 // Open the shard BEFORE marking as Held - if open fails,
                                 // we should release the lease and not claim ownership.
+                                let factory_open_started = std::time::Instant::now();
                                 let shard = match factory.open(&self.ctx.shard_id, &range).await {
-                                    Ok(shard) => shard,
+                                    Ok(shard) => {
+                                        debug!(
+                                            shard_id = %self.ctx.shard_id,
+                                            elapsed_ms = factory_open_started.elapsed().as_millis() as u64,
+                                            "k8s acquire: factory.open"
+                                        );
+                                        shard
+                                    }
                                     Err(e) => {
                                         // Failed to open - release the lease and retry
                                         tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to open shard, releasing lease");
@@ -1759,7 +1788,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                     node_id: self.node_id.clone(),
                                     shard_id: self.ctx.shard_id.to_string(),
                                 });
-                                info!(shard_id = %self.ctx.shard_id, rv = %rv, attempts = attempt, "k8s shard: acquired and opened");
+                                info!(shard_id = %self.ctx.shard_id, rv = %rv, attempts = attempt, total_ms = acquire_started.elapsed().as_millis() as u64, "k8s shard: acquired and opened");
 
                                 // Permanent lease - no renewal loop needed.
                                 // The lease persists until explicitly released.

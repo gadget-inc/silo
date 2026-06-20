@@ -131,6 +131,11 @@ impl ShardFactory {
     ) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
         let shard_id = *shard_id;
 
+        // Wall-clock timer for this open call. Compared against the per-init
+        // timer below to expose time spent waiting on a concurrent opener
+        // (OnceCell contention) vs. time spent actually opening.
+        let call_started = std::time::Instant::now();
+
         // Get or create the entry for this shard. The entry contains a OnceCell
         // that ensures only one caller actually opens the database.
         let entry = self
@@ -147,8 +152,11 @@ impl ShardFactory {
         let rate_limiter = Arc::clone(&self.rate_limiter);
         let metrics = self.metrics.clone();
 
-        entry
+        let result = entry
             .get_or_try_init(|| async {
+                // Timer for the actual open work (only the caller that wins the
+                // OnceCell runs this closure).
+                let init_started = std::time::Instant::now();
                 // For Backend::Fs, we need to open at the storage root level so that
                 // cloned databases can correctly resolve their relative parent SST paths.
                 // Extract the root from the template and use shard name as the db path.
@@ -202,10 +210,23 @@ impl ShardFactory {
                 )
                 .await?;
 
-                tracing::info!(shard_id = %shard_id, range = %range, "opened shard");
+                tracing::info!(
+                    shard_id = %shard_id,
+                    range = %range,
+                    init_ms = init_started.elapsed().as_millis() as u64,
+                    "opened shard"
+                );
                 Ok(shard_arc)
             })
-            .await
+            .await;
+
+        tracing::debug!(
+            shard_id = %shard_id,
+            total_ms = call_started.elapsed().as_millis() as u64,
+            "factory: open returned"
+        );
+
+        result
     }
 
     /// Validate that the template path has the shard placeholder at a directory boundary.

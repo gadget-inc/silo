@@ -443,6 +443,10 @@ impl JobStoreShard {
             terminal_job_expire_s,
         } = options;
 
+        // Wall-clock timer for the whole open, used to emit per-phase debug
+        // timings so slow shard opens can be attributed without a profiler.
+        let open_started = std::time::Instant::now();
+
         let slatedb_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
         let mut db_builder = slatedb::DbBuilder::new(db_path, store.clone())
             .with_merge_operator(counters::counter_merge_operator())
@@ -490,7 +494,13 @@ impl JobStoreShard {
         }
 
         let shard_span = info_span!("shard", shard = %name);
+        let db_build_started = std::time::Instant::now();
         let db = db_builder.build().instrument(shard_span.clone()).await?;
+        tracing::debug!(
+            shard = %name,
+            elapsed_ms = db_build_started.elapsed().as_millis() as u64,
+            "shard open: slatedb build"
+        );
         let db = InstrumentedDb::new(Arc::new(db), shard_span);
         let concurrency = Arc::new(ConcurrencyManager::new(
             name.clone(),
@@ -509,9 +519,16 @@ impl JobStoreShard {
         // Controlled by `hydrate_all_at_startup`. When false, the
         // singleflighted JIT `ensure_hydrated` path covers each queue on
         // first access.
+        let hydrate_started = std::time::Instant::now();
         if hydrate_all_at_startup {
             concurrency.counts().hydrate_all(&db, &range).await?;
         }
+        tracing::debug!(
+            shard = %name,
+            hydrated = hydrate_all_at_startup,
+            elapsed_ms = hydrate_started.elapsed().as_millis() as u64,
+            "shard open: hydrate"
+        );
 
         let brokers = TaskBrokerRegistry::new(
             Arc::clone(&db),
@@ -549,9 +566,15 @@ impl JobStoreShard {
             .concurrency
             .set_chain_resumer(limit_chain::ShardChainResumer::install(&shard));
 
+        let counters_started = std::time::Instant::now();
         shard
             .rebuild_background_action_queue_counters(&range)
             .await?;
+        tracing::debug!(
+            shard = %shard.name,
+            elapsed_ms = counters_started.elapsed().as_millis() as u64,
+            "shard open: rebuild bg action counters"
+        );
 
         // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready,
         // and after the chain resumer is installed. It takes the instrumented db so its writes
@@ -589,7 +612,19 @@ impl JobStoreShard {
         }
 
         // Set the shard creation timestamp if this is the first time opening
+        let created_at_started = std::time::Instant::now();
         shard.set_created_at_ms_if_unset().await?;
+        tracing::debug!(
+            shard = %shard.name,
+            elapsed_ms = created_at_started.elapsed().as_millis() as u64,
+            "shard open: set created_at"
+        );
+
+        tracing::debug!(
+            shard = %shard.name,
+            total_ms = open_started.elapsed().as_millis() as u64,
+            "shard open: complete"
+        );
 
         Ok(shard)
     }
