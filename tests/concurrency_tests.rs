@@ -3,7 +3,9 @@ mod test_helpers;
 use silo::codec::{decode_lease, decode_task, encode_concurrency_action, encode_lease};
 use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::{AttemptOutcome, AttemptStatus};
-use silo::keys::{concurrency_holder_key, concurrency_request_key};
+use silo::keys::{
+    concurrency_holder_key, concurrency_request_key, concurrency_requester_counter_key,
+};
 use silo::retry::RetryPolicy;
 use silo::task::{ConcurrencyAction, LeaseRecord, Task};
 use slatedb::WriteBatch;
@@ -210,8 +212,12 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
     );
 
     // Manually inject a pending request directly in DB without calling request_grant.
-    // This simulates a crash/bug window where durable request exists but in-memory
-    // scanner notification was missed.
+    // This simulates a crash/bug window where the durable request exists but the
+    // in-memory grant-scanner notification (`request_grant`/`grant_notify`) was
+    // missed. The durable requester counter is co-committed with the request row
+    // in the same batch here, mirroring production (`append_request_edits`): the
+    // counter is the durable source of truth the periodic reconciler scans, while
+    // the missed signal is purely in-memory.
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms: now,
         priority: 10,
@@ -228,6 +234,12 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
     let request_value = encode_concurrency_action(&action);
     let mut batch = WriteBatch::new();
     batch.put(&request_key, &request_value);
+    // Co-commit the requester counter, as production does atomically with the
+    // request. The counter-based `reconcile_pending_requests` scans these.
+    batch.merge(
+        &concurrency_requester_counter_key(tenant, &queue),
+        1i64.to_le_bytes(),
+    );
     shard
         .db()
         .write(batch)
