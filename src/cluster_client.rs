@@ -40,15 +40,17 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
 use crate::job_store_shard::DropTenantStats;
-#[cfg(feature = "server")]
-use crate::pb::QueryRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ColumnInfo, CompactShardRequest, DropTenantHoldersRequest, GetJobRequest,
     GetJobResponse, GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse,
     JobStatus, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
 };
+#[cfg(feature = "server")]
+use crate::pb::{QueryArrowRequest, QueryRequest};
 use crate::shard_range::ShardId;
+#[cfg(feature = "server")]
+use datafusion::arrow::array::RecordBatch;
 
 /// Configuration for gRPC client connections.
 ///
@@ -586,6 +588,74 @@ impl ClusterClient {
             row_count: resp.row_count,
             shard_id: *shard_id,
         })
+    }
+
+    /// Query a single shard and return Arrow RecordBatches (local or remote).
+    ///
+    /// Unlike [`query_shard`](Self::query_shard) (which normalizes to msgpack
+    /// [`QueryResult`]), this keeps results as Arrow so callers that already parse
+    /// `RecordBatch`es have a single decode path. Best-effort: invalidate-on-error,
+    /// no shard-moved redirect retry (the cluster_query path has richer retry if we
+    /// ever want to factor a shared helper).
+    #[cfg(feature = "server")]
+    pub async fn query_shard_batches(
+        &self,
+        shard_id: &ShardId,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, ClusterClientError> {
+        if let Some(shard) = self.factory.get(shard_id) {
+            debug!(shard_id = %shard_id, "querying local shard (arrow)");
+            let df = shard
+                .query_engine()
+                .sql(sql)
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(format!("SQL error: {}", e)))?;
+            return df.collect().await.map_err(|e| {
+                ClusterClientError::QueryFailed(format!("Query execution failed: {}", e))
+            });
+        }
+
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = %shard_id, addr = %addr, "querying remote shard (arrow)");
+        self.query_remote_shard_batches(shard_id, &addr, sql).await
+    }
+
+    /// Remote single-shard query via the streaming QueryArrow RPC, decoded to RecordBatches.
+    #[cfg(feature = "server")]
+    async fn query_remote_shard_batches(
+        &self,
+        shard_id: &ShardId,
+        addr: &str,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, ClusterClientError> {
+        let mut client = self.get_client(addr).await?;
+
+        let request = QueryArrowRequest {
+            shard: shard_id.to_string(),
+            sql: sql.to_string(),
+            tenant: None,
+            parameters: vec![],
+        };
+
+        let response = client.query_arrow(request).await.map_err(|e| {
+            self.invalidate_connection(addr);
+            ClusterClientError::QueryFailed(format!("gRPC error: {}", e))
+        })?;
+
+        let mut stream = response.into_inner();
+        let mut batches = Vec::new();
+        while let Some(msg) = stream
+            .message()
+            .await
+            .map_err(|e| ClusterClientError::QueryFailed(format!("stream error: {}", e)))?
+        {
+            batches.extend(
+                crate::arrow_ipc::ipc_to_batches_only(&msg.ipc_data)
+                    .map_err(|e| ClusterClientError::QueryFailed(format!("ipc decode: {}", e)))?,
+            );
+        }
+
+        Ok(batches)
     }
 
     /// Query all shards in the cluster and combine results

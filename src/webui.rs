@@ -1371,12 +1371,28 @@ async fn tenant_handler(
     let mut top_queues: Vec<TenantQueueRow> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
+    // A tenant's data lives on exactly one shard (XXH64 hash → range lookup), so resolve
+    // its owning shard once and query only that shard rather than fanning out to the whole
+    // cluster. Tradeoff: orphaned tenant data on a shard the tenant no longer hashes to is
+    // not surfaced here (use the cluster pages / drop_tenant_holders for orphan cleanup).
+    let shard_id = match state.coordinator.get_shard_owner_map().await {
+        Ok(map) => map.shard_for_tenant(&params.name),
+        Err(e) => {
+            errors.push(format!("Failed to resolve tenant shard: {}", e));
+            None
+        }
+    };
+
     let count_sql = format!(
         "SELECT status_kind, cnt FROM tenant_counts WHERE tenant = '{}'",
         tenant_escaped
     );
-    match state.query_engine.sql(&count_sql).await {
-        Ok(df) => match df.collect().await {
+    if let Some(shard_id) = shard_id {
+        match state
+            .cluster_client
+            .query_shard_batches(&shard_id, &count_sql)
+            .await
+        {
             Ok(batches) => {
                 for batch in batches {
                     let status_col = batch.column_by_name("status_kind").and_then(|c| {
@@ -1408,13 +1424,9 @@ async fn tenant_handler(
                 }
             }
             Err(e) => {
-                warn!(error = %e, tenant = %params.name, "failed to collect tenant count results");
+                warn!(error = %e, tenant = %params.name, "failed to query tenant counts");
                 errors.push(format!("Tenant counts query failed: {}", e));
             }
-        },
-        Err(e) => {
-            warn!(error = %e, tenant = %params.name, "failed to query tenant counts");
-            errors.push(format!("Tenant counts query failed: {}", e));
         }
     }
 
@@ -1422,8 +1434,12 @@ async fn tenant_handler(
         "SELECT queue_name, SUM(holders) as holders, SUM(requesters) as requesters FROM queue_counts WHERE tenant = '{}' GROUP BY queue_name",
         tenant_escaped
     );
-    match state.query_engine.sql(&queue_sql).await {
-        Ok(df) => match df.collect().await {
+    if let Some(shard_id) = shard_id {
+        match state
+            .cluster_client
+            .query_shard_batches(&shard_id, &queue_sql)
+            .await
+        {
             Ok(batches) => {
                 for batch in batches {
                     let name_col = batch.column_by_name("queue_name").and_then(|c| {
@@ -1464,13 +1480,9 @@ async fn tenant_handler(
                 top_queues.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.name.cmp(&b.name)));
             }
             Err(e) => {
-                warn!(error = %e, tenant = %params.name, "failed to collect queue counts results");
+                warn!(error = %e, tenant = %params.name, "failed to query queue counts");
                 errors.push(format!("Queue counts query failed: {}", e));
             }
-        },
-        Err(e) => {
-            warn!(error = %e, tenant = %params.name, "failed to query queue counts");
-            errors.push(format!("Queue counts query failed: {}", e));
         }
     }
 
@@ -1482,8 +1494,12 @@ async fn tenant_handler(
         "SELECT shard_id, id FROM jobs WHERE tenant = '{}' AND status_kind = 'Waiting' LIMIT 100",
         tenant_escaped
     );
-    match state.query_engine.sql(&waiting_sql).await {
-        Ok(df) => match df.collect().await {
+    if let Some(shard_id) = shard_id {
+        match state
+            .cluster_client
+            .query_shard_batches(&shard_id, &waiting_sql)
+            .await
+        {
             Ok(batches) => {
                 for batch in batches {
                     let shard_col = batch.column_by_name("shard_id").and_then(|c| {
@@ -1509,13 +1525,9 @@ async fn tenant_handler(
                 }
             }
             Err(e) => {
-                warn!(error = %e, tenant = %params.name, "failed to collect waiting jobs");
+                warn!(error = %e, tenant = %params.name, "failed to query waiting jobs");
                 errors.push(format!("Waiting jobs query failed: {}", e));
             }
-        },
-        Err(e) => {
-            warn!(error = %e, tenant = %params.name, "failed to query waiting jobs");
-            errors.push(format!("Waiting jobs query failed: {}", e));
         }
     }
 

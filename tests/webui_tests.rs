@@ -1328,8 +1328,14 @@ async fn test_tenant_detail_shows_queues_and_waiting_jobs() {
 
     let (_tmp, state, shard_map) = setup_multi_shard_state_with_tenancy(2, true).await;
 
-    let shard0_id = shard_map.shards()[0].id;
-    let shard0 = state.factory.get(&shard0_id).expect("shard 0");
+    // A tenant's data lives on the single shard it hashes to, and the tenant page now queries
+    // only that shard. Enqueue onto the owning shard rather than a fixed one so the data is
+    // found (writing to the wrong shard would make it "orphaned" and invisible to the page).
+    let owning_shard_id = shard_map
+        .shard_for_tenant("tenant-detail")
+        .expect("tenant-detail routes to a shard")
+        .id;
+    let shard0 = state.factory.get(&owning_shard_id).expect("owning shard");
     // Present-time enqueues so the chain populates queue_counts:
     // job 1 grants the only slot (holder), job 2 defers (requester).
     // Pre-fix this test used future start times — those grabbed holders
