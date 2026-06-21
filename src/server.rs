@@ -1091,13 +1091,9 @@ impl Silo for SiloService {
         let (shard, tenant) = self
             .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
             .await?;
-        let stats = shard
-            .drop_tenant_holders_and_runattempts(&tenant)
-            .await
-            .map_err(map_err)?;
+        let stats = shard.drop_tenant_holders(&tenant).await.map_err(map_err)?;
         Ok(Response::new(DropTenantHoldersResponse {
             holders_dropped: stats.holders_dropped as u64,
-            run_attempts_dropped: stats.run_attempts_dropped as u64,
         }))
     }
 

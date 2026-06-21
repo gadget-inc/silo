@@ -531,8 +531,9 @@ export interface CancelJobRequest {
 export interface CancelJobResponse {
 }
 /**
- * Forcibly drop all concurrency holders and in-flight run attempts for a tenant
- * on a single shard. Admin/operator action used to clear stuck concurrency state.
+ * Forcibly drop all concurrency holders for a tenant on a single shard, freeing
+ * held slots so stuck jobs can be re-granted. Emergency admin/operator action;
+ * in-flight run attempts are left running (and may briefly double-run).
  *
  * @generated from protobuf message silo.v1.DropTenantHoldersRequest
  */
@@ -556,10 +557,6 @@ export interface DropTenantHoldersResponse {
      * @generated from protobuf field: uint64 holders_dropped = 1
      */
     holdersDropped: bigint; // Number of concurrency holders deleted.
-    /**
-     * @generated from protobuf field: uint64 run_attempts_dropped = 2
-     */
-    runAttemptsDropped: bigint; // Number of in-flight run attempts deleted.
 }
 /**
  * Restart a cancelled or failed job, allowing it to be processed again.
@@ -3422,14 +3419,12 @@ export const DropTenantHoldersRequest = new DropTenantHoldersRequest$Type();
 class DropTenantHoldersResponse$Type extends MessageType<DropTenantHoldersResponse> {
     constructor() {
         super("silo.v1.DropTenantHoldersResponse", [
-            { no: 1, name: "holders_dropped", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
-            { no: 2, name: "run_attempts_dropped", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
+            { no: 1, name: "holders_dropped", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
         ]);
     }
     create(value?: PartialMessage<DropTenantHoldersResponse>): DropTenantHoldersResponse {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.holdersDropped = 0n;
-        message.runAttemptsDropped = 0n;
         if (value !== undefined)
             reflectionMergePartial<DropTenantHoldersResponse>(this, message, value);
         return message;
@@ -3441,9 +3436,6 @@ class DropTenantHoldersResponse$Type extends MessageType<DropTenantHoldersRespon
             switch (fieldNo) {
                 case /* uint64 holders_dropped */ 1:
                     message.holdersDropped = reader.uint64().toBigInt();
-                    break;
-                case /* uint64 run_attempts_dropped */ 2:
-                    message.runAttemptsDropped = reader.uint64().toBigInt();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3460,9 +3452,6 @@ class DropTenantHoldersResponse$Type extends MessageType<DropTenantHoldersRespon
         /* uint64 holders_dropped = 1; */
         if (message.holdersDropped !== 0n)
             writer.tag(1, WireType.Varint).uint64(message.holdersDropped);
-        /* uint64 run_attempts_dropped = 2; */
-        if (message.runAttemptsDropped !== 0n)
-            writer.tag(2, WireType.Varint).uint64(message.runAttemptsDropped);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

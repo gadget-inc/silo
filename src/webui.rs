@@ -941,12 +941,15 @@ async fn cancel_job_handler(
     }
 }
 
-/// Forcibly drop all concurrency holders and in-flight run attempts for a tenant.
+/// Forcibly drop all concurrency holders for a tenant, freeing held slots so
+/// stuck jobs can be re-granted. In-flight run attempts are left running.
 ///
-/// Resolves the tenant's shard from the cluster query engine and operates on a
-/// single shard (per the admin action's scope). If the tenant spans multiple
-/// shards, only the first is touched and the response notes the others were
-/// skipped.
+/// Resolves the tenant's owning shard via the shard owner map (XXH64 hash →
+/// range lookup) and operates on that single shard. This is an O(log n) metadata
+/// lookup — it deliberately does NOT scan the `jobs` table, which can time out
+/// for a tenant with a huge backlog (exactly the case this emergency button is
+/// for). Tradeoff: orphaned holders on a shard the tenant no longer hashes to
+/// (after a range change) are not surfaced here.
 async fn drop_tenant_holders_handler(
     State(state): State<AppState>,
     Query(params): Query<TenantParams>,
@@ -958,43 +961,13 @@ async fn drop_tenant_holders_handler(
         ))
     }
 
-    let tenant_escaped = sql_string_literal(&params.name);
-    let sql = format!(
-        "SELECT DISTINCT shard_id FROM jobs WHERE tenant = '{}'",
-        tenant_escaped
-    );
-
-    // Resolve which shard(s) the tenant lives on.
-    let mut shard_ids: Vec<crate::shard_range::ShardId> = Vec::new();
-    match state.query_engine.sql(&sql).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                for batch in batches {
-                    let Some(col) = batch.column_by_name("shard_id").and_then(|c| {
-                        c.as_any()
-                            .downcast_ref::<datafusion::arrow::array::StringArray>()
-                    }) else {
-                        continue;
-                    };
-                    for i in 0..batch.num_rows() {
-                        if col.is_null(i) {
-                            continue;
-                        }
-                        if let Ok(s) = crate::shard_range::ShardId::parse(col.value(i))
-                            && !shard_ids.contains(&s)
-                        {
-                            shard_ids.push(s);
-                        }
-                    }
-                }
-            }
-            Err(e) => return error_box(&format!("Failed to resolve tenant shard: {}", e)),
-        },
+    // Resolve the tenant's owning shard from the owner map (no table scan).
+    let shard_id = match state.coordinator.get_shard_owner_map().await {
+        Ok(map) => map.shard_for_tenant(&params.name),
         Err(e) => return error_box(&format!("Failed to resolve tenant shard: {}", e)),
-    }
-
-    let Some(shard_id) = shard_ids.first().copied() else {
-        return error_box("No data found for this tenant — nothing to drop.");
+    };
+    let Some(shard_id) = shard_id else {
+        return error_box("No owning shard found for this tenant — nothing to drop.");
     };
 
     match state
@@ -1003,17 +976,10 @@ async fn drop_tenant_holders_handler(
         .await
     {
         Ok(stats) => {
-            let mut body = format!(
-                "Dropped {} holders and {} run attempts on shard {}.",
-                stats.holders_dropped, stats.run_attempts_dropped, shard_id
+            let body = format!(
+                "Dropped {} holders on shard {}.",
+                stats.holders_dropped, shard_id
             );
-            if shard_ids.len() > 1 {
-                body.push_str(&format!(
-                    "\nNote: tenant spans {} shards; {} additional shard(s) were not touched.",
-                    shard_ids.len(),
-                    shard_ids.len() - 1
-                ));
-            }
             Html(format!(
                 r#"<div class="bg-emerald-900/30 border border-emerald-700 p-4"><div class="text-emerald-400 text-sm font-medium">Done</div><pre class="text-emerald-300 text-xs mt-2 whitespace-pre-wrap">{}</pre></div>"#,
                 body

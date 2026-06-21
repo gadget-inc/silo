@@ -7,11 +7,11 @@
     <div class="flex items-center justify-between">
         <h1 class="text-xl font-bold text-zinc-100">Tenant: <span class="text-emerald-400">{{ tenant_name }}</span></h1>
         <form hx-post="/tenant/drop-state?name={{ tenant_name_url }}"
-              hx-confirm="Drop ALL holders and run attempts for tenant {{ tenant_name }}? This cannot be undone."
+              hx-confirm="Force-drop ALL concurrency holders for tenant {{ tenant_name }} so stuck jobs can run again? In-flight jobs are NOT cancelled and may briefly double-run."
               hx-target="#drop-state-result" hx-swap="innerHTML" class="inline">
             <button type="submit"
                     class="px-3 py-1 text-sm bg-red-900/50 border border-red-700 text-red-400 hover:bg-red-900 transition-colors">
-                Drop holders &amp; run attempts
+                Drop holders
             </button>
         </form>
     </div>
