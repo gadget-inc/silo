@@ -131,6 +131,11 @@ impl ShardFactory {
     ) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
         let shard_id = *shard_id;
 
+        // Wall-clock timer for this open call. Compared against the per-init
+        // timer below to expose time spent waiting on a concurrent opener
+        // (OnceCell contention) vs. time spent actually opening.
+        let call_started = std::time::Instant::now();
+
         // Get or create the entry for this shard. The entry contains a OnceCell
         // that ensures only one caller actually opens the database.
         let entry = self
@@ -147,8 +152,11 @@ impl ShardFactory {
         let rate_limiter = Arc::clone(&self.rate_limiter);
         let metrics = self.metrics.clone();
 
-        entry
+        let result = entry
             .get_or_try_init(|| async {
+                // Timer for the actual open work (only the caller that wins the
+                // OnceCell runs this closure).
+                let init_started = std::time::Instant::now();
                 // For Backend::Fs, we need to open at the storage root level so that
                 // cloned databases can correctly resolve their relative parent SST paths.
                 // Extract the root from the template and use shard name as the db path.
@@ -202,10 +210,23 @@ impl ShardFactory {
                 )
                 .await?;
 
-                tracing::info!(shard_id = %shard_id, range = %range, "opened shard");
+                tracing::info!(
+                    shard_id = %shard_id,
+                    range = %range,
+                    init_ms = init_started.elapsed().as_millis() as u64,
+                    "opened shard"
+                );
                 Ok(shard_arc)
             })
-            .await
+            .await;
+
+        tracing::debug!(
+            shard_id = %shard_id,
+            total_ms = call_started.elapsed().as_millis() as u64,
+            "factory: open returned"
+        );
+
+        result
     }
 
     /// Validate that the template path has the shard placeholder at a directory boundary.
@@ -317,14 +338,23 @@ impl ShardFactory {
     ///
     /// A timeout is applied because SlateDB's internal retrying_object_store retries indefinitely on transient errors, which would cause close to hang forever if the object store is unreachable.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
+        // Wall-clock timer for the whole close call, including the timeout-guarded
+        // wait, so slow closes can be attributed without a profiler.
+        let call_started = std::time::Instant::now();
+
         tracing::trace!(shard_id = %shard_id, "factory.close: removing from instances");
         if let Some((id, entry)) = self.instances.remove(shard_id) {
             if let Some(shard) = entry.get() {
                 tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
+                let close_started = std::time::Instant::now();
                 let close_result = tokio::time::timeout(self.close_timeout, shard.close()).await;
                 match close_result {
                     Ok(Ok(())) => {
-                        tracing::info!(shard_id = %shard_id, "closed shard");
+                        tracing::info!(
+                            shard_id = %shard_id,
+                            close_ms = close_started.elapsed().as_millis() as u64,
+                            "closed shard"
+                        );
                     }
                     Ok(Err(e)) => {
                         // If the DB is already closed (e.g. a previous timed-out close
@@ -361,6 +391,13 @@ impl ShardFactory {
         } else {
             tracing::trace!(shard_id = %shard_id, "factory.close: shard not found in instances");
         }
+
+        tracing::debug!(
+            shard_id = %shard_id,
+            total_ms = call_started.elapsed().as_millis() as u64,
+            "factory: close returned"
+        );
+
         Ok(())
     }
 
