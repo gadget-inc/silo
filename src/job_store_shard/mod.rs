@@ -566,15 +566,16 @@ impl JobStoreShard {
             .concurrency
             .set_chain_resumer(limit_chain::ShardChainResumer::install(&shard));
 
-        let counters_started = std::time::Instant::now();
-        shard
-            .rebuild_background_action_queue_counters(&range)
-            .await?;
-        tracing::debug!(
-            shard = %shard.name,
-            elapsed_ms = counters_started.elapsed().as_millis() as u64,
-            "shard open: rebuild bg action counters"
-        );
+        // Rebuild the background-action queue counter gauges in the background
+        // rather than on the open critical path. The rebuild scans the entire
+        // JOB_STATUS prefix (one row per job on the shard) and does a point read
+        // of JOB_INFO per scheduled/running job, so it is O(jobs) and can take a
+        // very long time on large shards (tens of millions of jobs). Its only
+        // consumer is the Prometheus background-action queue gauge
+        // (`snapshot_background_action_queue_counters`), so blocking the shard
+        // from serving on it is unnecessary — the gauge simply reports an empty
+        // shard until the spawned rebuild completes.
+        shard.spawn_background_action_queue_counter_rebuild(range.clone());
 
         // Start the grant scanner after both ConcurrencyManager and TaskBrokerRegistry are ready,
         // and after the chain resumer is installed. It takes the instrumented db so its writes
@@ -813,6 +814,50 @@ impl JobStoreShard {
     /// tuple would sit idle until the next unrelated Drop or the 5 s
     /// periodic tick. The sleep also bounds the retry rate so a sustained
     /// failure (slatedb temporarily unavailable, etc.) doesn't tight-loop.
+    /// Spawn a one-shot background task that rebuilds the background-action
+    /// queue counter gauges from durable storage.
+    ///
+    /// This is kept off the open critical path because the rebuild scans the
+    /// whole JOB_STATUS prefix and point-reads JOB_INFO per scheduled/running
+    /// job — O(jobs), which is prohibitively slow on large shards. The gauge it
+    /// populates is metrics-only, so the shard can serve immediately while the
+    /// rebuild runs. A failure is logged and dropped; the periodic counter
+    /// reconciler (when enabled) and live transition deltas keep the gauge
+    /// converging afterwards.
+    fn spawn_background_action_queue_counter_rebuild(self: &Arc<Self>, range: ShardRange) {
+        let shard = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        let shard_name = self.name.clone();
+
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    tracing::debug!(
+                        shard = %shard_name,
+                        "skipping background action queue counter rebuild (shard closing)"
+                    );
+                }
+                result = shard.rebuild_background_action_queue_counters(&range) => {
+                    match result {
+                        Ok(()) => tracing::debug!(
+                            shard = %shard_name,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "shard open: rebuild bg action counters (background)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            shard = %shard_name,
+                            error = %e,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "background action queue counter rebuild failed; gauge will converge via reconcile and live deltas"
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
     fn spawn_holder_reconcile_task(self: &Arc<Self>, range: ShardRange) {
         /// Delay between reactive-reconciler retries when a pass re-queued
         /// at least one tuple. 100 ms = ~10 retries/sec ceiling under
