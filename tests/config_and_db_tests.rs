@@ -586,6 +586,10 @@ path = "/tmp/silo-%shard%"
         cfg.database.grant_scanner_buffer_size, 64,
         "missing grant_scanner_buffer_size should use default"
     );
+    assert_eq!(
+        cfg.database.grant_scanner_concurrency, 8,
+        "missing grant_scanner_concurrency should use default"
+    );
 }
 
 #[silo::test]
@@ -596,10 +600,12 @@ backend = "fs"
 path = "/tmp/silo-%shard%"
 grant_scanner_batch_size = 8
 grant_scanner_buffer_size = 4
+grant_scanner_concurrency = 2
 "#;
     let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
     assert_eq!(cfg.database.grant_scanner_batch_size, 8);
     assert_eq!(cfg.database.grant_scanner_buffer_size, 4);
+    assert_eq!(cfg.database.grant_scanner_concurrency, 2);
 }
 
 #[silo::test]
@@ -662,6 +668,10 @@ path = "/tmp/silo-%shard%"
         from_default.grant_scanner_buffer_size,
         from_toml.database.grant_scanner_buffer_size
     );
+    assert_eq!(
+        from_default.grant_scanner_concurrency,
+        from_toml.database.grant_scanner_concurrency
+    );
     assert!(from_default.wal.is_none() && from_toml.database.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.database.slatedb.is_none());
     assert!(from_default.memory_cache.is_none() && from_toml.database.memory_cache.is_none());
@@ -697,6 +707,10 @@ path = "/tmp/silo-shard"
     assert_eq!(
         from_default.grant_scanner_buffer_size,
         from_toml.grant_scanner_buffer_size
+    );
+    assert_eq!(
+        from_default.grant_scanner_concurrency,
+        from_toml.grant_scanner_concurrency
     );
     assert!(from_default.wal.is_none() && from_toml.wal.is_none());
     assert!(from_default.slatedb.is_none() && from_toml.slatedb.is_none());

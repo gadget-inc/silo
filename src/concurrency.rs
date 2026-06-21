@@ -856,6 +856,14 @@ pub struct ConcurrencyManager {
     /// Configurable via `grant_scanner_buffer_size` (default 64); stored
     /// already clamped to `>= 1`.
     grant_scanner_buffer_size: usize,
+    /// Max number of per-queue `process_grants` passes run concurrently when
+    /// draining `pending_grants`. Each entry in `work` is a unique
+    /// `(tenant, queue)`, so no two in-flight passes share a gating queue; this
+    /// bounds the `.buffered(...)` fan-out over those passes (order-preserving,
+    /// for DST determinism) so peak memory stays `N × per-pass`. Configurable
+    /// via `grant_scanner_concurrency` (default 8); stored already clamped to
+    /// `>= 1` (`.buffered(0)` is invalid).
+    grant_scanner_concurrency: usize,
     /// Consecutive-pass observation counts for drift-detected ghost
     /// candidates, keyed by (tenant, queue, task_id). Maintained only by
     /// `report_holder_drift` (a single periodic task). Rebuilt each pass from
@@ -881,6 +889,7 @@ impl ConcurrencyManager {
         hydrate_all_at_startup: bool,
         grant_scanner_batch_size: usize,
         grant_scanner_buffer_size: usize,
+        grant_scanner_concurrency: usize,
     ) -> Self {
         Self {
             shard: shard.into(),
@@ -896,6 +905,7 @@ impl ConcurrencyManager {
             // `.buffered(0)` is invalid.
             grant_scanner_batch_size: grant_scanner_batch_size.max(1),
             grant_scanner_buffer_size: grant_scanner_buffer_size.max(1),
+            grant_scanner_concurrency: grant_scanner_concurrency.max(1),
             ghost_candidates: Mutex::new(HashMap::new()),
         }
     }
@@ -1506,13 +1516,26 @@ impl ConcurrencyManager {
                         break;
                     }
 
-                    let mut granted_groups: Vec<String> = Vec::new();
-                    for (_key, (tenant, queue, count)) in work {
-                        let groups = mgr
-                            .process_grants(&db, &range, &tenant, &queue, count)
-                            .await;
-                        granted_groups.extend(groups);
-                    }
+                    // Fan out across queues with bounded concurrency. Each
+                    // (tenant, queue) is unique in `work`, so no two in-flight
+                    // passes share a gating queue; downstream chain-resumer
+                    // reservations are gated atomically by the per-key DashMap
+                    // guard. `buffered` (order-preserving) keeps collected order
+                    // deterministic against the BTreeMap iteration order for DST.
+                    let granted: Vec<Vec<String>> = futures::stream::iter(work.into_values())
+                        .map(|(tenant, queue, count)| {
+                            let mgr = Arc::clone(&mgr);
+                            let db = Arc::clone(&db);
+                            let range = range.clone();
+                            async move {
+                                mgr.process_grants(&db, &range, &tenant, &queue, count)
+                                    .await
+                            }
+                        })
+                        .buffered(mgr.grant_scanner_concurrency)
+                        .collect()
+                        .await;
+                    let granted_groups: Vec<String> = granted.into_iter().flatten().collect();
 
                     // Wake only the brokers whose task groups received grants
                     if !granted_groups.is_empty() {

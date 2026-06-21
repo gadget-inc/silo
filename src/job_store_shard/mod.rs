@@ -110,6 +110,9 @@ pub struct OpenShardOptions {
     /// Max in-flight status lookups the grant scanner buffers per pass.
     /// Populated from `grant_scanner_buffer_size` in the database config.
     pub grant_scanner_buffer_size: usize,
+    /// Max per-queue `process_grants` passes the grant scanner runs concurrently.
+    /// Populated from `grant_scanner_concurrency` in the database config.
+    pub grant_scanner_concurrency: usize,
     /// When set, jobs that reach Succeeded have their associated KV records
     /// re-put with a SlateDB row TTL of this many seconds. `None` disables
     /// the feature for successful jobs.
@@ -398,6 +401,7 @@ impl JobStoreShard {
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
                 grant_scanner_batch_size: cfg.grant_scanner_batch_size,
                 grant_scanner_buffer_size: cfg.grant_scanner_buffer_size,
+                grant_scanner_concurrency: cfg.grant_scanner_concurrency,
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
             },
@@ -440,6 +444,7 @@ impl JobStoreShard {
             hydrate_all_at_startup,
             grant_scanner_batch_size,
             grant_scanner_buffer_size,
+            grant_scanner_concurrency,
             completed_job_expire_s,
             terminal_job_expire_s,
         } = options;
@@ -509,6 +514,7 @@ impl JobStoreShard {
             hydrate_all_at_startup,
             grant_scanner_batch_size,
             grant_scanner_buffer_size,
+            grant_scanner_concurrency,
         ));
 
         // Eagerly hydrate the in-memory holders cache from durable storage so
