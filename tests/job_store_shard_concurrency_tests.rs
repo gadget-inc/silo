@@ -2251,6 +2251,304 @@ async fn grant_scanner_drains_backlog_larger_than_max_per_pass() {
     assert_eq!(count_concurrency_holders(shard.db()).await, N);
 }
 
+/// Tenant-fairness + reliability: a full queue with a huge backlog of stale
+/// requests still cleans them up (orphan reliability), but only a *bounded*
+/// amount per invocation (the per-invocation scan budget), so it can't pin a
+/// scanner slot walking the whole backlog and starve other tenants. Holders are
+/// untouched and nothing is granted (queue is full). Repeated invocations drain
+/// the stale backlog. Pre-fix one invocation walked the entire backlog in a
+/// single call.
+#[silo::test]
+async fn grant_scanner_full_queue_cleans_stale_bounded() {
+    const LIMIT: usize = 5;
+    const BACKLOG: usize = 3000;
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "full-clean-q";
+    let tenant = "full-clean-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: LIMIT as u32,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Fill all LIMIT slots with holders.
+    for i in 0..LIMIT {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("holder-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    let mut held = 0;
+    while held < LIMIT {
+        let tasks = shard.dequeue("w", "tg", LIMIT).await.unwrap().tasks;
+        held += tasks.len();
+    }
+
+    // Inject a large backlog of stale requests (nonexistent jobs).
+    for i in 0..BACKLOG {
+        let stale_action = ConcurrencyAction::EnqueueTask {
+            start_time_ms: 0,
+            priority: 50,
+            job_id: format!("ghost-{}", i),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            task_group: "tg".to_string(),
+            limit_index: 0,
+            held_queues: Vec::new(),
+            task_id: format!("ghost-{}:1:stale", i),
+            limits: Vec::new(),
+        };
+        let key = silo::keys::concurrency_request_key(
+            tenant,
+            queue,
+            0,
+            50,
+            &format!("ghost-{}", i),
+            1,
+            &format!("{:08}", i),
+        );
+        let val = encode_concurrency_action(&stale_action);
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(&key, &val);
+        shard.db().write(batch).await.unwrap();
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, BACKLOG);
+
+    // Queue is full (LIMIT held). One invocation cleans only a bounded slice.
+    let granted = shard
+        .process_concurrency_grants(tenant, queue, BACKLOG as u32)
+        .await;
+    assert_eq!(granted.len(), 0, "a full queue grants nothing");
+    let after_first = count_concurrency_requests(shard.db()).await;
+    assert!(
+        after_first > 0,
+        "one invocation must NOT walk/delete the whole backlog (scan budget bounds it)"
+    );
+    assert!(
+        after_first < BACKLOG,
+        "stale on a full queue must still be cleaned (orphan reliability)"
+    );
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        LIMIT,
+        "holders are untouched while cleaning stale"
+    );
+
+    // Repeated invocations eventually drain the stale backlog.
+    let mut prev = after_first;
+    for _ in 0..50 {
+        if count_concurrency_requests(shard.db()).await == 0 {
+            break;
+        }
+        let g = shard
+            .process_concurrency_grants(tenant, queue, BACKLOG as u32)
+            .await;
+        assert_eq!(g.len(), 0);
+        let remaining = count_concurrency_requests(shard.db()).await;
+        assert!(
+            remaining < prev,
+            "each invocation deletes at least some stale"
+        );
+        prev = remaining;
+    }
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "repeated invocations drain the full queue's stale backlog"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, LIMIT);
+}
+
+/// Tenant-fairness: an invocation grants at most `max_concurrency - holders`,
+/// regardless of how large the requested `count` is — reservations are never
+/// released mid-call, so aiming higher is pointless. Frees a subset of holders
+/// to create exactly N free slots and asserts exactly N grants out of a much
+/// larger valid backlog.
+#[silo::test]
+async fn grant_scanner_caps_grants_at_free_capacity() {
+    const LIMIT: usize = 5;
+    const WAITERS: usize = 10;
+    const RELEASE: usize = 3; // free slots after release
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "grantable-cap-q";
+    let tenant = "grantable-cap-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: LIMIT as u32,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Fill all LIMIT slots.
+    for i in 0..LIMIT {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("holder-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    let mut holder_tasks = Vec::new();
+    while holder_tasks.len() < LIMIT {
+        let tasks = shard.dequeue("w", "tg", LIMIT).await.unwrap().tasks;
+        for t in tasks {
+            holder_tasks.push(t.attempt().task_id().to_string());
+        }
+    }
+
+    // Enqueue WAITERS valid waiters — queue is full, so each becomes a request.
+    for i in 0..WAITERS {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("waiter-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, WAITERS);
+
+    // Free RELEASE slots → RELEASE grantable slots remain.
+    for task_id in holder_tasks.iter().take(RELEASE) {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .unwrap();
+    }
+
+    // Ask for far more than is grantable; must grant exactly the free slots.
+    let granted = shard
+        .process_concurrency_grants(tenant, queue, WAITERS as u32)
+        .await;
+    assert_eq!(
+        granted.len(),
+        RELEASE,
+        "grants are capped at free capacity ({}), not the requested count",
+        RELEASE
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        WAITERS - RELEASE,
+        "only the granted requests are consumed"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, LIMIT);
+}
+
+/// Tenant-fairness: when a queue has capacity but a huge front of non-grantable
+/// keys, a single invocation makes only *bounded* progress (the per-invocation
+/// scan budget), then yields so other queues in the same scanner cycle aren't
+/// starved. Repeated invocations drain it fully (forward progress each cycle).
+/// Pre-fix one invocation walked and deleted the entire backlog.
+#[silo::test]
+async fn grant_scanner_bounds_scan_per_invocation_with_capacity() {
+    const BACKLOG: usize = 3000; // comfortably exceeds the per-invocation budget
+
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "budget-q";
+    let tenant = "budget-tenant";
+
+    shard.stop_grant_scanner();
+
+    // No holders, no cached limit: capacity is available, so the pre-scan gate
+    // cannot short-circuit and the scan must run — bounded by the budget.
+    for i in 0..BACKLOG {
+        let stale_action = ConcurrencyAction::EnqueueTask {
+            start_time_ms: 0,
+            priority: 50,
+            job_id: format!("ghost-{}", i),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            task_group: "tg".to_string(),
+            limit_index: 0,
+            held_queues: Vec::new(),
+            task_id: format!("ghost-{}:1:stale", i),
+            limits: Vec::new(),
+        };
+        let key = silo::keys::concurrency_request_key(
+            tenant,
+            queue,
+            0,
+            50,
+            &format!("ghost-{}", i),
+            1,
+            &format!("{:08}", i),
+        );
+        let val = encode_concurrency_action(&stale_action);
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(&key, &val);
+        shard.db().write(batch).await.unwrap();
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, BACKLOG);
+
+    // First invocation: bounded progress, not a full drain.
+    let granted = shard
+        .process_concurrency_grants(tenant, queue, BACKLOG as u32)
+        .await;
+    assert_eq!(granted.len(), 0, "no valid requests behind the stale front");
+    let after_first = count_concurrency_requests(shard.db()).await;
+    assert!(
+        after_first > 0,
+        "one invocation must NOT drain the whole backlog (budget bounds the walk)"
+    );
+    assert!(
+        after_first < BACKLOG,
+        "one invocation must still make forward progress from the front"
+    );
+
+    // Repeated invocations make forward progress and eventually drain to zero.
+    let mut prev = after_first;
+    for _ in 0..50 {
+        if count_concurrency_requests(shard.db()).await == 0 {
+            break;
+        }
+        let g = shard
+            .process_concurrency_grants(tenant, queue, BACKLOG as u32)
+            .await;
+        assert_eq!(g.len(), 0);
+        let remaining = count_concurrency_requests(shard.db()).await;
+        assert!(
+            remaining < prev,
+            "each invocation must delete at least some"
+        );
+        prev = remaining;
+    }
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "repeated invocations drain the backlog fully"
+    );
+}
+
 /// Reproduces a Gadget production report: jobs enqueued with TWO concurrency limits
 /// (a floating "platform" limit + a user-named fixed concurrency limit, e.g.
 /// `exampleshopname.myshopify.com`) advance through the first (platform) limit

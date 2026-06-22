@@ -864,6 +864,18 @@ pub struct ConcurrencyManager {
     /// via `grant_scanner_concurrency` (default 8); stored already clamped to
     /// `>= 1` (`.buffered(0)` is invalid).
     grant_scanner_concurrency: usize,
+    /// Max number of pending-request keys a single `process_grants` invocation
+    /// will walk across all of its passes before committing what it found and
+    /// returning — even if neither capacity nor the iterator is exhausted. This
+    /// bounds the cost one queue can impose per scanner cycle so a single queue
+    /// with a huge backlog of non-grantable keys (holder-orphan / stale-request
+    /// shape) can't pin a `.buffered` slot and starve every other tenant's queue
+    /// on the shard. The queue is re-driven on the next cycle (its requester
+    /// counter is still non-zero), making bounded forward progress from the
+    /// front each time. Derived from `grant_scanner_batch_size` (a small
+    /// multiple) in `new`; always `>= grant_scanner_batch_size` so every
+    /// invocation can run at least one full pass.
+    grant_scanner_max_scan_per_invocation: usize,
     /// Consecutive-pass observation counts for drift-detected ghost
     /// candidates, keyed by (tenant, queue, task_id). Maintained only by
     /// `report_holder_drift` (a single periodic task). Rebuilt each pass from
@@ -906,6 +918,14 @@ impl ConcurrencyManager {
             grant_scanner_batch_size: grant_scanner_batch_size.max(1),
             grant_scanner_buffer_size: grant_scanner_buffer_size.max(1),
             grant_scanner_concurrency: grant_scanner_concurrency.max(1),
+            // Cap total keys walked per invocation at a small multiple of the
+            // per-pass batch so a giant non-grantable backlog yields after a
+            // bounded walk and round-robins with other queues, while still
+            // allowing several full passes of real draining per cycle. Clamp to
+            // `>= batch_size` so at least one full pass always runs.
+            grant_scanner_max_scan_per_invocation: (grant_scanner_batch_size.max(1))
+                .saturating_mul(4)
+                .max(grant_scanner_batch_size.max(1)),
             ghost_candidates: Mutex::new(HashMap::new()),
         }
     }
@@ -1687,6 +1707,17 @@ impl ConcurrencyManager {
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
+        // Per-invocation scan budget. Total request keys walked
+        // across all passes (valid, stale, and corrupt — the walk cost is what
+        // we bound). When it reaches `grant_scanner_max_scan_per_invocation` the
+        // call commits what it found and returns even if capacity/iterator are
+        // not exhausted, so a single queue with a huge non-grantable front
+        // cannot starve other tenants' queues sharing the `.buffered` fan-out.
+        // The queue is re-driven next cycle (its requester counter is still
+        // non-zero), making bounded forward progress from the front each time.
+        let mut scanned_this_invocation: usize = 0;
+        let mut total_stale_deleted: usize = 0;
+        let mut budget_exhausted = false;
         let chain_resumer = self.chain_resumer();
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
@@ -1696,8 +1727,15 @@ impl ConcurrencyManager {
         // are cleaned up along the way. Bounding per-pass scan size caps peak memory
         // (the scanned Vec, buffered status results, and WriteBatch all scale with it),
         // so a large accumulated `count` is drained over multiple bounded passes
-        // rather than one unbounded one.
-        while total_granted < count as usize && !iter_exhausted && !capacity_exhausted {
+        // rather than one unbounded one. The per-invocation scan budget
+        // (`budget_exhausted`) additionally bounds total keys walked across all
+        // passes, so a queue whose front is millions of non-grantable keys yields
+        // after bounded work instead of walking the whole backlog in one call.
+        while total_granted < count as usize
+            && !iter_exhausted
+            && !capacity_exhausted
+            && !budget_exhausted
+        {
             let needed = (count as usize - total_granted).min(self.grant_scanner_batch_size);
 
             let mut batch = WriteBatch::new();
@@ -1707,6 +1745,12 @@ impl ConcurrencyManager {
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
             while scanned.len() < needed {
+                if scanned_this_invocation >= self.grant_scanner_max_scan_per_invocation {
+                    // Yield mid-scan: commit this pass's accumulated edits below
+                    // and let the outer guard end the invocation.
+                    budget_exhausted = true;
+                    break;
+                }
                 let kv = match iter.next().await {
                     Ok(Some(kv)) => kv,
                     Ok(None) => {
@@ -1719,6 +1763,7 @@ impl ConcurrencyManager {
                         break;
                     }
                 };
+                scanned_this_invocation += 1;
 
                 let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
                     tracing::warn!(queue = %queue, "grant scanner: malformed request key, deleting");
@@ -2136,7 +2181,23 @@ impl ConcurrencyManager {
             }
 
             total_granted += grants.len();
+            total_stale_deleted += stale_and_corrupt_count;
             all_granted_groups.extend(grants.into_iter().map(|(_, tg)| tg));
+        }
+
+        // No silent cap: surface invocations that yielded on the scan budget so
+        // a queue needing many cycles to drain a huge non-grantable front is
+        // visible rather than looking fully drained.
+        if budget_exhausted {
+            tracing::debug!(
+                tenant = %tenant,
+                queue = %queue,
+                requested = count,
+                scanned = scanned_this_invocation,
+                stale_deleted = total_stale_deleted,
+                total_granted,
+                "grant scanner: hit per-invocation scan budget; yielding, will re-drive next cycle"
+            );
         }
 
         all_granted_groups
