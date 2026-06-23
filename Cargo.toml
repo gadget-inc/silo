@@ -145,6 +145,10 @@ name = "job_shard_throughput"
 harness = false
 
 [[bench]]
+name = "noisy_neighbor_throughput"
+harness = false
+
+[[bench]]
 name = "query_performance"
 harness = false
 required-features = ["server"]
