@@ -30,8 +30,8 @@ use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShard;
 use silo::settings::{Backend, DatabaseConfig};
 use silo::shard_range::ShardRange;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 // ---- Workload knobs (override via env for quick tuning) ----
@@ -172,7 +172,10 @@ fn spawn_drain_workers(
             tokio::spawn(async move {
                 let worker_id = format!("{group}-w{w}");
                 while !stop.load(Ordering::Relaxed) {
-                    let result = shard.dequeue(&worker_id, group, batch).await.expect("dequeue");
+                    let result = shard
+                        .dequeue(&worker_id, group, batch)
+                        .await
+                        .expect("dequeue");
                     if result.tasks.is_empty() {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                         continue;
@@ -180,7 +183,10 @@ fn spawn_drain_workers(
                     for t in &result.tasks {
                         let tid = t.attempt().task_id().to_string();
                         shard
-                            .report_attempt_outcome(&tid, AttemptOutcome::Success { result: Vec::new() })
+                            .report_attempt_outcome(
+                                &tid,
+                                AttemptOutcome::Success { result: Vec::new() },
+                            )
                             .await
                             .expect("report");
                         counter.fetch_add(1, Ordering::Relaxed);
@@ -203,7 +209,14 @@ async fn measure_drain(
     let counter = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
-    let handles = spawn_drain_workers(shard, group, num_workers, batch, Arc::clone(&counter), Arc::clone(&stop));
+    let handles = spawn_drain_workers(
+        shard,
+        group,
+        num_workers,
+        batch,
+        Arc::clone(&counter),
+        Arc::clone(&stop),
+    );
 
     while counter.load(Ordering::Relaxed) < b_total {
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -241,7 +254,9 @@ async fn scenario_noisy(
 
     let a_total = enqueue_tenant(&shard, "tenant-a", "group-a", a_queues, a_depth, now).await;
     let b_total = enqueue_tenant(&shard, "tenant-b", "group-b", b_queues, b_depth, now).await;
-    println!("  (tenant A backlog: {a_total} jobs across {a_queues} queues; tenant B: {b_total} jobs)");
+    println!(
+        "  (tenant A backlog: {a_total} jobs across {a_queues} queues; tenant B: {b_total} jobs)"
+    );
 
     // Start tenant A's churn and let it ramp before timing B, so the scanner is
     // already under sustained load when B begins draining.
