@@ -622,37 +622,16 @@ impl ConcurrencyCounts {
         self.pending_reconciliations.lock().unwrap().len()
     }
 
-    /// Snapshot every hydrated (tenant, queue) and its current in-memory
-    /// holder count. Used by the reconciler tick to compute drift against
-    /// the durable holder rows for each queue.
+    /// Snapshot every hydrated (tenant, queue) and the full set of in-memory
+    /// holder task_ids. Used by the self-healing drift pass to compute both the
+    /// exact ghost set (in-memory holders with no durable row) and the
+    /// per-queue drift count (`.len()` of the returned set).
     ///
     /// `NotHydrated` and `Hydrating` queues are intentionally skipped: we
     /// haven't loaded their durable rows yet, so comparing in-memory (empty)
-    /// against durable (unknown) is meaningless.
-    pub fn hydrated_queue_holders_snapshot(&self) -> Vec<(String, String, usize)> {
-        let mut out = Vec::new();
-        for entry in self.queues.iter() {
-            if !matches!(entry.state, HydrationState::Hydrated) {
-                continue;
-            }
-            let (tenant_arc, queue_arc) = entry.key();
-            out.push((
-                tenant_arc.to_string(),
-                queue_arc.to_string(),
-                entry.holders.len(),
-            ));
-        }
-        out
-    }
-
-    /// Snapshot every hydrated (tenant, queue) and the full set of in-memory
-    /// holder task_ids. Used by the self-healing drift pass to compute the
-    /// exact ghost set (in-memory holders with no durable row) rather than
-    /// just a count delta.
-    ///
-    /// Same hydration filter as `hydrated_queue_holders_snapshot`. The
-    /// DashMap entry guard is dropped before the caller does any `.await`
-    /// (the returned `HashSet`s are owned clones).
+    /// against durable (unknown) is meaningless. The DashMap entry guard is
+    /// dropped before the caller does any `.await` (the returned `HashSet`s
+    /// are owned clones).
     pub fn hydrated_queue_holders_with_ids(&self) -> Vec<(String, String, HashSet<String>)> {
         let mut out = Vec::new();
         for entry in self.queues.iter() {
@@ -921,11 +900,11 @@ impl ConcurrencyManager {
             // Cap total keys walked per invocation at a small multiple of the
             // per-pass batch so a giant non-grantable backlog yields after a
             // bounded walk and round-robins with other queues, while still
-            // allowing several full passes of real draining per cycle. Clamp to
-            // `>= batch_size` so at least one full pass always runs.
-            grant_scanner_max_scan_per_invocation: (grant_scanner_batch_size.max(1))
-                .saturating_mul(4)
-                .max(grant_scanner_batch_size.max(1)),
+            // allowing several full passes of real draining per cycle. `×4` is
+            // inherently `>= batch_size`, so at least one full pass always runs.
+            grant_scanner_max_scan_per_invocation: grant_scanner_batch_size
+                .max(1)
+                .saturating_mul(4),
             ghost_candidates: Mutex::new(HashMap::new()),
         }
     }
