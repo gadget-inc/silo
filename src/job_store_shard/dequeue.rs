@@ -11,6 +11,7 @@ use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned, now_epoch_ms};
+use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
     attempt_key, concurrency_holder_key, job_info_key, job_status_key, leased_task_key,
@@ -199,84 +200,6 @@ impl Drop for PendingGrantGuard<'_> {
         tracing::warn!(
             count = pending.len(),
             "dequeue future dropped/panicked with pending concurrency grants; queueing reconciliation"
-        );
-        for (tenant, queue, task_id) in pending {
-            self.concurrency
-                .request_reconciliation(tenant, queue, task_id);
-        }
-    }
-}
-
-/// RAII guard over durable concurrency holders that the iteration's batch
-/// has staged for deletion, paired with an in-memory `atomic_release` +
-/// `request_grant` that the dequeue body runs post-commit.
-///
-/// **Why this exists.** When `handle_run_attempt` finds a task whose
-/// `job_info` is missing (migration/cleanup race), it adds the durable
-/// holder-row delete to the batch and queues a matching in-memory release.
-/// `write_with_options(... await_durable: true)` applies the batch to the
-/// WAL on first poll, so by the time the await yields, the durable row may
-/// already be gone — but the post-commit `atomic_release` loop only runs if
-/// the await resolves cleanly. Cancellation mid-await leaves durable=0,
-/// in_memory=1: a ghost holder that wedges the queue (the prod 300/300 bug).
-///
-/// **What it does.** Same shape as [`PendingGrantGuard`]. On normal exit the
-/// dequeue body calls `take_all()` to run the in-memory release loop itself.
-/// If the future is dropped or panics, Drop enqueues each tuple for the
-/// reconciler, which point-looks-up the durable holder row to decide
-/// whether to release the in-memory entry (the WAL apply landed) or leave
-/// it alone (the WAL apply did not). Per-task_id, idempotent, correct in
-/// both branches of the ambiguity.
-struct PendingHolderReleaseGuard<'a> {
-    concurrency: &'a ConcurrencyManager,
-    pending: Option<Vec<(String, String, String)>>,
-}
-
-impl<'a> PendingHolderReleaseGuard<'a> {
-    fn new(concurrency: &'a ConcurrencyManager) -> Self {
-        Self {
-            concurrency,
-            pending: Some(Vec::new()),
-        }
-    }
-
-    fn extend<I: IntoIterator<Item = (String, String, String)>>(&mut self, iter: I) {
-        if let Some(v) = self.pending.as_mut() {
-            v.extend(iter);
-        }
-    }
-
-    /// Drain and return the current pending releases while leaving the guard
-    /// armed (with an empty buffer) for the next iteration. Used on the
-    /// commit-success path so the dequeue body runs the existing
-    /// `atomic_release` + `request_grant` loop itself.
-    fn take_all(&mut self) -> Vec<(String, String, String)> {
-        self.pending
-            .as_mut()
-            .map(std::mem::take)
-            .unwrap_or_default()
-    }
-
-    /// Neutralize the guard. Used at terminal exit paths (commit-failure /
-    /// dequeue Ok return). On commit-failure the caller discards the
-    /// returned vec: the batch didn't land so the durable holder is still
-    /// there and the in-memory state is already correct.
-    fn disarm(&mut self) -> Vec<(String, String, String)> {
-        self.pending.take().unwrap_or_default()
-    }
-}
-
-impl Drop for PendingHolderReleaseGuard<'_> {
-    fn drop(&mut self) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        if pending.is_empty() {
-            return;
-        }
-        tracing::warn!(
-            count = pending.len(),
-            "dequeue future dropped/panicked with pending holder releases; queueing reconciliation"
         );
         for (tenant, queue, task_id) in pending {
             self.concurrency

@@ -202,6 +202,14 @@ fn default_grant_scanner_buffer_size() -> usize {
     DEFAULT_GRANT_SCANNER_BUFFER_SIZE
 }
 
+/// Default for `grant_scanner_concurrency`: max per-queue `process_grants`
+/// passes the scanner runs concurrently when draining pending grants.
+pub const DEFAULT_GRANT_SCANNER_CONCURRENCY: usize = 8;
+
+fn default_grant_scanner_concurrency() -> usize {
+    DEFAULT_GRANT_SCANNER_CONCURRENCY
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -254,6 +262,13 @@ pub struct DatabaseTemplate {
     /// 64. Values below 1 are treated as 1.
     #[serde(default = "default_grant_scanner_buffer_size")]
     pub grant_scanner_buffer_size: usize,
+    /// Max per-queue `process_grants` passes the grant scanner runs concurrently
+    /// when draining pending grants. Each pending entry is a unique
+    /// (tenant, queue), so passes never share a gating queue; this bounds the
+    /// fan-out so peak memory stays proportional to this value. Defaults to 8.
+    /// Values below 1 are treated as 1.
+    #[serde(default = "default_grant_scanner_concurrency")]
+    pub grant_scanner_concurrency: usize,
     /// When set, jobs that finished successfully (Succeeded) have all of their
     /// associated KV records re-put with a SlateDB row TTL expiring this many
     /// seconds in the future. `None` (the default) disables the behaviour for
@@ -316,6 +331,7 @@ impl Default for DatabaseTemplate {
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
             grant_scanner_batch_size: default_grant_scanner_batch_size(),
             grant_scanner_buffer_size: default_grant_scanner_buffer_size(),
+            grant_scanner_concurrency: default_grant_scanner_concurrency(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
@@ -586,6 +602,10 @@ pub struct DatabaseConfig {
     /// `DatabaseTemplate::grant_scanner_buffer_size` for details. Defaults to 64.
     #[serde(default = "default_grant_scanner_buffer_size")]
     pub grant_scanner_buffer_size: usize,
+    /// Max per-queue `process_grants` passes the grant scanner runs concurrently.
+    /// See `DatabaseTemplate::grant_scanner_concurrency` for details. Defaults to 8.
+    #[serde(default = "default_grant_scanner_concurrency")]
+    pub grant_scanner_concurrency: usize,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
     /// `DatabaseTemplate::completed_job_expire_s` for details.
     #[serde(default)]
@@ -620,6 +640,7 @@ impl Default for DatabaseConfig {
             hydrate_all_at_startup: default_hydrate_all_at_startup(),
             grant_scanner_batch_size: default_grant_scanner_batch_size(),
             grant_scanner_buffer_size: default_grant_scanner_buffer_size(),
+            grant_scanner_concurrency: default_grant_scanner_concurrency(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             slatedb: None,

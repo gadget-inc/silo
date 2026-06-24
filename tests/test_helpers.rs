@@ -155,6 +155,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             hydrate_all_at_startup: false,
             grant_scanner_batch_size: silo::settings::DEFAULT_GRANT_SCANNER_BATCH_SIZE,
             grant_scanner_buffer_size: silo::settings::DEFAULT_GRANT_SCANNER_BUFFER_SIZE,
+            grant_scanner_concurrency: silo::settings::DEFAULT_GRANT_SCANNER_CONCURRENCY,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
         },

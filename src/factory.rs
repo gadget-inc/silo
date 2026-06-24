@@ -203,6 +203,7 @@ impl ShardFactory {
                         hydrate_all_at_startup: template.hydrate_all_at_startup,
                         grant_scanner_batch_size: template.grant_scanner_batch_size,
                         grant_scanner_buffer_size: template.grant_scanner_buffer_size,
+                        grant_scanner_concurrency: template.grant_scanner_concurrency,
                         completed_job_expire_s: template.completed_job_expire_s,
                         terminal_job_expire_s: template.terminal_job_expire_s,
                     },

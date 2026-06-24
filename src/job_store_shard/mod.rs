@@ -8,6 +8,7 @@ mod enqueue;
 mod expedite;
 mod floating;
 pub(crate) mod helpers;
+pub(crate) mod holder_release_guard;
 pub mod import;
 mod lease;
 mod lease_task;
@@ -109,6 +110,9 @@ pub struct OpenShardOptions {
     /// Max in-flight status lookups the grant scanner buffers per pass.
     /// Populated from `grant_scanner_buffer_size` in the database config.
     pub grant_scanner_buffer_size: usize,
+    /// Max per-queue `process_grants` passes the grant scanner runs concurrently.
+    /// Populated from `grant_scanner_concurrency` in the database config.
+    pub grant_scanner_concurrency: usize,
     /// When set, jobs that reach Succeeded have their associated KV records
     /// re-put with a SlateDB row TTL of this many seconds. `None` disables
     /// the feature for successful jobs.
@@ -397,6 +401,7 @@ impl JobStoreShard {
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
                 grant_scanner_batch_size: cfg.grant_scanner_batch_size,
                 grant_scanner_buffer_size: cfg.grant_scanner_buffer_size,
+                grant_scanner_concurrency: cfg.grant_scanner_concurrency,
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
             },
@@ -439,6 +444,7 @@ impl JobStoreShard {
             hydrate_all_at_startup,
             grant_scanner_batch_size,
             grant_scanner_buffer_size,
+            grant_scanner_concurrency,
             completed_job_expire_s,
             terminal_job_expire_s,
         } = options;
@@ -508,6 +514,7 @@ impl JobStoreShard {
             hydrate_all_at_startup,
             grant_scanner_batch_size,
             grant_scanner_buffer_size,
+            grant_scanner_concurrency,
         ));
 
         // Eagerly hydrate the in-memory holders cache from durable storage so
@@ -1160,6 +1167,16 @@ impl JobStoreShard {
         self.concurrency
             .reconcile_pending_holders(&self.db, &range)
             .await
+    }
+
+    /// Test-only: run one self-healing drift pass. Walks hydrated queues,
+    /// compares the in-memory holder set to durable rows, and enqueues any
+    /// ghosts (in-memory holders with no durable row) for reconciliation.
+    /// Callers typically follow with `reconcile_pending_holders_for_test` to
+    /// drive the actual release.
+    pub async fn report_holder_drift_for_test(&self) {
+        let range = self.get_range();
+        self.concurrency.report_holder_drift(&self.db, &range).await
     }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.

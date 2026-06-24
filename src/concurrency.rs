@@ -50,7 +50,7 @@ use slatedb::config::WriteOptions;
 
 use crate::instrumented_db::InstrumentedDb;
 
-use crate::job_store_shard::counters::encode_counter;
+use crate::job_store_shard::counters::{decode_counter, encode_counter};
 use crate::job_store_shard::helpers::WriteBatcher;
 
 use crate::codec::{
@@ -63,9 +63,9 @@ use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
     concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
-    concurrency_requester_counter_key, concurrency_requests_prefix, end_bound,
-    floating_limit_state_key, job_info_key, job_status_key, parse_concurrency_holder_key,
-    parse_concurrency_request_key, task_key,
+    concurrency_requester_counter_key, end_bound, floating_limit_state_key, job_info_key,
+    job_status_key, parse_concurrency_holder_key, parse_concurrency_request_key,
+    parse_concurrency_requester_counter_key, task_key,
 };
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
@@ -622,14 +622,17 @@ impl ConcurrencyCounts {
         self.pending_reconciliations.lock().unwrap().len()
     }
 
-    /// Snapshot every hydrated (tenant, queue) and its current in-memory
-    /// holder count. Used by the reconciler tick to compute drift against
-    /// the durable holder rows for each queue.
+    /// Snapshot every hydrated (tenant, queue) and the full set of in-memory
+    /// holder task_ids. Used by the self-healing drift pass to compute both the
+    /// exact ghost set (in-memory holders with no durable row) and the
+    /// per-queue drift count (`.len()` of the returned set).
     ///
     /// `NotHydrated` and `Hydrating` queues are intentionally skipped: we
     /// haven't loaded their durable rows yet, so comparing in-memory (empty)
-    /// against durable (unknown) is meaningless.
-    pub fn hydrated_queue_holders_snapshot(&self) -> Vec<(String, String, usize)> {
+    /// against durable (unknown) is meaningless. The DashMap entry guard is
+    /// dropped before the caller does any `.await` (the returned `HashSet`s
+    /// are owned clones).
+    pub fn hydrated_queue_holders_with_ids(&self) -> Vec<(String, String, HashSet<String>)> {
         let mut out = Vec::new();
         for entry in self.queues.iter() {
             if !matches!(entry.state, HydrationState::Hydrated) {
@@ -639,7 +642,7 @@ impl ConcurrencyCounts {
             out.push((
                 tenant_arc.to_string(),
                 queue_arc.to_string(),
-                entry.holders.len(),
+                entry.holders.clone(),
             ));
         }
         out
@@ -832,7 +835,43 @@ pub struct ConcurrencyManager {
     /// Configurable via `grant_scanner_buffer_size` (default 64); stored
     /// already clamped to `>= 1`.
     grant_scanner_buffer_size: usize,
+    /// Max number of per-queue `process_grants` passes run concurrently when
+    /// draining `pending_grants`. Each entry in `work` is a unique
+    /// `(tenant, queue)`, so no two in-flight passes share a gating queue; this
+    /// bounds the `.buffered(...)` fan-out over those passes (order-preserving,
+    /// for DST determinism) so peak memory stays `N × per-pass`. Configurable
+    /// via `grant_scanner_concurrency` (default 8); stored already clamped to
+    /// `>= 1` (`.buffered(0)` is invalid).
+    grant_scanner_concurrency: usize,
+    /// Max number of pending-request keys a single `process_grants` invocation
+    /// will walk across all of its passes before committing what it found and
+    /// returning — even if neither capacity nor the iterator is exhausted. This
+    /// bounds the cost one queue can impose per scanner cycle so a single queue
+    /// with a huge backlog of non-grantable keys (holder-orphan / stale-request
+    /// shape) can't pin a `.buffered` slot and starve every other tenant's queue
+    /// on the shard. The queue is re-driven on the next cycle (its requester
+    /// counter is still non-zero), making bounded forward progress from the
+    /// front each time. Derived from `grant_scanner_batch_size` (a small
+    /// multiple) in `new`; always `>= grant_scanner_batch_size` so every
+    /// invocation can run at least one full pass.
+    grant_scanner_max_scan_per_invocation: usize,
+    /// Consecutive-pass observation counts for drift-detected ghost
+    /// candidates, keyed by (tenant, queue, task_id). Maintained only by
+    /// `report_holder_drift` (a single periodic task). Rebuilt each pass from
+    /// the current ghost set, so it is bounded by the current ghost +
+    /// in-flight-reservation count and self-prunes when a candidate gains a
+    /// durable row or is released. See `GHOST_CONFIRM_PASSES`.
+    ghost_candidates: Mutex<HashMap<(String, String, String), u32>>,
 }
+
+/// A drift-detected ghost must be observed as a ghost in this many
+/// *consecutive* `report_holder_drift` passes before it is enqueued for
+/// release. A true ghost (a dropped-future leak) is permanent and survives
+/// every pass; an in-flight reservation (`try_reserve_internal` inserts into
+/// the in-memory holder set before its durable write commits) clears within
+/// one reconcile interval, so a value of 2 excludes those false positives.
+/// Bump to debounce harder.
+const GHOST_CONFIRM_PASSES: u32 = 2;
 
 impl ConcurrencyManager {
     pub fn new(
@@ -841,6 +880,7 @@ impl ConcurrencyManager {
         hydrate_all_at_startup: bool,
         grant_scanner_batch_size: usize,
         grant_scanner_buffer_size: usize,
+        grant_scanner_concurrency: usize,
     ) -> Self {
         Self {
             shard: shard.into(),
@@ -856,6 +896,16 @@ impl ConcurrencyManager {
             // `.buffered(0)` is invalid.
             grant_scanner_batch_size: grant_scanner_batch_size.max(1),
             grant_scanner_buffer_size: grant_scanner_buffer_size.max(1),
+            grant_scanner_concurrency: grant_scanner_concurrency.max(1),
+            // Cap total keys walked per invocation at a small multiple of the
+            // per-pass batch so a giant non-grantable backlog yields after a
+            // bounded walk and round-robins with other queues, while still
+            // allowing several full passes of real draining per cycle. `×4` is
+            // inherently `>= batch_size`, so at least one full pass always runs.
+            grant_scanner_max_scan_per_invocation: grant_scanner_batch_size
+                .max(1)
+                .saturating_mul(4),
+            ghost_candidates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1286,25 +1336,52 @@ impl ConcurrencyManager {
     }
 
     /// Walk every hydrated (tenant, queue) in this shard, compare the
-    /// in-memory holder count to the durable holder count (one ranged scan
-    /// per queue), and publish:
+    /// in-memory holder set to the durable holder set (one ranged scan per
+    /// queue), and:
     ///
-    /// * `silo_concurrency_holder_drift` — Σ |in_mem - durable| across hydrated queues
-    /// * `silo_concurrency_reconciliation_pending` — current size of the
-    ///   per-task_id reconciliation queue (stuck-reconciler signal)
+    /// 1. **Self-heal ghosts.** An in-memory holder with no durable row is a
+    ///    ghost candidate (the wedge bug — an in-memory reservation that
+    ///    survived after its durable holder was deleted). Candidates must be
+    ///    observed in `GHOST_CONFIRM_PASSES` *consecutive* passes (tracked in
+    ///    `ghost_candidates`) before being enqueued via `request_reconciliation`
+    ///    / `reconcile_pending_holders`. This recovers ghosts regardless of how
+    ///    they formed (e.g. a handler that releases in-memory state outside a
+    ///    `PendingHolderReleaseGuard`).
+    ///
+    ///    **Two-stage false-positive guard.** The per-`task_id` durable
+    ///    re-check in `reconcile_pending_holders` guards against the snapshot
+    ///    racing a holder *delete* (the original ghost case). But it cannot
+    ///    distinguish a true ghost from an in-flight reservation:
+    ///    `process_grants` calls `try_reserve_internal` (which inserts into the
+    ///    in-memory holder set) *before* its durable holder write commits, so a
+    ///    just-reserved-not-yet-durable slot looks identical to a ghost to a
+    ///    point-in-time `db.get`. Releasing it would over-grant the queue. The
+    ///    consecutive-pass requirement closes that gap: an in-flight reservation
+    ///    commits within milliseconds — far inside one `concurrency_reconcile_interval`
+    ///    — so it never survives to a second pass, whereas a real ghost is
+    ///    permanent and survives every pass.
+    /// 2. **Publish metrics** (only when metrics are enabled):
+    ///    * `silo_concurrency_holder_drift` — Σ |in_mem - durable| across hydrated queues
+    ///    * `silo_concurrency_reconciliation_pending` — current size of the
+    ///      per-task_id reconciliation queue (stuck-reconciler signal)
     ///
     /// Called from the periodic reconciler's tick (NOT from the reactive
     /// sub-tick wake) — keeps the cost amortized at the deployment-configured
     /// `concurrency_reconcile_interval` rather than firing on every dropped
-    /// dequeue future. Noop if metrics are disabled.
+    /// dequeue future. Self-healing runs even when metrics are disabled.
     pub async fn report_holder_drift(&self, db: &Arc<InstrumentedDb>, range: &ShardRange) {
-        let Some(metrics) = self.metrics.as_ref() else {
-            // Always publish the pending gauge if metrics are present; if not, skip everything.
-            return;
+        // Take the previous pass's ghost-candidate counts and rebuild a fresh
+        // map from this pass. Held outside the per-queue `.await` scans below
+        // (the lock must never span an await). A candidate absent from this
+        // pass (durable row appeared, or it was released) simply drops out.
+        let prev_candidates = {
+            let mut g = self.ghost_candidates.lock().unwrap();
+            std::mem::take(&mut *g)
         };
+        let mut next_candidates: HashMap<(String, String, String), u32> = HashMap::new();
 
         let mut drift_total: u64 = 0;
-        for (tenant, queue, in_mem_count) in self.counts.hydrated_queue_holders_snapshot() {
+        for (tenant, queue, in_mem_holders) in self.counts.hydrated_queue_holders_with_ids() {
             if !range.contains_tenant(&tenant) {
                 continue;
             }
@@ -1327,10 +1404,14 @@ impl ConcurrencyManager {
                     continue;
                 }
             };
-            let mut durable_count: usize = 0;
+            let mut durable_ids: HashSet<String> = HashSet::new();
             loop {
                 match iter.next().await {
-                    Ok(Some(_)) => durable_count += 1,
+                    Ok(Some(kv)) => {
+                        if let Some(parsed) = parse_concurrency_holder_key(&kv.key) {
+                            durable_ids.insert(parsed.task_id);
+                        }
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         tracing::debug!(
@@ -1343,14 +1424,45 @@ impl ConcurrencyManager {
                     }
                 }
             }
-            drift_total += (in_mem_count as i64 - durable_count as i64).unsigned_abs();
+
+            drift_total += (in_mem_holders.len() as i64 - durable_ids.len() as i64).unsigned_abs();
+
+            // Ghost candidates: in-memory holders with no durable row. Only
+            // enqueue for reconciliation once a candidate has survived
+            // `GHOST_CONFIRM_PASSES` consecutive passes — an in-flight
+            // reservation (durable write not yet committed) clears within one
+            // interval and so never reaches the threshold, while a real ghost
+            // is permanent. See this fn's doc comment for the full rationale.
+            for task_id in in_mem_holders.difference(&durable_ids) {
+                let key = (tenant.clone(), queue.clone(), task_id.clone());
+                let seen = prev_candidates
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                if seen >= GHOST_CONFIRM_PASSES {
+                    self.request_reconciliation(tenant.clone(), queue.clone(), task_id.clone());
+                }
+                // Saturate at the threshold so a long-lived ghost the
+                // reconciler keeps re-queueing doesn't grow the count
+                // unboundedly; re-enqueuing each pass is harmless
+                // (`pending_reconciliations` dedups and release is idempotent).
+                next_candidates.insert(key, seen.min(GHOST_CONFIRM_PASSES));
+            }
         }
 
-        let pending = self.counts.pending_reconciliations_len() as u64;
-        metrics.set_concurrency_reconciler_signals(&self.shard, drift_total, pending);
+        {
+            let mut g = self.ghost_candidates.lock().unwrap();
+            *g = next_candidates;
+        }
+
+        if let Some(metrics) = self.metrics.as_ref() {
+            let pending = self.counts.pending_reconciliations_len() as u64;
+            metrics.set_concurrency_reconciler_signals(&self.shard, drift_total, pending);
+        }
     }
 
-    fn request_grant_count(&self, tenant: &str, queue: &str, count: u32) {
+    pub(crate) fn request_grant_count(&self, tenant: &str, queue: &str, count: u32) {
         let key = concurrency_counts_key(tenant, queue);
         {
             let mut pending = self.pending_grants.lock().unwrap();
@@ -1403,13 +1515,26 @@ impl ConcurrencyManager {
                         break;
                     }
 
-                    let mut granted_groups: Vec<String> = Vec::new();
-                    for (_key, (tenant, queue, count)) in work {
-                        let groups = mgr
-                            .process_grants(&db, &range, &tenant, &queue, count)
-                            .await;
-                        granted_groups.extend(groups);
-                    }
+                    // Fan out across queues with bounded concurrency. Each
+                    // (tenant, queue) is unique in `work`, so no two in-flight
+                    // passes share a gating queue; downstream chain-resumer
+                    // reservations are gated atomically by the per-key DashMap
+                    // guard. `buffered` (order-preserving) keeps collected order
+                    // deterministic against the BTreeMap iteration order for DST.
+                    let granted: Vec<Vec<String>> = futures::stream::iter(work.into_values())
+                        .map(|(tenant, queue, count)| {
+                            let mgr = Arc::clone(&mgr);
+                            let db = Arc::clone(&db);
+                            let range = range.clone();
+                            async move {
+                                mgr.process_grants(&db, &range, &tenant, &queue, count)
+                                    .await
+                            }
+                        })
+                        .buffered(mgr.grant_scanner_concurrency)
+                        .collect()
+                        .await;
+                    let granted_groups: Vec<String> = granted.into_iter().flatten().collect();
 
                     // Wake only the brokers whose task groups received grants
                     if !granted_groups.is_empty() {
@@ -1426,12 +1551,24 @@ impl ConcurrencyManager {
         self.grant_notify.notify_one();
     }
 
-    /// Scan all pending concurrency requests and trigger grants for each queue.
+    /// Scan the per-queue requester counters and trigger grants for each queue
+    /// that has pending concurrency requests.
     ///
     /// This is used at grant-scanner startup and by the shard's periodic
     /// reconciliation task to self-heal from missed notifications.
+    ///
+    /// Rather than scanning the entire `CONCURRENCY_REQUEST` keyspace (tens of
+    /// millions of keys on a busy shard) we iterate the
+    /// `COUNTER_CONCURRENCY_REQUESTERS` counters, which are maintained
+    /// co-committed with request creation (`append_request_edits`) and
+    /// decremented on grant/cancel — a bounded set of ~one row per active
+    /// (tenant, queue). The counter is a safe over-estimate: `process_grants`
+    /// re-validates the real pending requests, so a stale-positive counter just
+    /// wakes the scanner for a queue that grants nothing. It will not
+    /// under-report newly created work because the increment lands in the same
+    /// write batch as the request row.
     pub async fn reconcile_pending_requests(&self, db: &InstrumentedDb, range: &ShardRange) {
-        let start = concurrency_requests_prefix();
+        let start = vec![crate::keys::prefix::COUNTER_CONCURRENCY_REQUESTERS];
         let end = end_bound(&start);
         let mut iter = match db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options_uncached())
@@ -1441,14 +1578,12 @@ impl ConcurrencyManager {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "grant scanner: failed to scan requests during reconciliation"
+                    "grant scanner: failed to scan requester counters during reconciliation"
                 );
                 return;
             }
         };
 
-        // Count pending requests per (tenant, queue)
-        let mut queue_counts: BTreeMap<Vec<u8>, (String, String, u32)> = BTreeMap::new();
         loop {
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
@@ -1462,7 +1597,7 @@ impl ConcurrencyManager {
                 }
             };
 
-            let Some(parsed) = parse_concurrency_request_key(&kv.key) else {
+            let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key) else {
                 continue;
             };
 
@@ -1471,16 +1606,10 @@ impl ConcurrencyManager {
                 continue;
             }
 
-            let key = concurrency_counts_key(&parsed.tenant, &parsed.queue);
-            let entry = queue_counts
-                .entry(key)
-                .or_insert_with(|| (parsed.tenant.clone(), parsed.queue.clone(), 0));
-            entry.2 += 1;
-        }
-
-        // Trigger grants for each queue with pending requests
-        for (_key, (tenant, queue, count)) in queue_counts {
-            self.request_grant_count(&tenant, &queue, count);
+            let count = decode_counter(&kv.value);
+            if count > 0 {
+                self.request_grant_count(&parsed.tenant, &parsed.queue, count as u32);
+            }
         }
     }
 
@@ -1557,6 +1686,17 @@ impl ConcurrencyManager {
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
+        // Per-invocation scan budget. Total request keys walked
+        // across all passes (valid, stale, and corrupt — the walk cost is what
+        // we bound). When it reaches `grant_scanner_max_scan_per_invocation` the
+        // call commits what it found and returns even if capacity/iterator are
+        // not exhausted, so a single queue with a huge non-grantable front
+        // cannot starve other tenants' queues sharing the `.buffered` fan-out.
+        // The queue is re-driven next cycle (its requester counter is still
+        // non-zero), making bounded forward progress from the front each time.
+        let mut scanned_this_invocation: usize = 0;
+        let mut total_stale_deleted: usize = 0;
+        let mut budget_exhausted = false;
         let chain_resumer = self.chain_resumer();
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
@@ -1566,8 +1706,15 @@ impl ConcurrencyManager {
         // are cleaned up along the way. Bounding per-pass scan size caps peak memory
         // (the scanned Vec, buffered status results, and WriteBatch all scale with it),
         // so a large accumulated `count` is drained over multiple bounded passes
-        // rather than one unbounded one.
-        while total_granted < count as usize && !iter_exhausted && !capacity_exhausted {
+        // rather than one unbounded one. The per-invocation scan budget
+        // (`budget_exhausted`) additionally bounds total keys walked across all
+        // passes, so a queue whose front is millions of non-grantable keys yields
+        // after bounded work instead of walking the whole backlog in one call.
+        while total_granted < count as usize
+            && !iter_exhausted
+            && !capacity_exhausted
+            && !budget_exhausted
+        {
             let needed = (count as usize - total_granted).min(self.grant_scanner_batch_size);
 
             let mut batch = WriteBatch::new();
@@ -1577,6 +1724,12 @@ impl ConcurrencyManager {
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
             while scanned.len() < needed {
+                if scanned_this_invocation >= self.grant_scanner_max_scan_per_invocation {
+                    // Yield mid-scan: commit this pass's accumulated edits below
+                    // and let the outer guard end the invocation.
+                    budget_exhausted = true;
+                    break;
+                }
                 let kv = match iter.next().await {
                     Ok(Some(kv)) => kv,
                     Ok(None) => {
@@ -1589,6 +1742,7 @@ impl ConcurrencyManager {
                         break;
                     }
                 };
+                scanned_this_invocation += 1;
 
                 let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
                     tracing::warn!(queue = %queue, "grant scanner: malformed request key, deleting");
@@ -2006,7 +2160,23 @@ impl ConcurrencyManager {
             }
 
             total_granted += grants.len();
+            total_stale_deleted += stale_and_corrupt_count;
             all_granted_groups.extend(grants.into_iter().map(|(_, tg)| tg));
+        }
+
+        // No silent cap: surface invocations that yielded on the scan budget so
+        // a queue needing many cycles to drain a huge non-grantable front is
+        // visible rather than looking fully drained.
+        if budget_exhausted {
+            tracing::debug!(
+                tenant = %tenant,
+                queue = %queue,
+                requested = count,
+                scanned = scanned_this_invocation,
+                stale_deleted = total_stale_deleted,
+                total_granted,
+                "grant scanner: hit per-invocation scan budget; yielding, will re-drive next cycle"
+            );
         }
 
         all_granted_groups

@@ -13,6 +13,7 @@ use crate::job::{FloatingLimitState, JobStatus, JobView};
 use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
+use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
     attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_tenant_prefix,
@@ -410,6 +411,19 @@ impl JobStoreShard {
             batch.delete(concurrency_holder_key(&tenant, queue, task_id));
         }
 
+        // Cancellation safety: arm a guard with the in-memory releases that the
+        // post-commit loop will perform. If the request future is dropped
+        // around the `await_durable` commit below, the durable holder delete
+        // may land while the in-memory `atomic_release` never runs — a ghost
+        // holder. The guard's Drop enqueues each (tenant, queue, task_id) for
+        // the reconciler, which re-checks the durable row before releasing.
+        let mut release_guard = PendingHolderReleaseGuard::new(&self.concurrency);
+        release_guard.extend(
+            held_queues_local
+                .iter()
+                .map(|queue| (tenant.clone(), queue.clone(), task_id.to_string())),
+        );
+
         // Two-phase DST events: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.
         let write_op = dst_events::next_write_op();
@@ -446,6 +460,10 @@ impl JobStoreShard {
             .await
         {
             dst_events::cancel_write(write_op);
+            // Commit failed: the batch didn't land, so the durable holders are
+            // still present and the in-memory state is already correct. Disarm
+            // and discard — no reconciliation needed.
+            release_guard.disarm();
             // Rollback any grants made during retry scheduling
             for (queue, grant_task_id) in &retry_grants {
                 self.concurrency
@@ -458,20 +476,22 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
 
-        // Post-commit: release in-memory concurrency counts and signal grant scanner.
-        for queue in &held_queues_local {
+        // Post-commit: release in-memory concurrency counts and signal grant
+        // scanner. Drain the guard (leaving it armed-but-empty so its Drop is a
+        // no-op) and run the release loop ourselves now that the commit landed.
+        for (release_tenant, queue, release_task_id) in release_guard.take_all() {
             let span = info_span!(
                 "concurrency.release",
                 queue = %queue,
-                finished_task_id = %task_id
+                finished_task_id = %release_task_id
             );
             let _g = span.enter();
             debug!("released ticket for finished task");
 
             self.concurrency
                 .counts()
-                .atomic_release(&tenant, queue, task_id);
-            self.concurrency.request_grant(&tenant, queue);
+                .atomic_release(&release_tenant, &queue, &release_task_id);
+            self.concurrency.request_grant(&release_tenant, &queue);
         }
         // If we scheduled a follow-up that is ready now, wake the scanner
         if let Some(nt) = followup_next_time
