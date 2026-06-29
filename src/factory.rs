@@ -87,7 +87,10 @@ impl ShardFactory {
         Self {
             instances: DashMap::new(),
             template: DatabaseTemplate {
-                path: "/noop".to_string(),
+                // A valid template path needs the %shard% placeholder at a path
+                // boundary. The root is unique per factory so the shared Memory
+                // store (the default backend) does not bleed across noop factories.
+                path: format!("noop-{}/%shard%", ShardId::new()),
                 apply_wal_on_close: false,
                 ..Default::default()
             },
@@ -744,6 +747,84 @@ impl ShardFactory {
         Ok(())
     }
 
+    /// Verify that each freshly cloned child holds the parent's full job set.
+    ///
+    /// A fresh SlateDB clone is a byte-for-byte copy of the parent, so
+    /// immediately after `clone_closed_shard` -- before post-commit cleanup
+    /// trims each child to its range -- every child's whole-shard `total_jobs`
+    /// must equal the parent's pre-close count. An empty or mis-placed child
+    /// (the object-store split data-loss signature) reads `0` and trips this
+    /// check, letting the split abort before the shard-map commit point.
+    ///
+    /// This is a manifest-landed tripwire keyed on the empty-child signature,
+    /// not a full row-integrity audit: a clone that landed the counter key but
+    /// corrupted rows would still pass.
+    pub async fn verify_cloned_children_match_parent(
+        &self,
+        parent_total_jobs: i64,
+        child_ids: &[ShardId],
+    ) -> Result<(), ShardFactoryError> {
+        for child_id in child_ids {
+            let child_total_jobs = self.read_cloned_shard_total_jobs(child_id).await?;
+            if child_total_jobs != parent_total_jobs {
+                return Err(ShardFactoryError::ChildVerification(format!(
+                    "cloned child {child_id} holds {child_total_jobs} jobs but parent held \
+                     {parent_total_jobs}; aborting split before commit to avoid data loss"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a freshly cloned child's database with the raw `open_with_resolved_store`
+    /// primitive, read its whole-shard `total_jobs`, and close it.
+    ///
+    /// Uses the raw open -- NOT `open` -- so the child is never registered in the
+    /// `instances` map: `open` caches the instance in the per-shard OnceCell, and
+    /// the post-commit `open(child)` would then return this stale pre-commit
+    /// handle instead of opening the committed child. Hydration is disabled and
+    /// `get_counters` reads a single merged counter key, so the check is O(1)
+    /// even on a multi-million-job shard.
+    async fn read_cloned_shard_total_jobs(
+        &self,
+        shard_id: &ShardId,
+    ) -> Result<i64, ShardFactoryError> {
+        let name = shard_id.to_string();
+        let (resolved, db_path) =
+            Self::resolve_at_root(&self.template.backend, &self.template.path, &name)?;
+        let wal_store = self.resolve_wal_store(&name)?;
+
+        let shard = JobStoreShard::open_with_resolved_store(
+            name.clone(),
+            &db_path,
+            OpenShardOptions {
+                store: resolved.store,
+                wal_store,
+                wal_close_config: None,
+                slatedb_settings: self.template.slatedb.clone(),
+                memory_cache: self.template.memory_cache.clone(),
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                metrics: self.metrics.clone(),
+                concurrency_reconcile_interval: Duration::from_millis(
+                    self.template.concurrency_reconcile_interval_ms.max(1),
+                ),
+                counter_reconciliation_seconds: None,
+                hydrate_all_at_startup: false,
+                grant_scanner_batch_size: self.template.grant_scanner_batch_size,
+                grant_scanner_buffer_size: self.template.grant_scanner_buffer_size,
+                grant_scanner_concurrency: self.template.grant_scanner_concurrency,
+                completed_job_expire_s: self.template.completed_job_expire_s,
+                terminal_job_expire_s: self.template.terminal_job_expire_s,
+            },
+            ShardRange::full(),
+        )
+        .await?;
+
+        let total_jobs = shard.get_counters().await?.total_jobs;
+        shard.close().await?;
+        Ok(total_jobs)
+    }
+
     /// Get the database template used by this factory.
     pub fn template(&self) -> &DatabaseTemplate {
         &self.template
@@ -766,6 +847,9 @@ impl std::fmt::Display for CloseAllError {
 pub enum ShardFactoryError {
     #[error("clone error: {0}")]
     CloneError(String),
+
+    #[error("child verification error: {0}")]
+    ChildVerification(String),
 
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),

@@ -506,6 +506,205 @@ async fn delete_object_store_shard_data_leaves_sibling_intact() {
     );
 }
 
+// --- post-split child verification tests ---
+
+/// A child that opens empty/short of the parent's job count is the object-store
+/// split data-loss signature. The pre-commit verification must detect it: a
+/// child whose whole-shard `total_jobs` differs from the parent's pre-close
+/// count fails verification so the split can abort before the shard-map commit.
+#[silo::test]
+async fn verify_cloned_children_detects_short_child() {
+    let factory = make_memory_factory();
+    let parent_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("only-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+    let parent_total = parent
+        .get_counters()
+        .await
+        .expect("parent counters")
+        .total_jobs;
+    assert_eq!(parent_total, 1);
+    parent.close().await.expect("close parent");
+
+    // A never-cloned child opens as an empty database -- total_jobs 0 -- exactly
+    // the empty-child symptom of the resolution bug. It must not match a parent
+    // that held one job.
+    let empty_child = ShardId::new();
+    let result = factory
+        .verify_cloned_children_match_parent(parent_total, &[empty_child])
+        .await;
+    assert!(
+        result.is_err(),
+        "an empty child must fail verification against a non-empty parent"
+    );
+}
+
+/// A successful clone -- each child a full copy of the parent -- must pass
+/// verification (no false positives), and the raw verification opens must not
+/// register the children in the factory's instance map. If they did, the
+/// post-commit `open(child)` would return the stale pre-commit handle.
+#[silo::test]
+async fn verify_cloned_children_accepts_full_clone_without_caching() {
+    let factory = make_memory_factory();
+    let parent_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("only-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+    let parent_total = parent
+        .get_counters()
+        .await
+        .expect("parent counters")
+        .total_jobs;
+    parent.close().await.expect("close parent");
+
+    factory
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .await
+        .expect("clone closed shard");
+
+    factory
+        .verify_cloned_children_match_parent(parent_total, &[left_child_id, right_child_id])
+        .await
+        .expect("full clones should pass verification");
+
+    // The raw verification open must leave no factory instance behind.
+    assert!(
+        !factory.owns_shard(&left_child_id),
+        "verification must not cache the left child in the instances map"
+    );
+    assert!(
+        !factory.owns_shard(&right_child_id),
+        "verification must not cache the right child in the instances map"
+    );
+    assert!(factory.get(&left_child_id).is_none());
+    assert!(factory.get(&right_child_id).is_none());
+
+    // The post-clone `open` returns a child that actually holds the parent's data
+    // (not a stale pre-commit handle).
+    let left_child = factory
+        .open(&left_child_id, &ShardRange::full())
+        .await
+        .expect("open left child after verification");
+    assert_eq!(
+        left_child
+            .get_counters()
+            .await
+            .expect("left counters")
+            .total_jobs,
+        parent_total,
+    );
+}
+
+/// When verification fails, the split aborts before touching the parent: the
+/// parent's data is untouched and the parent reopens with its full job set.
+/// (In the split state machine this maps to `PreCommitParentClosed`, which
+/// abandons the split and recovers the parent.)
+#[silo::test]
+async fn parent_reopens_intact_after_verification_mismatch() {
+    let factory = make_memory_factory();
+    let parent_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("survivor-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+    parent.close().await.expect("close parent");
+
+    factory
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .await
+        .expect("clone closed shard");
+
+    // Inject a mismatch by claiming the parent held more jobs than it did.
+    let result = factory
+        .verify_cloned_children_match_parent(99, &[left_child_id, right_child_id])
+        .await;
+    assert!(
+        result.is_err(),
+        "inflated parent count must fail verification"
+    );
+
+    // Recover the parent the way the split state machine does on a pre-commit
+    // abort: evict the stale closed factory entry, then reopen. The parent's
+    // data is untouched by the failed child verification, so it reopens intact.
+    factory
+        .close(&parent_id)
+        .await
+        .expect("evict stale parent entry");
+    let reopened = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("reopen parent after failed verification");
+    assert_eq!(
+        reopened
+            .get_counters()
+            .await
+            .expect("parent counters")
+            .total_jobs,
+        1,
+        "parent should retain its data after a failed split verification"
+    );
+    assert!(
+        reopened
+            .get_job("test-tenant", "survivor-job")
+            .await
+            .expect("get job from reopened parent")
+            .is_some(),
+        "parent should still contain its job after a failed split verification"
+    );
+}
+
 // --- template path validation tests ---
 
 #[silo::test]
