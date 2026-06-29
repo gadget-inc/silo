@@ -297,18 +297,27 @@ impl ShardFactory {
             Ok((resolved, shard_name.to_string()))
         } else {
             // Object store backends (Memory, S3, GCS, URL): resolve at the shared
-            // storage root (the prefix before the %shard% placeholder), symmetric
-            // with the local-FS branch. db_path is the bare shard name — a single
-            // relative segment under the shared root.
+            // storage root so a child's clone destination equals the path `open`
+            // reads for that child. When the template carries a %shard% (or
+            // {shard}) placeholder, the root is the prefix before it; otherwise the
+            // whole path is the root. db_path is always the bare shard name — a
+            // single relative segment under the shared root — so the (store,
+            // db_path) pair is identical between clone and open.
             //
             // This makes the parent store a correct shared ancestor of both
-            // children in clone_closed_shard, so a child's clone destination
-            // (<root>/<shard>) equals the path `open` later reads. Resolving the
-            // full per-shard path instead would root each shard at its own prefix
-            // (and double-nest as <root>/<shard>/<shard> for URL-style backends),
-            // leaving the clone unreachable from the child's open path.
-            let pos = Self::validate_template_path(template_path)?;
-            let root = template_path[..pos].trim_end_matches('/');
+            // children in clone_closed_shard. Resolving the full per-shard path
+            // instead would root each shard at its own prefix (and double-nest as
+            // <root>/<shard>/<shard> for URL-style backends), leaving the clone
+            // unreachable from the child's open path. Unlike the local-FS branch,
+            // this does not require the placeholder at a path boundary — object
+            // stores are key/value and impose no directory semantics.
+            let placeholder_pos = template_path
+                .find("%shard%")
+                .or_else(|| template_path.find("{shard}"));
+            let root = match placeholder_pos {
+                Some(pos) => template_path[..pos].trim_end_matches('/'),
+                None => template_path,
+            };
             let resolved = resolve_object_store(backend, root)?;
             Ok((resolved, shard_name.to_string()))
         }
