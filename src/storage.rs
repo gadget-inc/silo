@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use slatedb::object_store::ObjectStore;
+use slatedb::object_store::memory::InMemory;
 use slatedb::{Db, Error as SlateError};
 use std::fs;
 use std::path::Path;
@@ -8,6 +10,17 @@ use thiserror::Error;
 use url::Url;
 
 use crate::settings::Backend;
+
+/// Process-wide registry of in-memory stores keyed by root path.
+///
+/// `Backend::Memory` shards under the same root must share one `InMemory` so
+/// that multi-shard operations (clone/split, close-then-reopen) see each other's
+/// data, matching how a real object store behaves. Distinct roots stay isolated,
+/// so unrelated factories — each rooted at a unique path — do not bleed state.
+fn memory_store_registry() -> &'static Mutex<HashMap<String, Arc<InMemory>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<InMemory>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -54,11 +67,23 @@ pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedSto
                 root_path: canonical_str,
             })
         }
-        Backend::Memory => Ok(ResolvedStore {
-            store: Arc::new(slatedb::object_store::memory::InMemory::new()),
-            canonical_path: path.to_string(),
-            root_path: path.to_string(),
-        }),
+        Backend::Memory => {
+            let store = {
+                let mut registry = memory_store_registry()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Arc::clone(
+                    registry
+                        .entry(path.to_string())
+                        .or_insert_with(|| Arc::new(InMemory::new())),
+                )
+            };
+            Ok(ResolvedStore {
+                store,
+                canonical_path: path.to_string(),
+                root_path: path.to_string(),
+            })
+        }
         Backend::S3 | Backend::Gcs | Backend::Url => {
             // Interpret path as a URL understood by SlateDB's resolver, e.g. s3://bucket/prefix or gs://bucket/prefix
             let store = Db::resolve_object_store(path)?;

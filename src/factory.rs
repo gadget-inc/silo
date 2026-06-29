@@ -293,13 +293,21 @@ impl ShardFactory {
             let resolved = resolve_object_store(backend, root_path)?;
             Ok((resolved, shard_name.to_string()))
         } else {
-            // Object store backends (Memory, S3, GCS, URL): resolve full path
-            let full_path = template_path
-                .replace("%shard%", shard_name)
-                .replace("{shard}", shard_name);
-            let resolved = resolve_object_store(backend, &full_path)?;
-            let db_path = resolved.canonical_path.clone();
-            Ok((resolved, db_path))
+            // Object store backends (Memory, S3, GCS, URL): resolve at the shared
+            // storage root (the prefix before the %shard% placeholder), symmetric
+            // with the local-FS branch. db_path is the bare shard name — a single
+            // relative segment under the shared root.
+            //
+            // This makes the parent store a correct shared ancestor of both
+            // children in clone_closed_shard, so a child's clone destination
+            // (<root>/<shard>) equals the path `open` later reads. Resolving the
+            // full per-shard path instead would root each shard at its own prefix
+            // (and double-nest as <root>/<shard>/<shard> for URL-style backends),
+            // leaving the clone unreachable from the child's open path.
+            let pos = Self::validate_template_path(template_path)?;
+            let root = template_path[..pos].trim_end_matches('/');
+            let resolved = resolve_object_store(backend, root)?;
+            Ok((resolved, shard_name.to_string()))
         }
     }
 

@@ -22,6 +22,24 @@ fn make_fs_factory(tmp: &tempfile::TempDir) -> Arc<ShardFactory> {
     ))
 }
 
+/// Helper to create a Memory-backed factory rooted at a unique shared root.
+///
+/// All shards opened through this factory share one in-memory store, so
+/// multi-shard clone/open round-trips exercise the same shared-root path
+/// semantics as a real object store (GCS/S3).
+fn make_memory_factory() -> Arc<ShardFactory> {
+    let template = DatabaseTemplate {
+        backend: Backend::Memory,
+        path: format!("{}/%shard%", ShardId::new()),
+        ..Default::default()
+    };
+    Arc::new(ShardFactory::new(
+        template,
+        MockGubernatorClient::new_arc(),
+        None,
+    ))
+}
+
 /// Helper to create a filesystem-backed factory with separate WAL dir
 fn make_fs_factory_with_wal(
     data_tmp: &tempfile::TempDir,
@@ -336,6 +354,155 @@ async fn clone_closed_shard_with_split_wal() {
     assert_eq!(
         right_counters.total_jobs, 1,
         "right child should have the parent's job"
+    );
+}
+
+/// Regression guard for the object-store split data-loss bug.
+///
+/// On an object-store backend, parent and children must resolve under one
+/// shared storage root so a clone lands exactly where `open` later reads. When
+/// each shard instead gets its own store (or a double-nested path), the children
+/// open empty and the shard's data is silently lost. This drives the clone
+/// round-trip on the shared-root Memory backend and asserts each child holds the
+/// parent's full job set.
+#[silo::test]
+async fn clone_closed_shard_object_store_preserves_jobs() {
+    let factory = make_memory_factory();
+    let parent_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("cloned-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"cloned": true})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+
+    let parent_counters = parent.get_counters().await.expect("get parent counters");
+    assert_eq!(parent_counters.total_jobs, 1);
+
+    // Close parent (clone_closed_shard expects it to be closed)
+    parent.close().await.expect("close parent");
+
+    factory
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .await
+        .expect("clone closed shard");
+
+    // A fresh clone is a full byte-for-byte copy of the parent, so each child
+    // holds the parent's whole job set immediately after the split (cleanup
+    // trims each child to its range later).
+    let left_child = factory
+        .open(&left_child_id, &ShardRange::full())
+        .await
+        .expect("open left child");
+    assert_eq!(
+        left_child
+            .get_counters()
+            .await
+            .expect("get left child counters")
+            .total_jobs,
+        1,
+        "left child should have the parent's job"
+    );
+    assert!(
+        left_child
+            .get_job("test-tenant", "cloned-job")
+            .await
+            .expect("get job from left child")
+            .is_some(),
+        "left child should contain the parent's job"
+    );
+
+    let right_child = factory
+        .open(&right_child_id, &ShardRange::full())
+        .await
+        .expect("open right child");
+    assert_eq!(
+        right_child
+            .get_counters()
+            .await
+            .expect("get right child counters")
+            .total_jobs,
+        1,
+        "right child should have the parent's job"
+    );
+}
+
+/// `delete_shard_data` on an object-store backend must scope deletion to exactly
+/// one shard's prefix. Two shards share a single store root under the new
+/// resolution, so deleting one (via `reset`) must not touch a sibling whose
+/// prefix differs only by shard name.
+#[silo::test]
+async fn delete_object_store_shard_data_leaves_sibling_intact() {
+    let factory = make_memory_factory();
+    let shard_a = ShardId::new();
+    let shard_b = ShardId::new();
+
+    let a = factory
+        .open(&shard_a, &ShardRange::full())
+        .await
+        .expect("open shard a");
+    let b = factory
+        .open(&shard_b, &ShardRange::full())
+        .await
+        .expect("open shard b");
+
+    for (shard, job_id) in [(&a, "job-a"), (&b, "job-b")] {
+        shard
+            .enqueue(
+                "test-tenant",
+                Some(job_id.to_string()),
+                5,
+                test_helpers::now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue job");
+    }
+
+    // reset closes shard A, deletes its data via delete_shard_data, then reopens.
+    let a_reset = factory
+        .reset(&shard_a, &ShardRange::full())
+        .await
+        .expect("reset shard a");
+    assert_eq!(
+        a_reset.get_counters().await.expect("a counters").total_jobs,
+        0,
+        "reset shard A should be empty after its data is deleted"
+    );
+
+    // Sibling B shares the store root but its prefix differs by shard name, so
+    // deleting A must not have removed B's data.
+    assert_eq!(
+        b.get_counters().await.expect("b counters").total_jobs,
+        1,
+        "sibling shard B should keep its job after shard A's data is deleted"
+    );
+    assert!(
+        b.get_job("test-tenant", "job-b")
+            .await
+            .expect("get job from b")
+            .is_some(),
+        "sibling shard B should still contain its job"
     );
 }
 
