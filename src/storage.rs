@@ -17,6 +17,10 @@ use crate::settings::Backend;
 /// that multi-shard operations (clone/split, close-then-reopen) see each other's
 /// data, matching how a real object store behaves. Distinct roots stay isolated,
 /// so unrelated factories — each rooted at a unique path — do not bleed state.
+///
+/// Entries are never evicted: each distinct root holds its `InMemory` for the
+/// life of the process. This is acceptable because Memory is a dev/test-only
+/// backend; production deployments use S3/GCS and never reach this registry.
 fn memory_store_registry() -> &'static Mutex<HashMap<String, Arc<InMemory>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<InMemory>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))

@@ -820,9 +820,12 @@ impl ShardFactory {
         )
         .await?;
 
-        let total_jobs = shard.get_counters().await?.total_jobs;
+        // Always close the raw handle, even if the counter read fails, so the
+        // shard's SlateDB instance and its spawned background tasks (grant
+        // scanner, reconcilers) are released -- JobStoreShard has no Drop.
+        let counters = shard.get_counters().await;
         shard.close().await?;
-        Ok(total_jobs)
+        Ok(counters?.total_jobs)
     }
 
     /// Get the database template used by this factory.
