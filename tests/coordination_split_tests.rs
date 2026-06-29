@@ -5,7 +5,7 @@ use silo::coordination::SplitPhase;
 use silo::coordination::{Coordinator, EtcdCoordinator, ShardSplitter};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
-use silo::settings::{Backend, DatabaseTemplate};
+use silo::settings::{Backend, DatabaseTemplate, WalConfig};
 use silo::shard_range::ShardId;
 use tokio::sync::Mutex;
 
@@ -32,6 +32,27 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
             // Use Fs backend for split tests because SlateDB cloning requires a real object store
             backend: Backend::Fs,
             path: tmpdir.join("%shard%").to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    ))
+}
+
+/// Memory-backed factory for object-store split coverage: parent and children
+/// resolve under one shared store root, with a separate Memory WAL store per
+/// shard. The unique root (the test's unique prefix) keeps the process-global
+/// in-memory store from bleeding across test runs.
+fn make_memory_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
+    let root = format!("silo-split-mem-{}-{}", prefix, node_id);
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: format!("{root}/data/%shard%"),
+            wal: Some(WalConfig {
+                backend: Backend::Memory,
+                path: format!("{root}/wal/%shard%"),
+            }),
             ..Default::default()
         },
         MockGubernatorClient::new_arc(),
@@ -531,6 +552,125 @@ async fn execute_split_completes_full_cycle() {
         assert!(
             routed.id == split.left_child_id || routed.id == split.right_child_id,
             "tenant should route to one of the children"
+        );
+    }
+
+    c1.shutdown().await.unwrap();
+    let _ = h1.abort();
+}
+
+/// Drive a full split on the shared-root Memory backend (an object store, with a
+/// separate WAL store) and assert every enqueued job survives in the child that
+/// now owns its tenant's range. This is the object-store analogue of the
+/// local-FS full-cycle split -- the state-machine-level regression guard for the
+/// resolution data-loss bug, and proof the WAL + object-store split path opens
+/// children without "wal store reconfiguration unsupported".
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_split_preserves_jobs_on_object_store() {
+    let _guard = acquire_test_mutex().await;
+
+    let prefix = unique_prefix();
+    let num_shards: u32 = 1;
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let factory = make_memory_test_factory(&prefix, "n1");
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:7450",
+        num_shards,
+        10,
+        Arc::clone(&factory),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator");
+
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+
+    let shard_id = c1.owned_shards().await[0];
+
+    // Enqueue known jobs across several tenants into the parent before splitting.
+    let parent_range = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        shard_map.get_shard(&shard_id).unwrap().range.clone()
+    };
+    let parent = factory
+        .open(&shard_id, &parent_range)
+        .await
+        .expect("open parent shard");
+    let tenants = ["a", "b", "f", "m", "q", "t", "x", "z"];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for tenant in tenants {
+        parent
+            .enqueue(
+                tenant,
+                Some(format!("job-{tenant}")),
+                5,
+                now,
+                None,
+                rmp_serde::to_vec(&serde_json::json!({ "t": tenant })).unwrap(),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue to parent");
+    }
+    assert_eq!(
+        parent.get_counters().await.expect("counters").total_jobs,
+        tenants.len() as i64,
+    );
+
+    // Request and execute a balanced split.
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
+    let split_point = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        silo::shard_range::format_hash_boundary(
+            shard_map
+                .get_shard(&shard_id)
+                .unwrap()
+                .range
+                .midpoint()
+                .unwrap(),
+        )
+    };
+    let split = splitter
+        .request_split(shard_id, split_point)
+        .await
+        .expect("request split should succeed");
+    splitter
+        .execute_split(shard_id, || c1.get_shard_owner_map())
+        .await
+        .expect("execute split should succeed and preserve data");
+
+    // Every enqueued job must survive the split in the child that owns its
+    // tenant's range. Children open as full copies of the parent; post-commit
+    // cleanup only trims out-of-range rows, never the in-range job looked up
+    // here -- so this assertion is deterministic regardless of cleanup timing.
+    let shard_map = c1.get_shard_map().await.expect("get shard map after split");
+    for tenant in tenants {
+        let owner = shard_map
+            .shard_for_tenant(tenant)
+            .expect("tenant routes to a child");
+        assert!(
+            owner.id == split.left_child_id || owner.id == split.right_child_id,
+            "tenant {tenant} should route to one of the children",
+        );
+        let child = factory
+            .get(&owner.id)
+            .expect("child shard open after split");
+        assert!(
+            child
+                .get_job(tenant, &format!("job-{tenant}"))
+                .await
+                .expect("get_job")
+                .is_some(),
+            "job for tenant {tenant} must survive the split in its owning child",
         );
     }
 
