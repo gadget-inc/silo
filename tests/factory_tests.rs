@@ -40,6 +40,29 @@ fn make_memory_factory() -> Arc<ShardFactory> {
     ))
 }
 
+/// Helper to create a Memory-backed factory with a separate Memory WAL store.
+///
+/// The data store is rooted at a shared root (so parent and children resolve
+/// under one store); each shard gets its own WAL store keyed by the per-shard
+/// WAL path, mirroring a real object-store deployment with split WAL.
+fn make_memory_factory_with_wal() -> Arc<ShardFactory> {
+    let root = ShardId::new();
+    let template = DatabaseTemplate {
+        backend: Backend::Memory,
+        path: format!("{root}/data/%shard%"),
+        wal: Some(WalConfig {
+            backend: Backend::Memory,
+            path: format!("{root}/wal/%shard%"),
+        }),
+        ..Default::default()
+    };
+    Arc::new(ShardFactory::new(
+        template,
+        MockGubernatorClient::new_arc(),
+        None,
+    ))
+}
+
 /// Helper to create a filesystem-backed factory with separate WAL dir
 fn make_fs_factory_with_wal(
     data_tmp: &tempfile::TempDir,
@@ -281,6 +304,72 @@ async fn clone_closed_shard_creates_copies() {
     assert_eq!(
         right_counters.total_jobs, 1,
         "right child should have the parent's job"
+    );
+}
+
+/// The object-store clone round-trip must also work with a separate WAL store:
+/// cloning propagates each child's WAL store so the children open without
+/// "wal store reconfiguration unsupported", and each holds the parent's jobs.
+#[silo::test]
+async fn clone_closed_shard_object_store_with_split_wal() {
+    let factory = make_memory_factory_with_wal();
+    let parent_id = ShardId::new();
+    let left_child_id = ShardId::new();
+    let right_child_id = ShardId::new();
+
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent");
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("wal-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"wal": true})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+    parent.close().await.expect("close parent");
+
+    factory
+        .clone_closed_shard(&parent_id, &left_child_id, &right_child_id)
+        .await
+        .expect("clone closed shard with WAL on object store");
+
+    // Opening the children is where "wal store reconfiguration unsupported"
+    // would surface if the clone did not configure each child's WAL store.
+    let left_child = factory
+        .open(&left_child_id, &ShardRange::full())
+        .await
+        .expect("open left child with WAL");
+    assert_eq!(
+        left_child
+            .get_counters()
+            .await
+            .expect("left counters")
+            .total_jobs,
+        1,
+        "left child should hold the parent's job"
+    );
+
+    let right_child = factory
+        .open(&right_child_id, &ShardRange::full())
+        .await
+        .expect("open right child with WAL");
+    assert_eq!(
+        right_child
+            .get_counters()
+            .await
+            .expect("right counters")
+            .total_jobs,
+        1,
+        "right child should hold the parent's job"
     );
 }
 
