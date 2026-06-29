@@ -802,12 +802,68 @@ pub async fn heap_profile<W: Write>(
     Ok(())
 }
 
+/// Validate that a string is a raw 16-character hex hash boundary, returning it
+/// normalized to lowercase.
+///
+/// Shard range boundaries are 16-char hex-encoded u64 values compared
+/// lexicographically by the server, so case matters: uppercase hex digits sort
+/// before lowercase ones. `siloctl tenant hash` emits lowercase, so we normalize
+/// to lowercase to keep operator-supplied hashes comparable with the keyspace.
+fn validate_hash_boundary(hash: &str) -> anyhow::Result<String> {
+    if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!(
+            "invalid --at-hash '{}': expected a 16-character hex hash (from `siloctl tenant hash`)",
+            hash
+        ));
+    }
+    Ok(hash.to_ascii_lowercase())
+}
+
+/// Resolve the hash-space split point from the operator-provided options.
+///
+/// Exactly one selector must be set:
+/// - `tenant_id` (`--at`): hashed into the keyspace with
+///   [`silo::shard_range::hash_tenant`]. This is the operator-facing form — a
+///   real tenant id like `env-10000468093` only lands in the right shard once
+///   hashed, since shard ranges are hex hash boundaries, not raw tenant ids.
+/// - `raw_hash` (`--at-hash`): a precomputed 16-char hex boundary, used verbatim
+///   after validation (escape hatch for boundaries that aren't a single tenant).
+/// - `auto`: the numeric midpoint of `range`.
+fn resolve_split_point(
+    tenant_id: Option<&str>,
+    raw_hash: Option<&str>,
+    auto: bool,
+    range: &silo::shard_range::ShardRange,
+) -> anyhow::Result<String> {
+    match (tenant_id, raw_hash, auto) {
+        (Some(tenant_id), None, false) => Ok(silo::shard_range::hash_tenant(tenant_id)),
+        (None, Some(raw_hash), false) => validate_hash_boundary(raw_hash),
+        (None, None, true) => {
+            let mid = range.midpoint().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot compute midpoint for range [{}, {})",
+                    range.start,
+                    range.end
+                )
+            })?;
+            Ok(silo::shard_range::format_hash_boundary(mid))
+        }
+        (None, None, false) => Err(anyhow::anyhow!(
+            "one of --at <tenant-id>, --at-hash <hash>, or --auto must be specified"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "--at, --at-hash, and --auto are mutually exclusive"
+        )),
+    }
+}
+
 /// Request a shard split operation
 pub async fn shard_split<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
     shard: &str,
-    split_point: Option<String>,
+    at: Option<String>,
+    at_hash: Option<String>,
     auto: bool,
     wait: bool,
 ) -> anyhow::Result<()> {
@@ -831,35 +887,29 @@ pub async fn shard_split<W: Write>(
         connect(&shard_owner.grpc_addr, opts.auth_token.as_deref()).await?
     };
 
-    // Determine the split point
-    let split_point = if let Some(point) = split_point {
-        point
-    } else if auto {
-        // Compute numeric midpoint of the shard's hash-space range
-        let range = silo::shard_range::ShardRange::new(
-            shard_owner.range_start.clone(),
-            shard_owner.range_end.clone(),
-        );
-        let mid = range.midpoint().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot compute midpoint for range [{}, {})",
-                shard_owner.range_start,
-                shard_owner.range_end
-            )
-        })?;
-        silo::shard_range::format_hash_boundary(mid)
-    } else {
-        return Err(anyhow::anyhow!(
-            "Either --at <split-point> or --auto must be specified"
-        ));
-    };
+    // Resolve the hash-space split point. `--at` is hashed client-side; the
+    // server validates boundaries against the hex hash keyspace, not raw tenant
+    // ids, so passing a tenant id verbatim would be rejected.
+    let range = silo::shard_range::ShardRange::new(
+        shard_owner.range_start.clone(),
+        shard_owner.range_end.clone(),
+    );
+    let split_point = resolve_split_point(at.as_deref(), at_hash.as_deref(), auto, &range)?;
 
     if !opts.json {
-        writeln!(
-            out,
-            "Requesting split of shard {} at '{}'...",
-            shard, split_point
-        )?;
+        if let Some(tenant_id) = at.as_deref() {
+            writeln!(
+                out,
+                "Requesting split of shard {} at tenant '{}' (hash {})...",
+                shard, tenant_id, split_point
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Requesting split of shard {} at '{}'...",
+                shard, split_point
+            )?;
+        }
         out.flush()?;
     }
 
@@ -1280,4 +1330,102 @@ pub async fn dump_tasks<W: Write>(opts: &GlobalOptions, out: &mut W) -> anyhow::
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use silo::shard_range::{ShardRange, format_hash_boundary, hash_tenant};
+
+    /// `--at` hashes the tenant id into the keyspace rather than sending it
+    /// verbatim. Regression test for the shard-split footgun where a real tenant
+    /// id (`env-10000468093`) was rejected by the server because shard ranges are
+    /// hex hash boundaries, not raw tenant ids.
+    #[test]
+    fn at_hashes_tenant_id_into_keyspace() {
+        let tenant = "env-10000468093";
+        let range = ShardRange::full();
+
+        let resolved = resolve_split_point(Some(tenant), None, false, &range).unwrap();
+
+        // The resolved point is the tenant's hash, not the raw tenant id.
+        assert_eq!(resolved, hash_tenant(tenant));
+        assert_ne!(resolved, tenant);
+
+        // It is a 16-char lowercase hex boundary, comparable with the keyspace.
+        assert_eq!(resolved.len(), 16);
+        assert!(resolved.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // The exact range from the gameday: the raw tenant id is rejected by the
+        // server's hex-keyspace `contains` check, reproducing the reported error.
+        let bug_range = ShardRange::new("a000000000000000", "c000000000000000");
+        assert!(
+            !bug_range.contains(tenant),
+            "raw tenant id should not be within a hex-hash range"
+        );
+
+        // The hashed point, by contrast, is a valid hex boundary that lands inside
+        // a bracketing range — exactly what the server expects.
+        let val = u64::from_str_radix(&resolved, 16).unwrap();
+        let bracket = ShardRange::new(
+            format_hash_boundary(val),
+            format_hash_boundary(val.checked_add(1).expect("hash is not u64::MAX")),
+        );
+        assert!(
+            bracket.contains(&resolved),
+            "hashed split point should be within its hex range"
+        );
+    }
+
+    #[test]
+    fn at_hash_passes_raw_boundary_through() {
+        let range = ShardRange::full();
+        let resolved = resolve_split_point(None, Some("a000000000000000"), false, &range).unwrap();
+        assert_eq!(resolved, "a000000000000000");
+    }
+
+    #[test]
+    fn at_hash_normalizes_uppercase_to_lowercase() {
+        // Boundaries are compared lexicographically; uppercase hex sorts before
+        // lowercase, so an uppercase hash must be normalized to match the keyspace.
+        let range = ShardRange::full();
+        let resolved = resolve_split_point(None, Some("ABCDEF0123456789"), false, &range).unwrap();
+        assert_eq!(resolved, "abcdef0123456789");
+    }
+
+    #[test]
+    fn at_hash_rejects_non_hex_and_wrong_length() {
+        let range = ShardRange::full();
+
+        // A tenant id is not a valid raw hash.
+        let err = resolve_split_point(None, Some("env-10000468093"), false, &range).unwrap_err();
+        assert!(err.to_string().contains("16-character hex hash"));
+
+        // Too short.
+        assert!(resolve_split_point(None, Some("abc123"), false, &range).is_err());
+
+        // Right length, non-hex characters.
+        assert!(resolve_split_point(None, Some("zzzzzzzzzzzzzzzz"), false, &range).is_err());
+    }
+
+    #[test]
+    fn auto_uses_range_midpoint() {
+        let range = ShardRange::new("a000000000000000", "c000000000000000");
+        let resolved = resolve_split_point(None, None, true, &range).unwrap();
+        assert_eq!(resolved, "b000000000000000");
+    }
+
+    #[test]
+    fn requires_exactly_one_selector() {
+        let range = ShardRange::full();
+
+        // None specified.
+        let err = resolve_split_point(None, None, false, &range).unwrap_err();
+        assert!(err.to_string().contains("must be specified"));
+
+        // More than one specified (defense in depth; clap also enforces this).
+        let err = resolve_split_point(Some("env-1"), Some("a000000000000000"), false, &range)
+            .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
 }
