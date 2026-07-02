@@ -120,15 +120,18 @@ enum ClusterAction {
 
 #[derive(Subcommand, Debug)]
 enum ShardAction {
-    /// Split a shard into two at a specified tenant ID
+    /// Split a shard into two at a tenant ID (hashed into the keyspace)
     Split {
         /// Shard ID (UUID) to split
         shard: String,
-        /// Tenant ID at which to split the keyspace
+        /// Tenant ID to split at; hashed into the keyspace client-side
         #[arg(long)]
         at: Option<String>,
-        /// Automatically compute the midpoint of the shard's range
+        /// Raw 16-char hex hash boundary to split at (from `siloctl tenant hash`)
         #[arg(long, conflicts_with = "at")]
+        at_hash: Option<String>,
+        /// Automatically compute the midpoint of the shard's range
+        #[arg(long, conflicts_with_all = ["at", "at_hash"])]
         auto: bool,
         /// Wait for split to complete
         #[arg(long)]
@@ -291,9 +294,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ShardAction::Split {
                 shard,
                 at,
+                at_hash,
                 auto,
                 wait,
-            } => siloctl::shard_split(&opts, &mut stdout, shard, at.clone(), *auto, *wait).await,
+            } => {
+                siloctl::shard_split(
+                    &opts,
+                    &mut stdout,
+                    shard,
+                    at.clone(),
+                    at_hash.clone(),
+                    *auto,
+                    *wait,
+                )
+                .await
+            }
             ShardAction::SplitStatus { shard } => {
                 siloctl::shard_split_status(&opts, &mut stdout, shard).await
             }
