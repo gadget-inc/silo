@@ -296,31 +296,88 @@ impl ShardFactory {
             let resolved = resolve_object_store(backend, root_path)?;
             Ok((resolved, shard_name.to_string()))
         } else {
-            // Object store backends (Memory, S3, GCS, URL): resolve at the shared
+            // Object store backends (Memory, S3, GCS, URL): resolve at a shared
             // storage root so a child's clone destination equals the path `open`
-            // reads for that child. When the template carries a %shard% (or
-            // {shard}) placeholder, the root is the prefix before it; otherwise the
-            // whole path is the root. db_path is always the bare shard name — a
-            // single relative segment under the shared root — so the (store,
-            // db_path) pair is identical between clone and open.
-            //
-            // This makes the parent store a correct shared ancestor of both
-            // children in clone_closed_shard. Resolving the full per-shard path
-            // instead would root each shard at its own prefix (and double-nest as
-            // <root>/<shard>/<shard> for URL-style backends), leaving the clone
-            // unreachable from the child's open path. Unlike the local-FS branch,
-            // this does not require the placeholder at a path boundary — object
-            // stores are key/value and impose no directory semantics.
-            let placeholder_pos = template_path
-                .find("%shard%")
-                .or_else(|| template_path.find("{shard}"));
-            let root = match placeholder_pos {
-                Some(pos) => template_path[..pos].trim_end_matches('/'),
-                None => template_path,
-            };
-            let resolved = resolve_object_store(backend, root)?;
-            Ok((resolved, shard_name.to_string()))
+            // reads for that child, while keeping every object at the exact key
+            // the pre-split-fix code wrote. Production data already lives at
+            // those legacy keys — `<path>/<path>` relative to the bucket, where
+            // <path> is the template's URL path with the shard substituted — so
+            // the key layout is load-bearing: moving it strands every existing
+            // shard, which then reopens empty (the staging "data reset"
+            // incident). The store root is a shared ancestor of parent and
+            // children, which is what clone_closed_shard needs; db_path carries
+            // the remainder of the legacy key so root + db_path reproduces it
+            // byte-for-byte. Memory uses the same formula so tests exercise the
+            // production layout. Unlike the local-FS branch, this never rejects
+            // a template — object stores are key/value and impose no directory
+            // semantics.
+            let (root, db_path) =
+                Self::object_store_root_and_db_path(backend, template_path, shard_name)?;
+            let resolved = resolve_object_store(backend, &root)?;
+            Ok((resolved, db_path))
         }
+    }
+
+    /// Compute the shared store root and per-shard db_path for object-store
+    /// backends (Memory, S3, GCS, URL).
+    ///
+    /// Legacy layout contract: the pre-split-fix code resolved the fully
+    /// substituted template as each shard's own store prefix AND its db_path,
+    /// so objects landed at `<path>/<path>` relative to the bucket — template
+    /// `gs://bucket/silo/%shard%` put shard `data-0`'s objects under
+    /// `silo/data-0/silo/data-0/`. Production wrote durable data there, so the
+    /// pair returned here must satisfy: the root's bucket-relative path joined
+    /// with db_path equals that legacy `<path>/<path>` prefix.
+    ///
+    /// The root is the template truncated at the last `/` strictly before the
+    /// shard placeholder — a shared ancestor of all shards, and a path-segment
+    /// boundary, which object_store prefix composition requires. db_path is
+    /// `<tail>/<path>`, where <tail> is the substituted template remainder
+    /// after the root and <path> is the substituted template's bucket-relative
+    /// path (the raw substituted string for Memory, which has no bucket).
+    ///
+    /// Templates without a placeholder (test sentinels) have no legacy data:
+    /// the whole path is the root and db_path is the bare shard name.
+    fn object_store_root_and_db_path(
+        backend: &crate::settings::Backend,
+        template_path: &str,
+        shard_name: &str,
+    ) -> Result<(String, String), JobStoreShardError> {
+        let placeholder_pos = template_path
+            .find("%shard%")
+            .or_else(|| template_path.find("{shard}"));
+        let Some(pos) = placeholder_pos else {
+            return Ok((template_path.to_string(), shard_name.to_string()));
+        };
+
+        let full = template_path
+            .replace("%shard%", shard_name)
+            .replace("{shard}", shard_name);
+
+        let root = match template_path[..pos].rfind('/') {
+            Some(slash) => &template_path[..slash],
+            None => "",
+        };
+        let tail = full[root.len()..].trim_start_matches('/');
+
+        let legacy_path = match backend {
+            crate::settings::Backend::S3
+            | crate::settings::Backend::Gcs
+            | crate::settings::Backend::Url => {
+                let url = url::Url::parse(&full).map_err(|e| {
+                    JobStoreShardError::Codec(format!(
+                        "failed to parse object store URL '{}': {}. Expected format: \
+                         gs://bucket/path or s3://bucket/path",
+                        full, e
+                    ))
+                })?;
+                let url_path = url.path();
+                url_path.strip_prefix('/').unwrap_or(url_path).to_string()
+            }
+            _ => full.clone(),
+        };
+
+        Ok((root.to_string(), format!("{tail}/{legacy_path}")))
     }
 
     /// Resolve the WAL object store for a shard, if split WAL storage is configured.
@@ -868,4 +925,75 @@ pub enum ShardFactoryError {
 
     #[error("shard error: {0}")]
     ShardError(#[from] JobStoreShardError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShardFactory;
+    use crate::settings::Backend;
+
+    fn resolve(backend: Backend, template: &str, shard: &str) -> (String, String) {
+        ShardFactory::object_store_root_and_db_path(&backend, template, shard).unwrap()
+    }
+
+    /// The production/staging template shape. The legacy resolver wrote shard
+    /// objects at `silo/<shard>/silo/<shard>/…` relative to the bucket, and
+    /// durable data lives there: the root's bucket-relative path (`silo`)
+    /// joined with db_path must keep addressing exactly that prefix.
+    #[test]
+    fn gcs_template_reproduces_legacy_double_nested_keys() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/silo/%shard%", "data-0");
+        assert_eq!(root, "gs://bucket/silo");
+        assert_eq!(db_path, "data-0/silo/data-0");
+    }
+
+    #[test]
+    fn gcs_template_at_bucket_root() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/%shard%", "data-0");
+        assert_eq!(root, "gs://bucket");
+        assert_eq!(db_path, "data-0/data-0");
+    }
+
+    #[test]
+    fn gcs_template_with_suffix_after_placeholder() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/pre/%shard%/db", "data-0");
+        assert_eq!(root, "gs://bucket/pre");
+        assert_eq!(db_path, "data-0/db/pre/data-0/db");
+    }
+
+    #[test]
+    fn curly_placeholder_resolves_like_percent() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/silo/{shard}", "data-0");
+        assert_eq!(root, "gs://bucket/silo");
+        assert_eq!(db_path, "data-0/silo/data-0");
+    }
+
+    /// Memory shares the URL-backend formula (minus URL parsing), so tests on
+    /// the Memory backend exercise the same key layout as production.
+    #[test]
+    fn memory_template_uses_same_layout_as_url_backends() {
+        let (root, db_path) = resolve(Backend::Memory, "mem-root/silo/%shard%", "data-0");
+        assert_eq!(root, "mem-root/silo");
+        assert_eq!(db_path, "data-0/mem-root/silo/data-0");
+    }
+
+    /// A mid-segment placeholder roots one path segment up, because object
+    /// store prefixes compose per segment. The full substituted path embedded
+    /// in db_path keeps shards of different templates distinct even when they
+    /// share that root.
+    #[test]
+    fn mid_segment_placeholder_roots_at_segment_boundary() {
+        let (root, db_path) = resolve(Backend::Memory, "test-memory-%shard%", "data-0");
+        assert_eq!(root, "");
+        assert_eq!(db_path, "test-memory-data-0/test-memory-data-0");
+    }
+
+    /// Placeholder-less templates are test sentinels with no legacy data; each
+    /// shard is a bare name under the whole path.
+    #[test]
+    fn no_placeholder_uses_bare_shard_name() {
+        let (root, db_path) = resolve(Backend::Memory, "unused", "data-0");
+        assert_eq!(root, "unused");
+        assert_eq!(db_path, "data-0");
+    }
 }

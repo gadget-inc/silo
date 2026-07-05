@@ -905,3 +905,93 @@ async fn close_all_shards() {
     // So get() will still return the closed shard Arc
     // The key test is that close_all doesn't error
 }
+
+// --- legacy key-layout compatibility tests ---
+
+/// Regression test for the staging data-reset incident (PR #377 deploy).
+///
+/// The legacy resolver opened shard `data-0` of template
+/// `gs://bucket/silo/%shard%` with a store scoped to `silo/data-0` and
+/// db_path `silo/data-0`, landing every object at
+/// `silo/data-0/silo/data-0/…` relative to the bucket. The current resolver
+/// scopes the store to the shared root `silo` (so clone/split works) with
+/// db_path `data-0/silo/data-0`. Both must address the same objects: if they
+/// diverge, every shard written before the resolver change reopens empty.
+#[silo::test]
+async fn new_resolution_reads_data_written_by_legacy_resolution() {
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::prefix::PrefixStore;
+
+    let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    // Legacy writer: store scoped to the full per-shard prefix, db_path the
+    // bucket-relative per-shard path — the double-nested layout.
+    let legacy_store: Arc<dyn ObjectStore> =
+        Arc::new(PrefixStore::new(Arc::clone(&bucket), "silo/data-0"));
+    let db = slatedb::DbBuilder::new("silo/data-0", legacy_store)
+        .build()
+        .await
+        .expect("legacy open");
+    db.put(b"job:1", b"payload").await.expect("legacy put");
+    db.close().await.expect("legacy close");
+
+    // Current reader: store scoped to the shared root, db_path carrying the
+    // rest of the legacy key.
+    let new_store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(Arc::clone(&bucket), "silo"));
+    let db = slatedb::DbBuilder::new("data-0/silo/data-0", new_store)
+        .build()
+        .await
+        .expect("current open");
+    let value = db.get(b"job:1").await.expect("current get");
+    assert_eq!(value.as_deref(), Some(b"payload".as_ref()));
+    db.close().await.expect("current close");
+}
+
+/// Objects written through the factory land under the legacy double-nested
+/// prefix: `<shard>/<substituted template>/` relative to the shared root.
+/// Memory shares the production formula, so this pins the layout that GCS/S3
+/// deployments depend on.
+#[silo::test]
+async fn factory_shard_objects_land_at_legacy_double_nested_keys() {
+    use futures::TryStreamExt;
+
+    let root = format!("{}/silo", ShardId::new());
+    let template = DatabaseTemplate {
+        backend: Backend::Memory,
+        path: format!("{root}/%shard%"),
+        ..Default::default()
+    };
+    let factory = Arc::new(ShardFactory::new(
+        template,
+        MockGubernatorClient::new_arc(),
+        None,
+    ));
+
+    let shard_id = ShardId::new();
+    factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+    factory.close(&shard_id).await.expect("close shard");
+
+    let resolved =
+        silo::storage::resolve_object_store(&Backend::Memory, &root).expect("resolve root store");
+    let objects: Vec<_> = resolved
+        .store
+        .list(None)
+        .try_collect()
+        .await
+        .expect("list objects");
+
+    assert!(!objects.is_empty(), "shard open should write objects");
+    let expected_prefix = format!("{shard_id}/{root}/{shard_id}/");
+    for obj in &objects {
+        assert!(
+            obj.location.as_ref().starts_with(&expected_prefix),
+            "object {} is not under the legacy double-nested prefix {}",
+            obj.location,
+            expected_prefix
+        );
+    }
+}
