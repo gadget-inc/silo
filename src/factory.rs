@@ -87,7 +87,10 @@ impl ShardFactory {
         Self {
             instances: DashMap::new(),
             template: DatabaseTemplate {
-                path: "/noop".to_string(),
+                // A valid template path needs the %shard% placeholder at a path
+                // boundary. The root is unique per factory so the shared Memory
+                // store (the default backend) does not bleed across noop factories.
+                path: format!("noop-{}/%shard%", ShardId::new()),
                 apply_wal_on_close: false,
                 ..Default::default()
             },
@@ -293,14 +296,88 @@ impl ShardFactory {
             let resolved = resolve_object_store(backend, root_path)?;
             Ok((resolved, shard_name.to_string()))
         } else {
-            // Object store backends (Memory, S3, GCS, URL): resolve full path
-            let full_path = template_path
-                .replace("%shard%", shard_name)
-                .replace("{shard}", shard_name);
-            let resolved = resolve_object_store(backend, &full_path)?;
-            let db_path = resolved.canonical_path.clone();
+            // Object store backends (Memory, S3, GCS, URL): resolve at a shared
+            // storage root so a child's clone destination equals the path `open`
+            // reads for that child, while keeping every object at the exact key
+            // the pre-split-fix code wrote. Production data already lives at
+            // those legacy keys — `<path>/<path>` relative to the bucket, where
+            // <path> is the template's URL path with the shard substituted — so
+            // the key layout is load-bearing: moving it strands every existing
+            // shard, which then reopens empty (the staging "data reset"
+            // incident). The store root is a shared ancestor of parent and
+            // children, which is what clone_closed_shard needs; db_path carries
+            // the remainder of the legacy key so root + db_path reproduces it
+            // byte-for-byte. Memory uses the same formula so tests exercise the
+            // production layout. Unlike the local-FS branch, this never rejects
+            // a template — object stores are key/value and impose no directory
+            // semantics.
+            let (root, db_path) =
+                Self::object_store_root_and_db_path(backend, template_path, shard_name)?;
+            let resolved = resolve_object_store(backend, &root)?;
             Ok((resolved, db_path))
         }
+    }
+
+    /// Compute the shared store root and per-shard db_path for object-store
+    /// backends (Memory, S3, GCS, URL).
+    ///
+    /// Legacy layout contract: the pre-split-fix code resolved the fully
+    /// substituted template as each shard's own store prefix AND its db_path,
+    /// so objects landed at `<path>/<path>` relative to the bucket — template
+    /// `gs://bucket/silo/%shard%` put shard `data-0`'s objects under
+    /// `silo/data-0/silo/data-0/`. Production wrote durable data there, so the
+    /// pair returned here must satisfy: the root's bucket-relative path joined
+    /// with db_path equals that legacy `<path>/<path>` prefix.
+    ///
+    /// The root is the template truncated at the last `/` strictly before the
+    /// shard placeholder — a shared ancestor of all shards, and a path-segment
+    /// boundary, which object_store prefix composition requires. db_path is
+    /// `<tail>/<path>`, where <tail> is the substituted template remainder
+    /// after the root and <path> is the substituted template's bucket-relative
+    /// path (the raw substituted string for Memory, which has no bucket).
+    ///
+    /// Templates without a placeholder (test sentinels) have no legacy data:
+    /// the whole path is the root and db_path is the bare shard name.
+    fn object_store_root_and_db_path(
+        backend: &crate::settings::Backend,
+        template_path: &str,
+        shard_name: &str,
+    ) -> Result<(String, String), JobStoreShardError> {
+        let placeholder_pos = template_path
+            .find("%shard%")
+            .or_else(|| template_path.find("{shard}"));
+        let Some(pos) = placeholder_pos else {
+            return Ok((template_path.to_string(), shard_name.to_string()));
+        };
+
+        let full = template_path
+            .replace("%shard%", shard_name)
+            .replace("{shard}", shard_name);
+
+        let root = match template_path[..pos].rfind('/') {
+            Some(slash) => &template_path[..slash],
+            None => "",
+        };
+        let tail = full[root.len()..].trim_start_matches('/');
+
+        let legacy_path = match backend {
+            crate::settings::Backend::S3
+            | crate::settings::Backend::Gcs
+            | crate::settings::Backend::Url => {
+                let url = url::Url::parse(&full).map_err(|e| {
+                    JobStoreShardError::Codec(format!(
+                        "failed to parse object store URL '{}': {}. Expected format: \
+                         gs://bucket/path or s3://bucket/path",
+                        full, e
+                    ))
+                })?;
+                let url_path = url.path();
+                url_path.strip_prefix('/').unwrap_or(url_path).to_string()
+            }
+            _ => full.clone(),
+        };
+
+        Ok((root.to_string(), format!("{tail}/{legacy_path}")))
     }
 
     /// Resolve the WAL object store for a shard, if split WAL storage is configured.
@@ -736,6 +813,87 @@ impl ShardFactory {
         Ok(())
     }
 
+    /// Verify that each freshly cloned child holds the parent's full job set.
+    ///
+    /// A fresh SlateDB clone is a byte-for-byte copy of the parent, so
+    /// immediately after `clone_closed_shard` -- before post-commit cleanup
+    /// trims each child to its range -- every child's whole-shard `total_jobs`
+    /// must equal the parent's pre-close count. An empty or mis-placed child
+    /// (the object-store split data-loss signature) reads `0` and trips this
+    /// check, letting the split abort before the shard-map commit point.
+    ///
+    /// This is a manifest-landed tripwire keyed on the empty-child signature,
+    /// not a full row-integrity audit: a clone that landed the counter key but
+    /// corrupted rows would still pass.
+    pub async fn verify_cloned_children_match_parent(
+        &self,
+        parent_total_jobs: i64,
+        child_ids: &[ShardId],
+    ) -> Result<(), ShardFactoryError> {
+        for child_id in child_ids {
+            let child_total_jobs = self.read_cloned_shard_total_jobs(child_id).await?;
+            if child_total_jobs != parent_total_jobs {
+                return Err(ShardFactoryError::ChildVerification(format!(
+                    "cloned child {child_id} holds {child_total_jobs} jobs but parent held \
+                     {parent_total_jobs}; aborting split before commit to avoid data loss"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a freshly cloned child's database with the raw `open_with_resolved_store`
+    /// primitive, read its whole-shard `total_jobs`, and close it.
+    ///
+    /// Uses the raw open -- NOT `open` -- so the child is never registered in the
+    /// `instances` map: `open` caches the instance in the per-shard OnceCell, and
+    /// the post-commit `open(child)` would then return this stale pre-commit
+    /// handle instead of opening the committed child. Hydration is disabled and
+    /// `get_counters` reads a single merged counter key, so the check is O(1)
+    /// even on a multi-million-job shard.
+    async fn read_cloned_shard_total_jobs(
+        &self,
+        shard_id: &ShardId,
+    ) -> Result<i64, ShardFactoryError> {
+        let name = shard_id.to_string();
+        let (resolved, db_path) =
+            Self::resolve_at_root(&self.template.backend, &self.template.path, &name)?;
+        let wal_store = self.resolve_wal_store(&name)?;
+
+        let shard = JobStoreShard::open_with_resolved_store(
+            name.clone(),
+            &db_path,
+            OpenShardOptions {
+                store: resolved.store,
+                wal_store,
+                wal_close_config: None,
+                slatedb_settings: self.template.slatedb.clone(),
+                memory_cache: self.template.memory_cache.clone(),
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                metrics: self.metrics.clone(),
+                concurrency_reconcile_interval: Duration::from_millis(
+                    self.template.concurrency_reconcile_interval_ms.max(1),
+                ),
+                counter_reconciliation_seconds: None,
+                hydrate_all_at_startup: false,
+                grant_scanner_batch_size: self.template.grant_scanner_batch_size,
+                grant_scanner_buffer_size: self.template.grant_scanner_buffer_size,
+                grant_scanner_concurrency: self.template.grant_scanner_concurrency,
+                completed_job_expire_s: self.template.completed_job_expire_s,
+                terminal_job_expire_s: self.template.terminal_job_expire_s,
+            },
+            ShardRange::full(),
+        )
+        .await?;
+
+        // Always close the raw handle, even if the counter read fails, so the
+        // shard's SlateDB instance and its spawned background tasks (grant
+        // scanner, reconcilers) are released -- JobStoreShard has no Drop.
+        let counters = shard.get_counters().await;
+        shard.close().await?;
+        Ok(counters?.total_jobs)
+    }
+
     /// Get the database template used by this factory.
     pub fn template(&self) -> &DatabaseTemplate {
         &self.template
@@ -759,9 +917,83 @@ pub enum ShardFactoryError {
     #[error("clone error: {0}")]
     CloneError(String),
 
+    #[error("child verification error: {0}")]
+    ChildVerification(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
 
     #[error("shard error: {0}")]
     ShardError(#[from] JobStoreShardError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShardFactory;
+    use crate::settings::Backend;
+
+    fn resolve(backend: Backend, template: &str, shard: &str) -> (String, String) {
+        ShardFactory::object_store_root_and_db_path(&backend, template, shard).unwrap()
+    }
+
+    /// The production/staging template shape. The legacy resolver wrote shard
+    /// objects at `silo/<shard>/silo/<shard>/…` relative to the bucket, and
+    /// durable data lives there: the root's bucket-relative path (`silo`)
+    /// joined with db_path must keep addressing exactly that prefix.
+    #[test]
+    fn gcs_template_reproduces_legacy_double_nested_keys() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/silo/%shard%", "data-0");
+        assert_eq!(root, "gs://bucket/silo");
+        assert_eq!(db_path, "data-0/silo/data-0");
+    }
+
+    #[test]
+    fn gcs_template_at_bucket_root() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/%shard%", "data-0");
+        assert_eq!(root, "gs://bucket");
+        assert_eq!(db_path, "data-0/data-0");
+    }
+
+    #[test]
+    fn gcs_template_with_suffix_after_placeholder() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/pre/%shard%/db", "data-0");
+        assert_eq!(root, "gs://bucket/pre");
+        assert_eq!(db_path, "data-0/db/pre/data-0/db");
+    }
+
+    #[test]
+    fn curly_placeholder_resolves_like_percent() {
+        let (root, db_path) = resolve(Backend::Gcs, "gs://bucket/silo/{shard}", "data-0");
+        assert_eq!(root, "gs://bucket/silo");
+        assert_eq!(db_path, "data-0/silo/data-0");
+    }
+
+    /// Memory shares the URL-backend formula (minus URL parsing), so tests on
+    /// the Memory backend exercise the same key layout as production.
+    #[test]
+    fn memory_template_uses_same_layout_as_url_backends() {
+        let (root, db_path) = resolve(Backend::Memory, "mem-root/silo/%shard%", "data-0");
+        assert_eq!(root, "mem-root/silo");
+        assert_eq!(db_path, "data-0/mem-root/silo/data-0");
+    }
+
+    /// A mid-segment placeholder roots one path segment up, because object
+    /// store prefixes compose per segment. The full substituted path embedded
+    /// in db_path keeps shards of different templates distinct even when they
+    /// share that root.
+    #[test]
+    fn mid_segment_placeholder_roots_at_segment_boundary() {
+        let (root, db_path) = resolve(Backend::Memory, "test-memory-%shard%", "data-0");
+        assert_eq!(root, "");
+        assert_eq!(db_path, "test-memory-data-0/test-memory-data-0");
+    }
+
+    /// Placeholder-less templates are test sentinels with no legacy data; each
+    /// shard is a bare name under the whole path.
+    #[test]
+    fn no_placeholder_uses_bare_shard_name() {
+        let (root, db_path) = resolve(Backend::Memory, "unused", "data-0");
+        assert_eq!(root, "unused");
+        assert_eq!(db_path, "data-0");
+    }
 }

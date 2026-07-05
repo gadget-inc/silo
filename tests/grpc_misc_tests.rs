@@ -1043,7 +1043,7 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
 
         // Use Memory backend to exercise the object store deletion path
         let template = DatabaseTemplate {
-            path: "test-memory-%shard%".to_string(),
+            path: "test-memory/%shard%".to_string(),
             ..Default::default()
         };
         let rate_limiter = MockGubernatorClient::new_arc();

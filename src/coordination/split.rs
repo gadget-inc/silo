@@ -517,6 +517,25 @@ impl ShardSplitter {
                             parent_shard_id
                         )))
                     })?;
+
+                    // Capture the parent's whole-shard job count from the still-open
+                    // handle, before closing it. The post-clone verification below
+                    // confirms each child holds this full set (a fresh clone is a
+                    // byte-for-byte copy; cleanup trims each child to its range only
+                    // after commit), catching the empty-child data-loss signature.
+                    let parent_total_jobs = parent_shard
+                        .get_counters()
+                        .await
+                        .map_err(|e| {
+                            SplitExecutionError::PreCommit(CoordinationError::BackendError(
+                                format!(
+                                    "failed to read parent shard {} counters before cloning: {}",
+                                    parent_shard_id, e
+                                ),
+                            ))
+                        })?
+                        .total_jobs;
+
                     parent_shard.close().await.map_err(|e| {
                         SplitExecutionError::PreCommit(CoordinationError::BackendError(format!(
                             "failed to close parent shard before cloning: {}",
@@ -559,7 +578,36 @@ impl ShardSplitter {
                         parent_shard_id = %parent_shard_id,
                         left_child = %split.left_child_id,
                         right_child = %split.right_child_id,
-                        "cloning complete, updating shard map"
+                        "cloning complete, verifying children before commit"
+                    );
+
+                    // Defense-in-depth: before the commit point, open each child
+                    // and confirm it holds the parent's full job set. A child that
+                    // opens empty/short (the object-store resolution bug's data-loss
+                    // signature) fails here, aborting the split as
+                    // PreCommitParentClosed so the shard map stays untouched and the
+                    // parent is recovered/reopenable -- never silent data loss.
+                    self.ctx
+                        .factory
+                        .verify_cloned_children_match_parent(
+                            parent_total_jobs,
+                            &[split.left_child_id, split.right_child_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            SplitExecutionError::PreCommitParentClosed(
+                                CoordinationError::BackendError(format!(
+                                    "post-clone child verification failed for split of {}: {}",
+                                    parent_shard_id, e
+                                )),
+                            )
+                        })?;
+
+                    info!(
+                        parent_shard_id = %parent_shard_id,
+                        left_child = %split.left_child_id,
+                        right_child = %split.right_child_id,
+                        "children verified, updating shard map"
                     );
 
                     // Pre-add BOTH children to owned set BEFORE updating the shard map.
