@@ -168,6 +168,19 @@ pub struct Metrics {
     /// Steady-state expected to be 0; sustained growth means the reconciler
     /// is stuck (slatedb unavailable, etc.).
     concurrency_reconciliation_pending: GaugeVec,
+    /// Wall time of a single `process_grants` invocation (one (tenant, queue))
+    /// across all of its passes, including precheck-skipped invocations.
+    concurrency_process_grants_duration: HistogramVec,
+    /// CONCURRENCY_REQUEST keys walked by a single `process_grants` invocation
+    /// across all of its passes.
+    concurrency_process_grants_keys_scanned: HistogramVec,
+    concurrency_process_grants_total: CounterVec,
+    concurrency_process_grants_stale_total: CounterVec,
+    concurrency_reconcile_total: CounterVec,
+    concurrency_reconcile_duration: HistogramVec,
+    /// Sizes of the grant scanner's pending lanes, labeled `lane=hot|cold`.
+    concurrency_pending_grants: GaugeVec,
+    concurrency_grant_next_hop_skips: CounterVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -569,23 +582,83 @@ impl Metrics {
             .set(stats.hydrated_queue_count as f64);
     }
 
-    /// Update per-shard reconciler signal gauges:
-    /// * `drift` = sum of |in_memory - durable| holder counts across hydrated
-    ///   queues, computed at the end of each periodic reconciler tick.
-    /// * `pending` = current size of the per-task_id reconciliation queue.
-    ///
-    /// Non-zero `drift` or sustained-non-zero `pending` indicates the
-    /// reconciler is observing inconsistency between in-memory and durable
-    /// holder state — the same signal that, if it grows, manifests as the
-    /// production queue wedge. Pair with an alert that fires if either
-    /// remains non-zero across multiple scrape intervals.
-    pub fn set_concurrency_reconciler_signals(&self, shard: &str, drift: u64, pending: u64) {
+    /// Update the per-shard holder-drift gauge: sum of |in_memory - durable|
+    /// holder counts across hydrated queues, computed at the completion of a
+    /// full drift pass. Non-zero drift indicates inconsistency between
+    /// in-memory and durable holder state — the same signal that, if it
+    /// grows, manifests as the production queue wedge. Pair with an alert
+    /// that fires if it remains non-zero across multiple scrape intervals.
+    pub fn set_concurrency_holder_drift(&self, shard: &str, drift: u64) {
         self.concurrency_holder_drift
             .with_label_values(&[shard])
             .set(drift as f64);
+    }
+
+    /// Update the per-shard reconciliation-pending gauge: current size of the
+    /// per-task_id reconciliation queue. Published every reconcile tick;
+    /// sustained non-zero means the reconciler is stuck.
+    pub fn set_concurrency_reconciliation_pending(&self, shard: &str, pending: u64) {
         self.concurrency_reconciliation_pending
             .with_label_values(&[shard])
             .set(pending as f64);
+    }
+
+    /// Record one completed `process_grants` invocation: wall time, total
+    /// request keys walked across all of its passes, and stale request rows
+    /// deleted along the way.
+    pub fn record_concurrency_process_grants(
+        &self,
+        shard: &str,
+        duration_s: f64,
+        keys_scanned: u64,
+        stale_deleted: u64,
+    ) {
+        self.concurrency_process_grants_total
+            .with_label_values(&[shard])
+            .inc();
+        self.concurrency_process_grants_duration
+            .with_label_values(&[shard])
+            .observe(duration_s);
+        self.concurrency_process_grants_keys_scanned
+            .with_label_values(&[shard])
+            .observe(keys_scanned as f64);
+        if stale_deleted > 0 {
+            self.concurrency_process_grants_stale_total
+                .with_label_values(&[shard])
+                .inc_by(stale_deleted as f64);
+        }
+    }
+
+    /// Record one completed `reconcile_pending_requests` sweep slice: the
+    /// wall time of the counter scan that re-seeds the grant scanner's cold
+    /// lane.
+    pub fn record_concurrency_reconcile_sweep(&self, shard: &str, duration_s: f64) {
+        self.concurrency_reconcile_total
+            .with_label_values(&[shard])
+            .inc();
+        self.concurrency_reconcile_duration
+            .with_label_values(&[shard])
+            .observe(duration_s);
+    }
+
+    /// Update the grant scanner pending-lane size gauges (hot = event-driven
+    /// nudges drained fully each iteration; cold = reconciler sweep entries
+    /// drained in bounded batches).
+    pub fn set_concurrency_pending_grants(&self, shard: &str, hot: usize, cold: usize) {
+        self.concurrency_pending_grants
+            .with_label_values(&[shard, "hot"])
+            .set(hot as f64);
+        self.concurrency_pending_grants
+            .with_label_values(&[shard, "cold"])
+            .set(cold as f64);
+    }
+
+    /// Record a grant-scanner candidate deferred because its next concurrency
+    /// hop was saturated with a deep requester backlog.
+    pub fn record_concurrency_grant_next_hop_skip(&self, shard: &str) {
+        self.concurrency_grant_next_hop_skips
+            .with_label_values(&[shard])
+            .inc();
     }
 
     /// Update SlateDB storage metrics from a shard's StatRegistry.
@@ -2062,6 +2135,97 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_process_grants_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_process_grants_duration_seconds",
+                "Wall time of a single process_grants invocation (one (tenant, queue)) across all of its passes, including precheck-skipped invocations",
+            )
+            .buckets(SCAN_DURATION_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_process_grants_keys_scanned = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_process_grants_keys_scanned",
+                "Number of CONCURRENCY_REQUEST keys read by a single process_grants invocation across all passes",
+            )
+            .buckets(vec![1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0]),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_process_grants_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_process_grants_total",
+                "Total process_grants invocations per shard (each invocation drains pending requests for a single (tenant, queue))",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_process_grants_stale_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_process_grants_stale_total",
+                "Total request rows deleted by process_grants for being malformed, of unknown variant, or for a non-current job attempt",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconcile_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_reconcile_total",
+                "Total reconcile_pending_requests sweep slices completed per shard",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_reconcile_duration = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_reconcile_duration_seconds",
+                "Wall time of a reconcile_pending_requests sweep slice per shard",
+            )
+            .buckets(SCAN_DURATION_BUCKETS.to_vec()),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_pending_grants = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_concurrency_pending_grants",
+                "Number of (tenant, queue) entries pending in the grant scanner's lanes: lane=hot (event-driven nudges, drained fully each iteration) vs lane=cold (reconciler sweep entries, drained in bounded batches)",
+            ),
+            &["shard", "lane"],
+        )?,
+    );
+
+    let concurrency_grant_next_hop_skips = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_grant_next_hop_skips_total",
+                "Grant-scanner candidates deferred because their next concurrency hop was saturated with a deep requester backlog",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // SlateDB watcher metrics (driven by Db::subscribe)
     let slatedb_durable_seq = register(
         &registry,
@@ -2171,6 +2335,14 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_holders_cache_hydrated_queues,
         concurrency_holder_drift,
         concurrency_reconciliation_pending,
+        concurrency_process_grants_duration,
+        concurrency_process_grants_keys_scanned,
+        concurrency_process_grants_total,
+        concurrency_process_grants_stale_total,
+        concurrency_reconcile_total,
+        concurrency_reconcile_duration,
+        concurrency_pending_grants,
+        concurrency_grant_next_hop_skips,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
         slatedb_manifest_last_l0_seq,

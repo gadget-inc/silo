@@ -36,7 +36,7 @@
 //!   request from a restart or retry is still in the DB. Since Cancelled is terminal,
 //!   this also catches any stale cancelled requests.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -622,30 +622,39 @@ impl ConcurrencyCounts {
         self.pending_reconciliations.lock().unwrap().len()
     }
 
-    /// Snapshot every hydrated (tenant, queue) and the full set of in-memory
-    /// holder task_ids. Used by the self-healing drift pass to compute both the
-    /// exact ghost set (in-memory holders with no durable row) and the
-    /// per-queue drift count (`.len()` of the returned set).
-    ///
-    /// `NotHydrated` and `Hydrating` queues are intentionally skipped: we
-    /// haven't loaded their durable rows yet, so comparing in-memory (empty)
-    /// against durable (unknown) is meaningless. The DashMap entry guard is
-    /// dropped before the caller does any `.await` (the returned `HashSet`s
-    /// are owned clones).
-    pub fn hydrated_queue_holders_with_ids(&self) -> Vec<(String, String, HashSet<String>)> {
+    /// Snapshot every hydrated (tenant, queue) key, SORTED. Used by the
+    /// self-healing drift pass to build its per-pass work list. Sorted
+    /// because DashMap iteration order is nondeterministic and must never
+    /// reach DST-observable behavior (the drift pass's visit order). Unlike
+    /// the old whole-cache snapshot this does NOT clone any holder sets —
+    /// per-queue holders are fetched lazily via `holders_if_hydrated` as the
+    /// sliced pass visits each queue.
+    pub fn hydrated_queue_keys(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for entry in self.queues.iter() {
             if !matches!(entry.state, HydrationState::Hydrated) {
                 continue;
             }
             let (tenant_arc, queue_arc) = entry.key();
-            out.push((
-                tenant_arc.to_string(),
-                queue_arc.to_string(),
-                entry.holders.clone(),
-            ));
+            out.push((tenant_arc.to_string(), queue_arc.to_string()));
         }
+        out.sort_unstable();
         out
+    }
+
+    /// Owned clone of one queue's in-memory holder task_ids, or `None` when
+    /// the queue is absent or not (fully) hydrated — a queue that left the
+    /// `Hydrated` state between the pass snapshot and its visit is skipped,
+    /// matching the old whole-cache snapshot's filter: comparing in-memory
+    /// (empty/partial) against durable (unknown) is meaningless. The DashMap
+    /// guard is dropped before the caller does any `.await`.
+    pub fn holders_if_hydrated(&self, tenant: &str, queue: &str) -> Option<HashSet<String>> {
+        let key = queue_key(tenant, queue);
+        let entry = self.queues.get(&key)?;
+        if !matches!(entry.state, HydrationState::Hydrated) {
+            return None;
+        }
+        Some(entry.holders.clone())
     }
 
     /// Snapshot the sizes of the in-memory holders cache for metrics reporting.
@@ -779,6 +788,64 @@ pub struct CachedQueueLimit {
     pub limit_type: ConcurrencyLimitType,
 }
 
+/// Tuning knobs for the background grant scanner, carried as one struct
+/// through `OpenShardOptions` so call sites stay readable as knobs
+/// accumulate. Raw values straight from settings; `ConcurrencyManager::new`
+/// applies the clamps (`>= 1` where a zero would stall or panic, and the
+/// `[0.0, 0.9]` fraction clamp).
+#[derive(Debug, Clone)]
+pub struct GrantScannerConfig {
+    /// Max grants materialized, status-checked, and committed per
+    /// `process_grants` pass.
+    pub batch_size: usize,
+    /// Max in-flight job-status lookups buffered within a single pass.
+    pub buffer_size: usize,
+    /// Max per-queue `process_grants` passes run concurrently per drain
+    /// iteration.
+    pub concurrency: usize,
+    /// Max reconciler-sourced (cold-lane) queue entries merged into a single
+    /// drain iteration alongside all event-driven (hot-lane) entries.
+    pub cold_batch_size: usize,
+    /// Minimum requester backlog on a candidate's next concurrency hop before
+    /// the scanner defers granting the candidate while that hop is saturated.
+    /// 0 disables the skip.
+    pub next_hop_skip_min_backlog: u64,
+    /// Fraction of each queue's capacity the scanner leaves unfilled for
+    /// immediate (live) grants.
+    pub live_headroom_fraction: f64,
+}
+
+impl Default for GrantScannerConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: crate::settings::DEFAULT_GRANT_SCANNER_BATCH_SIZE,
+            buffer_size: crate::settings::DEFAULT_GRANT_SCANNER_BUFFER_SIZE,
+            concurrency: crate::settings::DEFAULT_GRANT_SCANNER_CONCURRENCY,
+            cold_batch_size: crate::settings::DEFAULT_GRANT_SCANNER_COLD_BATCH_SIZE,
+            next_hop_skip_min_backlog:
+                crate::settings::DEFAULT_GRANT_SCANNER_NEXT_HOP_SKIP_MIN_BACKLOG,
+            live_headroom_fraction: crate::settings::DEFAULT_GRANT_SCANNER_LIVE_HEADROOM_FRACTION,
+        }
+    }
+}
+
+/// The grant scanner's cold pending lane: (tenant, queue) entries seeded by
+/// the periodic `reconcile_pending_requests` sweep, drained in bounded
+/// batches so a shard-wide sweep backlog can never delay servicing the hot
+/// lane's event-driven nudges. `pop_cursor` implements round-robin draining —
+/// see `take_pending_grant_batch` for why a plain `pop_first` would starve
+/// the lexicographic tail.
+#[derive(Default)]
+struct ColdLane {
+    /// Key: `concurrency_counts_key(tenant, queue)`; value: (tenant, queue,
+    /// pending count). BTreeMap for deterministic iteration order (DST).
+    entries: BTreeMap<Vec<u8>, (String, String, u32)>,
+    /// The last key handed out by `take_pending_grant_batch`; the next batch
+    /// resumes strictly after it and wraps to the front when the tail is
+    /// exhausted.
+    pop_cursor: Option<Vec<u8>>,
+}
+
 /// High-level concurrency manager with a background grant scanner.
 ///
 /// The grant scanner is a single background task that processes all pending grants.
@@ -789,10 +856,22 @@ pub struct ConcurrencyManager {
     /// on per-shard metrics emitted from the grant paths.
     shard: String,
     counts: ConcurrencyCounts,
-    /// Pending grant counts per queue. Key: concurrency_counts_key(tenant, queue).
-    /// Value: (tenant, queue, count). Lock held only briefly for increment/drain.
-    /// BTreeMap ensures deterministic iteration order for DST reproducibility.
+    /// HOT pending lane: grant counts per queue from event-driven callers
+    /// (releases from dequeue/lease/cancel/import/drop-tenant, at-capacity
+    /// ticket conversions, floating-limit raises, ghost releases). Drained in
+    /// FULL every scanner iteration so a freed slot is refilled within one
+    /// iteration rather than one shard-wide sweep. Key:
+    /// concurrency_counts_key(tenant, queue). Value: (tenant, queue, count).
+    /// Lock held only briefly for increment/drain. BTreeMap ensures
+    /// deterministic iteration order for DST reproducibility.
     pending_grants: Mutex<BTreeMap<Vec<u8>, (String, String, u32)>>,
+    /// COLD pending lane: entries seeded by the periodic
+    /// `reconcile_pending_requests` counter sweep, drained at most
+    /// `grant_scanner_cold_batch_size` per iteration behind the hot lane. On
+    /// a queue-heavy shard the sweep re-seeds hundreds of thousands of
+    /// entries; letting them share the hot lane meant a release nudge waited
+    /// an entire shard-wide cycle (~40 min observed) to be serviced.
+    pending_grants_cold: Mutex<ColdLane>,
     grant_notify: tokio::sync::Notify,
     grant_running: AtomicBool,
     /// Sub-tick wake for the periodic holder reconciler. Fired by
@@ -805,6 +884,10 @@ pub struct ConcurrencyManager {
     /// In-memory cache of resolved concurrency limits per queue.
     /// Key: concurrency_counts_key(tenant, queue). Populated during enqueue and grant_next.
     limit_cache: Mutex<HashMap<Vec<u8>, CachedQueueLimit>>,
+    /// Resume cursor for sliced `reconcile_pending_requests` sweeps: the
+    /// counter key the next sliced sweep starts scanning from. `None` starts
+    /// at the front of the counter keyspace.
+    reconcile_cursor: Mutex<Option<Vec<u8>>>,
     metrics: Option<Metrics>,
     /// Callback for resuming a job's limit chain after a deferred concurrency
     /// grant is awarded. Wired up by `JobStoreShard::open` after the shard
@@ -856,57 +939,110 @@ pub struct ConcurrencyManager {
     /// multiple) in `new`; always `>= grant_scanner_batch_size` so every
     /// invocation can run at least one full pass.
     grant_scanner_max_scan_per_invocation: usize,
-    /// Consecutive-pass observation counts for drift-detected ghost
-    /// candidates, keyed by (tenant, queue, task_id). Maintained only by
-    /// `report_holder_drift` (a single periodic task). Rebuilt each pass from
-    /// the current ghost set, so it is bounded by the current ghost +
-    /// in-flight-reservation count and self-prunes when a candidate gains a
-    /// durable row or is released. See `GHOST_CONFIRM_PASSES`.
-    ghost_candidates: Mutex<HashMap<(String, String, String), u32>>,
+    /// Max cold-lane (reconciler-sourced) queue entries merged into a single
+    /// drain iteration alongside all hot-lane (event-driven) entries. Bounds
+    /// how long a reconcile-sweep backlog can delay servicing a release
+    /// nudge. Configurable via `grant_scanner_cold_batch_size` (default 64);
+    /// stored already clamped to `>= 1`.
+    grant_scanner_cold_batch_size: usize,
+    /// Minimum requester backlog on a candidate's next concurrency hop before
+    /// `process_grants` defers granting the candidate while that hop is
+    /// saturated. 0 disables the next-hop skip. Configurable via
+    /// `grant_scanner_next_hop_skip_min_backlog` (default 1024).
+    grant_scanner_next_hop_skip_min_backlog: u64,
+    /// Fraction of each queue's capacity the scanner leaves unfilled for
+    /// immediate (live) grants. Configurable via
+    /// `grant_scanner_live_headroom_fraction` (default 0.0); stored already
+    /// clamped to `[0.0, 0.9]` with non-finite values treated as 0.0.
+    grant_scanner_live_headroom_fraction: f64,
+    /// State of the (possibly multi-tick) holder-drift pass. Maintained only
+    /// by `report_holder_drift` (a single periodic task). See `DriftPass`.
+    drift_pass: Mutex<DriftPass>,
 }
+
+/// End a `process_grants` invocation after this many CONSECUTIVE next-hop
+/// skips with no intervening non-skipped candidate (a grant candidate or
+/// stale-row cleanup both reset the run). Bounds the walk over a front
+/// dominated by candidates whose next hop is saturated-with-backlog: without
+/// it, every cold-sweep re-drive of such a queue re-walks up to the full
+/// per-invocation scan budget (batch_size × 4 — 8192 keys with the staging
+/// config) doing nothing, inflating drain-iteration time. Large enough that
+/// a mixed front with grantable candidates for a different hop inside the
+/// window is still served in one invocation.
+const MAX_CONSECUTIVE_NEXT_HOP_SKIPS: usize = 64;
 
 /// A drift-detected ghost must be observed as a ghost in this many
 /// *consecutive* `report_holder_drift` passes before it is enqueued for
 /// release. A true ghost (a dropped-future leak) is permanent and survives
 /// every pass; an in-flight reservation (`try_reserve_internal` inserts into
 /// the in-memory holder set before its durable write commits) clears within
-/// one reconcile interval, so a value of 2 excludes those false positives.
-/// Bump to debounce harder.
+/// one pass — far shorter than a full sliced pass over all hydrated queues —
+/// so a value of 2 excludes those false positives. Bump to debounce harder.
 const GHOST_CONFIRM_PASSES: u32 = 2;
+
+/// Accumulators for the holder-drift pass. A full pass visits every hydrated
+/// queue in one sorted snapshot; with per-tick slicing
+/// (`holder_drift_scan_slice`) the pass spans multiple reconcile ticks, so
+/// its state lives here between ticks. The drift gauge and the
+/// ghost-candidate promotion both advance only at FULL-pass boundaries,
+/// preserving `GHOST_CONFIRM_PASSES` = two complete passes.
+#[derive(Default)]
+struct DriftPass {
+    /// Queues still to visit this pass, in sorted order. Refilled from a
+    /// fresh sorted snapshot when empty (= a new pass begins).
+    work: VecDeque<(String, String)>,
+    /// Ghost-candidate observation counts as of the last COMPLETED pass,
+    /// keyed by (tenant, queue, task_id). Bounded by the ghost +
+    /// in-flight-reservation count; self-prunes when a candidate gains a
+    /// durable row or is released (absent from the next pass's set).
+    prev_candidates: HashMap<(String, String, String), u32>,
+    /// Ghost-candidate observation counts accumulated by the CURRENT pass.
+    next_candidates: HashMap<(String, String, String), u32>,
+    /// Σ |in_memory - durable| accumulated by the current pass; published to
+    /// the drift gauge when the pass completes.
+    drift_total: u64,
+}
 
 impl ConcurrencyManager {
     pub fn new(
         shard: impl Into<String>,
         metrics: Option<Metrics>,
         hydrate_all_at_startup: bool,
-        grant_scanner_batch_size: usize,
-        grant_scanner_buffer_size: usize,
-        grant_scanner_concurrency: usize,
+        scanner: GrantScannerConfig,
     ) -> Self {
         Self {
             shard: shard.into(),
             counts: ConcurrencyCounts::with_config(hydrate_all_at_startup),
             pending_grants: Mutex::new(BTreeMap::new()),
+            pending_grants_cold: Mutex::new(ColdLane::default()),
             grant_notify: tokio::sync::Notify::new(),
             grant_running: AtomicBool::new(false),
             reconcile_notify: Arc::new(tokio::sync::Notify::new()),
             limit_cache: Mutex::new(HashMap::new()),
+            reconcile_cursor: Mutex::new(None),
             metrics,
             chain_resumer: Mutex::new(None),
             // Clamp to >= 1: a 0 batch would stall the drain loop and
             // `.buffered(0)` / `.buffer_unordered(0)` are invalid.
-            grant_scanner_batch_size: grant_scanner_batch_size.max(1),
-            grant_scanner_buffer_size: grant_scanner_buffer_size.max(1),
-            grant_scanner_concurrency: grant_scanner_concurrency.max(1),
+            grant_scanner_batch_size: scanner.batch_size.max(1),
+            grant_scanner_buffer_size: scanner.buffer_size.max(1),
+            grant_scanner_concurrency: scanner.concurrency.max(1),
             // Cap total keys walked per invocation at a small multiple of the
             // per-pass batch so a giant non-grantable backlog yields after a
             // bounded walk and round-robins with other queues, while still
             // allowing several full passes of real draining per cycle. `×4` is
             // inherently `>= batch_size`, so at least one full pass always runs.
-            grant_scanner_max_scan_per_invocation: grant_scanner_batch_size
-                .max(1)
-                .saturating_mul(4),
-            ghost_candidates: Mutex::new(HashMap::new()),
+            grant_scanner_max_scan_per_invocation: scanner.batch_size.max(1).saturating_mul(4),
+            grant_scanner_cold_batch_size: scanner.cold_batch_size.max(1),
+            grant_scanner_next_hop_skip_min_backlog: scanner.next_hop_skip_min_backlog,
+            // Non-finite fractions (NaN/inf from a hand-edited TOML) are
+            // meaningless as a headroom share — treat them as disabled.
+            grant_scanner_live_headroom_fraction: if scanner.live_headroom_fraction.is_finite() {
+                scanner.live_headroom_fraction.clamp(0.0, 0.9)
+            } else {
+                0.0
+            },
+            drift_pass: Mutex::new(DriftPass::default()),
         }
     }
 
@@ -1050,6 +1186,95 @@ impl ConcurrencyManager {
                 Self::floating_state_capacity(db, tenant, queue).await
             }
         }
+    }
+
+    /// Capacity the SCANNER may fill for a queue: full capacity minus the
+    /// configured live-headroom share, never reduced below 1 so a backlog
+    /// always drains. Immediate paths (enqueue-time grants, chain-resume
+    /// downstream grants, dequeue ticket conversion) keep the full capacity,
+    /// so the reserved share stays available for fresh work while the
+    /// scanner digs out a deferred backlog. With the default fraction of 0.0
+    /// this is the identity. A zero capacity stays zero — the headroom knob
+    /// must never grant slots a limit of 0 forbids.
+    fn scanner_effective_capacity(&self, capacity: usize) -> usize {
+        let fraction = self.grant_scanner_live_headroom_fraction;
+        if fraction <= 0.0 || capacity == 0 {
+            return capacity;
+        }
+        capacity
+            .saturating_sub((capacity as f64 * fraction).ceil() as usize)
+            .max(1)
+    }
+
+    /// Decide whether the grant scanner should defer a candidate because its
+    /// NEXT concurrency hop is saturated with a deep requester backlog.
+    ///
+    /// The gate is the FIRST limit after `limit_index`: a RateLimit gate
+    /// never skips (the chain writes a `CheckRateLimit` task — real progress
+    /// that holds no capacity), and a terminal candidate (no further limits)
+    /// never skips (granting emits the RunAttempt). A Concurrency /
+    /// FloatingConcurrency gate skips iff its holders >= its capacity AND its
+    /// durable requester counter >= `grant_scanner_next_hop_skip_min_backlog`
+    /// (0 disables the check entirely).
+    ///
+    /// Inputs degrade safely: `holder_count` on an unhydrated next hop reads
+    /// 0 and an unreadable counter reads 0, so missing data can only make the
+    /// skip NOT fire — behavior falls back to granting as before. Decisions
+    /// (including the floating-capacity point-read and the counter
+    /// point-read) are cached in `cache` for the invocation, keyed by the
+    /// next hop's queue name: in practice every candidate in one queue shares
+    /// the same next hop (the tenant's platform queue), so the whole
+    /// invocation pays at most a couple of point reads.
+    async fn next_hop_should_skip(
+        &self,
+        db: &Arc<InstrumentedDb>,
+        tenant: &str,
+        limits: &[Limit],
+        limit_index: u32,
+        cache: &mut HashMap<String, bool>,
+    ) -> bool {
+        if self.grant_scanner_next_hop_skip_min_backlog == 0 {
+            return false;
+        }
+        let Some(next) = limits.get(limit_index as usize + 1) else {
+            return false;
+        };
+        // Split queue-name extraction from capacity resolution so the cache
+        // check happens before the floating-state point read.
+        let (next_queue, fixed_capacity, floating_default) = match next {
+            Limit::RateLimit(_) => return false,
+            Limit::Concurrency(cl) => (cl.key.as_str(), Some(cl.max_concurrency as usize), 0),
+            Limit::FloatingConcurrency(fl) => {
+                (fl.key.as_str(), None, fl.default_max_concurrency as usize)
+            }
+        };
+        if let Some(&decision) = cache.get(next_queue) {
+            return decision;
+        }
+        let capacity = match fixed_capacity {
+            Some(capacity) => capacity,
+            // The durable floating row is what the next hop's own scan path
+            // gates on; fall back to the limit's embedded default when the
+            // row is missing/unreadable, mirroring resolve_queue_capacity_from_limits.
+            None => Self::floating_state_capacity(db, tenant, next_queue)
+                .await
+                .unwrap_or(floating_default),
+        };
+        let holders = self.counts.holder_count(tenant, next_queue);
+        let decision = if holders >= capacity {
+            let depth = match db
+                .get(&concurrency_requester_counter_key(tenant, next_queue))
+                .await
+            {
+                Ok(Some(raw)) => decode_counter(&raw),
+                _ => 0,
+            };
+            depth >= self.grant_scanner_next_hop_skip_min_backlog as i64
+        } else {
+            false
+        };
+        cache.insert(next_queue.to_string(), decision);
+        decision
     }
 
     /// Handle concurrency for a new job enqueue.
@@ -1414,25 +1639,50 @@ impl ConcurrencyManager {
     /// sub-tick wake) — keeps the cost amortized at the deployment-configured
     /// `concurrency_reconcile_interval` rather than firing on every dropped
     /// dequeue future. Self-healing runs even when metrics are disabled.
-    pub async fn report_holder_drift(&self, db: &Arc<InstrumentedDb>, range: &ShardRange) {
-        // Take the previous pass's ghost-candidate counts and rebuild a fresh
-        // map from this pass. Held outside the per-queue `.await` scans below
-        // (the lock must never span an await). A candidate absent from this
-        // pass (durable row appeared, or it was released) simply drops out.
-        let prev_candidates = {
-            let mut g = self.ghost_candidates.lock().unwrap();
-            std::mem::take(&mut *g)
+    ///
+    /// `slice` bounds the queues scanned per call: a full pass over all
+    /// hydrated queues spans `ceil(hydrated / slice)` ticks, with work,
+    /// ghost-candidate counts, and the drift accumulator carried between
+    /// ticks in `drift_pass`. On a queue-heavy shard this replaces the old
+    /// behavior of issuing one durable ranged scan per hydrated queue —
+    /// hundreds of thousands of scans — EVERY tick. The trade-off is drift
+    /// gauge freshness and drift-detected ghost latency of ~one full pass;
+    /// the reactive `request_reconciliation` path (sub-tick) is unaffected
+    /// and remains the primary ghost-release path. Tests pass `usize::MAX`
+    /// so one call is one full pass.
+    pub async fn report_holder_drift(
+        &self,
+        db: &Arc<InstrumentedDb>,
+        range: &ShardRange,
+        slice: usize,
+    ) {
+        // Pop this tick's batch under the lock (never held across awaits).
+        // An empty work list means a new pass begins: take a fresh sorted
+        // snapshot of the hydrated queues.
+        let (batch, pass_completes) = {
+            let mut pass = self.drift_pass.lock().unwrap();
+            if pass.work.is_empty() {
+                pass.work = self.counts.hydrated_queue_keys().into();
+            }
+            let take = slice.min(pass.work.len());
+            let batch: Vec<(String, String)> = pass.work.drain(..take).collect();
+            (batch, pass.work.is_empty())
         };
-        let mut next_candidates: HashMap<(String, String, String), u32> = HashMap::new();
 
-        let mut drift_total: u64 = 0;
-        for (tenant, queue, in_mem_holders) in self.counts.hydrated_queue_holders_with_ids() {
-            if !range.contains_tenant(&tenant) {
+        let mut batch_drift: u64 = 0;
+        let mut batch_ghosts: Vec<(String, String, String)> = Vec::new();
+        for (tenant, queue) in &batch {
+            if !range.contains_tenant(tenant) {
                 continue;
             }
-            // Per-queue ranged scan. Cost dominated by holder count; capped
-            // by the deployment's reconcile interval.
-            let start = crate::keys::concurrency_holders_queue_prefix(&tenant, &queue);
+            // A queue that left the Hydrated state since the pass snapshot is
+            // skipped — same filter the whole-cache snapshot applied.
+            let Some(in_mem_holders) = self.counts.holders_if_hydrated(tenant, queue) else {
+                continue;
+            };
+            // Per-queue ranged scan. Cost dominated by holder count; total
+            // per tick bounded by `slice`.
+            let start = crate::keys::concurrency_holders_queue_prefix(tenant, queue);
             let end = crate::keys::end_bound(&start);
             let mut iter = match db
                 .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
@@ -1470,40 +1720,66 @@ impl ConcurrencyManager {
                 }
             }
 
-            drift_total += (in_mem_holders.len() as i64 - durable_ids.len() as i64).unsigned_abs();
+            batch_drift += (in_mem_holders.len() as i64 - durable_ids.len() as i64).unsigned_abs();
 
-            // Ghost candidates: in-memory holders with no durable row. Only
-            // enqueue for reconciliation once a candidate has survived
-            // `GHOST_CONFIRM_PASSES` consecutive passes — an in-flight
-            // reservation (durable write not yet committed) clears within one
-            // interval and so never reaches the threshold, while a real ghost
-            // is permanent. See this fn's doc comment for the full rationale.
+            // Ghost candidates: in-memory holders with no durable row.
             for task_id in in_mem_holders.difference(&durable_ids) {
-                let key = (tenant.clone(), queue.clone(), task_id.clone());
-                let seen = prev_candidates
+                batch_ghosts.push((tenant.clone(), queue.clone(), task_id.clone()));
+            }
+        }
+
+        // Fold the batch into the pass accumulators and promote confirmed
+        // ghosts. Only enqueue a candidate for reconciliation once it has
+        // survived `GHOST_CONFIRM_PASSES` consecutive FULL passes — an
+        // in-flight reservation (durable write not yet committed) clears
+        // long before the next pass revisits its queue, while a real ghost
+        // is permanent. Candidates absent from a pass (durable row appeared,
+        // or released) drop out at the pass-boundary swap. Confirmations are
+        // collected under the lock and enqueued after it drops.
+        let (to_reconcile, completed_drift) = {
+            let mut pass = self.drift_pass.lock().unwrap();
+            pass.drift_total = pass.drift_total.saturating_add(batch_drift);
+            let mut to_reconcile = Vec::new();
+            for key in batch_ghosts {
+                let seen = pass
+                    .prev_candidates
                     .get(&key)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(1);
                 if seen >= GHOST_CONFIRM_PASSES {
-                    self.request_reconciliation(tenant.clone(), queue.clone(), task_id.clone());
+                    to_reconcile.push(key.clone());
                 }
                 // Saturate at the threshold so a long-lived ghost the
                 // reconciler keeps re-queueing doesn't grow the count
                 // unboundedly; re-enqueuing each pass is harmless
                 // (`pending_reconciliations` dedups and release is idempotent).
-                next_candidates.insert(key, seen.min(GHOST_CONFIRM_PASSES));
+                pass.next_candidates
+                    .insert(key, seen.min(GHOST_CONFIRM_PASSES));
             }
-        }
-
-        {
-            let mut g = self.ghost_candidates.lock().unwrap();
-            *g = next_candidates;
+            let completed_drift = if pass_completes {
+                let drift = pass.drift_total;
+                pass.drift_total = 0;
+                pass.prev_candidates = std::mem::take(&mut pass.next_candidates);
+                Some(drift)
+            } else {
+                None
+            };
+            (to_reconcile, completed_drift)
+        };
+        for (tenant, queue, task_id) in to_reconcile {
+            self.request_reconciliation(tenant, queue, task_id);
         }
 
         if let Some(metrics) = self.metrics.as_ref() {
+            // Pending is a live queue size: publish every tick. Drift is a
+            // pass-level aggregate: publish only when a full pass completes,
+            // so the gauge never shows a partial sweep as "drift shrank".
             let pending = self.counts.pending_reconciliations_len() as u64;
-            metrics.set_concurrency_reconciler_signals(&self.shard, drift_total, pending);
+            metrics.set_concurrency_reconciliation_pending(&self.shard, pending);
+            if let Some(drift) = completed_drift {
+                metrics.set_concurrency_holder_drift(&self.shard, drift);
+            }
         }
     }
 
@@ -1514,19 +1790,111 @@ impl ConcurrencyManager {
             let entry = pending
                 .entry(key)
                 .or_insert_with(|| (tenant.to_string(), queue.to_string(), 0));
-            entry.2 += count;
+            entry.2 = entry.2.saturating_add(count);
         }
         self.grant_notify.notify_one();
     }
 
-    /// Test-only: peek the current pending-grant count for a queue. Used by
+    /// Cold-lane variant of `request_grant_count`, used only by the
+    /// `reconcile_pending_requests` counter sweep.
+    ///
+    /// SET/max semantics rather than accumulation: the sweep re-reads the
+    /// durable requester counter on every visit, so the counter value IS the
+    /// outstanding demand. Accumulating it (the old shared-lane behavior)
+    /// grew the pending count without bound while a queue went unserviced —
+    /// u32 overflow in minutes for a queue with tens of millions of
+    /// requesters.
+    pub(crate) fn request_grant_count_cold(&self, tenant: &str, queue: &str, count: u32) {
+        let key = concurrency_counts_key(tenant, queue);
+        {
+            let mut cold = self.pending_grants_cold.lock().unwrap();
+            let entry = cold
+                .entries
+                .entry(key)
+                .or_insert_with(|| (tenant.to_string(), queue.to_string(), 0));
+            entry.2 = entry.2.max(count);
+        }
+        self.grant_notify.notify_one();
+    }
+
+    /// Compute one drain iteration's work set: ALL hot-lane entries plus at
+    /// most `grant_scanner_cold_batch_size` cold-lane entries, merged with
+    /// saturating counts on key collision.
+    ///
+    /// Cold entries are popped ROUND-ROBIN from `pop_cursor` (next key
+    /// strictly after it, wrapping to the front) — NOT `pop_first`. The
+    /// reconcile sweep re-seeds the cold lane continuously while pops proceed
+    /// at the drain rate; whenever re-seeding outpaces popping, a
+    /// global-minimum pop stays confined forever to the lexicographically
+    /// smallest resident keys and the tail is never visited. The cursor
+    /// bounds every resident entry's wait to one pop-rotation, independent of
+    /// the insert pattern, and is deterministic for DST.
+    ///
+    /// Fully synchronous; never holds both lane locks at once.
+    pub fn take_pending_grant_batch(&self) -> BTreeMap<Vec<u8>, (String, String, u32)> {
+        let mut work = {
+            let mut pending = self.pending_grants.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+
+        let cold = &mut *self.pending_grants_cold.lock().unwrap();
+        for _ in 0..self.grant_scanner_cold_batch_size {
+            let next_key = cold
+                .pop_cursor
+                .as_deref()
+                .and_then(|cursor| {
+                    cold.entries
+                        .range::<[u8], _>((
+                            std::ops::Bound::Excluded(cursor),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .map(|(k, _)| k.clone())
+                })
+                // Cursor unset or tail exhausted: wrap to the front.
+                .or_else(|| cold.entries.keys().next().cloned());
+            let Some(key) = next_key else { break };
+            let Some((tenant, queue, count)) = cold.entries.remove(&key) else {
+                break;
+            };
+            match work.entry(key.clone()) {
+                std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                    let entry = occupied.get_mut();
+                    entry.2 = entry.2.saturating_add(count);
+                }
+                std::collections::btree_map::Entry::Vacant(vacant) => {
+                    vacant.insert((tenant, queue, count));
+                }
+            }
+            cold.pop_cursor = Some(key);
+        }
+        work
+    }
+
+    /// Test-only: peek the current pending-grant count for a queue, summed
+    /// across the hot and cold lanes. Used by
     /// `reconcile_pending_holders_kicks_grant_per_release` to assert that
     /// the reconciler kicked the scanner once per ghost release rather than
     /// once per queue.
     pub fn pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        self.hot_pending_grant_count_for_test(tenant, queue)
+            .saturating_add(self.cold_pending_grant_count_for_test(tenant, queue))
+    }
+
+    /// Test-only: peek the hot-lane pending-grant count for a queue.
+    #[doc(hidden)]
+    pub fn hot_pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
         let key = concurrency_counts_key(tenant, queue);
         let pending = self.pending_grants.lock().unwrap();
         pending.get(&key).map(|(_, _, n)| *n).unwrap_or(0)
+    }
+
+    /// Test-only: peek the cold-lane pending-grant count for a queue.
+    #[doc(hidden)]
+    pub fn cold_pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        let key = concurrency_counts_key(tenant, queue);
+        let cold = self.pending_grants_cold.lock().unwrap();
+        cold.entries.get(&key).map(|(_, _, n)| *n).unwrap_or(0)
     }
 
     /// Start the background grant scanner task.
@@ -1541,8 +1909,9 @@ impl ConcurrencyManager {
         self.grant_running.store(true, Ordering::SeqCst);
         let mgr = Arc::clone(self);
         tokio::spawn(async move {
-            // Startup: scan for existing pending requests
-            mgr.reconcile_pending_requests(&db, &range).await;
+            // Startup: one full sweep for existing pending requests, seeding
+            // the cold lane so recovery work drains behind live nudges.
+            mgr.reconcile_pending_requests(&db, &range, None).await;
 
             loop {
                 mgr.grant_notify.notified().await;
@@ -1550,14 +1919,34 @@ impl ConcurrencyManager {
                     break;
                 }
 
-                // Inner loop: drain and process until no more pending work
+                // Inner loop: drain and process until no more pending work.
+                // Each iteration takes ALL hot-lane entries plus a bounded
+                // cold-lane batch, so a shard-wide reconcile-sweep backlog
+                // (potentially hundreds of thousands of cold entries) can
+                // delay a release-driven hot nudge by at most one iteration
+                // instead of one full cycle over the whole backlog.
                 loop {
-                    let work = {
-                        let mut pending = mgr.pending_grants.lock().unwrap();
-                        std::mem::take(&mut *pending)
-                    };
+                    // Re-check the stop flag per iteration: with a large cold
+                    // backlog the inner loop can run for a long time, and
+                    // `close()` must not leave the scanner granting against a
+                    // closing DB. The AtomicBool (not select!/abort) is the
+                    // cancellation boundary because `process_grants` is not
+                    // cancellation-safe mid-pass — in-memory reservations are
+                    // only rolled back on its explicit error paths.
+                    if !mgr.grant_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let work = mgr.take_pending_grant_batch();
                     if work.is_empty() {
                         break;
+                    }
+                    // Lane sizes AFTER the take: what remains queued. Hot is
+                    // ~0 in steady state (drained fully every iteration);
+                    // cold sawtooths with the periodic reconcile sweep.
+                    if let Some(ref m) = mgr.metrics {
+                        let hot = mgr.pending_grants.lock().unwrap().len();
+                        let cold = mgr.pending_grants_cold.lock().unwrap().entries.len();
+                        m.set_concurrency_pending_grants(&mgr.shard, hot, cold);
                     }
 
                     // Fan out across queues with bounded concurrency. Each
@@ -1626,9 +2015,34 @@ impl ConcurrencyManager {
     /// wakes the scanner for a queue that grants nothing. It will not
     /// under-report newly created work because the increment lands in the same
     /// write batch as the request row.
-    pub async fn reconcile_pending_requests(&self, db: &InstrumentedDb, range: &ShardRange) {
-        let start = vec![crate::keys::prefix::COUNTER_CONCURRENCY_REQUESTERS];
-        let end = end_bound(&start);
+    ///
+    /// Discovered queues are seeded into the scanner's COLD lane so a
+    /// shard-wide sweep can never delay event-driven (hot-lane) nudges.
+    ///
+    /// `max_keys` bounds the counter keys WALKED this call — grantable or
+    /// not, including zero-valued and out-of-range rows, since the walk cost
+    /// is what a tick must bound. `None` sweeps the whole keyspace in one
+    /// call (scanner startup, diagnostics). `Some(n)` walks at most `n` keys
+    /// resuming from the persistent cursor and saves the new resume point, so
+    /// a shard with hundreds of thousands of counter rows spreads full
+    /// coverage across ticks instead of re-scanning everything every 5s.
+    /// Reaching the end of the keyspace resets the cursor to the front.
+    pub async fn reconcile_pending_requests(
+        &self,
+        db: &InstrumentedDb,
+        range: &ShardRange,
+        max_keys: Option<usize>,
+    ) {
+        let sweep_started = std::time::Instant::now();
+        let prefix_start = vec![crate::keys::prefix::COUNTER_CONCURRENCY_REQUESTERS];
+        let end = end_bound(&prefix_start);
+        // Sliced sweeps resume from the saved cursor; full sweeps always
+        // cover the whole keyspace from the front.
+        let saved_cursor = self.reconcile_cursor.lock().unwrap().clone();
+        let start = match saved_cursor {
+            Some(cursor) if max_keys.is_some() => cursor,
+            _ => prefix_start,
+        };
         let mut iter = match db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options_uncached())
             .await
@@ -1643,7 +2057,14 @@ impl ConcurrencyManager {
             }
         };
 
+        let mut walked: usize = 0;
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut budget_exhausted = false;
         loop {
+            if max_keys.is_some_and(|budget| walked >= budget) {
+                budget_exhausted = true;
+                break;
+            }
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
                 Ok(None) => break,
@@ -1655,6 +2076,8 @@ impl ConcurrencyManager {
                     break;
                 }
             };
+            walked += 1;
+            last_key = Some(kv.key.to_vec());
 
             let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key) else {
                 continue;
@@ -1667,8 +2090,31 @@ impl ConcurrencyManager {
 
             let count = decode_counter(&kv.value);
             if count > 0 {
-                self.request_grant_count(&parsed.tenant, &parsed.queue, count as u32);
+                // Clamp rather than cast: a drifted counter beyond u32::MAX
+                // must not wrap into a tiny pending count.
+                let count = count.clamp(0, u32::MAX as i64) as u32;
+                self.request_grant_count_cold(&parsed.tenant, &parsed.queue, count);
             }
+        }
+
+        // Persist the resume point. Budget exhaustion mid-keyspace resumes at
+        // the successor of the last walked key — append 0x00, the immediate
+        // successor in bytewise order (never increment bytes: 0xFF would
+        // overflow). Reaching the end (or a scan error) resets to the front
+        // so the next sliced sweep starts a fresh rotation.
+        *self.reconcile_cursor.lock().unwrap() = match (budget_exhausted, last_key) {
+            (true, Some(mut key)) => {
+                key.push(0x00);
+                Some(key)
+            }
+            _ => None,
+        };
+
+        if let Some(ref m) = self.metrics {
+            m.record_concurrency_reconcile_sweep(
+                &self.shard,
+                sweep_started.elapsed().as_secs_f64(),
+            );
         }
     }
 
@@ -1689,6 +2135,21 @@ impl ConcurrencyManager {
         queue: &str,
         count: u32,
     ) -> Vec<String> {
+        let invocation_started = std::time::Instant::now();
+        // Invocation-level accounting, recorded once at every exit path
+        // (including precheck skips) so invocation rate and per-invocation
+        // walk cost are observable regardless of how the invocation ends.
+        let record_invocation = |keys_scanned: usize, stale_deleted: usize| {
+            if let Some(ref m) = self.metrics {
+                m.record_concurrency_process_grants(
+                    &self.shard,
+                    invocation_started.elapsed().as_secs_f64(),
+                    keys_scanned as u64,
+                    stale_deleted as u64,
+                );
+            }
+        };
+
         if let Err(e) = self.counts.ensure_hydrated(db, range, tenant, queue).await {
             tracing::warn!(
                 error = %e,
@@ -1696,15 +2157,21 @@ impl ConcurrencyManager {
                 queue = %queue,
                 "grant scanner: failed to hydrate queue"
             );
+            record_invocation(0, 0);
             return Vec::new();
         }
 
         // [SILO-GRANT-1] Pre: Queue has capacity. Fast pre-scan gate: when the
         // queue's capacity is known (cached limit; durable state row for
-        // floating) and every slot is occupied, the try_reserve_internal guard
-        // below cannot succeed for any candidate — the transition cannot fire,
-        // so skip building the request iterator and the per-candidate status
-        // reads entirely. `saturating_sub` is required: holders can
+        // floating) and every SCANNER-fillable slot is occupied, the
+        // try_reserve_internal guard below cannot succeed for any candidate —
+        // the transition cannot fire, so skip building the request iterator
+        // and the per-candidate status reads entirely. The gate uses the same
+        // headroom-reduced capacity the reserve loop grants against (see
+        // `scanner_effective_capacity`): gating on full capacity while
+        // reserving against the reduced one would re-scan a full batch every
+        // cycle just to fail the first reserve whenever holders sit inside
+        // the headroom band. `saturating_sub` is required: holders can
         // legitimately exceed capacity after a floating-limit shrink
         // (try_reserve_internal gates with `>=` and never evicts). Skipping
         // leaves the requester counter untouched, so the periodic reconciler
@@ -1716,8 +2183,9 @@ impl ConcurrencyManager {
         // request cleanup for a saturated queue pauses until a slot frees, and
         // a lowered fixed limit gates old requests that embed a higher one.
         if let Some(capacity) = self.known_queue_capacity(db, tenant, queue).await {
+            let effective_capacity = self.scanner_effective_capacity(capacity);
             let holders = self.counts.holder_count(tenant, queue);
-            if capacity.saturating_sub(holders) == 0 {
+            if effective_capacity.saturating_sub(holders) == 0 {
                 if let Some(ref m) = self.metrics {
                     m.record_concurrency_grant_precheck_skip(&self.shard);
                 }
@@ -1726,9 +2194,11 @@ impl ConcurrencyManager {
                     queue = %queue,
                     requested = count,
                     capacity,
+                    effective_capacity,
                     holders,
                     "grant scanner: queue at capacity, skipping request scan"
                 );
+                record_invocation(0, 0);
                 return Vec::new();
             }
         }
@@ -1745,6 +2215,7 @@ impl ConcurrencyManager {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!(error = %e, "grant scanner: failed to scan requests");
+                record_invocation(0, 0);
                 return Vec::new();
             }
         };
@@ -1779,6 +2250,13 @@ impl ConcurrencyManager {
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
+        // Next-hop saturation skip state: decisions cached per next-hop queue
+        // for the whole invocation (most candidates in one queue share the
+        // same next hop, e.g. the tenant's platform queue), plus a
+        // consecutive-skip run counter bounding futile walks — see the skip
+        // block below.
+        let mut next_hop_skip_cache: HashMap<String, bool> = HashMap::new();
+        let mut consecutive_next_hop_skips: usize = 0;
         // Per-invocation scan budget. Total request keys walked
         // across all passes (valid, stale, and corrupt — the walk cost is what
         // we bound). When it reaches `grant_scanner_max_scan_per_invocation` the
@@ -1814,6 +2292,10 @@ impl ConcurrencyManager {
             let mut batch = WriteBatch::new();
             let mut grants: Vec<(String, String)> = Vec::new();
             let mut stale_and_corrupt_count: usize = 0;
+            // Stale count as of the last next-hop skip: cleanup progress
+            // between skips resets the consecutive-skip run (a walk that is
+            // deleting stale rows is not futile).
+            let mut stale_at_last_skip: usize = 0;
 
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
@@ -1983,6 +2465,59 @@ impl ConcurrencyManager {
                     max_concurrency = Some((l, lt));
                 }
 
+                // Defer candidates whose NEXT concurrency hop is saturated
+                // with a deep requester backlog: granting them cannot make
+                // the job runnable — the chain immediately parks a deferred
+                // request at that hop — so it only converts "waiting here"
+                // into a parked holder plus one more line entry (pure state
+                // inflation), while occupying this queue's slots with jobs
+                // that cannot run (the shared-queue wedge shape). The row is
+                // left in place — no grant, no delete, no counter decrement —
+                // and keeps its original start_time, so when it is eventually
+                // granted it parks at its age-correct position in the next
+                // hop's FIFO. Liveness: the requester counter stays non-zero,
+                // so the periodic reconcile sweep re-drives this queue; the
+                // depth threshold guarantees the next hop still has far more
+                // than one sweep period of backlog when that happens.
+                if self
+                    .next_hop_should_skip(
+                        db,
+                        tenant,
+                        &limits,
+                        limit_index,
+                        &mut next_hop_skip_cache,
+                    )
+                    .await
+                {
+                    // Cleanup progress since the last skip resets the run: a
+                    // walk that is deleting stale rows is not futile.
+                    if stale_and_corrupt_count > stale_at_last_skip {
+                        consecutive_next_hop_skips = 0;
+                    }
+                    stale_at_last_skip = stale_and_corrupt_count;
+                    consecutive_next_hop_skips += 1;
+                    if let Some(ref m) = self.metrics {
+                        m.record_concurrency_grant_next_hop_skip(&self.shard);
+                    }
+                    if consecutive_next_hop_skips >= MAX_CONSECUTIVE_NEXT_HOP_SKIPS {
+                        // A uniform skip-front: end the invocation instead of
+                        // walking (and, on every cold re-drive, re-walking)
+                        // up to the full scan budget of rows that cannot
+                        // grant — the repeated futile walk is what inflated
+                        // drain-iteration time and starved the cold pop rate.
+                        // Counting consecutively regardless of WHICH hop
+                        // skipped is deliberate: a front alternating between
+                        // two saturated hops is equally futile. Any
+                        // non-skipped candidate resets the run, so a mixed
+                        // front with grantable work inside the window still
+                        // finds it.
+                        budget_exhausted = true;
+                        break;
+                    }
+                    continue;
+                }
+                consecutive_next_hop_skips = 0;
+
                 scanned.push(ScannedRequest {
                     request_key: kv.key.to_vec(),
                     task_id: task_id_str,
@@ -2094,7 +2629,14 @@ impl ConcurrencyManager {
             // FloatingConcurrency/Concurrency limit grants immediately), so we
             // collect all per-pass reservations into `pass_reservations` for
             // rollback if the batch write fails.
-            let limit = max_concurrency.map(|(l, _)| l).unwrap_or(1);
+            //
+            // The scanner reserves against the headroom-reduced capacity so
+            // the configured live share of slots stays reachable by immediate
+            // grants (which use full capacity) while a backlog drains. Note
+            // the resumer's downstream immediate grants also use full
+            // capacity — headroom applies only to the queue being scanned.
+            let limit =
+                self.scanner_effective_capacity(max_concurrency.map(|(l, _)| l).unwrap_or(1));
             // `(queue, task_id)` reservations to release if the per-pass batch
             // write fails. Includes both the just-won queue and any further
             // grants the chain resumer made.
@@ -2150,6 +2692,7 @@ impl ConcurrencyManager {
                     for (q, tid) in &pass_reservations {
                         self.counts.release_reservation(tenant, q, tid);
                     }
+                    record_invocation(scanned_this_invocation, total_stale_deleted);
                     return all_granted_groups;
                 };
 
@@ -2186,6 +2729,7 @@ impl ConcurrencyManager {
                         for (q, tid) in &pass_reservations {
                             self.counts.release_reservation(tenant, q, tid);
                         }
+                        record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted_groups;
                     }
                 }
@@ -2233,6 +2777,7 @@ impl ConcurrencyManager {
                     prior_grants = total_granted,
                     "grant scanner: batch write failed, rolled back this pass's reservations"
                 );
+                record_invocation(scanned_this_invocation, total_stale_deleted);
                 return all_granted_groups;
             }
 
@@ -2273,6 +2818,7 @@ impl ConcurrencyManager {
             );
         }
 
+        record_invocation(scanned_this_invocation, total_stale_deleted);
         all_granted_groups
     }
 }

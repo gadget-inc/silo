@@ -5483,3 +5483,1183 @@ async fn count_holders_for_queue(
     }
     count
 }
+
+// ---------------------------------------------------------------------------
+// Grant scanner pending-lane tests (hot/cold split)
+// ---------------------------------------------------------------------------
+
+/// One drain batch takes ALL hot-lane entries but caps the cold lane at
+/// `grant_scanner_cold_batch_size` (default 64), so a large reconcile-sweep
+/// backlog cannot delay event-driven nudges by more than one iteration.
+#[silo::test]
+async fn grant_scanner_lane_batch_takes_hot_fully_and_cold_bounded() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "lane-tenant";
+
+    // 70 cold entries (six more than the default cold batch of 64) plus 3
+    // hot nudges.
+    for i in 0..70 {
+        shard.seed_cold_pending_grant_for_test(tenant, &format!("cold-{i:03}"), 1);
+    }
+    for i in 0..3 {
+        shard.seed_hot_pending_grant_for_test(tenant, &format!("hot-{i}"), 1);
+    }
+
+    let batch = shard.take_pending_grant_batch_for_test();
+    assert_eq!(batch.len(), 64 + 3, "all hot + one bounded cold batch");
+    let queues: HashSet<&str> = batch.iter().map(|(_, q, _)| q.as_str()).collect();
+    for i in 0..3 {
+        assert!(
+            queues.contains(format!("hot-{i}").as_str()),
+            "hot-{i} taken"
+        );
+    }
+    // Cold is drained from the front on the first batch (cursor unset), so
+    // cold-000..cold-063 are taken and cold-064..cold-069 remain.
+    assert!(queues.contains("cold-000") && queues.contains("cold-063"));
+    assert!(!queues.contains("cold-064"));
+    for i in 0..3 {
+        assert_eq!(
+            shard.hot_pending_grant_count_for_test(tenant, &format!("hot-{i}")),
+            0,
+            "hot lane fully drained"
+        );
+    }
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, "cold-063"),
+        0
+    );
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, "cold-064"),
+        1
+    );
+
+    // Second batch drains the cold remainder.
+    let batch2 = shard.take_pending_grant_batch_for_test();
+    assert_eq!(batch2.len(), 6);
+    let batch3 = shard.take_pending_grant_batch_for_test();
+    assert!(batch3.is_empty());
+}
+
+/// Finding-1 regression: the cold lane pops round-robin from a cursor, so a
+/// reconcile sweep continuously re-seeding lexicographically-small keys can
+/// never starve the tail. With a naive `pop_first`, re-inserted small keys
+/// would be re-popped every batch and large keys would never be visited.
+#[silo::test]
+async fn grant_scanner_cold_lane_round_robin_survives_reseed() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "rr-tenant";
+    let queue = |i: usize| format!("q-{i:03}");
+
+    for i in 0..130 {
+        shard.seed_cold_pending_grant_for_test(tenant, &queue(i), 1);
+    }
+
+    // Batch 1: front of the keyspace, q-000..q-063.
+    let b1: HashSet<String> = shard
+        .take_pending_grant_batch_for_test()
+        .into_iter()
+        .map(|(_, q, _)| q)
+        .collect();
+    assert_eq!(b1.len(), 64);
+    assert!(b1.contains("q-000") && b1.contains("q-063"));
+    assert!(!b1.contains("q-064"));
+
+    // Re-seed the already-popped small keys, as the periodic sweep would.
+    for i in 0..10 {
+        shard.seed_cold_pending_grant_for_test(tenant, &queue(i), 1);
+    }
+
+    // Batch 2 continues from the cursor (q-064..q-127) — it must NOT return
+    // to the freshly re-seeded q-000..q-009.
+    let b2: HashSet<String> = shard
+        .take_pending_grant_batch_for_test()
+        .into_iter()
+        .map(|(_, q, _)| q)
+        .collect();
+    assert_eq!(b2.len(), 64);
+    assert!(b2.contains("q-064") && b2.contains("q-127"));
+    for i in 0..10 {
+        assert!(
+            !b2.contains(&queue(i)),
+            "{} must wait for the wrap",
+            queue(i)
+        );
+    }
+
+    // Batch 3 finishes the tail (q-128, q-129) then wraps to the re-seeded
+    // front — every resident key is visited within one rotation.
+    let b3: HashSet<String> = shard
+        .take_pending_grant_batch_for_test()
+        .into_iter()
+        .map(|(_, q, _)| q)
+        .collect();
+    assert_eq!(b3.len(), 12, "tail (2) + wrapped re-seeded front (10)");
+    assert!(b3.contains("q-128") && b3.contains("q-129"));
+    for i in 0..10 {
+        assert!(b3.contains(&queue(i)));
+    }
+
+    assert!(shard.take_pending_grant_batch_for_test().is_empty());
+}
+
+/// Lane merge semantics: a queue present in both lanes merges with a
+/// saturating sum; repeated cold seeds take the max (the sweep re-reads the
+/// counter, so its value IS the demand — accumulation was the u32-overflow
+/// bug), while hot seeds accumulate (each release is one new free slot).
+#[silo::test]
+async fn grant_scanner_lane_counts_merge_and_saturate() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "merge-tenant";
+
+    // Cold takes the max of repeated seeds, not the sum.
+    shard.seed_cold_pending_grant_for_test(tenant, "q", 5);
+    shard.seed_cold_pending_grant_for_test(tenant, "q", 2);
+    assert_eq!(shard.cold_pending_grant_count_for_test(tenant, "q"), 5);
+    shard.seed_cold_pending_grant_for_test(tenant, "q", 9);
+    assert_eq!(shard.cold_pending_grant_count_for_test(tenant, "q"), 9);
+    // A drifted counter near u32::MAX must not wrap when re-seeded.
+    shard.seed_cold_pending_grant_for_test(tenant, "q", u32::MAX);
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, "q"),
+        u32::MAX
+    );
+
+    // Hot accumulates (saturating).
+    shard.seed_hot_pending_grant_for_test(tenant, "q", 3);
+    shard.seed_hot_pending_grant_for_test(tenant, "q", 4);
+    assert_eq!(shard.hot_pending_grant_count_for_test(tenant, "q"), 7);
+    assert_eq!(shard.pending_grant_count_for_test(tenant, "q"), u32::MAX);
+
+    // The merged batch carries a single entry for the queue with a
+    // saturating combined count.
+    let batch = shard.take_pending_grant_batch_for_test();
+    assert_eq!(batch.len(), 1);
+    let (t, q, n) = &batch[0];
+    assert_eq!((t.as_str(), q.as_str()), (tenant, "q"));
+    assert_eq!(*n, u32::MAX, "hot + cold saturates instead of wrapping");
+}
+
+/// End-to-end: work discovered only via the reconcile sweep (cold lane) is
+/// granted by the running scanner — the cold lane drains even with zero
+/// event-driven nudges.
+#[silo::test]
+async fn grant_scanner_cold_lane_drains_via_running_scanner() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "cold-drain-tenant";
+    let queue = "cold-drain-q";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Holder takes the slot; waiter defers into a durable request row with a
+    // non-zero requester counter.
+    shard
+        .enqueue(
+            tenant,
+            Some("holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue holder");
+    let tasks = shard.dequeue("w", "tg", 1).await.expect("dequeue").tasks;
+    assert_eq!(tasks.len(), 1);
+    let holder_task = tasks[0].attempt().task_id().to_string();
+    shard
+        .enqueue(
+            tenant,
+            Some("waiter".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue waiter");
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+
+    // Free the slot. The release fires a hot nudge, but the scanner is
+    // stopped — take (and discard) the batch so only durable state remains:
+    // a free slot, a pending request row, and a non-zero requester counter.
+    shard
+        .report_attempt_outcome(&holder_task, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("release holder");
+    let _ = shard.take_pending_grant_batch_for_test();
+
+    // Restarting the scanner runs the startup reconcile sweep, which
+    // rediscovers the queue from its requester counter and grants the waiter
+    // with no event-driven nudge involved.
+    shard.start_grant_scanner_for_test();
+    let holders = poll_until(|| count_concurrency_holders(shard.db()), |n| *n == 1, 5_000).await;
+    assert_eq!(holders, 1, "waiter granted via sweep-discovered work");
+    let requests = poll_until(
+        || count_concurrency_requests(shard.db()),
+        |n| *n == 0,
+        5_000,
+    )
+    .await;
+    assert_eq!(requests, 0, "waiter's request row consumed");
+}
+
+// ---------------------------------------------------------------------------
+// Sliced reconcile sweep tests (cursor + SET semantics)
+// ---------------------------------------------------------------------------
+
+/// The reconcile sweep SETs the cold-lane pending count to the requester
+/// counter value instead of accumulating it. Under the old `+=` semantics a
+/// queue that went unserviced between sweeps grew its pending count without
+/// bound — u32 overflow in minutes for a queue with tens of millions of
+/// requesters.
+#[silo::test]
+async fn reconcile_sweep_sets_pending_to_counter_instead_of_accumulating() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "sweep-set-tenant";
+    let queue = "sweep-set-q";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    });
+
+    shard.stop_grant_scanner();
+
+    // One holder + three deferred waiters => requester counter == 3.
+    shard
+        .enqueue(
+            tenant,
+            Some("holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue holder");
+    for i in 0..3 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("waiter-{i}")),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue waiter");
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, 3);
+
+    shard.reconcile_pending_concurrency_requests_once().await;
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, queue),
+        3,
+        "sweep seeds the cold lane with the counter value"
+    );
+    assert_eq!(
+        shard.hot_pending_grant_count_for_test(tenant, queue),
+        0,
+        "sweep must not touch the hot lane"
+    );
+
+    // A second sweep re-reads the same counter: the pending count must stay
+    // equal to it, not double.
+    shard.reconcile_pending_concurrency_requests_once().await;
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, queue),
+        3,
+        "repeat sweeps are idempotent (SET/max, not +=)"
+    );
+}
+
+/// Sliced sweeps walk at most `max_keys` counter keys per call, resume from
+/// a persistent cursor, and wrap to the front after reaching the end of the
+/// counter keyspace.
+#[silo::test]
+async fn reconcile_sweep_cursor_progresses_and_wraps() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let tenant = "sweep-cursor-tenant";
+    let queues = ["q-a", "q-b", "q-c"];
+
+    shard.stop_grant_scanner();
+
+    // Each queue: one holder + one deferred waiter => counter == 1.
+    for queue in &queues {
+        let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: queue.to_string(),
+            max_concurrency: 1,
+        });
+        for id in ["holder", "waiter"] {
+            shard
+                .enqueue(
+                    tenant,
+                    Some(format!("{queue}-{id}")),
+                    50,
+                    now,
+                    None,
+                    vec![1],
+                    vec![limit.clone()],
+                    None,
+                    "tg",
+                )
+                .await
+                .expect("enqueue");
+        }
+    }
+
+    // Slice 1 walks the first two counter keys only.
+    shard
+        .reconcile_pending_concurrency_requests_sliced_for_test(2)
+        .await;
+    assert_eq!(shard.cold_pending_grant_count_for_test(tenant, "q-a"), 1);
+    assert_eq!(shard.cold_pending_grant_count_for_test(tenant, "q-b"), 1);
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, "q-c"),
+        0,
+        "budget exhausted before q-c"
+    );
+    let _ = shard.take_pending_grant_batch_for_test();
+
+    // Slice 2 resumes after q-b: only q-c is walked, and reaching the end of
+    // the keyspace resets the cursor.
+    shard
+        .reconcile_pending_concurrency_requests_sliced_for_test(2)
+        .await;
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, "q-a"),
+        0,
+        "already-walked keys are not re-seeded mid-rotation"
+    );
+    assert_eq!(shard.cold_pending_grant_count_for_test(tenant, "q-c"), 1);
+    let _ = shard.take_pending_grant_batch_for_test();
+
+    // Slice 3 starts a fresh rotation from the front.
+    shard
+        .reconcile_pending_concurrency_requests_sliced_for_test(2)
+        .await;
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(tenant, "q-a"),
+        1,
+        "cursor wrapped to the front"
+    );
+    assert_eq!(shard.cold_pending_grant_count_for_test(tenant, "q-b"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Sliced holder-drift pass tests
+// ---------------------------------------------------------------------------
+
+fn read_concurrency_holder_drift(metrics: &silo::metrics::Metrics) -> f64 {
+    metrics
+        .registry()
+        .gather()
+        .into_iter()
+        .find(|f| f.get_name() == "silo_concurrency_holder_drift")
+        .map(|f| {
+            f.get_metric()
+                .iter()
+                .map(|m| m.get_gauge().get_value())
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
+/// The sliced drift pass publishes the drift gauge only at FULL-pass
+/// boundaries (a partial tick must not report a shrunken sweep), and ghost
+/// confirmation still requires `GHOST_CONFIRM_PASSES` = two complete passes,
+/// spanning however many ticks each pass takes.
+#[silo::test]
+async fn holder_drift_sliced_pass_full_pass_gauge_and_ghost_confirm() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let tenant = "drift-slice-tenant";
+
+    shard.stop_grant_scanner();
+
+    // Three hydrated queues, each with one durable holder.
+    for q in ["q-a", "q-b", "q-c"] {
+        let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: q.to_string(),
+            max_concurrency: 2,
+        });
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("{q}-job")),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit],
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue");
+    }
+    let tasks = shard.dequeue("w", "tg", 3).await.expect("dequeue").tasks;
+    assert_eq!(tasks.len(), 3);
+
+    // Ghost: an in-memory holder with no durable row, on the LAST queue of
+    // the sorted snapshot so partial ticks cannot have visited it yet.
+    shard.concurrency_insert_holder(tenant, "q-c", "ghost-task");
+    assert_eq!(shard.hot_pending_grant_count_for_test(tenant, "q-c"), 0);
+
+    // Pass 1, tick 1 (slice 2): visits q-a, q-b — incomplete, gauge untouched.
+    shard.report_holder_drift_sliced_for_test(2).await;
+    assert_eq!(
+        read_concurrency_holder_drift(&metrics),
+        0.0,
+        "partial pass must not publish"
+    );
+
+    // Pass 1, tick 2: visits q-c, completing the pass — gauge publishes the
+    // ghost's drift. The ghost has been seen in ONE full pass: not confirmed,
+    // so reconciliation releases nothing.
+    shard.report_holder_drift_sliced_for_test(2).await;
+    assert_eq!(read_concurrency_holder_drift(&metrics), 1.0);
+    shard.reconcile_pending_holders_for_test().await;
+    assert_eq!(
+        shard.hot_pending_grant_count_for_test(tenant, "q-c"),
+        0,
+        "one full pass must not confirm a ghost"
+    );
+
+    // Pass 2 (two more ticks): the ghost survives a second complete pass and
+    // is enqueued for reconciliation; the release fires a hot-lane nudge.
+    shard.report_holder_drift_sliced_for_test(2).await;
+    shard.report_holder_drift_sliced_for_test(2).await;
+    shard.reconcile_pending_holders_for_test().await;
+    assert_eq!(
+        shard.hot_pending_grant_count_for_test(tenant, "q-c"),
+        1,
+        "ghost confirmed after two full passes and released"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Next-hop saturation skip tests
+// ---------------------------------------------------------------------------
+
+fn read_concurrency_next_hop_skips(metrics: &silo::metrics::Metrics) -> f64 {
+    metrics
+        .registry()
+        .gather()
+        .into_iter()
+        .find(|f| f.get_name() == "silo_concurrency_grant_next_hop_skips_total")
+        .map(|f| {
+            f.get_metric()
+                .iter()
+                .map(|m| m.get_counter().get_value())
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
+/// Write a pending request row for `queue` directly, the durable shape an
+/// at-capacity deferral produces. `limits` carries the job's full chain and
+/// `limit_index` 0 points at `queue`. Rows for skip-fronts may reference
+/// fabricated job ids — the next-hop check runs before status validation, so
+/// skipped rows never read job state.
+async fn inject_request_row(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+    job_id: &str,
+    start_time_ms: i64,
+    limits: Vec<Limit>,
+) {
+    let action = ConcurrencyAction::EnqueueTask {
+        start_time_ms,
+        priority: 50,
+        job_id: job_id.to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "tg".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: format!("{job_id}:1:x"),
+        limits,
+    };
+    let key =
+        silo::keys::concurrency_request_key(tenant, queue, start_time_ms, 50, job_id, 1, "x0000");
+    let val = encode_concurrency_action(&action);
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&key, &val);
+    shard.db().write(batch).await.expect("inject request row");
+}
+
+/// Seed the durable requester counter for a queue with an absolute value (a
+/// plain put is the merge operator's base value).
+async fn seed_requester_counter(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+    value: i64,
+) {
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(
+        &silo::keys::concurrency_requester_counter_key(tenant, queue),
+        &value.to_le_bytes(),
+    );
+    shard.db().write(batch).await.expect("seed counter");
+}
+
+/// The scanner defers candidates whose next concurrency hop is saturated
+/// with a deep backlog (rows intact, nothing deleted, metric incremented),
+/// and grants them normally once the hop frees a slot.
+#[silo::test]
+async fn grant_scanner_next_hop_skip_defers_and_resumes_after_release() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let tenant = "nhs-tenant";
+    let user_q = "nhs-user-q";
+    let platform_q = "nhs-platform-q";
+    let chain = vec![
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: user_q.to_string(),
+            max_concurrency: 3,
+        }),
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: platform_q.to_string(),
+            max_concurrency: 1,
+        }),
+    ];
+
+    shard.stop_grant_scanner();
+
+    // Saturate the platform hop with a platform-only job and lease it so it
+    // can be released later.
+    shard
+        .enqueue(
+            tenant,
+            Some("platform-holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![chain[1].clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue platform holder");
+    let tasks = shard.dequeue("w", "tg", 1).await.expect("dequeue").tasks;
+    assert_eq!(tasks.len(), 1);
+    let platform_task = tasks[0].attempt().task_id().to_string();
+    seed_requester_counter(&shard, tenant, platform_q, 2_000).await;
+
+    // Two real waiters: future-scheduled (status Scheduled, attempt 1, no
+    // capacity consumed) with past-dated injected request rows at the user
+    // queue — the "granted user slot would park at platform" shape.
+    for i in 0..2 {
+        let job_id = format!("waiter-{i}");
+        shard
+            .enqueue(
+                tenant,
+                Some(job_id.clone()),
+                50,
+                now + 3_600_000,
+                None,
+                vec![1],
+                vec![chain[0].clone(), chain[1].clone()],
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue waiter");
+        inject_request_row(&shard, tenant, user_q, &job_id, 1_000 + i, chain.clone()).await;
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+
+    // Saturated + deep next hop: both candidates defer; rows survive.
+    let skips_before = read_concurrency_next_hop_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(
+        granted.len(),
+        0,
+        "no grants while the next hop is saturated"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        2,
+        "skipped rows are neither granted nor deleted"
+    );
+    assert_eq!(
+        read_concurrency_next_hop_skips(&metrics) - skips_before,
+        2.0
+    );
+
+    // Free the platform slot: the skip no longer fires (holders < cap
+    // regardless of line depth) and both user grants proceed — the first
+    // waiter chains straight through the platform hop, the second parks
+    // there as a deferred request.
+    shard
+        .report_attempt_outcome(&platform_task, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("release platform holder");
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(granted.len(), 2, "grants resume once the hop frees a slot");
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "two user rows consumed, one new platform row parked"
+    );
+}
+
+/// The skip resolves a floating next hop's capacity from its durable state
+/// row (the value the hop's own scan path gates on), not the limit's
+/// embedded default.
+#[silo::test]
+async fn grant_scanner_next_hop_skip_floating_follows_durable_state() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let tenant = "nhs-float-tenant";
+    let user_q = "nhs-float-user-q";
+    let platform_q = "nhs-float-platform-q";
+    let refresh_interval_ms = 60_000_000i64;
+    let floating = Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+        key: platform_q.to_string(),
+        default_max_concurrency: 1,
+        refresh_interval_ms,
+        metadata: vec![],
+    });
+    let chain = vec![
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: user_q.to_string(),
+            max_concurrency: 3,
+        }),
+        floating.clone(),
+    ];
+
+    shard.stop_grant_scanner();
+
+    // Platform-only holder saturates the floating hop at its durable cap of 1.
+    shard
+        .enqueue(
+            tenant,
+            Some("platform-holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![floating.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue platform holder");
+    seed_requester_counter(&shard, tenant, platform_q, 2_000).await;
+
+    let write_floating_state = |max: u32| {
+        silo::codec::encode_floating_limit_state(&silo::job::FloatingLimitState {
+            current_max_concurrency: max,
+            last_refreshed_at_ms: now,
+            refresh_task_scheduled: true,
+            refresh_interval_ms,
+            default_max_concurrency: 1,
+            retry_count: 0,
+            next_retry_at_ms: None,
+            metadata: vec![],
+        })
+    };
+
+    for i in 0..2 {
+        let job_id = format!("waiter-{i}");
+        shard
+            .enqueue(
+                tenant,
+                Some(job_id.clone()),
+                50,
+                now + 3_600_000,
+                None,
+                vec![1],
+                chain.clone(),
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue waiter");
+        inject_request_row(&shard, tenant, user_q, &job_id, 1_000 + i, chain.clone()).await;
+    }
+
+    // Durable row says cap 1 (== holders): skip fires.
+    let skips_before = read_concurrency_next_hop_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_next_hop_skips(&metrics) - skips_before,
+        2.0
+    );
+
+    // Raise the durable row: capacity now exceeds holders, so the skip stops
+    // firing even though the deep counter is unchanged.
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(
+        &silo::keys::floating_limit_state_key(tenant, platform_q),
+        &write_floating_state(10),
+    );
+    shard.db().write(batch).await.expect("raise floating cap");
+
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(granted.len(), 2, "durable raise re-enables grants");
+}
+
+/// Setting the backlog knob to 0 disables the skip entirely: grants proceed
+/// and park at the saturated hop, matching the old behavior.
+#[silo::test]
+async fn grant_scanner_next_hop_skip_disabled_by_zero_knob() {
+    let (_tmp, shard, metrics) =
+        open_temp_shard_with_grant_scanner_config(silo::concurrency::GrantScannerConfig {
+            next_hop_skip_min_backlog: 0,
+            ..Default::default()
+        })
+        .await;
+    let now = now_ms();
+    let tenant = "nhs-off-tenant";
+    let user_q = "nhs-off-user-q";
+    let platform_q = "nhs-off-platform-q";
+    let chain = vec![
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: user_q.to_string(),
+            max_concurrency: 3,
+        }),
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: platform_q.to_string(),
+            max_concurrency: 1,
+        }),
+    ];
+
+    shard.stop_grant_scanner();
+
+    shard
+        .enqueue(
+            tenant,
+            Some("platform-holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![chain[1].clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue platform holder");
+    seed_requester_counter(&shard, tenant, platform_q, 2_000).await;
+
+    for i in 0..2 {
+        let job_id = format!("waiter-{i}");
+        shard
+            .enqueue(
+                tenant,
+                Some(job_id.clone()),
+                50,
+                now + 3_600_000,
+                None,
+                vec![1],
+                chain.clone(),
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue waiter");
+        inject_request_row(&shard, tenant, user_q, &job_id, 1_000 + i, chain.clone()).await;
+    }
+
+    let skips_before = read_concurrency_next_hop_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(
+        granted.len(),
+        2,
+        "knob 0 restores the old grant-and-park behavior"
+    );
+    assert_eq!(
+        read_concurrency_next_hop_skips(&metrics) - skips_before,
+        0.0
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        2,
+        "both grants parked as deferred rows at the platform hop"
+    );
+}
+
+/// Finding-2 regression: a uniform skip-front ends the invocation after
+/// `MAX_CONSECUTIVE_NEXT_HOP_SKIPS` (64) consecutive skips instead of
+/// walking the full scan budget on every re-drive.
+#[silo::test]
+async fn grant_scanner_next_hop_skip_uniform_front_bails_bounded() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let tenant = "nhs-bail-tenant";
+    let user_q = "nhs-bail-user-q";
+    let platform_q = "nhs-bail-platform-q";
+    let chain = vec![
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: user_q.to_string(),
+            max_concurrency: 3,
+        }),
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: platform_q.to_string(),
+            max_concurrency: 1,
+        }),
+    ];
+
+    shard.stop_grant_scanner();
+
+    shard
+        .enqueue(
+            tenant,
+            Some("platform-holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![chain[1].clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue platform holder");
+    seed_requester_counter(&shard, tenant, platform_q, 2_000).await;
+
+    // 500 skip-front rows. Fabricated job ids are fine: skipped rows never
+    // reach status validation.
+    for i in 0..500 {
+        inject_request_row(
+            &shard,
+            tenant,
+            user_q,
+            &format!("front-{i:04}"),
+            1_000 + i,
+            chain.clone(),
+        )
+        .await;
+    }
+
+    let skips_before = read_concurrency_next_hop_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_next_hop_skips(&metrics) - skips_before,
+        64.0,
+        "invocation bails after 64 consecutive skips, not 500"
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 500);
+}
+
+/// A front alternating between TWO saturated hops is equally futile and must
+/// also bail: the run counter is per-invocation, not per-hop.
+#[silo::test]
+async fn grant_scanner_next_hop_skip_alternating_hops_bails() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let tenant = "nhs-alt-tenant";
+    let user_q = "nhs-alt-user-q";
+    let user_limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: user_q.to_string(),
+        max_concurrency: 3,
+    });
+
+    shard.stop_grant_scanner();
+
+    for hop in ["nhs-alt-hop-a", "nhs-alt-hop-b"] {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("{hop}-holder")),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![Limit::Concurrency(silo::job::ConcurrencyLimit {
+                    key: hop.to_string(),
+                    max_concurrency: 1,
+                })],
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue hop holder");
+        seed_requester_counter(&shard, tenant, hop, 2_000).await;
+    }
+
+    for i in 0..100i64 {
+        let hop = if i % 2 == 0 {
+            "nhs-alt-hop-a"
+        } else {
+            "nhs-alt-hop-b"
+        };
+        let chain = vec![
+            user_limit.clone(),
+            Limit::Concurrency(silo::job::ConcurrencyLimit {
+                key: hop.to_string(),
+                max_concurrency: 1,
+            }),
+        ];
+        inject_request_row(
+            &shard,
+            tenant,
+            user_q,
+            &format!("alt-{i:03}"),
+            1_000 + i,
+            chain,
+        )
+        .await;
+    }
+
+    let skips_before = read_concurrency_next_hop_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_next_hop_skips(&metrics) - skips_before,
+        64.0,
+        "alternating saturated hops still bail at the run limit"
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 100);
+}
+
+/// A grantable candidate within the 64-row window behind a skip-front is
+/// still found and granted in ONE invocation — the bail must not starve
+/// mixed fronts.
+#[silo::test]
+async fn grant_scanner_next_hop_skip_mixed_front_grants_within_window() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let tenant = "nhs-mixed-tenant";
+    let user_q = "nhs-mixed-user-q";
+    let platform_q = "nhs-mixed-platform-q";
+    let user_limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: user_q.to_string(),
+        max_concurrency: 3,
+    });
+    let chain = vec![
+        user_limit.clone(),
+        Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: platform_q.to_string(),
+            max_concurrency: 1,
+        }),
+    ];
+
+    shard.stop_grant_scanner();
+
+    shard
+        .enqueue(
+            tenant,
+            Some("platform-holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![chain[1].clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue platform holder");
+    seed_requester_counter(&shard, tenant, platform_q, 2_000).await;
+
+    // 40 skip rows in front (< the 64 bail window)…
+    for i in 0..40 {
+        inject_request_row(
+            &shard,
+            tenant,
+            user_q,
+            &format!("front-{i:03}"),
+            1_000 + i,
+            chain.clone(),
+        )
+        .await;
+    }
+    // …then a grantable TERMINAL candidate (user queue only — no next hop),
+    // backed by a real Scheduled job so validation passes.
+    shard
+        .enqueue(
+            tenant,
+            Some("grantable".to_string()),
+            50,
+            now + 3_600_000,
+            None,
+            vec![1],
+            vec![user_limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue grantable");
+    inject_request_row(
+        &shard,
+        tenant,
+        user_q,
+        "grantable",
+        2_000,
+        vec![user_limit.clone()],
+    )
+    .await;
+
+    let skips_before = read_concurrency_next_hop_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, user_q, 100).await;
+    assert_eq!(
+        granted.len(),
+        1,
+        "grantable candidate behind 40 skips is served in one invocation"
+    );
+    assert_eq!(
+        read_concurrency_next_hop_skips(&metrics) - skips_before,
+        40.0
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        40,
+        "only the grantable row was consumed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live-headroom knob tests
+// ---------------------------------------------------------------------------
+
+/// With `live_headroom_fraction` = 0.2 on a cap-10 queue, the scanner fills
+/// only to 8 (and precheck-skips beyond that, no scan churn), while the
+/// immediate enqueue path still uses all 10 slots — the reserved share stays
+/// available to fresh work during a backlog dig-out.
+#[silo::test]
+async fn grant_scanner_live_headroom_reserves_slots_for_immediate_grants() {
+    let (_tmp, shard, metrics) =
+        open_temp_shard_with_grant_scanner_config(silo::concurrency::GrantScannerConfig {
+            live_headroom_fraction: 0.2,
+            ..Default::default()
+        })
+        .await;
+    let now = now_ms();
+    let tenant = "headroom-tenant";
+    let queue = "headroom-q";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 10,
+    });
+
+    shard.stop_grant_scanner();
+
+    // The immediate enqueue path fills all 10 slots — headroom does not
+    // apply to it.
+    for i in 0..10 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("job-{i}")),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue");
+    }
+    assert_eq!(count_concurrency_holders(shard.db()).await, 10);
+    let tasks = shard.dequeue("w", "tg", 10).await.expect("dequeue").tasks;
+    assert_eq!(tasks.len(), 10);
+
+    // Two deferred waiters for the scanner to drain later.
+    for i in 0..2 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("waiter-{i}")),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .expect("enqueue waiter");
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+
+    // Saturated beyond the effective cap of 8: the precheck skips without
+    // scanning.
+    let skips_before = read_concurrency_grant_precheck_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, queue, 100).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        1.0
+    );
+
+    // Free four slots (holders 10 -> 6): the scanner grants only back up to
+    // its effective cap of 8.
+    for task in tasks.iter().take(4) {
+        shard
+            .report_attempt_outcome(
+                &task.attempt().task_id().to_string(),
+                AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("release");
+    }
+    let granted = shard.process_concurrency_grants(tenant, queue, 100).await;
+    assert_eq!(granted.len(), 2, "scanner refills to the effective cap");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 8);
+
+    // At the effective cap the precheck skips again — no scan churn inside
+    // the headroom band.
+    let skips_before = read_concurrency_grant_precheck_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, queue, 100).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        1.0
+    );
+
+    // A fresh enqueue takes a slot inside the headroom band immediately.
+    shard
+        .enqueue(
+            tenant,
+            Some("fresh".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .expect("enqueue fresh");
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        9,
+        "immediate path grants inside the reserved headroom"
+    );
+}
