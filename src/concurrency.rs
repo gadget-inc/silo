@@ -963,6 +963,14 @@ impl ConcurrencyManager {
         cache.values().cloned().collect()
     }
 
+    /// Look up the cached limit for a single (tenant, queue). Returns None if
+    /// no enqueue/dequeue/refresh/grant pass has cached this queue's limit yet
+    /// (e.g., freshly restarted shard).
+    pub(crate) fn cached_queue_limit(&self, tenant: &str, queue: &str) -> Option<CachedQueueLimit> {
+        let key = concurrency_counts_key(tenant, queue);
+        self.limit_cache.lock().unwrap().get(&key).cloned()
+    }
+
     /// Resolve the gating queue's capacity from the persisted limits list.
     /// Public so dequeue and other shard paths can compute capacity without
     /// fetching JobInfo when the limits are already in hand (e.g., off a
@@ -974,6 +982,26 @@ impl ConcurrencyManager {
         limits: &[Limit],
     ) -> (usize, ConcurrencyLimitType) {
         Self::resolve_queue_capacity_from_limits(db, tenant, queue, limits).await
+    }
+
+    /// Point-read the durable floating-limit state row for (tenant, queue) and
+    /// return its current max concurrency. None when the row is missing or
+    /// unreadable — callers choose their own fallback (the scan path falls back
+    /// to the limit's default_max_concurrency; the pre-scan gate treats it as
+    /// unknown and lets the scan run).
+    async fn floating_state_capacity(
+        db: &InstrumentedDb,
+        tenant: &str,
+        queue: &str,
+    ) -> Option<usize> {
+        let state_key = floating_limit_state_key(tenant, queue);
+        match db.get(&state_key).await {
+            Ok(Some(raw)) => match decode_floating_limit_state(raw) {
+                Ok(state) => Some(state.current_max_concurrency() as usize),
+                Err(_) => None,
+            },
+            _ => None,
+        }
     }
 
     async fn resolve_queue_capacity_from_limits(
@@ -988,14 +1016,7 @@ impl ConcurrencyManager {
                     return (cl.max_concurrency as usize, ConcurrencyLimitType::Fixed);
                 }
                 Limit::FloatingConcurrency(fl) if fl.key == queue => {
-                    let state_key = floating_limit_state_key(tenant, queue);
-                    let state_capacity = match db.get(&state_key).await {
-                        Ok(Some(raw)) => match decode_floating_limit_state(raw) {
-                            Ok(state) => Some(state.current_max_concurrency() as usize),
-                            Err(_) => None,
-                        },
-                        _ => None,
-                    };
+                    let state_capacity = Self::floating_state_capacity(db, tenant, queue).await;
                     return (
                         state_capacity.unwrap_or(fl.default_max_concurrency as usize),
                         ConcurrencyLimitType::Floating,
@@ -1005,6 +1026,29 @@ impl ConcurrencyManager {
             }
         }
         (1, ConcurrencyLimitType::Fixed)
+    }
+
+    /// Resolve the queue's current capacity WITHOUT scanning requests.
+    /// Fixed limits come straight from the in-memory cache; Floating limits do
+    /// one point read of the durable state row (the cached snapshot may be
+    /// stale, and the durable row is what the scan path would gate on).
+    /// Returns None when capacity cannot be cheaply determined — cache miss,
+    /// or a Floating limit whose state row is missing/unreadable — in which
+    /// case the caller must fall back to the scan, which resolves capacity
+    /// from the request's embedded limits and re-populates the cache.
+    async fn known_queue_capacity(
+        &self,
+        db: &InstrumentedDb,
+        tenant: &str,
+        queue: &str,
+    ) -> Option<usize> {
+        let cached = self.cached_queue_limit(tenant, queue)?;
+        match cached.limit_type {
+            ConcurrencyLimitType::Fixed => Some(cached.max_concurrency as usize),
+            ConcurrencyLimitType::Floating => {
+                Self::floating_state_capacity(db, tenant, queue).await
+            }
+        }
     }
 
     /// Handle concurrency for a new job enqueue.
@@ -1638,6 +1682,40 @@ impl ConcurrencyManager {
                 "grant scanner: failed to hydrate queue"
             );
             return Vec::new();
+        }
+
+        // [SILO-GRANT-1] Pre: Queue has capacity. Fast pre-scan gate: when the
+        // queue's capacity is known (cached limit; durable state row for
+        // floating) and every slot is occupied, the try_reserve_internal guard
+        // below cannot succeed for any candidate — the transition cannot fire,
+        // so skip building the request iterator and the per-candidate status
+        // reads entirely. `saturating_sub` is required: holders can
+        // legitimately exceed capacity after a floating-limit shrink
+        // (try_reserve_internal gates with `>=` and never evicts). Skipping
+        // leaves the requester counter untouched, so the periodic reconciler
+        // re-drives this queue every tick at O(1) cost, and every release /
+        // floating-raise path nudges the scanner the moment capacity frees.
+        // Unknown capacity (cache miss after restart, unreadable floating
+        // state) falls through to the scan, which resolves the limit from the
+        // first request and re-warms the cache. Accepted trade-offs: stale
+        // request cleanup for a saturated queue pauses until a slot frees, and
+        // a lowered fixed limit gates old requests that embed a higher one.
+        if let Some(capacity) = self.known_queue_capacity(db, tenant, queue).await {
+            let holders = self.counts.holder_count(tenant, queue);
+            if capacity.saturating_sub(holders) == 0 {
+                if let Some(ref m) = self.metrics {
+                    m.record_concurrency_grant_precheck_skip(&self.shard);
+                }
+                tracing::debug!(
+                    tenant = %tenant,
+                    queue = %queue,
+                    requested = count,
+                    capacity,
+                    holders,
+                    "grant scanner: queue at capacity, skipping request scan"
+                );
+                return Vec::new();
+            }
         }
 
         let now_ms = crate::job_store_shard::now_epoch_ms();

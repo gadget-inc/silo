@@ -1939,6 +1939,23 @@ fn read_concurrency_tickets_granted_for(
         .unwrap_or(0.0)
 }
 
+/// Read the current value of the `silo_concurrency_grant_precheck_skips_total`
+/// counter, summed across all label values.
+fn read_concurrency_grant_precheck_skips(metrics: &silo::metrics::Metrics) -> f64 {
+    metrics
+        .registry()
+        .gather()
+        .into_iter()
+        .find(|f| f.get_name() == "silo_concurrency_grant_precheck_skips_total")
+        .map(|f| {
+            f.get_metric()
+                .iter()
+                .map(|m| m.get_counter().get_value())
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
 /// Tests that stale requests interleaved with valid ones are handled correctly:
 /// the grant scanner should skip stale ones and keep scanning to find valid ones.
 #[silo::test]
@@ -2251,19 +2268,18 @@ async fn grant_scanner_drains_backlog_larger_than_max_per_pass() {
     assert_eq!(count_concurrency_holders(shard.db()).await, N);
 }
 
-/// Tenant-fairness + reliability: a full queue with a huge backlog of stale
-/// requests still cleans them up (orphan reliability), but only a *bounded*
-/// amount per invocation (the per-invocation scan budget), so it can't pin a
-/// scanner slot walking the whole backlog and starve other tenants. Holders are
-/// untouched and nothing is granted (queue is full). Repeated invocations drain
-/// the stale backlog. Pre-fix one invocation walked the entire backlog in a
-/// single call.
+/// A saturated queue with a huge stale backlog: the pre-scan capacity gate
+/// skips the scan entirely while the queue is full (stale cleanup pauses — the
+/// accepted trade-off), then once a slot frees, cleanup resumes with only a
+/// *bounded* amount walked per invocation (the per-invocation scan budget), so
+/// it can't pin a scanner slot walking the whole backlog and starve other
+/// tenants. Repeated invocations drain the stale backlog.
 #[silo::test]
 async fn grant_scanner_full_queue_cleans_stale_bounded() {
     const LIMIT: usize = 5;
     const BACKLOG: usize = 3000;
 
-    let (_tmp, shard) = open_temp_shard().await;
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
     let now = now_ms();
     let queue = "full-clean-q";
     let tenant = "full-clean-tenant";
@@ -2291,10 +2307,12 @@ async fn grant_scanner_full_queue_cleans_stale_bounded() {
             .await
             .unwrap();
     }
-    let mut held = 0;
-    while held < LIMIT {
+    let mut holder_tasks = Vec::with_capacity(LIMIT);
+    while holder_tasks.len() < LIMIT {
         let tasks = shard.dequeue("w", "tg", LIMIT).await.unwrap().tasks;
-        held += tasks.len();
+        for t in tasks {
+            holder_tasks.push(t.attempt().task_id().to_string());
+        }
     }
 
     // Inject a large backlog of stale requests (nonexistent jobs).
@@ -2327,11 +2345,39 @@ async fn grant_scanner_full_queue_cleans_stale_bounded() {
     }
     assert_eq!(count_concurrency_requests(shard.db()).await, BACKLOG);
 
-    // Queue is full (LIMIT held). One invocation cleans only a bounded slice.
+    // Queue is full (LIMIT held): the capacity gate skips the scan without
+    // walking (or cleaning) any of the stale backlog.
+    let skips_before = read_concurrency_grant_precheck_skips(&metrics);
     let granted = shard
         .process_concurrency_grants(tenant, queue, BACKLOG as u32)
         .await;
     assert_eq!(granted.len(), 0, "a full queue grants nothing");
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        1.0,
+        "a saturated queue with a warm limit cache must skip via the pre-scan gate"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        BACKLOG,
+        "the gate must not touch the backlog while saturated"
+    );
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        LIMIT,
+        "holders are untouched by the skip"
+    );
+
+    // Free one slot: stale cleanup resumes, bounded per invocation.
+    shard
+        .report_attempt_outcome(&holder_tasks[0], AttemptOutcome::Success { result: vec![] })
+        .await
+        .unwrap();
+
+    let granted = shard
+        .process_concurrency_grants(tenant, queue, BACKLOG as u32)
+        .await;
+    assert_eq!(granted.len(), 0, "stale requests grant nothing");
     let after_first = count_concurrency_requests(shard.db()).await;
     assert!(
         after_first > 0,
@@ -2339,12 +2385,7 @@ async fn grant_scanner_full_queue_cleans_stale_bounded() {
     );
     assert!(
         after_first < BACKLOG,
-        "stale on a full queue must still be cleaned (orphan reliability)"
-    );
-    assert_eq!(
-        count_concurrency_holders(shard.db()).await,
-        LIMIT,
-        "holders are untouched while cleaning stale"
+        "stale must be cleaned once capacity exists (orphan reliability)"
     );
 
     // Repeated invocations eventually drain the stale backlog.
@@ -2367,9 +2408,498 @@ async fn grant_scanner_full_queue_cleans_stale_bounded() {
     assert_eq!(
         count_concurrency_requests(shard.db()).await,
         0,
-        "repeated invocations drain the full queue's stale backlog"
+        "repeated invocations drain the stale backlog once capacity exists"
     );
-    assert_eq!(count_concurrency_holders(shard.db()).await, LIMIT);
+    assert_eq!(count_concurrency_holders(shard.db()).await, LIMIT - 1);
+}
+
+/// A saturated fixed-limit queue with a warm limit cache: the pre-scan
+/// capacity gate returns before opening the request iterator. The oracle for
+/// "no scan ran" is a stale request injected at the front of the queue — a
+/// scan would delete it (see grant_scanner_handles_all_stale_requests), so its
+/// survival plus the skip counter proves the gate fired.
+#[silo::test]
+async fn grant_scanner_precheck_skips_scan_when_fixed_queue_saturated() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let queue = "precheck-fixed-q";
+    let tenant = "precheck-fixed-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    });
+
+    shard.stop_grant_scanner();
+
+    // Take the only slot (the enqueue warms the limit cache).
+    shard
+        .enqueue(
+            tenant,
+            Some("holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+    let tasks = shard.dequeue("w", "tg", 1).await.unwrap().tasks;
+    assert_eq!(tasks.len(), 1);
+
+    // A real waiter defers into a request…
+    shard
+        .enqueue(
+            tenant,
+            Some("waiter".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+    // …plus a stale request (nonexistent job) that sorts first.
+    let stale_action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: 0,
+        priority: 50,
+        job_id: "ghost".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "tg".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "ghost:1:stale".to_string(),
+        limits: Vec::new(),
+    };
+    let key = silo::keys::concurrency_request_key(tenant, queue, 0, 50, "ghost", 1, "x0000");
+    let val = encode_concurrency_action(&stale_action);
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&key, &val);
+    shard.db().write(batch).await.unwrap();
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+
+    let skips_before = read_concurrency_grant_precheck_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, queue, 100).await;
+    assert_eq!(granted.len(), 0, "saturated queue grants nothing");
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        1.0,
+        "the gate must skip the scan for a saturated fixed-limit queue"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        2,
+        "no scan ran: the stale front row survives untouched"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+
+    // The skip is stable across repeated drives while saturated.
+    let granted = shard.process_concurrency_grants(tenant, queue, 100).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        2.0,
+        "every saturated drive skips again"
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+}
+
+/// Releasing a holder re-opens the gate: the next drive scans, cleans the
+/// stale front (cleanup deferred while saturated resumes on the first free
+/// slot), and grants the real waiter.
+#[silo::test]
+async fn grant_scanner_precheck_resumes_grants_after_release() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let queue = "precheck-release-q";
+    let tenant = "precheck-release-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    });
+
+    shard.stop_grant_scanner();
+
+    shard
+        .enqueue(
+            tenant,
+            Some("holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+    let tasks = shard.dequeue("w", "tg", 1).await.unwrap().tasks;
+    assert_eq!(tasks.len(), 1);
+    let holder_task = tasks[0].attempt().task_id().to_string();
+
+    shard
+        .enqueue(
+            tenant,
+            Some("waiter".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+    let stale_action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: 0,
+        priority: 50,
+        job_id: "ghost".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "tg".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "ghost:1:stale".to_string(),
+        limits: Vec::new(),
+    };
+    let key = silo::keys::concurrency_request_key(tenant, queue, 0, 50, "ghost", 1, "x0000");
+    let val = encode_concurrency_action(&stale_action);
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&key, &val);
+    shard.db().write(batch).await.unwrap();
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+
+    // Sanity: while saturated, the gate skips.
+    let skips_before = read_concurrency_grant_precheck_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, queue, 100).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        1.0
+    );
+
+    // Release the holder, then drive again: the gate sees free capacity, the
+    // scan runs, deletes the stale front row, and grants the waiter.
+    shard
+        .report_attempt_outcome(&holder_task, AttemptOutcome::Success { result: vec![] })
+        .await
+        .unwrap();
+
+    let skips_before_resume = read_concurrency_grant_precheck_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, queue, 100).await;
+    assert_eq!(
+        granted.len(),
+        1,
+        "the real waiter is granted once a slot frees"
+    );
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before_resume,
+        0.0,
+        "no skip when capacity exists"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "stale front cleaned and waiter request consumed"
+    );
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "the waiter now holds the slot"
+    );
+}
+
+/// The gate for floating-limit queues follows the DURABLE state row, not the
+/// cached snapshot: raising the row re-opens grants, shrinking it below the
+/// holder count (legitimately over-capacity) skips via saturating math, and a
+/// missing row makes capacity unknown so the scan runs (and cleans stale).
+#[silo::test]
+async fn grant_scanner_precheck_floating_follows_durable_state() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    let queue = "precheck-float-q";
+    let tenant = "precheck-float-tenant";
+    let refresh_interval_ms = 60_000_000i64;
+    let limit = Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+        key: queue.to_string(),
+        default_max_concurrency: 1,
+        refresh_interval_ms,
+        metadata: vec![],
+    });
+
+    shard.stop_grant_scanner();
+
+    // Holder takes the single default slot; two waiters defer into requests.
+    shard
+        .enqueue(
+            tenant,
+            Some("holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+    let tasks = shard.dequeue("w", "tg", 1).await.unwrap().tasks;
+    assert_eq!(tasks.len(), 1);
+    for i in 0..2 {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("waiter-{}", i)),
+                50,
+                now,
+                None,
+                vec![1],
+                vec![limit.clone()],
+                None,
+                "tg",
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+
+    let encode_state = |max: u32| {
+        silo::codec::encode_floating_limit_state(&silo::job::FloatingLimitState {
+            current_max_concurrency: max,
+            last_refreshed_at_ms: now,
+            refresh_task_scheduled: true,
+            refresh_interval_ms,
+            default_max_concurrency: 1,
+            retry_count: 0,
+            next_retry_at_ms: None,
+            metadata: vec![],
+        })
+    };
+    let state_key = silo::keys::floating_limit_state_key(tenant, queue);
+
+    // Durable state at 1 == holder count → skip.
+    let skips_before = read_concurrency_grant_precheck_skips(&metrics);
+    let granted = shard.process_concurrency_grants(tenant, queue, 10).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        1.0
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+
+    // Raise the DURABLE row to 3 without touching the in-memory cache (the
+    // cached snapshot still says 1): the gate must read the row and let the
+    // scan grant both waiters.
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&state_key, &encode_state(3));
+    shard.db().write(batch).await.unwrap();
+
+    let granted = shard.process_concurrency_grants(tenant, queue, 10).await;
+    assert_eq!(granted.len(), 2, "raised durable state re-opens grants");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 3);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        1.0,
+        "no skip when the durable row shows free capacity"
+    );
+
+    // Shrink the row back below the holder count (3 holders, capacity 1):
+    // saturating math must treat this as zero free, not underflow.
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&state_key, &encode_state(1));
+    shard.db().write(batch).await.unwrap();
+    shard
+        .enqueue(
+            tenant,
+            Some("late-waiter".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+
+    let granted = shard.process_concurrency_grants(tenant, queue, 10).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        2.0,
+        "an over-capacity queue skips"
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+
+    // Delete the state row: capacity is unknown, so the gate falls through and
+    // the scan runs — proven by it cleaning an injected stale front row.
+    let stale_action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: 0,
+        priority: 50,
+        job_id: "ghost".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "tg".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "ghost:1:stale".to_string(),
+        limits: Vec::new(),
+    };
+    let key = silo::keys::concurrency_request_key(tenant, queue, 0, 50, "ghost", 1, "x0000");
+    let val = encode_concurrency_action(&stale_action);
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&key, &val);
+    batch.delete(&state_key);
+    shard.db().write(batch).await.unwrap();
+    assert_eq!(count_concurrency_requests(shard.db()).await, 2);
+
+    let granted = shard.process_concurrency_grants(tenant, queue, 10).await;
+    assert_eq!(
+        granted.len(),
+        0,
+        "the scan falls back to default_max_concurrency=1 against 3 holders"
+    );
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics) - skips_before,
+        2.0,
+        "unknown capacity must not count as a skip"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "the scan ran: the stale ghost row was deleted"
+    );
+}
+
+/// After a restart the limit cache is empty, so the gate cannot fire: the
+/// first drive falls through to the scan (current behavior), which resolves
+/// the limit from the head request and re-caches it — so the second drive
+/// skips. Uses a real close/reopen to exercise the production cold path
+/// (hydration rebuilds holder counts from durable rows). The pending request
+/// is injected directly (no requester counter) so the reopened shard's
+/// startup reconciliation has nothing to drive — keeps the background
+/// scanner quiescent and the metric deterministic.
+#[silo::test]
+async fn grant_scanner_precheck_cold_cache_scans_and_self_warms() {
+    use silo::gubernator::MockGubernatorClient;
+    use silo::settings::{Backend, DatabaseConfig};
+    use silo::shard_range::ShardRange;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+        ..Default::default()
+    };
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let queue = "precheck-cold-q";
+    let tenant = "precheck-cold-tenant";
+    let limit = Limit::Concurrency(silo::job::ConcurrencyLimit {
+        key: queue.to_string(),
+        max_concurrency: 1,
+    });
+
+    // Phase 1: durably saturate the queue (one holder), then close.
+    let shard1 = silo::job_store_shard::JobStoreShard::open(
+        &cfg,
+        rate_limiter.clone(),
+        None,
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard1");
+    shard1.stop_grant_scanner();
+    let now = now_ms();
+    shard1
+        .enqueue(
+            tenant,
+            Some("holder".to_string()),
+            50,
+            now,
+            None,
+            vec![1],
+            vec![limit.clone()],
+            None,
+            "tg",
+        )
+        .await
+        .unwrap();
+    let tasks = shard1.dequeue("w", "tg", 1).await.unwrap().tasks;
+    assert_eq!(tasks.len(), 1);
+
+    // Inject a ghost request that EMBEDS the queue's limits: the cold scan
+    // resolves capacity from it (warming the cache) before its missing job
+    // status gets it deleted as stale.
+    let stale_action = ConcurrencyAction::EnqueueTask {
+        start_time_ms: 0,
+        priority: 50,
+        job_id: "ghost".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: "tg".to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: "ghost:1:stale".to_string(),
+        limits: vec![limit.clone()],
+    };
+    let key = silo::keys::concurrency_request_key(tenant, queue, 0, 50, "ghost", 1, "x0000");
+    let val = encode_concurrency_action(&stale_action);
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&key, &val);
+    shard1.db().write(batch).await.unwrap();
+    shard1.close().await.expect("close shard1");
+
+    // Phase 2: reopen — the in-memory limit cache is empty.
+    let metrics = silo::metrics::init().expect("init metrics");
+    let shard2 = silo::job_store_shard::JobStoreShard::open(
+        &cfg,
+        rate_limiter,
+        Some(metrics.clone()),
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard2");
+    shard2.stop_grant_scanner();
+    assert_eq!(count_concurrency_requests(shard2.db()).await, 1);
+
+    // First drive: cache miss → the gate falls through, the scan runs
+    // (hydration rebuilt holder_count = 1), caches the limit from the ghost's
+    // embedded limits, and deletes the ghost as stale.
+    let granted = shard2.process_concurrency_grants(tenant, queue, 10).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics),
+        0.0,
+        "a cold cache must scan, not skip"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard2.db()).await,
+        0,
+        "the scan ran and cleaned the stale ghost"
+    );
+
+    // Second drive: the first scan self-warmed the cache, so the gate fires.
+    let granted = shard2.process_concurrency_grants(tenant, queue, 10).await;
+    assert_eq!(granted.len(), 0);
+    assert_eq!(
+        read_concurrency_grant_precheck_skips(&metrics),
+        1.0,
+        "the first scan self-warms the cache; the second drive skips"
+    );
 }
 
 /// Tenant-fairness: an invocation grants at most `max_concurrency - holders`,

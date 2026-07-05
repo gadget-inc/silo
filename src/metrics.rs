@@ -153,6 +153,7 @@ pub struct Metrics {
     // Concurrency metrics
     concurrency_tickets_granted: CounterVec,
     concurrency_tickets_converted: CounterVec,
+    concurrency_grant_precheck_skips: CounterVec,
     concurrency_holders_cache_holders: GaugeVec,
     concurrency_holders_cache_queues: GaugeVec,
     concurrency_holders_cache_hydrated_queues: GaugeVec,
@@ -541,6 +542,14 @@ impl Metrics {
         self.concurrency_tickets_converted
             .with_label_values(&[shard])
             .inc_by(n as f64);
+    }
+
+    /// Record a grant-scanner invocation that skipped the request scan
+    /// because the queue's known capacity was fully occupied.
+    pub fn record_concurrency_grant_precheck_skip(&self, shard: &str) {
+        self.concurrency_grant_precheck_skips
+            .with_label_values(&[shard])
+            .inc();
     }
 
     /// Update the in-memory concurrency holders cache size gauges for a shard.
@@ -1987,6 +1996,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_grant_precheck_skips = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_grant_precheck_skips_total",
+                "Total number of grant-scanner invocations skipped because the queue's known capacity had zero free slots",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let concurrency_holders_cache_holders = register(
         &registry,
         GaugeVec::new(
@@ -2145,6 +2165,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_errors_total,
         concurrency_tickets_granted,
         concurrency_tickets_converted,
+        concurrency_grant_precheck_skips,
         concurrency_holders_cache_holders,
         concurrency_holders_cache_queues,
         concurrency_holders_cache_hydrated_queues,
