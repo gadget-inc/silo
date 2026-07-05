@@ -838,18 +838,19 @@ pub struct ConcurrencyManager {
     /// Max number of per-queue `process_grants` passes run concurrently when
     /// draining `pending_grants`. Each entry in `work` is a unique
     /// `(tenant, queue)`, so no two in-flight passes share a gating queue; this
-    /// bounds the `.buffered(...)` fan-out over those passes (order-preserving,
-    /// for DST determinism) so peak memory stays `N × per-pass`. Configurable
-    /// via `grant_scanner_concurrency` (default 8); stored already clamped to
-    /// `>= 1` (`.buffered(0)` is invalid).
+    /// bounds the `.buffer_unordered(...)` fan-out over those passes
+    /// (completion-order, so one slow queue can't head-of-line block the rest)
+    /// so peak memory stays `N × per-pass`. Configurable via
+    /// `grant_scanner_concurrency` (default 8); stored already clamped to
+    /// `>= 1` (`.buffer_unordered(0)` is invalid).
     grant_scanner_concurrency: usize,
     /// Max number of pending-request keys a single `process_grants` invocation
     /// will walk across all of its passes before committing what it found and
     /// returning — even if neither capacity nor the iterator is exhausted. This
     /// bounds the cost one queue can impose per scanner cycle so a single queue
     /// with a huge backlog of non-grantable keys (holder-orphan / stale-request
-    /// shape) can't pin a `.buffered` slot and starve every other tenant's queue
-    /// on the shard. The queue is re-driven on the next cycle (its requester
+    /// shape) can't pin a `.buffer_unordered` slot and starve every other
+    /// tenant's queue on the shard. The queue is re-driven on the next cycle (its requester
     /// counter is still non-zero), making bounded forward progress from the
     /// front each time. Derived from `grant_scanner_batch_size` (a small
     /// multiple) in `new`; always `>= grant_scanner_batch_size` so every
@@ -893,7 +894,7 @@ impl ConcurrencyManager {
             metrics,
             chain_resumer: Mutex::new(None),
             // Clamp to >= 1: a 0 batch would stall the drain loop and
-            // `.buffered(0)` is invalid.
+            // `.buffered(0)` / `.buffer_unordered(0)` are invalid.
             grant_scanner_batch_size: grant_scanner_batch_size.max(1),
             grant_scanner_buffer_size: grant_scanner_buffer_size.max(1),
             grant_scanner_concurrency: grant_scanner_concurrency.max(1),
@@ -1563,8 +1564,15 @@ impl ConcurrencyManager {
                     // (tenant, queue) is unique in `work`, so no two in-flight
                     // passes share a gating queue; downstream chain-resumer
                     // reservations are gated atomically by the per-key DashMap
-                    // guard. `buffered` (order-preserving) keeps collected order
-                    // deterministic against the BTreeMap iteration order for DST.
+                    // guard. `buffer_unordered` (completion-order) rather than
+                    // `buffered` (submission-order): with `buffered`, one slow
+                    // pass (a queue with a deep backlog) blocks yielding of
+                    // every already-finished pass behind it, so completed
+                    // futures pile up in the window and no new pass can start
+                    // until the slow one finishes — head-of-line blocking that
+                    // serializes other queues behind the busiest one. With
+                    // `buffer_unordered`, a slow pass occupies exactly one slot
+                    // while the remaining slots keep draining the other queues.
                     let granted: Vec<Vec<String>> = futures::stream::iter(work.into_values())
                         .map(|(tenant, queue, count)| {
                             let mgr = Arc::clone(&mgr);
@@ -1575,10 +1583,17 @@ impl ConcurrencyManager {
                                     .await
                             }
                         })
-                        .buffered(mgr.grant_scanner_concurrency)
+                        .buffer_unordered(mgr.grant_scanner_concurrency)
                         .collect()
                         .await;
-                    let granted_groups: Vec<String> = granted.into_iter().flatten().collect();
+                    // Canonicalize: `buffer_unordered` collects in completion
+                    // order, which depends on scheduling. Sorting (and deduping
+                    // groups granted via multiple queues) makes the broker wake
+                    // sequence a pure function of the granted *set*, keeping
+                    // downstream behavior independent of interleaving for DST.
+                    let mut granted_groups: Vec<String> = granted.into_iter().flatten().collect();
+                    granted_groups.sort_unstable();
+                    granted_groups.dedup();
 
                     // Wake only the brokers whose task groups received grants
                     if !granted_groups.is_empty() {
@@ -1769,7 +1784,8 @@ impl ConcurrencyManager {
         // we bound). When it reaches `grant_scanner_max_scan_per_invocation` the
         // call commits what it found and returns even if capacity/iterator are
         // not exhausted, so a single queue with a huge non-grantable front
-        // cannot starve other tenants' queues sharing the `.buffered` fan-out.
+        // cannot starve other tenants' queues sharing the `.buffer_unordered`
+        // fan-out.
         // The queue is re-driven next cycle (its requester counter is still
         // non-zero), making bounded forward progress from the front each time.
         let mut scanned_this_invocation: usize = 0;
