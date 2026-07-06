@@ -960,16 +960,21 @@ pub struct ConcurrencyManager {
     drift_pass: Mutex<DriftPass>,
 }
 
-/// End a `process_grants` invocation after this many CONSECUTIVE next-hop
-/// skips with no intervening non-skipped candidate (a grant candidate or
-/// stale-row cleanup both reset the run). Bounds the walk over a front
-/// dominated by candidates whose next hop is saturated-with-backlog: without
-/// it, every cold-sweep re-drive of such a queue re-walks up to the full
-/// per-invocation scan budget (batch_size × 4 — 8192 keys with the staging
-/// config) doing nothing, inflating drain-iteration time. Large enough that
-/// a mixed front with grantable candidates for a different hop inside the
-/// window is still served in one invocation.
-const MAX_CONSECUTIVE_NEXT_HOP_SKIPS: usize = 64;
+/// Memoized per-hop durable reads for `next_hop_should_skip`, keyed by the
+/// next hop's queue name for the duration of one `process_grants` invocation.
+/// The two point reads (floating state row, requester counter) are per-hop and
+/// stable across candidates, so they are cached; but the capacity a Fixed hop
+/// is COMPARED against is the candidate's OWN embedded limit, resolved per
+/// candidate — so a stale low limit on an old parked row can no longer veto a
+/// newer row whose embedded (raised) limit shows the hop has real headroom.
+#[derive(Default)]
+struct NextHopReads {
+    /// Durable floating-state capacity (Floating hops only); filled on first read.
+    floating_capacity: Option<usize>,
+    /// Durable requester-counter depth; filled the first time a candidate
+    /// finds this hop saturated.
+    depth: Option<i64>,
+}
 
 /// A drift-detected ghost must be observed as a ghost in this many
 /// *consecutive* `report_holder_drift` passes before it is enqueued for
@@ -1209,72 +1214,94 @@ impl ConcurrencyManager {
     /// Decide whether the grant scanner should defer a candidate because its
     /// NEXT concurrency hop is saturated with a deep requester backlog.
     ///
-    /// The gate is the FIRST limit after `limit_index`: a RateLimit gate
-    /// never skips (the chain writes a `CheckRateLimit` task — real progress
-    /// that holds no capacity), and a terminal candidate (no further limits)
-    /// never skips (granting emits the RunAttempt). A Concurrency /
-    /// FloatingConcurrency gate skips iff its holders >= its capacity AND its
-    /// durable requester counter >= `grant_scanner_next_hop_skip_min_backlog`
-    /// (0 disables the check entirely).
+    /// The gate is the next CAPACITY-HOLDING hop after `limit_index`, found by
+    /// walking forward THROUGH any RateLimit entries: a rate limit holds and
+    /// releases no concurrency slot (the chain writes a `CheckRateLimit` task
+    /// and proceeds still holding this queue's slot), so the hop that actually
+    /// decides whether granting merely parks a holder is the next Concurrency /
+    /// FloatingConcurrency limit, not the rate limit. A terminal candidate (no
+    /// further concurrency hop) never skips (granting emits the RunAttempt). A
+    /// Concurrency / FloatingConcurrency gate skips iff its holders >= this
+    /// candidate's capacity AND its durable requester counter >=
+    /// `grant_scanner_next_hop_skip_min_backlog` (0 disables the check).
     ///
     /// Inputs degrade safely: `holder_count` on an unhydrated next hop reads
     /// 0 and an unreadable counter reads 0, so missing data can only make the
-    /// skip NOT fire — behavior falls back to granting as before. Decisions
-    /// (including the floating-capacity point-read and the counter
-    /// point-read) are cached in `cache` for the invocation, keyed by the
-    /// next hop's queue name: in practice every candidate in one queue shares
-    /// the same next hop (the tenant's platform queue), so the whole
-    /// invocation pays at most a couple of point reads.
+    /// skip NOT fire — behavior falls back to granting as before. The two
+    /// durable point reads (floating state, requester counter) are memoized in
+    /// `cache` per next-hop queue for the invocation, but the holders-vs-capacity
+    /// comparison is re-evaluated per candidate against that candidate's own
+    /// embedded capacity (see `NextHopReads`).
     async fn next_hop_should_skip(
         &self,
         db: &Arc<InstrumentedDb>,
         tenant: &str,
         limits: &[Limit],
         limit_index: u32,
-        cache: &mut HashMap<String, bool>,
+        cache: &mut HashMap<String, NextHopReads>,
     ) -> bool {
         if self.grant_scanner_next_hop_skip_min_backlog == 0 {
             return false;
         }
-        let Some(next) = limits.get(limit_index as usize + 1) else {
-            return false;
-        };
-        // Split queue-name extraction from capacity resolution so the cache
-        // check happens before the floating-state point read.
-        let (next_queue, fixed_capacity, floating_default) = match next {
-            Limit::RateLimit(_) => return false,
-            Limit::Concurrency(cl) => (cl.key.as_str(), Some(cl.max_concurrency as usize), 0),
-            Limit::FloatingConcurrency(fl) => {
-                (fl.key.as_str(), None, fl.default_max_concurrency as usize)
+        // Look through rate limits to the next capacity-holding hop; a terminal
+        // candidate (nothing, or only rate limits, after `limit_index`) never skips.
+        let mut probe = limit_index as usize + 1;
+        let next = loop {
+            match limits.get(probe) {
+                None => return false,
+                Some(Limit::RateLimit(_)) => probe += 1,
+                Some(other) => break other,
             }
         };
-        if let Some(&decision) = cache.get(next_queue) {
-            return decision;
+        let next_queue = match next {
+            Limit::Concurrency(cl) => cl.key.as_str(),
+            Limit::FloatingConcurrency(fl) => fl.key.as_str(),
+            // Unreachable: RateLimit is looked through above.
+            Limit::RateLimit(_) => return false,
+        };
+        let reads = cache.entry(next_queue.to_string()).or_default();
+
+        // This candidate's view of the hop capacity. Fixed: the embedded
+        // per-request limit, resolved per candidate. Floating: the durable
+        // state row (a per-hop value, memoized), falling back to the embedded
+        // default when the row is missing/unreadable — mirroring
+        // resolve_queue_capacity_from_limits.
+        let capacity = match next {
+            Limit::Concurrency(cl) => cl.max_concurrency as usize,
+            Limit::FloatingConcurrency(fl) => {
+                if reads.floating_capacity.is_none() {
+                    reads.floating_capacity = Some(
+                        Self::floating_state_capacity(db, tenant, next_queue)
+                            .await
+                            .unwrap_or(fl.default_max_concurrency as usize),
+                    );
+                }
+                reads.floating_capacity.unwrap()
+            }
+            Limit::RateLimit(_) => return false,
+        };
+        if self.counts.holder_count(tenant, next_queue) < capacity {
+            return false;
         }
-        let capacity = match fixed_capacity {
-            Some(capacity) => capacity,
-            // The durable floating row is what the next hop's own scan path
-            // gates on; fall back to the limit's embedded default when the
-            // row is missing/unreadable, mirroring resolve_queue_capacity_from_limits.
-            None => Self::floating_state_capacity(db, tenant, next_queue)
-                .await
-                .unwrap_or(floating_default),
-        };
-        let holders = self.counts.holder_count(tenant, next_queue);
-        let decision = if holders >= capacity {
-            let depth = match db
-                .get(&concurrency_requester_counter_key(tenant, next_queue))
-                .await
-            {
-                Ok(Some(raw)) => decode_counter(&raw),
-                _ => 0,
-            };
-            depth >= self.grant_scanner_next_hop_skip_min_backlog as i64
-        } else {
-            false
-        };
-        cache.insert(next_queue.to_string(), decision);
-        decision
+        // Saturated for this candidate — consult the durable requester counter
+        // (memoized per hop for the invocation).
+        if reads.depth.is_none() {
+            reads.depth = Some(
+                match db
+                    .get(&concurrency_requester_counter_key(tenant, next_queue))
+                    .await
+                {
+                    Ok(Some(raw)) => decode_counter(&raw),
+                    _ => 0,
+                },
+            );
+        }
+        // Saturating conversion: a config value above i64::MAX must not wrap to
+        // a negative threshold (which would make the skip fire on any saturated
+        // hop regardless of backlog depth).
+        let min_backlog =
+            i64::try_from(self.grant_scanner_next_hop_skip_min_backlog).unwrap_or(i64::MAX);
+        reads.depth.unwrap() >= min_backlog
     }
 
     /// Handle concurrency for a new job enqueue.
@@ -1656,6 +1683,12 @@ impl ConcurrencyManager {
         range: &ShardRange,
         slice: usize,
     ) {
+        // Clamp to >= 1: a slice of 0 would `drain(..0)` nothing each tick, so
+        // `pass.work` never empties, `pass_completes` is never true, and the
+        // drift gauge / ghost confirmation would stall forever (never
+        // self-healing a leaked holder). Honors the settings doc "values below
+        // 1 are treated as 1".
+        let slice = slice.max(1);
         // Pop this tick's batch under the lock (never held across awaits).
         // An empty work list means a new pass begins: take a fresh sorted
         // snapshot of the hydrated queues.
@@ -2033,6 +2066,12 @@ impl ConcurrencyManager {
         range: &ShardRange,
         max_keys: Option<usize>,
     ) {
+        // Clamp a sliced budget to >= 1 (a full sweep stays `None`): a `Some(0)`
+        // budget would break before walking any key every tick — seeding
+        // nothing into the cold lane and resetting the cursor forever — so
+        // deferred requests not carried by a hot nudge would never be
+        // rediscovered. Honors the settings doc "values below 1 are treated as 1".
+        let max_keys = max_keys.map(|budget| budget.max(1));
         let sweep_started = std::time::Instant::now();
         let prefix_start = vec![crate::keys::prefix::COUNTER_CONCURRENCY_REQUESTERS];
         let end = end_bound(&prefix_start);
@@ -2059,10 +2098,15 @@ impl ConcurrencyManager {
 
         let mut walked: usize = 0;
         let mut last_key: Option<Vec<u8>> = None;
-        let mut budget_exhausted = false;
+        // Set when the sweep stops before cleanly reaching the end of the
+        // keyspace — either the per-tick budget was hit or a scan error
+        // interrupted iteration. Both resume the next sweep AFTER the last good
+        // key rather than restarting the rotation at the front; only a clean
+        // `Ok(None)` end resets to the front for a fresh rotation.
+        let mut stopped_early = false;
         loop {
             if max_keys.is_some_and(|budget| walked >= budget) {
-                budget_exhausted = true;
+                stopped_early = true;
                 break;
             }
             let kv = match iter.next().await {
@@ -2073,6 +2117,13 @@ impl ConcurrencyManager {
                         error = %e,
                         "grant scanner: reconciliation scan iteration error"
                     );
+                    // Resume forward from the last good key instead of resetting
+                    // to the front: a transient object-store error clears and
+                    // the next sweep continues past it, so keys already covered
+                    // this rotation aren't re-walked. A persistent error is no
+                    // worse than the pre-slicing full sweep, which also
+                    // refaulted here every tick.
+                    stopped_early = true;
                     break;
                 }
             };
@@ -2097,12 +2148,12 @@ impl ConcurrencyManager {
             }
         }
 
-        // Persist the resume point. Budget exhaustion mid-keyspace resumes at
-        // the successor of the last walked key — append 0x00, the immediate
-        // successor in bytewise order (never increment bytes: 0xFF would
-        // overflow). Reaching the end (or a scan error) resets to the front
-        // so the next sliced sweep starts a fresh rotation.
-        *self.reconcile_cursor.lock().unwrap() = match (budget_exhausted, last_key) {
+        // Persist the resume point. Stopping early mid-keyspace (budget hit or
+        // scan error) resumes at the successor of the last walked key — append
+        // 0x00, the immediate successor in bytewise order (never increment
+        // bytes: 0xFF would overflow). Cleanly reaching the end resets to the
+        // front so the next sliced sweep starts a fresh rotation.
+        *self.reconcile_cursor.lock().unwrap() = match (stopped_early, last_key) {
             (true, Some(mut key)) => {
                 key.push(0x00);
                 Some(key)
@@ -2175,8 +2226,9 @@ impl ConcurrencyManager {
         // legitimately exceed capacity after a floating-limit shrink
         // (try_reserve_internal gates with `>=` and never evicts). Skipping
         // leaves the requester counter untouched, so the periodic reconciler
-        // re-drives this queue every tick at O(1) cost, and every release /
-        // floating-raise path nudges the scanner the moment capacity frees.
+        // re-drives this queue on its next sliced-sweep cursor rotation, and
+        // every release / floating-raise path (plus the scanner's own
+        // write-failure rollback) nudges the scanner the moment capacity frees.
         // Unknown capacity (cache miss after restart, unreadable floating
         // state) falls through to the scan, which resolves the limit from the
         // first request and re-warms the cache. Accepted trade-offs: stale
@@ -2250,13 +2302,13 @@ impl ConcurrencyManager {
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
-        // Next-hop saturation skip state: decisions cached per next-hop queue
-        // for the whole invocation (most candidates in one queue share the
-        // same next hop, e.g. the tenant's platform queue), plus a
-        // consecutive-skip run counter bounding futile walks — see the skip
-        // block below.
-        let mut next_hop_skip_cache: HashMap<String, bool> = HashMap::new();
-        let mut consecutive_next_hop_skips: usize = 0;
+        // Next-hop saturation skip state: per-hop durable reads memoized for
+        // the whole invocation (most candidates in one queue share the same
+        // next hop, e.g. the tenant's platform queue). A skipped candidate
+        // still consumes the per-invocation scan budget below, so a front
+        // dominated by saturated-next-hop candidates yields at the budget like
+        // any other non-grantable front — no separate early-bail counter.
+        let mut next_hop_skip_cache: HashMap<String, NextHopReads> = HashMap::new();
         // Per-invocation scan budget. Total request keys walked
         // across all passes (valid, stale, and corrupt — the walk cost is what
         // we bound). When it reaches `grant_scanner_max_scan_per_invocation` the
@@ -2292,10 +2344,6 @@ impl ConcurrencyManager {
             let mut batch = WriteBatch::new();
             let mut grants: Vec<(String, String)> = Vec::new();
             let mut stale_and_corrupt_count: usize = 0;
-            // Stale count as of the last next-hop skip: cleanup progress
-            // between skips resets the consecutive-skip run (a walk that is
-            // deleting stale rows is not futile).
-            let mut stale_at_last_skip: usize = 0;
 
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
@@ -2475,10 +2523,22 @@ impl ConcurrencyManager {
                 // left in place — no grant, no delete, no counter decrement —
                 // and keeps its original start_time, so when it is eventually
                 // granted it parks at its age-correct position in the next
-                // hop's FIFO. Liveness: the requester counter stays non-zero,
-                // so the periodic reconcile sweep re-drives this queue; the
-                // depth threshold guarantees the next hop still has far more
-                // than one sweep period of backlog when that happens.
+                // hop's FIFO.
+                //
+                // A skipped row still consumed the per-invocation scan budget
+                // (`scanned_this_invocation` was already incremented above), so
+                // a front of >budget saturated candidates yields at the budget
+                // like any other non-grantable front and a grantable candidate
+                // anywhere within the budget window is still reached this
+                // invocation. Liveness for candidates past the window: the
+                // requester counter stays non-zero, so the periodic reconcile
+                // sweep re-drives this queue on its next cursor rotation. The
+                // min-backlog threshold is a heuristic that the hop stays
+                // saturated across that rotation — sound for a deep, slowly
+                // draining hop (the wedge shape this targets), but a small-cap
+                // hop that drains its whole line within a rotation is re-driven
+                // a rotation later than ideal (bounded staleness, no lost work;
+                // no reverse-edge nudge wakes upstream queues on desaturation).
                 if self
                     .next_hop_should_skip(
                         db,
@@ -2489,34 +2549,11 @@ impl ConcurrencyManager {
                     )
                     .await
                 {
-                    // Cleanup progress since the last skip resets the run: a
-                    // walk that is deleting stale rows is not futile.
-                    if stale_and_corrupt_count > stale_at_last_skip {
-                        consecutive_next_hop_skips = 0;
-                    }
-                    stale_at_last_skip = stale_and_corrupt_count;
-                    consecutive_next_hop_skips += 1;
                     if let Some(ref m) = self.metrics {
                         m.record_concurrency_grant_next_hop_skip(&self.shard);
                     }
-                    if consecutive_next_hop_skips >= MAX_CONSECUTIVE_NEXT_HOP_SKIPS {
-                        // A uniform skip-front: end the invocation instead of
-                        // walking (and, on every cold re-drive, re-walking)
-                        // up to the full scan budget of rows that cannot
-                        // grant — the repeated futile walk is what inflated
-                        // drain-iteration time and starved the cold pop rate.
-                        // Counting consecutively regardless of WHICH hop
-                        // skipped is deliberate: a front alternating between
-                        // two saturated hops is equally futile. Any
-                        // non-skipped candidate resets the run, so a mixed
-                        // front with grantable work inside the window still
-                        // finds it.
-                        budget_exhausted = true;
-                        break;
-                    }
                     continue;
                 }
-                consecutive_next_hop_skips = 0;
 
                 scanned.push(ScannedRequest {
                     request_key: kv.key.to_vec(),
@@ -2770,6 +2807,13 @@ impl ConcurrencyManager {
                 for (q, tid) in &pass_reservations {
                     self.counts.release_reservation(tenant, q, tid);
                 }
+                // The batch did not commit, so this queue's durable request
+                // rows and requester counter are untouched — the freed slots
+                // are grantable again immediately. Re-nudge the hot lane so the
+                // retry happens on the next drain iteration rather than waiting
+                // for the sliced reconcile sweep to rotate back to this queue
+                // (release_reservation alone does not wake the scanner).
+                self.request_grant(tenant, queue);
                 tracing::warn!(
                     error = %e,
                     pass_grants = grants.len(),
