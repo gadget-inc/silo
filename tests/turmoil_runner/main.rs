@@ -85,6 +85,15 @@ fn concurrency_limits() {
 }
 
 #[test]
+fn grant_scanner_scheduling() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::grant_scanner_scheduling::run();
+    } else {
+        verify_determinism("grant_scanner_scheduling", get_seed());
+    }
+}
+
+#[test]
 fn concurrent_grant_race() {
     if is_subprocess() || is_fuzz_mode() {
         scenarios::concurrent_grant_race::run();

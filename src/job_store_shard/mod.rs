@@ -46,7 +46,7 @@ use tracing::{Instrument, info_span};
 use crate::instrumented_db::InstrumentedDb;
 
 use crate::codec::CodecError;
-use crate::concurrency::ConcurrencyManager;
+use crate::concurrency::{ConcurrencyManager, GrantScannerConfig};
 use crate::gubernator::RateLimitClient;
 use crate::job::{JobStatus, JobStatusKind, JobView};
 use crate::job_attempt::JobAttemptView;
@@ -104,15 +104,17 @@ pub struct OpenShardOptions {
     /// Populated from `DatabaseConfig::hydrate_all_at_startup` /
     /// `DatabaseTemplate::hydrate_all_at_startup`; tests set it explicitly.
     pub hydrate_all_at_startup: bool,
-    /// Max grants the background grant scanner commits per `process_grants`
-    /// pass. Populated from `grant_scanner_batch_size` in the database config.
-    pub grant_scanner_batch_size: usize,
-    /// Max in-flight status lookups the grant scanner buffers per pass.
-    /// Populated from `grant_scanner_buffer_size` in the database config.
-    pub grant_scanner_buffer_size: usize,
-    /// Max per-queue `process_grants` passes the grant scanner runs concurrently.
-    /// Populated from `grant_scanner_concurrency` in the database config.
-    pub grant_scanner_concurrency: usize,
+    /// Grant scanner tuning (batch/buffer/fan-out sizes, cold-lane batch,
+    /// next-hop skip threshold, live headroom). Populated from the
+    /// `grant_scanner_*` knobs in the database config.
+    pub grant_scanner: GrantScannerConfig,
+    /// Max requester-counter keys the periodic concurrency reconcile sweep
+    /// walks per tick. Populated from `concurrency_reconcile_scan_slice` in
+    /// the database config.
+    pub concurrency_reconcile_scan_slice: usize,
+    /// Max hydrated queues the periodic holder-drift report scans per tick.
+    /// Populated from `holder_drift_scan_slice` in the database config.
+    pub holder_drift_scan_slice: usize,
     /// When set, jobs that reach Succeeded have their associated KV records
     /// re-put with a SlateDB row TTL of this many seconds. `None` disables
     /// the feature for successful jobs.
@@ -199,6 +201,10 @@ pub struct JobStoreShard {
     pub(crate) metrics: Option<Metrics>,
     /// Interval for periodic concurrency request reconciliation.
     concurrency_reconcile_interval: Duration,
+    /// Max requester-counter keys walked per periodic reconcile tick.
+    concurrency_reconcile_scan_slice: usize,
+    /// Max hydrated queues scanned per periodic holder-drift tick.
+    holder_drift_scan_slice: usize,
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
@@ -399,9 +405,16 @@ impl JobStoreShard {
                 ),
                 counter_reconciliation_seconds: cfg.counter_reconciliation_seconds,
                 hydrate_all_at_startup: cfg.hydrate_all_at_startup,
-                grant_scanner_batch_size: cfg.grant_scanner_batch_size,
-                grant_scanner_buffer_size: cfg.grant_scanner_buffer_size,
-                grant_scanner_concurrency: cfg.grant_scanner_concurrency,
+                grant_scanner: GrantScannerConfig {
+                    batch_size: cfg.grant_scanner_batch_size,
+                    buffer_size: cfg.grant_scanner_buffer_size,
+                    concurrency: cfg.grant_scanner_concurrency,
+                    cold_batch_size: cfg.grant_scanner_cold_batch_size,
+                    next_hop_skip_min_backlog: cfg.grant_scanner_next_hop_skip_min_backlog,
+                    live_headroom_fraction: cfg.grant_scanner_live_headroom_fraction,
+                },
+                concurrency_reconcile_scan_slice: cfg.concurrency_reconcile_scan_slice,
+                holder_drift_scan_slice: cfg.holder_drift_scan_slice,
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
             },
@@ -442,9 +455,9 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
             counter_reconciliation_seconds,
             hydrate_all_at_startup,
-            grant_scanner_batch_size,
-            grant_scanner_buffer_size,
-            grant_scanner_concurrency,
+            grant_scanner,
+            concurrency_reconcile_scan_slice,
+            holder_drift_scan_slice,
             completed_job_expire_s,
             terminal_job_expire_s,
         } = options;
@@ -512,9 +525,7 @@ impl JobStoreShard {
             name.clone(),
             metrics.clone(),
             hydrate_all_at_startup,
-            grant_scanner_batch_size,
-            grant_scanner_buffer_size,
-            grant_scanner_concurrency,
+            grant_scanner,
         ));
 
         // Eagerly hydrate the in-memory holders cache from durable storage so
@@ -555,6 +566,8 @@ impl JobStoreShard {
             wal_close_config,
             metrics,
             concurrency_reconcile_interval,
+            concurrency_reconcile_scan_slice,
+            holder_drift_scan_slice,
             cancellation: CancellationToken::new(),
             store,
             db_path: db_path.to_string(),
@@ -969,17 +982,26 @@ impl JobStoreShard {
                             .concurrency
                             .reconcile_pending_holders(&shard.db, &range)
                             .await;
+                        // Sliced sweep: walk at most `scan_slice` counter
+                        // keys per tick, resuming from a cursor, so full
+                        // keyspace coverage spreads across ticks instead of
+                        // re-scanning every counter row every 5s on
+                        // queue-heavy shards.
                         shard
                             .concurrency
-                            .reconcile_pending_requests(shard.db.as_ref(), &range)
+                            .reconcile_pending_requests(
+                                shard.db.as_ref(),
+                                &range,
+                                Some(shard.concurrency_reconcile_scan_slice),
+                            )
                             .await;
-                        // After draining, snapshot drift + pending-queue size
-                        // for prometheus. Cheap per tick (one ranged scan per
-                        // hydrated queue); the per-tick cadence keeps the
-                        // total cost bounded.
+                        // After draining, advance the sliced drift pass and
+                        // snapshot the pending-queue size for prometheus. A
+                        // full drift pass over all hydrated queues spans
+                        // multiple ticks on queue-heavy shards.
                         shard
                             .concurrency
-                            .report_holder_drift(&shard.db, &range)
+                            .report_holder_drift(&shard.db, &range, shard.holder_drift_scan_slice)
                             .await;
                     }
                     _ = cancellation.cancelled() => {
@@ -1150,10 +1172,44 @@ impl JobStoreShard {
     }
 
     /// Test-only: peek the current pending-grant count accumulated for
-    /// `(tenant, queue)`. Used by the reconciler regression test to assert
-    /// that each ghost release fired its own `request_grant`.
+    /// `(tenant, queue)`, summed across the hot and cold lanes. Used by the
+    /// reconciler regression test to assert that each ghost release fired its
+    /// own `request_grant`.
     pub fn pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
         self.concurrency.pending_grant_count_for_test(tenant, queue)
+    }
+
+    /// Test-only: peek the hot-lane pending-grant count for `(tenant, queue)`.
+    #[doc(hidden)]
+    pub fn hot_pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        self.concurrency
+            .hot_pending_grant_count_for_test(tenant, queue)
+    }
+
+    /// Test-only: peek the cold-lane pending-grant count for `(tenant, queue)`.
+    #[doc(hidden)]
+    pub fn cold_pending_grant_count_for_test(&self, tenant: &str, queue: &str) -> u32 {
+        self.concurrency
+            .cold_pending_grant_count_for_test(tenant, queue)
+    }
+
+    /// Test-only: seed the grant scanner's cold pending lane directly, as the
+    /// periodic reconcile sweep would.
+    #[doc(hidden)]
+    pub fn seed_cold_pending_grant_for_test(&self, tenant: &str, queue: &str, count: u32) {
+        self.concurrency
+            .request_grant_count_cold(tenant, queue, count);
+    }
+
+    /// Test-only: compute one drain-iteration work batch (all hot entries +
+    /// a bounded round-robin cold batch), as the scanner's inner loop would.
+    /// Call `stop_grant_scanner` first so the background task doesn't race.
+    #[doc(hidden)]
+    pub fn take_pending_grant_batch_for_test(&self) -> Vec<(String, String, u32)> {
+        self.concurrency
+            .take_pending_grant_batch()
+            .into_values()
+            .collect()
     }
 
     /// Test-only: drain pending reconciliations and apply them now. Returns
@@ -1169,14 +1225,27 @@ impl JobStoreShard {
             .await
     }
 
-    /// Test-only: run one self-healing drift pass. Walks hydrated queues,
-    /// compares the in-memory holder set to durable rows, and enqueues any
-    /// ghosts (in-memory holders with no durable row) for reconciliation.
-    /// Callers typically follow with `reconcile_pending_holders_for_test` to
-    /// drive the actual release.
+    /// Test-only: run one FULL self-healing drift pass (unbounded slice, so
+    /// one call visits every hydrated queue). Walks hydrated queues, compares
+    /// the in-memory holder set to durable rows, and enqueues any ghosts
+    /// (in-memory holders with no durable row) for reconciliation. Callers
+    /// typically follow with `reconcile_pending_holders_for_test` to drive
+    /// the actual release.
     pub async fn report_holder_drift_for_test(&self) {
         let range = self.get_range();
-        self.concurrency.report_holder_drift(&self.db, &range).await
+        self.concurrency
+            .report_holder_drift(&self.db, &range, usize::MAX)
+            .await
+    }
+
+    /// Test-only: advance the sliced drift pass by at most `slice` queues,
+    /// exactly as one periodic tick does.
+    #[doc(hidden)]
+    pub async fn report_holder_drift_sliced_for_test(&self, slice: usize) {
+        let range = self.get_range();
+        self.concurrency
+            .report_holder_drift(&self.db, &range, slice)
+            .await
     }
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
@@ -1243,7 +1312,18 @@ impl JobStoreShard {
     pub async fn reconcile_pending_concurrency_requests_once(&self) {
         let range = self.get_range();
         self.concurrency
-            .reconcile_pending_requests(self.db.as_ref(), &range)
+            .reconcile_pending_requests(self.db.as_ref(), &range, None)
+            .await;
+    }
+
+    /// Test-only: run one SLICED reconcile sweep (at most `max_keys` counter
+    /// keys walked, resuming from the persistent cursor), exactly as the
+    /// periodic tick does.
+    #[doc(hidden)]
+    pub async fn reconcile_pending_concurrency_requests_sliced_for_test(&self, max_keys: usize) {
+        let range = self.get_range();
+        self.concurrency
+            .reconcile_pending_requests(self.db.as_ref(), &range, Some(max_keys))
             .await;
     }
 
@@ -1253,6 +1333,26 @@ impl JobStoreShard {
     /// with manual `process_concurrency_grants` calls.
     pub fn stop_grant_scanner(&self) {
         self.concurrency.stop_grant_scanner();
+    }
+
+    /// Test-only: (re)start the background grant scanner after a
+    /// `stop_grant_scanner`, re-running its startup reconcile sweep. Lets
+    /// tests stage durable state with the scanner stopped and then observe
+    /// the scanner discovering and draining it.
+    #[doc(hidden)]
+    pub fn start_grant_scanner_for_test(&self) {
+        self.concurrency.start_grant_scanner(
+            Arc::clone(&self.db),
+            Arc::clone(&self.brokers),
+            self.get_range(),
+        );
+    }
+
+    /// Test-only: seed the grant scanner's hot pending lane directly, as an
+    /// event-driven release nudge would.
+    #[doc(hidden)]
+    pub fn seed_hot_pending_grant_for_test(&self, tenant: &str, queue: &str, count: u32) {
+        self.concurrency.request_grant_count(tenant, queue, count);
     }
 
     /// Directly process pending concurrency grants for a single queue.

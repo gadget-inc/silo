@@ -3154,17 +3154,16 @@ async fn reimport_failed_to_scheduled_ignores_stale_concurrency_requests() {
         2
     );
 
-    // Trigger reconciliation: stale request for non-current attempt should be dropped.
+    // Trigger reconciliation while the queue is saturated: the capacity gate
+    // skips the scan entirely (the blocker import warmed the limit cache via
+    // the limit-chain walker), so the stale request is not cleaned yet —
+    // cleanup is deferred until a slot frees.
     shard.reconcile_pending_concurrency_requests_once().await;
-    let requests_after_reconcile = test_helpers::poll_until(
-        || async { test_helpers::count_concurrency_requests(shard.db()).await },
-        |count| *count == 1,
-        2_000,
-    )
-    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
-        requests_after_reconcile, 1,
-        "stale request should be ignored and removed by grant scanner"
+        test_helpers::count_concurrency_requests(shard.db()).await,
+        2,
+        "saturated queue: the gate defers stale-request cleanup"
     );
 
     // Free queue capacity, then reconcile again to grant the valid request.
@@ -3183,6 +3182,16 @@ async fn reimport_failed_to_scheduled_ignores_stale_concurrency_requests() {
     assert_eq!(r[0].status, JobStatusKind::Succeeded);
 
     shard.reconcile_pending_concurrency_requests_once().await;
+    let requests_after_free = test_helpers::poll_until(
+        || async { test_helpers::count_concurrency_requests(shard.db()).await },
+        |count| *count == 0,
+        2_000,
+    )
+    .await;
+    assert_eq!(
+        requests_after_free, 0,
+        "once capacity frees, the scan drops the stale request and grants the valid one"
+    );
     let dequeued = test_helpers::poll_until(
         || async { shard.dequeue("worker-1", "default", 1).await.unwrap() },
         |d| d.tasks.len() == 1,

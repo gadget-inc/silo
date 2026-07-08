@@ -210,6 +210,51 @@ fn default_grant_scanner_concurrency() -> usize {
     DEFAULT_GRANT_SCANNER_CONCURRENCY
 }
 
+/// Default for `grant_scanner_cold_batch_size`: max reconciler-sourced
+/// (cold-lane) queue entries merged into one drain iteration alongside all
+/// event-driven (hot-lane) entries.
+pub const DEFAULT_GRANT_SCANNER_COLD_BATCH_SIZE: usize = 64;
+
+fn default_grant_scanner_cold_batch_size() -> usize {
+    DEFAULT_GRANT_SCANNER_COLD_BATCH_SIZE
+}
+
+/// Default for `concurrency_reconcile_scan_slice`: max requester-counter keys
+/// the periodic reconcile sweep walks per tick before saving a cursor and
+/// yielding.
+pub const DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE: usize = 20_000;
+
+fn default_concurrency_reconcile_scan_slice() -> usize {
+    DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE
+}
+
+/// Default for `holder_drift_scan_slice`: max hydrated queues the periodic
+/// holder-drift report scans per tick before yielding; a full pass over all
+/// hydrated queues spans multiple ticks on queue-heavy shards.
+pub const DEFAULT_HOLDER_DRIFT_SCAN_SLICE: usize = 5_000;
+
+fn default_holder_drift_scan_slice() -> usize {
+    DEFAULT_HOLDER_DRIFT_SCAN_SLICE
+}
+
+/// Default for `grant_scanner_next_hop_skip_min_backlog`: minimum requester
+/// backlog on a candidate's next concurrency hop before the scanner defers
+/// granting the candidate while that hop is saturated. 0 disables the skip.
+pub const DEFAULT_GRANT_SCANNER_NEXT_HOP_SKIP_MIN_BACKLOG: u64 = 1024;
+
+fn default_grant_scanner_next_hop_skip_min_backlog() -> u64 {
+    DEFAULT_GRANT_SCANNER_NEXT_HOP_SKIP_MIN_BACKLOG
+}
+
+/// Default for `grant_scanner_live_headroom_fraction`: fraction of each
+/// queue's capacity the grant scanner leaves unfilled for immediate (live)
+/// grants. 0.0 means the scanner may fill every slot.
+pub const DEFAULT_GRANT_SCANNER_LIVE_HEADROOM_FRACTION: f64 = 0.0;
+
+fn default_grant_scanner_live_headroom_fraction() -> f64 {
+    DEFAULT_GRANT_SCANNER_LIVE_HEADROOM_FRACTION
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -269,6 +314,38 @@ pub struct DatabaseTemplate {
     /// Values below 1 are treated as 1.
     #[serde(default = "default_grant_scanner_concurrency")]
     pub grant_scanner_concurrency: usize,
+    /// Max reconciler-sourced (cold-lane) queue entries the grant scanner
+    /// merges into a single drain iteration alongside all event-driven
+    /// (hot-lane) entries. Bounds how long a reconcile-sweep backlog can delay
+    /// servicing a release-driven nudge. Defaults to 64. Values below 1 are
+    /// treated as 1.
+    #[serde(default = "default_grant_scanner_cold_batch_size")]
+    pub grant_scanner_cold_batch_size: usize,
+    /// Max requester-counter keys the periodic concurrency reconcile sweep
+    /// walks per tick. The sweep resumes from a cursor on the next tick, so
+    /// full keyspace coverage spans multiple ticks on queue-heavy shards
+    /// instead of re-scanning everything every tick. Defaults to 20000.
+    /// Values below 1 are treated as 1.
+    #[serde(default = "default_concurrency_reconcile_scan_slice")]
+    pub concurrency_reconcile_scan_slice: usize,
+    /// Max hydrated queues the periodic holder-drift report scans per tick.
+    /// A full drift pass over all hydrated queues spans multiple ticks; the
+    /// drift gauge updates at full-pass boundaries. Defaults to 5000. Values
+    /// below 1 are treated as 1.
+    #[serde(default = "default_holder_drift_scan_slice")]
+    pub holder_drift_scan_slice: usize,
+    /// Minimum requester backlog on a candidate's next concurrency hop before
+    /// the grant scanner defers granting the candidate while that hop is
+    /// saturated (avoids parking holders behind a deeply backlogged
+    /// downstream queue). 0 disables the skip. Defaults to 1024.
+    #[serde(default = "default_grant_scanner_next_hop_skip_min_backlog")]
+    pub grant_scanner_next_hop_skip_min_backlog: u64,
+    /// Fraction of each queue's capacity the grant scanner leaves unfilled
+    /// for immediate (live) grants, so fresh enqueues keep instant admission
+    /// while the scanner digs out a deferred backlog. Clamped to [0.0, 0.9].
+    /// Defaults to 0.0 (scanner may fill every slot).
+    #[serde(default = "default_grant_scanner_live_headroom_fraction")]
+    pub grant_scanner_live_headroom_fraction: f64,
     /// When set, jobs that finished successfully (Succeeded) have all of their
     /// associated KV records re-put with a SlateDB row TTL expiring this many
     /// seconds in the future. `None` (the default) disables the behaviour for
@@ -332,6 +409,12 @@ impl Default for DatabaseTemplate {
             grant_scanner_batch_size: default_grant_scanner_batch_size(),
             grant_scanner_buffer_size: default_grant_scanner_buffer_size(),
             grant_scanner_concurrency: default_grant_scanner_concurrency(),
+            grant_scanner_cold_batch_size: default_grant_scanner_cold_batch_size(),
+            concurrency_reconcile_scan_slice: default_concurrency_reconcile_scan_slice(),
+            holder_drift_scan_slice: default_holder_drift_scan_slice(),
+            grant_scanner_next_hop_skip_min_backlog:
+                default_grant_scanner_next_hop_skip_min_backlog(),
+            grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
@@ -606,6 +689,29 @@ pub struct DatabaseConfig {
     /// See `DatabaseTemplate::grant_scanner_concurrency` for details. Defaults to 8.
     #[serde(default = "default_grant_scanner_concurrency")]
     pub grant_scanner_concurrency: usize,
+    /// Max cold-lane entries merged per drain iteration. See
+    /// `DatabaseTemplate::grant_scanner_cold_batch_size` for details. Defaults to 64.
+    #[serde(default = "default_grant_scanner_cold_batch_size")]
+    pub grant_scanner_cold_batch_size: usize,
+    /// Max requester-counter keys walked per reconcile tick. See
+    /// `DatabaseTemplate::concurrency_reconcile_scan_slice` for details.
+    /// Defaults to 20000.
+    #[serde(default = "default_concurrency_reconcile_scan_slice")]
+    pub concurrency_reconcile_scan_slice: usize,
+    /// Max hydrated queues scanned per holder-drift tick. See
+    /// `DatabaseTemplate::holder_drift_scan_slice` for details. Defaults to 5000.
+    #[serde(default = "default_holder_drift_scan_slice")]
+    pub holder_drift_scan_slice: usize,
+    /// Minimum next-hop backlog before the scanner defers a candidate. See
+    /// `DatabaseTemplate::grant_scanner_next_hop_skip_min_backlog` for details.
+    /// Defaults to 1024; 0 disables.
+    #[serde(default = "default_grant_scanner_next_hop_skip_min_backlog")]
+    pub grant_scanner_next_hop_skip_min_backlog: u64,
+    /// Fraction of queue capacity the scanner leaves for immediate grants. See
+    /// `DatabaseTemplate::grant_scanner_live_headroom_fraction` for details.
+    /// Defaults to 0.0.
+    #[serde(default = "default_grant_scanner_live_headroom_fraction")]
+    pub grant_scanner_live_headroom_fraction: f64,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
     /// `DatabaseTemplate::completed_job_expire_s` for details.
     #[serde(default)]
@@ -641,6 +747,12 @@ impl Default for DatabaseConfig {
             grant_scanner_batch_size: default_grant_scanner_batch_size(),
             grant_scanner_buffer_size: default_grant_scanner_buffer_size(),
             grant_scanner_concurrency: default_grant_scanner_concurrency(),
+            grant_scanner_cold_batch_size: default_grant_scanner_cold_batch_size(),
+            concurrency_reconcile_scan_slice: default_concurrency_reconcile_scan_slice(),
+            holder_drift_scan_slice: default_holder_drift_scan_slice(),
+            grant_scanner_next_hop_skip_min_backlog:
+                default_grant_scanner_next_hop_skip_min_backlog(),
+            grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             slatedb: None,

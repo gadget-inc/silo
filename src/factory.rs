@@ -8,6 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 
+use crate::concurrency::GrantScannerConfig;
 use crate::gubernator::RateLimitClient;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, OpenShardOptions};
 use crate::metrics::Metrics;
@@ -201,9 +202,17 @@ impl ShardFactory {
                         ),
                         counter_reconciliation_seconds: template.counter_reconciliation_seconds,
                         hydrate_all_at_startup: template.hydrate_all_at_startup,
-                        grant_scanner_batch_size: template.grant_scanner_batch_size,
-                        grant_scanner_buffer_size: template.grant_scanner_buffer_size,
-                        grant_scanner_concurrency: template.grant_scanner_concurrency,
+                        grant_scanner: GrantScannerConfig {
+                            batch_size: template.grant_scanner_batch_size,
+                            buffer_size: template.grant_scanner_buffer_size,
+                            concurrency: template.grant_scanner_concurrency,
+                            cold_batch_size: template.grant_scanner_cold_batch_size,
+                            next_hop_skip_min_backlog: template
+                                .grant_scanner_next_hop_skip_min_backlog,
+                            live_headroom_fraction: template.grant_scanner_live_headroom_fraction,
+                        },
+                        concurrency_reconcile_scan_slice: template.concurrency_reconcile_scan_slice,
+                        holder_drift_scan_slice: template.holder_drift_scan_slice,
                         completed_job_expire_s: template.completed_job_expire_s,
                         terminal_job_expire_s: template.terminal_job_expire_s,
                     },

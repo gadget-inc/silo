@@ -153,9 +153,10 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
             counter_reconciliation_seconds: None,
             hydrate_all_at_startup: false,
-            grant_scanner_batch_size: silo::settings::DEFAULT_GRANT_SCANNER_BATCH_SIZE,
-            grant_scanner_buffer_size: silo::settings::DEFAULT_GRANT_SCANNER_BUFFER_SIZE,
-            grant_scanner_concurrency: silo::settings::DEFAULT_GRANT_SCANNER_CONCURRENCY,
+            grant_scanner: silo::concurrency::GrantScannerConfig::default(),
+            concurrency_reconcile_scan_slice:
+                silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
+            holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
         },
@@ -164,6 +165,51 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
     .await
     .expect("open shard");
     (tmp, shard)
+}
+
+/// Open a temp shard with a custom grant scanner config (and metrics), for
+/// tests exercising scanner tuning knobs like the next-hop skip threshold.
+#[allow(dead_code)]
+pub async fn open_temp_shard_with_grant_scanner_config(
+    grant_scanner: silo::concurrency::GrantScannerConfig,
+) -> (
+    tempfile::TempDir,
+    std::sync::Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
+    let metrics = silo::metrics::init().expect("init metrics");
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let resolved = resolve_object_store(&Backend::Fs, tmp.path().to_string_lossy().as_ref())
+        .expect("resolve fs object store");
+    let shard = JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &resolved.canonical_path,
+        OpenShardOptions {
+            store: resolved.store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
+            rate_limiter,
+            metrics: Some(metrics.clone()),
+            concurrency_reconcile_interval: Duration::from_millis(
+                silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
+            ),
+            counter_reconciliation_seconds: None,
+            hydrate_all_at_startup: false,
+            grant_scanner,
+            concurrency_reconcile_scan_slice:
+                silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
+            holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
+            completed_job_expire_s: None,
+            terminal_job_expire_s: None,
+        },
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+    (tmp, shard, metrics)
 }
 
 /// Open a temp shard with a specific range (useful for testing split-aware behavior)
