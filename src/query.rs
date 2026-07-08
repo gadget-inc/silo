@@ -771,10 +771,16 @@ impl Scan for JobsScanner {
         // drops the cursor and stops the scan at its next `.await` — no zombies.
         let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> =
             if projection.fields().is_empty()
+                && limit.is_none()
                 && shard.count_from_status_counters
                 && matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) })
             {
-                // COUNT(*) over a whole tenant: answer from per-status counters.
+                // Empty-projection full-tenant scan with no LIMIT — the shape of
+                // `SELECT COUNT(*) FROM jobs WHERE tenant = ...`. Answer the row
+                // tally from the per-status counters (O(#statuses)) rather than
+                // walking the index. The `limit.is_none()` guard excludes shapes
+                // like `EXISTS`/`SELECT 1 ... LIMIT n` that push a scan limit and
+                // want actual rows, not a (reconciler-lagged) counter tally.
                 Box::pin(count_from_counters_stream(
                     shard,
                     projection.clone(),
@@ -1053,7 +1059,7 @@ fn fullscan_join_stream(
             }
 
             // Advance the status cursor up to this window's last key.
-            let mut status_map: HashMap<String, JobStatus> = HashMap::new();
+            let mut status_map: HashMap<(String, String), JobStatus> = HashMap::new();
             if let Some(join) = status_join.as_mut() {
                 let last = infos.last().expect("infos non-empty");
                 let window_end = (last.0.clone(), last.1.clone());
@@ -1062,8 +1068,10 @@ fn fullscan_join_stream(
 
             let pairs: Vec<(String, String)> =
                 infos.iter().map(|(t, id, _)| (t.clone(), id.clone())).collect();
-            let jobs_map: HashMap<String, JobView> =
-                infos.into_iter().map(|(_, id, view)| (id, view)).collect();
+            let jobs_map: HashMap<(String, String), JobView> = infos
+                .into_iter()
+                .map(|(t, id, view)| ((t, id), view))
+                .collect();
             let pair_refs: Vec<&(String, String)> = pairs.iter().collect();
             let batch =
                 build_job_pairs_batch(&projection, &shard_id, &pair_refs, &jobs_map, &status_map)?;
@@ -1094,15 +1102,15 @@ impl StatusJoinCursor {
         }
     }
 
-    /// Insert into `out` (keyed by job_id) every status record whose
-    /// `(tenant, job_id)` key is `<= window_end`. Status rows past the window are
-    /// left buffered for the next call. Both keyspaces encode `(tenant, job_id)`
-    /// with the same order-preserving tuple encoding, so Rust tuple comparison
-    /// matches on-disk key order.
+    /// Insert into `out` (keyed by `(tenant, job_id)`) every status record whose
+    /// key is `<= window_end`. Status rows past the window are left buffered for
+    /// the next call. Both keyspaces encode `(tenant, job_id)` with the same
+    /// order-preserving tuple encoding, so Rust tuple comparison matches on-disk
+    /// key order.
     async fn collect_window(
         &mut self,
         window_end: &(String, String),
-        out: &mut HashMap<String, JobStatus>,
+        out: &mut HashMap<(String, String), JobStatus>,
     ) -> DfResult<()> {
         loop {
             if self.buffer.is_empty() {
@@ -1136,7 +1144,7 @@ impl StatusJoinCursor {
                     let status =
                         crate::job_store_shard::helpers::decode_job_status_owned(&kv.value)
                             .map_err(exec_err)?;
-                    out.insert(key.1, status);
+                    out.insert(key, status);
                 }
                 Some(_) => break, // front is past this window; keep it buffered
             }
@@ -1168,7 +1176,7 @@ fn job_pairs_stream(
             let pairs = vec![(tenant.clone(), id.clone())];
             let (jobs_map, status_map) = fetch_batch_data(&shard, &pairs, &needs).await?;
             let existing: Vec<&(String, String)> = if needs.need_job_info || needs.needs_existence_check {
-                pairs.iter().filter(|(_, id)| jobs_map.contains_key(id)).collect()
+                pairs.iter().filter(|pair| jobs_map.contains_key(*pair)).collect()
             } else {
                 pairs.iter().collect()
             };
@@ -1228,7 +1236,7 @@ fn job_pairs_stream(
             // With job_info fetched, the map is the authoritative presence check;
             // otherwise the index scan is the source of truth (scans skip tombstones).
             let existing: Vec<&(String, String)> = if needs.need_job_info || needs.needs_existence_check {
-                pending.iter().filter(|(_, id)| jobs_map.contains_key(id)).collect()
+                pending.iter().filter(|pair| jobs_map.contains_key(*pair)).collect()
             } else {
                 pending.iter().collect()
             };
@@ -1442,9 +1450,16 @@ async fn fetch_batch_data(
     shard: &JobStoreShard,
     pairs: &[(String, String)],
     needs: &ProjectionNeeds,
-) -> DfResult<(HashMap<String, JobView>, HashMap<String, JobStatus>)> {
-    let mut jobs_map: HashMap<String, JobView> = HashMap::new();
-    let mut status_map: HashMap<String, JobStatus> = HashMap::new();
+) -> DfResult<(
+    HashMap<(String, String), JobView>,
+    HashMap<(String, String), JobStatus>,
+)> {
+    // Keyed by (tenant, job_id): job ids are unique only per-tenant, so a
+    // cross-tenant scan (FullScan with no tenant filter) can surface the same id
+    // under two tenants in one batch. Keying by id alone would let one overwrite
+    // the other.
+    let mut jobs_map: HashMap<(String, String), JobView> = HashMap::new();
+    let mut status_map: HashMap<(String, String), JobStatus> = HashMap::new();
     if !needs.need_job_info && !needs.need_any_status() && !needs.needs_existence_check {
         return Ok((jobs_map, status_map));
     }
@@ -1481,8 +1496,16 @@ async fn fetch_batch_data(
                 }
             }
         );
-        jobs_map.extend(jobs_result?);
-        status_map.extend(status_result?);
+        jobs_map.extend(
+            jobs_result?
+                .into_iter()
+                .map(|(id, v)| ((tenant.clone(), id), v)),
+        );
+        status_map.extend(
+            status_result?
+                .into_iter()
+                .map(|(id, s)| ((tenant.clone(), id), s)),
+        );
     }
     Ok((jobs_map, status_map))
 }
@@ -1492,8 +1515,8 @@ fn build_job_pairs_batch(
     projection: &SchemaRef,
     shard_id: &str,
     pairs: &[&(String, String)],
-    jobs_map: &HashMap<String, JobView>,
-    status_map: &HashMap<String, JobStatus>,
+    jobs_map: &HashMap<(String, String), JobView>,
+    status_map: &HashMap<(String, String), JobStatus>,
 ) -> DfResult<RecordBatch> {
     let n = pairs.len();
     if projection.fields().is_empty() {
@@ -1512,13 +1535,13 @@ fn build_job_pairs_batch(
             "priority" => Arc::new(UInt8Array::from(
                 pairs
                     .iter()
-                    .map(|p| jobs_map.get(&p.1).map_or(0, |v| v.priority()))
+                    .map(|p| jobs_map.get(*p).map_or(0, |v| v.priority()))
                     .collect::<Vec<u8>>(),
             )),
             "enqueue_time_ms" => Arc::new(Int64Array::from(
                 pairs
                     .iter()
-                    .map(|p| jobs_map.get(&p.1).map_or(0, |v| v.enqueue_time_ms()))
+                    .map(|p| jobs_map.get(*p).map_or(0, |v| v.enqueue_time_ms()))
                     .collect::<Vec<i64>>(),
             )),
             "payload" => Arc::new(StringArray::from(
@@ -1526,7 +1549,7 @@ fn build_job_pairs_batch(
                     .iter()
                     .map(|p| {
                         jobs_map
-                            .get(&p.1)
+                            .get(*p)
                             .and_then(|v| v.payload_as_json().ok().map(|j| j.to_string()))
                     })
                     .collect::<Vec<Option<String>>>(),
@@ -1536,7 +1559,7 @@ fn build_job_pairs_batch(
                     .iter()
                     .map(|p| {
                         jobs_map
-                            .get(&p.1)
+                            .get(*p)
                             .map_or_else(String::new, |v| v.task_group().to_string())
                     })
                     .collect::<Vec<String>>(),
@@ -1544,19 +1567,19 @@ fn build_job_pairs_batch(
             "status_kind" => Arc::new(StringArray::from(
                 pairs
                     .iter()
-                    .map(|p| status_map.get(&p.1).map(display_status_kind))
+                    .map(|p| status_map.get(*p).map(display_status_kind))
                     .collect::<Vec<Option<String>>>(),
             )),
             "status_changed_at_ms" => Arc::new(Int64Array::from(
                 pairs
                     .iter()
-                    .map(|p| status_map.get(&p.1).map(|s| s.changed_at_ms))
+                    .map(|p| status_map.get(*p).map(|s| s.changed_at_ms))
                     .collect::<Vec<Option<i64>>>(),
             )),
             "current_attempt" => Arc::new(UInt32Array::from(
                 pairs
                     .iter()
-                    .map(|p| status_map.get(&p.1).and_then(|s| s.current_attempt))
+                    .map(|p| status_map.get(*p).and_then(|s| s.current_attempt))
                     .collect::<Vec<Option<u32>>>(),
             )),
             "next_attempt_starts_after_ms" => Arc::new(Int64Array::from(
@@ -1564,7 +1587,7 @@ fn build_job_pairs_batch(
                     .iter()
                     .map(|p| {
                         status_map
-                            .get(&p.1)
+                            .get(*p)
                             .and_then(|s| s.next_attempt_starts_after_ms)
                     })
                     .collect::<Vec<Option<i64>>>(),
@@ -1573,7 +1596,7 @@ fn build_job_pairs_batch(
             "limits" => Arc::new(StringArray::from(
                 pairs
                     .iter()
-                    .map(|p| jobs_map.get(&p.1).map(|v| limits_to_json(&v.limits())))
+                    .map(|p| jobs_map.get(*p).map(|v| limits_to_json(&v.limits())))
                     .collect::<Vec<Option<String>>>(),
             )),
             other => {
@@ -1619,7 +1642,7 @@ fn limits_to_json(limits: &[crate::job::Limit]) -> String {
 /// Build the Arrow `Map<Utf8, Utf8>` column for job metadata key/value pairs.
 fn build_metadata_column(
     pairs: &[&(String, String)],
-    jobs_map: &HashMap<String, JobView>,
+    jobs_map: &HashMap<(String, String), JobView>,
 ) -> DfResult<ArrayRef> {
     use datafusion::arrow::array::{MapArray, StructArray};
     let mut keys_builder = datafusion::arrow::array::StringBuilder::new();
@@ -1628,7 +1651,7 @@ fn build_metadata_column(
     offsets.push(0);
     let mut total = 0i32;
     for p in pairs {
-        let metadata = jobs_map.get(&p.1).map_or_else(Vec::new, |v| v.metadata());
+        let metadata = jobs_map.get(*p).map_or_else(Vec::new, |v| v.metadata());
         for (k, v) in &metadata {
             keys_builder.append_value(k);
             values_builder.append_value(v);

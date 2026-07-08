@@ -475,11 +475,15 @@ pub struct ServerConfig {
     /// Defaults to 5000ms (5s). Set to 0 to disable statement timeout.
     #[serde(default = "default_statement_timeout_ms")]
     pub statement_timeout_ms: Option<u64>,
-    /// Maximum serialized size (in bytes) of a single unary `Query` result set.
-    /// The server accumulates result batches up to this bound and returns
-    /// `RESOURCE_EXHAUSTED` if exceeded, before the (larger) gRPC message-size
-    /// wall and before the extra MessagePack copy. Defaults to 64 MiB. Set to 0
-    /// to disable. Does not apply to `QueryArrow`, which streams incrementally.
+    /// Cap on the in-memory Arrow size (`RecordBatch::get_array_memory_size`,
+    /// summed across result batches) of a single unary `Query` result set. This
+    /// is an approximation of, not an exact bound on, the MessagePack-serialized
+    /// wire size — per-row serialization repeats column names, so a very wide,
+    /// short-value result can serialize somewhat larger than it measures here.
+    /// Keep it comfortably below the gRPC message wall (`MAX_GRPC_MESSAGE_SIZE`)
+    /// so a breach returns a `RESOURCE_EXHAUSTED` "add a LIMIT" hint rather than
+    /// an opaque encoder error. Enforced before the MessagePack copy. Defaults to
+    /// 64 MiB. Set to 0 to disable. Does not apply to `QueryArrow`, which streams.
     #[serde(default = "default_max_result_bytes")]
     pub max_result_bytes: usize,
     /// Maximum number of SQL statements allowed to execute concurrently against

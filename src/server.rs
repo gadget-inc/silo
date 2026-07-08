@@ -214,14 +214,19 @@ const CLUSTER_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 /// message to wrap in `Status::unavailable`.
 type ClusterInfoFuture = Shared<BoxFuture<'static, Result<GetClusterInfoResponse, String>>>;
 
-/// A planned SQL statement ready to stream: output schema, the deadline-wrapped
-/// record-batch stream, the shard name (for metrics/logging), and the admission
-/// permit held for the statement's lifetime.
+/// A planned SQL statement ready to stream: output schema, the (raw, not yet
+/// deadline-wrapped) record-batch stream, the shard name (for metrics/logging),
+/// the admission permit held for the statement's lifetime, and the configured
+/// statement timeout. Each caller applies its own deadline policy: the unary
+/// path wraps the whole stream in an absolute deadline (it collects server-side),
+/// while `QueryArrow` bounds per-batch server work and per-send client stalls
+/// instead, so a slow-but-progressing reader isn't charged the total.
 struct PreparedStatement {
     schema: datafusion::arrow::datatypes::SchemaRef,
     stream: datafusion::physical_plan::SendableRecordBatchStream,
     shard_name: String,
     permit: Option<OwnedSemaphorePermit>,
+    timeout: Option<Duration>,
 }
 
 /// RAII guard tracking a statement as in-flight. Bumps the per-shard in-flight
@@ -511,22 +516,13 @@ impl SiloService {
             .await
             .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
 
-        // Enforce the statement deadline on the output stream itself.
-        let stream = if let Some(timeout) = self.cfg.server.statement_timeout() {
-            crate::query::stream_with_deadline(
-                stream,
-                tokio::time::Instant::now() + timeout,
-                timeout,
-            )
-        } else {
-            stream
-        };
-
+        // The deadline is applied by the caller (see PreparedStatement docs).
         Ok(PreparedStatement {
             schema,
             stream,
             shard_name,
             permit,
+            timeout: self.cfg.server.statement_timeout(),
         })
     }
 
@@ -1513,10 +1509,18 @@ impl Silo for SiloService {
             mut stream,
             shard_name,
             permit,
+            timeout,
         } = self
             .prepare_shard_stream(&r.shard, &r.sql, r.parameters)
             .await?;
         let _permit = permit; // held until the response is built
+
+        // The unary path collects the whole result server-side, so an absolute
+        // deadline over the output stream correctly bounds total server work.
+        if let Some(t) = timeout {
+            stream = crate::query::stream_with_deadline(stream, tokio::time::Instant::now() + t, t);
+        }
+
         let started = Instant::now();
         let guard = InflightGuard::new(self.metrics.clone(), shard_name.clone());
 
@@ -1595,9 +1599,10 @@ impl Silo for SiloService {
         let r = req.into_inner();
         let PreparedStatement {
             schema: _,
-            mut stream,
+            stream,
             shard_name,
             permit,
+            timeout,
         } = self
             .prepare_shard_stream(&r.shard, &r.sql, r.parameters)
             .await?;
@@ -1606,34 +1611,78 @@ impl Silo for SiloService {
         let sql = r.sql;
         let started = Instant::now();
 
-        // Stream Arrow IPC messages one batch at a time as the scan produces them,
-        // so gRPC flow control backpressures the scan directly (no upfront collect,
-        // no detached producer). The permit and in-flight guard live for the whole
-        // stream; dropping the stream (client disconnect) drops them and the scan.
-        let out = async_stream::stream! {
+        // Run the producer as a spawned task (driven by the runtime, not the
+        // client) feeding a bounded channel. This is deliberately NOT the
+        // detached-producer anti-pattern that caused the original OOM: the scan is
+        // lazy and pulled one batch at a time (no upfront materialization), and the
+        // producer is fully cancellation-aware. Spawning is what makes the timeouts
+        // effective — an `async_stream` would only be polled when the client reads,
+        // so a connected-but-idle client could pin its admission permit and scan
+        // snapshot indefinitely (the deadline could never fire). Here:
+        //   * a per-batch timeout bounds server-side production, and
+        //   * a per-send timeout bounds how long a stalled client holds the buffer
+        //     full — a steady reader drains within the window and is never charged,
+        //     so client read time is not counted against the statement deadline.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ArrowIpcMessage, Status>>(4);
+        tokio::spawn(async move {
             let _permit = permit;
             let guard = InflightGuard::new(metrics.clone(), shard_name.clone());
+            let mut stream = stream;
             let mut rows = 0usize;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(batch) => {
-                        rows += batch.num_rows();
-                        match batch_to_ipc(&batch) {
-                            Ok(ipc_data) => yield Ok(ArrowIpcMessage { ipc_data }),
-                            Err(e) => {
-                                guard.settle();
-                                yield Err(Status::internal(format!(
-                                    "Failed to serialize batch: {}",
-                                    e
-                                )));
-                                return;
+            loop {
+                // Bound server-side production of the next batch.
+                let item = match timeout {
+                    Some(d) => match tokio::time::timeout(d, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => {
+                            guard.settle();
+                            if let Some(m) = &metrics {
+                                m.record_query_cancelled(&shard_name, "deadline");
                             }
+                            let _ = tx
+                                .send(Err(Status::deadline_exceeded(format!(
+                                    "Query exceeded statement timeout of {} ms",
+                                    d.as_millis()
+                                ))))
+                                .await;
+                            return;
                         }
-                    }
-                    Err(e) => {
-                        yield Err(stream_error_to_status(&metrics, &shard_name, e, &guard));
+                    },
+                    None => stream.next().await,
+                };
+                let batch = match item {
+                    Some(Ok(b)) => b,
+                    Some(Err(e)) => {
+                        let status = stream_error_to_status(&metrics, &shard_name, e, &guard);
+                        let _ = tx.send(Err(status)).await;
                         return;
                     }
+                    None => break,
+                };
+                rows += batch.num_rows();
+                let ipc_data = match batch_to_ipc(&batch) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        guard.settle();
+                        let _ = tx
+                            .send(Err(Status::internal(format!(
+                                "Failed to serialize batch: {}",
+                                e
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                // Bound how long a stalled client can hold the buffer full (and thus
+                // the permit + snapshot). Receiver-drop or idle-timeout both stop the
+                // producer; the guard's Drop records the cancellation.
+                let send = tx.send(Ok(ArrowIpcMessage { ipc_data }));
+                let sent = match timeout {
+                    Some(d) => matches!(tokio::time::timeout(d, send).await, Ok(Ok(()))),
+                    None => send.await.is_ok(),
+                };
+                if !sent {
+                    return;
                 }
             }
             guard.settle();
@@ -1650,8 +1699,11 @@ impl Silo for SiloService {
                     );
                 }
             }
-        };
-        Ok(Response::new(Box::pin(out)))
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn import_jobs(

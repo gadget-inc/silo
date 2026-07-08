@@ -1083,6 +1083,74 @@ async fn sql_fullscan_join_hydrates_status() {
 }
 
 #[silo::test]
+async fn sql_cross_tenant_same_id_no_collision() {
+    // Two tenants can each own a job with the same client-chosen id. A
+    // cross-tenant scan (no tenant filter → FullScan join over job_info +
+    // job_status) must key hydration by (tenant, id), not id alone, or one
+    // tenant's row would display the other's data.
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    // Same id "dup" under two tenants, with distinct enqueue times.
+    shard
+        .enqueue(
+            "tenant-a",
+            Some("dup".to_string()),
+            10,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue a");
+    shard
+        .enqueue(
+            "tenant-b",
+            Some("dup".to_string()),
+            10,
+            now + 5000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue b");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT tenant, id, enqueue_time_ms FROM jobs ORDER BY tenant")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    // Map tenant -> enqueue_time_ms from the result and check each is its own.
+    let mut got: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for b in &batches {
+        let tenants = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let times = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..b.num_rows() {
+            got.insert(tenants.value(i).to_string(), times.value(i));
+        }
+    }
+    assert_eq!(
+        got.get("tenant-a"),
+        Some(&now),
+        "tenant-a keeps its own time"
+    );
+    assert_eq!(
+        got.get("tenant-b"),
+        Some(&(now + 5000)),
+        "tenant-b keeps its own time"
+    );
+}
+
+#[silo::test]
 async fn sql_suffix_id_match() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
