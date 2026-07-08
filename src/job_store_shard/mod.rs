@@ -15,7 +15,7 @@ mod lease_task;
 pub(crate) mod limit_chain;
 mod rate_limit;
 mod restart;
-mod scan;
+pub(crate) mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
 pub use drop_tenant_holders::DropTenantStats;
@@ -124,6 +124,10 @@ pub struct OpenShardOptions {
     /// row TTL of this many seconds. `None` disables the feature for those
     /// jobs.
     pub terminal_job_expire_s: Option<u64>,
+    /// When true, the query engine answers unfiltered per-tenant `COUNT(*)`
+    /// statements from per-status counters instead of scanning the status index.
+    /// Populated from `DatabaseConfig::count_from_status_counters`.
+    pub count_from_status_counters: bool,
 }
 
 /// Compute the row TTL (`expire_ts`, epoch ms) for a job that reached the
@@ -226,6 +230,9 @@ pub struct JobStoreShard {
     /// TTL (seconds) applied to non-success terminal jobs' associated records
     /// (Failed, Cancelled, …). `None` disables the feature for those jobs.
     pub(crate) terminal_job_expire_s: Option<u64>,
+    /// When true, the query engine answers unfiltered per-tenant `COUNT(*)`
+    /// from per-status counters instead of a full status-index scan.
+    pub(crate) count_from_status_counters: bool,
 }
 
 #[derive(Debug, Error)]
@@ -417,6 +424,7 @@ impl JobStoreShard {
                 holder_drift_scan_slice: cfg.holder_drift_scan_slice,
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
+                count_from_status_counters: cfg.count_from_status_counters,
             },
             range,
         )
@@ -460,6 +468,7 @@ impl JobStoreShard {
             holder_drift_scan_slice,
             completed_job_expire_s,
             terminal_job_expire_s,
+            count_from_status_counters,
         } = options;
 
         // Wall-clock timer for the whole open, used to emit per-phase debug
@@ -576,6 +585,7 @@ impl JobStoreShard {
             background_action_queue_counts: DashMap::new(),
             completed_job_expire_s,
             terminal_job_expire_s,
+            count_from_status_counters,
         });
 
         // Install the chain resumer before starting the grant scanner so the

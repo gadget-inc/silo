@@ -985,6 +985,103 @@ async fn sql_count_aggregate() {
     assert_eq!(count_arr.value(0), 3);
 }
 
+// Extract the first Int64 value from the first batch (COUNT(*) results, etc.).
+fn extract_first_i64(batches: &[RecordBatch]) -> i64 {
+    let arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("i64 column");
+    arr.value(0)
+}
+
+#[silo::test]
+async fn sql_count_star_served_from_counters() {
+    // An unfiltered per-tenant COUNT(*) is answered from per-status counters, so
+    // it does not scan the status index at all (scanned-keys delta stays 0).
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    for i in 0..40 {
+        enqueue_job(&shard, &format!("j{i:03}"), 10, now).await;
+    }
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    let before = metrics.query_scanned_keys_value(shard.name());
+    let batches = sql
+        .sql("SELECT COUNT(*) FROM jobs WHERE tenant = '-'")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let after = metrics.query_scanned_keys_value(shard.name());
+
+    assert_eq!(extract_first_i64(&batches), 40);
+    assert_eq!(
+        after, before,
+        "counter-served COUNT(*) must not scan the status index"
+    );
+}
+
+#[silo::test]
+async fn sql_limit_scan_stops_early() {
+    // A bounded LIMIT over an indexed status filter must stop after roughly LIMIT
+    // keys, never walking the whole tenant — the property that keeps a polling
+    // client from stacking full-tenant scans.
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    for i in 0..400 {
+        enqueue_job(&shard, &format!("j{i:04}"), 10, now).await;
+    }
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    let before = metrics.query_scanned_keys_value(shard.name());
+    let ids = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting' LIMIT 10",
+    )
+    .await;
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - before;
+
+    assert_eq!(ids.len(), 10, "LIMIT 10 should return 10 rows");
+    assert!(
+        scanned < 100.0,
+        "LIMIT 10 scanned {scanned} keys; expected far fewer than the 400 enqueued"
+    );
+}
+
+#[silo::test]
+async fn sql_fullscan_join_hydrates_status() {
+    // Projecting a job_info column (enqueue_time_ms) alongside a status column
+    // drives the FullScan job_info/job_status merge-join. Every live job must be
+    // returned with its status wired on.
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    for id in ["a1", "a2", "a3"] {
+        enqueue_job(&shard, id, 10, now).await;
+    }
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    let batches = sql
+        .sql("SELECT id, enqueue_time_ms, status_kind FROM jobs WHERE tenant = '-' ORDER BY id")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let ids = extract_string_column(&batches, 0);
+    assert_eq!(ids, vec!["a1", "a2", "a3"]);
+    // status_kind (col 2) must be non-null for every row — the join found each status.
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let status_nulls: usize = batches.iter().map(|b| b.column(2).null_count()).sum();
+    assert_eq!(total_rows, 3);
+    assert_eq!(
+        status_nulls, 0,
+        "every joined row should carry a status_kind"
+    );
+}
+
 #[silo::test]
 async fn sql_suffix_id_match() {
     let (_tmp, shard) = open_temp_shard().await;

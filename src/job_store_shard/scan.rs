@@ -2,7 +2,10 @@
 
 use std::ops::ControlFlow;
 
-use crate::instrumented_db::InstrumentedDb;
+use slatedb::KeyValue;
+use slatedb::config::ScanOptions;
+
+use crate::instrumented_db::{InstrumentedDb, InstrumentedDbIterator};
 use crate::job::JobStatusKind;
 use crate::job::{JobStatus, JobView};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
@@ -12,6 +15,60 @@ use crate::keys::{
     job_info_prefix, job_status_prefix, jobs_prefix, jobs_status_prefix, parse_job_info_key,
     parse_job_status_key, parse_metadata_index_key, parse_status_time_index_key,
 };
+use crate::metrics::Metrics;
+
+/// An owning, pull-based cursor over a SlateDB key range.
+///
+/// This is the primitive the streaming query scanners build on. It differs from
+/// the collect-oriented [`scan_collect`] helper in two load-bearing ways:
+///
+/// 1. **Laziness / cancellation.** The cursor owns the underlying
+///    [`InstrumentedDbIterator`] (and thus the SlateDB read snapshot). When the
+///    query stream that holds it is dropped — e.g. because the statement
+///    deadline fired or the client disconnected — the cursor is dropped and the
+///    scan stops at the next `.await`. There is no detached task to leak.
+/// 2. **Incremental yield.** Callers pull one bounded chunk at a time
+///    ([`next_kv_chunk`]) and emit a `RecordBatch` per chunk, so peak memory is
+///    O(chunk) rather than O(entire index).
+///
+/// Every key pulled is counted into the `silo_query_scanned_keys_total` metric
+/// (per shard), which is how tests and dashboards observe that a scan actually
+/// stopped early instead of running to completion as a zombie.
+pub(crate) struct RangeScanCursor {
+    iter: InstrumentedDbIterator,
+    shard_name: String,
+    metrics: Option<Metrics>,
+}
+
+impl RangeScanCursor {
+    /// Pull up to `max` more key/value pairs from the range. Returns an empty
+    /// `Vec` once the range is exhausted. Each returned key counts toward the
+    /// per-shard scanned-keys metric.
+    ///
+    /// This is the sole `.await` point in a streaming scan loop, so it is also
+    /// the cancellation point: dropping the cursor between calls stops the scan.
+    pub(crate) async fn next_kv_chunk(
+        &mut self,
+        max: usize,
+    ) -> Result<Vec<KeyValue>, JobStoreShardError> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(max.min(1024));
+        while out.len() < max {
+            match self.iter.next().await? {
+                Some(kv) => out.push(kv),
+                None => break,
+            }
+        }
+        if !out.is_empty()
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_query_scanned_keys(&self.shard_name, out.len() as u64);
+        }
+        Ok(out)
+    }
+}
 
 /// Shared scan-and-collect loop: opens a range iterator, applies a per-key
 /// extractor, and collects up to `limit` results.
@@ -55,6 +112,27 @@ async fn scan_collect<T>(
 }
 
 impl JobStoreShard {
+    /// Open a [`RangeScanCursor`] over `start..end` for incremental, cancellable
+    /// streaming scans. Prefer this over [`scan_collect`] on the query path,
+    /// where results must be yielded in bounded chunks rather than materialized
+    /// whole.
+    pub(crate) async fn open_range_cursor(
+        &self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        opts: &ScanOptions,
+    ) -> Result<RangeScanCursor, JobStoreShardError> {
+        let iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, opts)
+            .await?;
+        Ok(RangeScanCursor {
+            iter,
+            shard_name: self.name.clone(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
     /// Scan all jobs for a tenant ordered by job id (lexicographic), unfiltered.
     pub async fn scan_jobs(
         &self,

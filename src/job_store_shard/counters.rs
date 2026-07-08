@@ -491,6 +491,34 @@ impl JobStoreShard {
         Ok(results)
     }
 
+    /// Sum the live job counters for a single tenant across all status kinds.
+    ///
+    /// Unlike [`scan_tenant_status_counters`], this does **not** apply the
+    /// shard-range filter: it counts every counter row physically present for
+    /// the tenant, matching the semantics of a physical
+    /// `COUNT(*) FROM jobs WHERE tenant = ...` scan (which counts rows regardless
+    /// of routing). This is the value served for that query shape when
+    /// `count_from_status_counters` is enabled.
+    pub async fn count_tenant_live_jobs(&self, tenant: &str) -> Result<i64, JobStoreShardError> {
+        use crate::keys::{
+            end_bound, parse_tenant_status_counter_key, tenant_status_counter_tenant_prefix,
+        };
+
+        let start = tenant_status_counter_tenant_prefix(tenant);
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut total: i64 = 0;
+        while let Some(kv) = iter.next().await? {
+            if parse_tenant_status_counter_key(&kv.key).is_some() {
+                let count = decode_counter(&kv.value);
+                if count > 0 {
+                    total += count;
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Get the current concurrency requester count for a specific tenant/queue.
     pub async fn get_concurrency_requester_count(
         &self,

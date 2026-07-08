@@ -159,6 +159,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
+            count_from_status_counters: true,
         },
         ShardRange::full(),
     )
@@ -204,6 +205,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
+            count_from_status_counters: true,
         },
         ShardRange::full(),
     )

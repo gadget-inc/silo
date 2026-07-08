@@ -215,6 +215,7 @@ impl ShardFactory {
                         holder_drift_scan_slice: template.holder_drift_scan_slice,
                         completed_job_expire_s: template.completed_job_expire_s,
                         terminal_job_expire_s: template.terminal_job_expire_s,
+                        count_from_status_counters: template.count_from_status_counters,
                     },
                     range.clone(),
                 )

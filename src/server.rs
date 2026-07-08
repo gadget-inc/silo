@@ -1,14 +1,17 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use futures::FutureExt;
+use futures::StreamExt;
 use futures::future::{BoxFuture, Shared};
 use rand::seq::SliceRandom;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -211,6 +214,77 @@ const CLUSTER_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 /// message to wrap in `Status::unavailable`.
 type ClusterInfoFuture = Shared<BoxFuture<'static, Result<GetClusterInfoResponse, String>>>;
 
+/// A planned SQL statement ready to stream: output schema, the deadline-wrapped
+/// record-batch stream, the shard name (for metrics/logging), and the admission
+/// permit held for the statement's lifetime.
+struct PreparedStatement {
+    schema: datafusion::arrow::datatypes::SchemaRef,
+    stream: datafusion::physical_plan::SendableRecordBatchStream,
+    shard_name: String,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+/// RAII guard tracking a statement as in-flight. Bumps the per-shard in-flight
+/// gauge on creation and drops it on `Drop`. If the guard is dropped without
+/// being settled — the handler future was cancelled because the client hung up —
+/// it records a `cancelled{reason="disconnect"}`.
+struct InflightGuard {
+    metrics: Option<Metrics>,
+    shard: String,
+    settled: Cell<bool>,
+}
+
+impl InflightGuard {
+    fn new(metrics: Option<Metrics>, shard: String) -> Self {
+        if let Some(m) = &metrics {
+            m.query_inflight_inc(&shard);
+        }
+        Self {
+            metrics,
+            shard,
+            settled: Cell::new(false),
+        }
+    }
+
+    /// Mark the statement as finished (completed or reported an error), so the
+    /// guard's drop does not record a spurious disconnect.
+    fn settle(&self) {
+        self.settled.set(true);
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(m) = &self.metrics {
+            m.query_inflight_dec(&self.shard);
+            if !self.settled.get() {
+                m.record_query_cancelled(&self.shard, "disconnect");
+            }
+        }
+    }
+}
+
+/// Map a scan-stream error into a gRPC `Status`, recording the deadline metric
+/// when the error is a statement timeout. Settles `guard` so its drop does not
+/// additionally report a disconnect.
+fn stream_error_to_status(
+    metrics: &Option<Metrics>,
+    shard: &str,
+    err: datafusion::error::DataFusionError,
+    guard: &InflightGuard,
+) -> Status {
+    guard.settle();
+    if let datafusion::error::DataFusionError::External(inner) = &err
+        && let Some(timeout) = inner.downcast_ref::<crate::query::StatementTimeout>()
+    {
+        if let Some(m) = metrics {
+            m.record_query_cancelled(shard, "deadline");
+        }
+        return Status::deadline_exceeded(timeout.to_string());
+    }
+    Status::internal(format!("Query execution failed: {}", err))
+}
+
 /// gRPC service implementation backed by a `ShardFactory`.
 #[derive(Clone)]
 pub struct SiloService {
@@ -224,6 +298,10 @@ pub struct SiloService {
     /// In-flight `GetClusterInfo` future, shared across concurrent callers
     /// so only one fetch hits the coordinator at a time.
     cluster_info_inflight: Arc<Mutex<Option<ClusterInfoFuture>>>,
+    /// Per-shard admission-control semaphores for SQL statements. Created lazily
+    /// on first query to a shard; bounds concurrent `Query`/`QueryArrow`
+    /// execution so a hot tenant can't stack unbounded scans on one shard.
+    query_permits: Arc<DashMap<crate::shard_range::ShardId, Arc<Semaphore>>>,
 }
 
 impl SiloService {
@@ -240,6 +318,7 @@ impl SiloService {
             metrics,
             cluster_info_cache: Arc::new(Mutex::new(None)),
             cluster_info_inflight: Arc::new(Mutex::new(None)),
+            query_permits: Arc::new(DashMap::new()),
         }
     }
 
@@ -372,65 +451,110 @@ impl SiloService {
         Ok(Some(ParamValues::List(positional)))
     }
 
-    /// Execute a SQL query against a shard and return the resulting record batches.
-    async fn execute_shard_query(
+    /// Plan a SQL statement against a shard and return a lazy, deadline-bounded
+    /// output stream plus the admission permit held for its lifetime.
+    ///
+    /// The returned stream is lazy: no scan work happens until it is polled, and
+    /// dropping it (statement timeout, client disconnect, satisfied LIMIT) drops
+    /// the underlying scan cursors so the scan stops rather than running on as a
+    /// detached zombie.
+    async fn prepare_shard_stream(
         &self,
         shard_str: &str,
         sql: &str,
         parameters: Vec<QueryParameter>,
-    ) -> Result<
-        (
-            datafusion::arrow::datatypes::SchemaRef,
-            Vec<datafusion::arrow::array::RecordBatch>,
-        ),
-        Status,
-    > {
+    ) -> Result<PreparedStatement, Status> {
         let shard_id = Self::parse_shard_id(shard_str)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
-        let query_engine = shard.query_engine();
+        let shard_name = shard.name().to_string();
 
+        // Per-shard admission control: bound concurrent statements so a polling
+        // client can't stack scans on one shard. Clients treat RESOURCE_EXHAUSTED
+        // as retryable and back off.
+        let permit = if let Some(max) = self.cfg.server.max_concurrent_statements() {
+            let semaphore = self
+                .query_permits
+                .entry(shard_id)
+                .or_insert_with(|| Arc::new(Semaphore::new(max)))
+                .clone();
+            match semaphore.try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    if let Some(m) = &self.metrics {
+                        m.record_query_rejected(&shard_name, "concurrency");
+                    }
+                    return Err(Status::resource_exhausted(format!(
+                        "shard {shard_id} has {max} statements already in flight (server.max_concurrent_statements)"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        let query_engine = shard.query_engine();
         let mut dataframe = query_engine
             .sql(sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {}", e)))?;
 
-        if let Some(param_values) = Self::query_parameters_to_param_values(parameters)? {
+        let param_values = Self::query_parameters_to_param_values(parameters)?;
+        if let Some(param_values) = param_values {
             dataframe = dataframe
                 .with_param_values(param_values)
                 .map_err(|e| Status::invalid_argument(format!("SQL parameter error: {}", e)))?;
         }
 
         let schema = dataframe.schema().inner().clone();
-
         let stream = dataframe
             .execute_stream()
             .await
             .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
 
-        // DataFusion documents that dropping the stream aborts query execution.
-        // Wrapping stream collection in a timeout ensures timed-out queries stop
-        // running instead of continuing in the background.
-        let collect_future = datafusion::physical_plan::common::collect(stream);
-        let batches = if let Some(statement_timeout) = self.cfg.server.statement_timeout() {
-            match tokio::time::timeout(statement_timeout, collect_future).await {
-                Ok(Ok(batches)) => batches,
-                Ok(Err(e)) => {
-                    return Err(Status::internal(format!("Query execution failed: {}", e)));
-                }
-                Err(_) => {
-                    return Err(Status::deadline_exceeded(format!(
-                        "Query exceeded statement timeout of {} ms",
-                        statement_timeout.as_millis()
-                    )));
-                }
-            }
+        // Enforce the statement deadline on the output stream itself.
+        let stream = if let Some(timeout) = self.cfg.server.statement_timeout() {
+            crate::query::stream_with_deadline(
+                stream,
+                tokio::time::Instant::now() + timeout,
+                timeout,
+            )
         } else {
-            collect_future
-                .await
-                .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?
+            stream
         };
 
-        Ok((schema, batches))
+        Ok(PreparedStatement {
+            schema,
+            stream,
+            shard_name,
+            permit,
+        })
+    }
+
+    /// Emit a WARN-level slow-query log line if the statement exceeded the
+    /// configured threshold. No-op when `server.slow_query_log_ms` is 0.
+    fn maybe_log_slow_query(
+        &self,
+        shard: &str,
+        sql: &str,
+        started: Instant,
+        rows: usize,
+        bytes: usize,
+    ) {
+        let Some(threshold) = self.cfg.server.slow_query_log_threshold() else {
+            return;
+        };
+        let elapsed = started.elapsed();
+        if elapsed >= threshold {
+            let sql_trunc: String = sql.chars().take(512).collect();
+            warn!(
+                shard = shard,
+                elapsed_ms = elapsed.as_millis() as u64,
+                rows,
+                bytes,
+                sql = %sql_trunc,
+                "slow query"
+            );
+        }
     }
 
     /// Get shard with async lookup of owner for redirect metadata.
@@ -1384,9 +1508,55 @@ impl Silo for SiloService {
 
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
         let r = req.into_inner();
-        let (schema, batches) = self
-            .execute_shard_query(&r.shard, &r.sql, r.parameters)
+        let PreparedStatement {
+            schema,
+            mut stream,
+            shard_name,
+            permit,
+        } = self
+            .prepare_shard_stream(&r.shard, &r.sql, r.parameters)
             .await?;
+        let _permit = permit; // held until the response is built
+        let started = Instant::now();
+        let guard = InflightGuard::new(self.metrics.clone(), shard_name.clone());
+
+        // Collect the result set, enforcing the result-size cap before the extra
+        // MessagePack copy and the gRPC message-size wall.
+        let max_bytes = self.cfg.server.max_result_bytes();
+        let mut batches: Vec<datafusion::arrow::array::RecordBatch> = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut total_rows = 0usize;
+        while let Some(item) = stream.next().await {
+            let batch = match item {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(stream_error_to_status(
+                        &self.metrics,
+                        &shard_name,
+                        e,
+                        &guard,
+                    ));
+                }
+            };
+            total_rows += batch.num_rows();
+            if let Some(cap) = max_bytes {
+                total_bytes = total_bytes.saturating_add(batch.get_array_memory_size());
+                if total_bytes > cap {
+                    guard.settle();
+                    if let Some(m) = &self.metrics {
+                        m.record_query_rejected(&shard_name, "result_size");
+                    }
+                    return Err(Status::resource_exhausted(format!(
+                        "query result exceeded max_result_bytes ({cap} bytes) after {total_rows} rows; \
+                         add a LIMIT, project fewer columns, or use QueryArrow"
+                    )));
+                }
+            }
+            batches.push(batch);
+        }
+        guard.settle();
+        self.maybe_log_slow_query(&shard_name, &r.sql, started, total_rows, total_bytes);
+
         let columns: Vec<ColumnInfo> = schema
             .fields()
             .iter()
@@ -1423,36 +1593,65 @@ impl Silo for SiloService {
         req: Request<QueryArrowRequest>,
     ) -> Result<Response<Self::QueryArrowStream>, Status> {
         let r = req.into_inner();
-        let (_schema, batches) = self
-            .execute_shard_query(&r.shard, &r.sql, r.parameters)
+        let PreparedStatement {
+            schema: _,
+            mut stream,
+            shard_name,
+            permit,
+        } = self
+            .prepare_shard_stream(&r.shard, &r.sql, r.parameters)
             .await?;
+        let metrics = self.metrics.clone();
+        let slow_threshold = self.cfg.server.slow_query_log_threshold();
+        let sql = r.sql;
+        let started = Instant::now();
 
-        // Create a stream that yields Arrow IPC messages
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-
-        tokio::spawn(async move {
-            for batch in batches {
-                match batch_to_ipc(&batch) {
-                    Ok(ipc_data) => {
-                        if tx.send(Ok(ArrowIpcMessage { ipc_data })).await.is_err() {
-                            break; // Client disconnected
+        // Stream Arrow IPC messages one batch at a time as the scan produces them,
+        // so gRPC flow control backpressures the scan directly (no upfront collect,
+        // no detached producer). The permit and in-flight guard live for the whole
+        // stream; dropping the stream (client disconnect) drops them and the scan.
+        let out = async_stream::stream! {
+            let _permit = permit;
+            let guard = InflightGuard::new(metrics.clone(), shard_name.clone());
+            let mut rows = 0usize;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(batch) => {
+                        rows += batch.num_rows();
+                        match batch_to_ipc(&batch) {
+                            Ok(ipc_data) => yield Ok(ArrowIpcMessage { ipc_data }),
+                            Err(e) => {
+                                guard.settle();
+                                yield Err(Status::internal(format!(
+                                    "Failed to serialize batch: {}",
+                                    e
+                                )));
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!(
-                                "Failed to serialize batch: {}",
-                                e
-                            ))))
-                            .await;
-                        break;
+                        yield Err(stream_error_to_status(&metrics, &shard_name, e, &guard));
+                        return;
                     }
                 }
             }
-        });
-
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Response::new(Box::pin(stream)))
+            guard.settle();
+            if let Some(threshold) = slow_threshold {
+                let elapsed = started.elapsed();
+                if elapsed >= threshold {
+                    let sql_trunc: String = sql.chars().take(512).collect();
+                    warn!(
+                        shard = %shard_name,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        rows,
+                        sql = %sql_trunc,
+                        "slow query (arrow)"
+                    );
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(out)))
     }
 
     async fn import_jobs(

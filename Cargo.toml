@@ -97,6 +97,7 @@ storekey = { version = "0.11", features = ["storekey-derive"] }
 hex = "0.4"
 base64 = "0.22"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+async-stream = "0.3"
 
 [features]
 default = ["k8s", "server"]
@@ -114,7 +115,6 @@ mad-turmoil = "0.2"
 rand = "0.9"
 fastrand = "2"                                                      # For deterministic simulation - seed must be set explicitly
 rand_chacha = "0.9"
-async-stream = "0.3"
 tower = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
 hyper = { version = "1", features = ["client", "http1", "server"] }
