@@ -128,6 +128,21 @@ pub struct Metrics {
     grpc_requests: CounterVec,
     grpc_request_duration: HistogramVec,
 
+    // Query (SQL statement) metrics
+    /// Number of SQL statements currently executing, per shard. Bounded by the
+    /// per-shard admission-control semaphore.
+    query_inflight: GaugeVec,
+    /// Statements rejected before execution, per shard and reason
+    /// (`concurrency` = admission limit hit, `result_size` = result byte cap hit).
+    query_rejected: CounterVec,
+    /// Statements whose scan was cancelled before completing, per shard and
+    /// reason (`deadline` = statement timeout, `disconnect` = client hung up).
+    query_cancelled: CounterVec,
+    /// Total index/table keys pulled by streaming scans, per shard. A scan that
+    /// stops early (LIMIT reached, deadline fired, stream dropped) stops
+    /// advancing this counter — the signal that a query is not running as a zombie.
+    query_scanned_keys: CounterVec,
+
     // Shard/broker metrics
     shards_owned: Gauge,
     coordination_shards_open: Gauge,
@@ -375,6 +390,46 @@ impl Metrics {
         self.grpc_request_duration
             .with_label_values(&[method])
             .observe(duration_secs);
+    }
+
+    /// Increment the in-flight statement gauge for a shard.
+    pub fn query_inflight_inc(&self, shard: &str) {
+        self.query_inflight.with_label_values(&[shard]).inc();
+    }
+
+    /// Decrement the in-flight statement gauge for a shard.
+    pub fn query_inflight_dec(&self, shard: &str) {
+        self.query_inflight.with_label_values(&[shard]).dec();
+    }
+
+    /// Record a statement rejected before execution. `reason` is `concurrency`
+    /// or `result_size`.
+    pub fn record_query_rejected(&self, shard: &str, reason: &str) {
+        self.query_rejected
+            .with_label_values(&[shard, reason])
+            .inc();
+    }
+
+    /// Record a statement scan cancelled before completion. `reason` is
+    /// `deadline` or `disconnect`.
+    pub fn record_query_cancelled(&self, shard: &str, reason: &str) {
+        self.query_cancelled
+            .with_label_values(&[shard, reason])
+            .inc();
+    }
+
+    /// Add `n` to the per-shard scanned-keys counter. Called by
+    /// `RangeScanCursor` for every chunk of keys it pulls.
+    pub fn record_query_scanned_keys(&self, shard: &str, n: u64) {
+        self.query_scanned_keys
+            .with_label_values(&[shard])
+            .inc_by(n as f64);
+    }
+
+    /// Read the current scanned-keys counter for a shard. Exposed for tests and
+    /// operational assertions that a scan stopped early.
+    pub fn query_scanned_keys_value(&self, shard: &str) -> f64 {
+        self.query_scanned_keys.with_label_values(&[shard]).get()
     }
 
     /// Update the number of shards owned by this node (from coordinator).
@@ -1872,6 +1927,48 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    // Query (SQL statement) metrics
+    let query_inflight = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_query_inflight",
+                "Number of SQL statements currently executing per shard",
+            ),
+            &["shard"],
+        )?,
+    );
+    let query_rejected = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_query_rejected_total",
+                "SQL statements rejected before execution (reason: concurrency|result_size)",
+            ),
+            &["shard", "reason"],
+        )?,
+    );
+    let query_cancelled = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_query_cancelled_total",
+                "SQL statement scans cancelled before completing (reason: deadline|disconnect)",
+            ),
+            &["shard", "reason"],
+        )?,
+    );
+    let query_scanned_keys = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_query_scanned_keys_total",
+                "Total index/table keys pulled by streaming query scans per shard",
+            ),
+            &["shard"],
+        )?,
+    );
+
     // Shard/broker metrics
     let shards_owned = register(
         &registry,
@@ -2311,6 +2408,10 @@ pub fn init() -> anyhow::Result<Metrics> {
         background_actions_running_state: Arc::new(Mutex::new(HashMap::new())),
         grpc_requests,
         grpc_request_duration,
+        query_inflight,
+        query_rejected,
+        query_cancelled,
+        query_scanned_keys,
         shards_owned,
         coordination_shards_open,
         broker_buffer_size,

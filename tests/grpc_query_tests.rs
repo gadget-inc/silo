@@ -228,26 +228,137 @@ async fn grpc_server_query_arrow_statement_timeout() -> anyhow::Result<()> {
             CROSS JOIN jobs j4
         "#;
 
-        let result = client
+        // QueryArrow now streams incrementally: the handler returns a stream
+        // immediately and the statement-timeout surfaces when the client reads
+        // from it (rather than from the initial call, as with the unary path).
+        let mut stream = client
             .query_arrow(QueryArrowRequest {
                 shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
                 sql: heavy_query.to_string(),
                 tenant: None,
                 parameters: vec![],
             })
+            .await?
+            .into_inner();
+
+        let mut timeout_status = None;
+        loop {
+            match stream.message().await {
+                Ok(Some(_)) => continue, // drain any batches produced before the deadline
+                Ok(None) => break,
+                Err(status) => {
+                    timeout_status = Some(status);
+                    break;
+                }
+            }
+        }
+
+        let status = timeout_status.expect("expected statement timeout for query_arrow");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            status.message().contains("statement timeout"),
+            "expected timeout message, got: {}",
+            status.message()
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_result_size_cap() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let mut config = AppConfig::load(None).expect("load default config");
+        config.server.max_result_bytes = 100; // tiny cap so any real result trips it
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), config).await?;
+
+        enqueue_jobs_for_heavy_query(&mut client, 30).await?;
+
+        let result = client
+            .query(QueryRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT * FROM jobs".to_string(),
+                tenant: None,
+                parameters: vec![],
+            })
             .await;
 
         match result {
-            Ok(_) => panic!("expected statement timeout for query_arrow"),
+            Ok(_) => panic!("expected result-size cap rejection"),
             Err(status) => {
-                assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
                 assert!(
-                    status.message().contains("statement timeout"),
-                    "expected timeout message, got: {}",
+                    status.message().contains("max_result_bytes"),
+                    "expected result-size message, got: {}",
                     status.message()
                 );
             }
         }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_server_query_admission_control() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let mut config = AppConfig::load(None).expect("load default config");
+        config.server.max_concurrent_statements = 1;
+        config.server.statement_timeout_ms = Some(0); // don't let the held stream self-cancel
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), config).await?;
+
+        enqueue_jobs_for_heavy_query(&mut client, 120).await?;
+
+        // Hold one QueryArrow statement open. Its admission permit is acquired in
+        // the handler (before the response returns) and lives in the streaming
+        // response; a large cross-join keeps the stream from completing (gRPC flow
+        // control suspends it once the send window fills), so the permit stays held.
+        let _held = client
+            .query_arrow(QueryArrowRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT * FROM jobs j1 CROSS JOIN jobs j2".to_string(),
+                tenant: None,
+                parameters: vec![],
+            })
+            .await?
+            .into_inner();
+
+        // A second concurrent statement on the same shard must be rejected.
+        let result = client
+            .query(QueryRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                sql: "SELECT COUNT(*) FROM jobs".to_string(),
+                tenant: None,
+                parameters: vec![],
+            })
+            .await;
+
+        match result {
+            Ok(_) => panic!("expected admission-control rejection while a statement is in flight"),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                assert!(
+                    status.message().contains("max_concurrent_statements"),
+                    "expected admission message, got: {}",
+                    status.message()
+                );
+            }
+        }
+
+        // Release the held stream (frees the permit) before shutting down.
+        drop(_held);
 
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())

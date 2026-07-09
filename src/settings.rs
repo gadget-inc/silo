@@ -382,6 +382,11 @@ pub struct DatabaseTemplate {
     /// the silo pod itself.
     #[serde(default)]
     pub periodic_full_compaction_s: Option<u64>,
+    /// When true, unfiltered per-tenant `SELECT COUNT(*)` statements are answered
+    /// from per-status counters instead of a full status-index scan. See
+    /// `DatabaseConfig::count_from_status_counters`. Defaults to true.
+    #[serde(default = "default_count_from_status_counters")]
+    pub count_from_status_counters: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -418,6 +423,7 @@ impl Default for DatabaseTemplate {
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
+            count_from_status_counters: default_count_from_status_counters(),
             slatedb: None,
             memory_cache: None,
         }
@@ -469,6 +475,28 @@ pub struct ServerConfig {
     /// Defaults to 5000ms (5s). Set to 0 to disable statement timeout.
     #[serde(default = "default_statement_timeout_ms")]
     pub statement_timeout_ms: Option<u64>,
+    /// Cap on the in-memory Arrow size (`RecordBatch::get_array_memory_size`,
+    /// summed across result batches) of a single unary `Query` result set. This
+    /// is an approximation of, not an exact bound on, the MessagePack-serialized
+    /// wire size — per-row serialization repeats column names, so a very wide,
+    /// short-value result can serialize somewhat larger than it measures here.
+    /// Keep it comfortably below the gRPC message wall (`MAX_GRPC_MESSAGE_SIZE`)
+    /// so a breach returns a `RESOURCE_EXHAUSTED` "add a LIMIT" hint rather than
+    /// an opaque encoder error. Enforced before the MessagePack copy. Defaults to
+    /// 64 MiB. Set to 0 to disable. Does not apply to `QueryArrow`, which streams.
+    #[serde(default = "default_max_result_bytes")]
+    pub max_result_bytes: usize,
+    /// Maximum number of SQL statements allowed to execute concurrently against
+    /// a single shard. Excess statements are rejected immediately with
+    /// `RESOURCE_EXHAUSTED` (clients back off and retry). Defaults to 8. Set to
+    /// 0 to disable admission control.
+    #[serde(default = "default_max_concurrent_statements")]
+    pub max_concurrent_statements: usize,
+    /// Statements whose wall-clock execution exceeds this many milliseconds are
+    /// logged at WARN with their tenant, timing, and (truncated) SQL. Defaults
+    /// to 1000ms. Set to 0 to disable slow-query logging.
+    #[serde(default = "default_slow_query_log_ms")]
+    pub slow_query_log_ms: u64,
     /// Shared secret for gRPC authentication. When set, all incoming gRPC
     /// requests must include this token as a Bearer token in the `authorization`
     /// metadata header. When unset (default), authentication is disabled.
@@ -483,6 +511,9 @@ impl Default for ServerConfig {
             grpc_addr: default_grpc_addr(),
             dev_mode: false,
             statement_timeout_ms: default_statement_timeout_ms(),
+            max_result_bytes: default_max_result_bytes(),
+            max_concurrent_statements: default_max_concurrent_statements(),
+            slow_query_log_ms: default_slow_query_log_ms(),
             auth_token: None,
         }
     }
@@ -497,6 +528,22 @@ impl ServerConfig {
                 Some(Duration::from_millis(timeout_ms))
             }
         })
+    }
+
+    /// Result-size cap in bytes, or `None` when disabled (`max_result_bytes == 0`).
+    pub fn max_result_bytes(&self) -> Option<usize> {
+        (self.max_result_bytes != 0).then_some(self.max_result_bytes)
+    }
+
+    /// Per-shard concurrent statement limit, or `None` when disabled
+    /// (`max_concurrent_statements == 0`).
+    pub fn max_concurrent_statements(&self) -> Option<usize> {
+        (self.max_concurrent_statements != 0).then_some(self.max_concurrent_statements)
+    }
+
+    /// Slow-query log threshold, or `None` when disabled (`slow_query_log_ms == 0`).
+    pub fn slow_query_log_threshold(&self) -> Option<Duration> {
+        (self.slow_query_log_ms != 0).then(|| Duration::from_millis(self.slow_query_log_ms))
     }
 }
 
@@ -648,6 +695,22 @@ fn default_statement_timeout_ms() -> Option<u64> {
     Some(5_000)
 }
 
+fn default_max_result_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_max_concurrent_statements() -> usize {
+    8
+}
+
+fn default_slow_query_log_ms() -> u64 {
+    1_000
+}
+
+fn default_count_from_status_counters() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseConfig {
     pub name: String,
@@ -720,6 +783,15 @@ pub struct DatabaseConfig {
     /// See `DatabaseTemplate::terminal_job_expire_s` for details.
     #[serde(default)]
     pub terminal_job_expire_s: Option<u64>,
+    /// When true, unfiltered per-tenant `SELECT COUNT(*) FROM jobs WHERE
+    /// tenant = ...` statements are answered from the transactionally-maintained
+    /// per-status counters (O(#statuses) reads) instead of walking the whole
+    /// status index. Counts share the same freshness contract as the
+    /// `tenant_counts` table (may lag TTL-compacted rows until the counter
+    /// reconciler runs). Defaults to true; set false to force exact scan-based
+    /// counting.
+    #[serde(default = "default_count_from_status_counters")]
+    pub count_from_status_counters: bool,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -755,6 +827,7 @@ impl Default for DatabaseConfig {
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
+            count_from_status_counters: default_count_from_status_counters(),
             slatedb: None,
             memory_cache: None,
         }
@@ -864,12 +937,7 @@ fn expand_env_vars(input: &str) -> Cow<'_, str> {
 impl AppConfig {
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let default = Self {
-            server: ServerConfig {
-                grpc_addr: default_grpc_addr(),
-                dev_mode: false,
-                statement_timeout_ms: default_statement_timeout_ms(),
-                auth_token: None,
-            },
+            server: ServerConfig::default(),
             coordination: CoordinationConfig::default(),
             tenancy: TenancyConfig { enabled: false },
             gubernator: GubernatorSettings::default(),

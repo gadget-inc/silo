@@ -558,6 +558,61 @@ path = "/tmp/silo-%shard%"
 }
 
 #[silo::test]
+fn parse_toml_query_guardrail_defaults() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+
+    assert_eq!(cfg.server.max_result_bytes, 64 * 1024 * 1024);
+    assert_eq!(cfg.server.max_concurrent_statements, 8);
+    assert_eq!(cfg.server.slow_query_log_ms, 1000);
+    assert!(
+        cfg.database.count_from_status_counters,
+        "count_from_status_counters defaults on"
+    );
+
+    assert_eq!(cfg.server.max_result_bytes(), Some(64 * 1024 * 1024));
+    assert_eq!(cfg.server.max_concurrent_statements(), Some(8));
+    assert_eq!(
+        cfg.server.slow_query_log_threshold(),
+        Some(std::time::Duration::from_millis(1000))
+    );
+}
+
+#[silo::test]
+fn parse_toml_query_guardrails_custom_and_disabled() {
+    let toml_str = r#"
+[server]
+max_result_bytes = 1048576
+max_concurrent_statements = 0
+slow_query_log_ms = 0
+
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+count_from_status_counters = false
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+
+    assert_eq!(cfg.server.max_result_bytes, 1_048_576);
+    assert_eq!(cfg.server.max_result_bytes(), Some(1_048_576));
+    assert_eq!(
+        cfg.server.max_concurrent_statements(),
+        None,
+        "0 disables admission control"
+    );
+    assert_eq!(
+        cfg.server.slow_query_log_threshold(),
+        None,
+        "0 disables slow-query logging"
+    );
+    assert!(!cfg.database.count_from_status_counters);
+}
+
+#[silo::test]
 fn parse_toml_with_custom_concurrency_reconcile_interval() {
     let toml_str = r#"
 [database]

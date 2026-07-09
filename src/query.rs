@@ -1,5 +1,7 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ops::ControlFlow;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -22,12 +24,72 @@ use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
 };
 use datafusion::prelude::DataFrame;
-use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
+use futures::{Stream, StreamExt};
+use slatedb::KeyValue;
 
 use crate::job::{JobStatus, JobView};
 use crate::job_store_shard::{JobStoreShard, TenantStatusCounterScanRange};
+
+/// Error surfaced when a statement exceeds its configured deadline. It travels
+/// out of the scan stream as a `DataFusionError::External` so the gRPC layer can
+/// downcast it and map to `DEADLINE_EXCEEDED` (rather than a generic internal error).
+#[derive(Debug)]
+pub struct StatementTimeout {
+    pub timeout: std::time::Duration,
+}
+
+impl std::fmt::Display for StatementTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Query exceeded statement timeout of {} ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for StatementTimeout {}
+
+/// Wrap a record-batch stream so each poll is bounded by an absolute deadline.
+/// When the deadline elapses the stream yields a single
+/// `DataFusionError::External(StatementTimeout)` and ends. Dropping the wrapped
+/// stream at that point drops the underlying scan cursor, so the scan actually
+/// stops — this is the defense that turns a timed-out query into no work rather
+/// than a background zombie.
+pub fn stream_with_deadline(
+    inner: SendableRecordBatchStream,
+    deadline: tokio::time::Instant,
+    timeout: std::time::Duration,
+) -> SendableRecordBatchStream {
+    let schema = inner.schema();
+    let stream = async_stream::try_stream! {
+        let mut inner = inner;
+        loop {
+            match tokio::time::timeout_at(deadline, inner.next()).await {
+                Ok(Some(item)) => yield item?,
+                Ok(None) => break,
+                Err(_) => {
+                    Err(DataFusionError::External(Box::new(StatementTimeout { timeout })))?;
+                }
+            }
+        }
+    };
+    Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(stream)))
+}
+
+/// Boxed per-key extractor mapping an index key to an optional `(tenant, id)`
+/// pair, mirroring the `ControlFlow` contract of `scan_collect`'s `extract`
+/// closure so streaming scans can early-exit (`Break`) and skip (`Continue(None)`).
+type PairExtractor = Box<dyn Fn(&[u8]) -> ControlFlow<(), Option<(String, String)>> + Send>;
+
+/// Map any displayable error into a DataFusion execution error.
+fn exec_err(e: impl std::fmt::Display) -> DataFusionError {
+    DataFusionError::Execution(e.to_string())
+}
+
+/// Default key-chunk size for streaming scans of bounded auxiliary keyspaces
+/// (holder entries, task-queue entries) whose scanners collect the whole range.
+const DEFAULT_SCAN_CHUNK: usize = 1024;
 
 /// Shared utility to get the EXPLAIN plan for a query.
 /// Used by both ShardQueryEngine and ClusterQueryEngine.
@@ -700,96 +762,149 @@ impl Scan for JobsScanner {
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
         let strategy = parse_jobs_scan_strategy(filters);
-        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
-        let proj = Arc::clone(&projection);
-        tokio::spawn(async move {
-            if let Err(e) = stream_jobs(&shard, &proj, &strategy, batch_size, limit, &tx).await {
-                let _ = tx.send(Err(e)).await;
-            }
-        });
-        Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&projection),
-            ReceiverStream::new(rx).map(|r| r),
-        ))
+        let needs = analyze_projection(&projection, &strategy);
+
+        // Each branch produces its own lazy `async_stream` generator that owns
+        // the underlying scan cursor(s). Because nothing is spawned, dropping the
+        // returned stream (statement timeout, client disconnect, LIMIT satisfied)
+        // drops the cursor and stops the scan at its next `.await` — no zombies.
+        let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> =
+            if projection.fields().is_empty()
+                && limit.is_none()
+                && shard.count_from_status_counters
+                && matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) })
+            {
+                // Empty-projection full-tenant scan with no LIMIT — the shape of
+                // `SELECT COUNT(*) FROM jobs WHERE tenant = ...`. Answer the row
+                // tally from the per-status counters (O(#statuses)) rather than
+                // walking the index. The `limit.is_none()` guard excludes shapes
+                // like `EXISTS`/`SELECT 1 ... LIMIT n` that push a scan limit and
+                // want actual rows, not a (reconciler-lagged) counter tally.
+                Box::pin(count_from_counters_stream(
+                    shard,
+                    projection.clone(),
+                    strategy,
+                ))
+            } else if needs.use_status_index_path {
+                Box::pin(status_index_stream(
+                    shard,
+                    projection.clone(),
+                    strategy,
+                    batch_size,
+                    limit,
+                ))
+            } else if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
+                Box::pin(fullscan_join_stream(
+                    shard,
+                    projection.clone(),
+                    needs,
+                    strategy,
+                    batch_size,
+                    limit,
+                ))
+            } else {
+                Box::pin(job_pairs_stream(
+                    shard,
+                    projection.clone(),
+                    needs,
+                    strategy,
+                    batch_size,
+                    limit,
+                ))
+            };
+
+        Box::pin(RecordBatchStreamAdapter::new(projection, inner))
     }
 }
 
-/// Top-level driver: picks the status-index fast path or the standard job-pairs path.
-async fn stream_jobs(
-    shard: &Arc<JobStoreShard>,
-    projection: &SchemaRef,
-    strategy: &JobsScanStrategy,
-    batch_size: usize,
-    limit: Option<usize>,
-    tx: &mpsc::Sender<DfResult<RecordBatch>>,
-) -> DfResult<()> {
-    let needs = analyze_projection(projection, strategy);
-    if needs.use_status_index_path {
-        stream_via_status_index(shard, projection, strategy, batch_size, limit, tx).await
-    } else {
-        stream_via_job_pairs(shard, projection, strategy, &needs, batch_size, limit, tx).await
-    }
-}
-
-/// Scans the status/time index and emits RecordBatches without any point-lookups.
-/// Used when the projection only needs tenant, id, status_kind, or status_changed_at_ms.
-async fn stream_via_status_index(
-    shard: &Arc<JobStoreShard>,
-    projection: &SchemaRef,
-    strategy: &JobsScanStrategy,
-    batch_size: usize,
-    limit: Option<usize>,
-    tx: &mpsc::Sender<DfResult<RecordBatch>>,
-) -> DfResult<()> {
-    let tenant = if let JobsScanStrategy::FullScan { tenant } = strategy {
-        tenant.as_deref()
-    } else {
-        None
-    };
-    let indexed = collect_status_index_data(shard, tenant, limit).await?;
-    let shard_id = shard.name().to_string();
-    let mut sent = 0usize;
-    let mut i = 0usize;
-    while i < indexed.len() && limit.is_none_or(|l| sent < l) {
-        let row_count = if let Some(l) = limit {
-            batch_size
-                .min(indexed.len() - i)
-                .min(l.saturating_sub(sent))
-        } else {
-            batch_size.min(indexed.len() - i)
+/// COUNT(*)-over-a-tenant fast path: sum the transactionally-maintained
+/// per-status counters instead of walking the status index. Emits a single
+/// zero-column batch whose row count is the tenant's live job total.
+fn count_from_counters_stream(
+    shard: Arc<JobStoreShard>,
+    projection: SchemaRef,
+    strategy: JobsScanStrategy,
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    async_stream::try_stream! {
+        let JobsScanStrategy::FullScan { tenant: Some(tenant) } = strategy else {
+            return; // guarded by the caller; nothing to emit otherwise
         };
-        let chunk = &indexed[i..i + row_count];
-        let batch = build_status_index_batch(projection, &shard_id, chunk)?;
-        sent += batch.num_rows();
-        if tx.send(Ok(batch)).await.is_err() {
-            return Ok(());
-        }
-        i += row_count;
+        let total = shard
+            .count_tenant_live_jobs(&tenant)
+            .await
+            .map_err(exec_err)?;
+        yield make_empty_projection_batch(&projection, total.max(0) as usize)?;
     }
-    Ok(())
 }
 
-/// Gather all (tenant, job_id, status_kind, changed_at_ms) tuples from the status/time index.
-async fn collect_status_index_data(
-    shard: &JobStoreShard,
-    tenant: Option<&str>,
+/// Streams the status/time index in bounded chunks, emitting RecordBatches with
+/// no point-lookups. Used when the projection only needs tenant, id,
+/// status_kind, or status_changed_at_ms (including the COUNT(*) fallback when
+/// counter-based counting is disabled).
+fn status_index_stream(
+    shard: Arc<JobStoreShard>,
+    projection: SchemaRef,
+    strategy: JobsScanStrategy,
+    batch_size: usize,
     limit: Option<usize>,
-) -> DfResult<Vec<(String, String, String, i64)>> {
-    match tenant {
-        Some(t) => shard
-            .scan_jobs_with_status_kind(t, limit)
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    async_stream::try_stream! {
+        let tenant = match &strategy {
+            JobsScanStrategy::FullScan { tenant } => tenant.clone(),
+            _ => None,
+        };
+        let (start, end) = match &tenant {
+            Some(t) => {
+                let s = crate::keys::idx_status_time_tenant_prefix(t);
+                let e = crate::keys::end_bound(&s);
+                (s, e)
+            }
+            None => {
+                let s = crate::keys::idx_status_time_all_prefix();
+                let e = crate::keys::end_bound(&s);
+                (s, e)
+            }
+        };
+        let shard_id = shard.name().to_string();
+        let mut cursor = shard
+            .open_range_cursor(start, end, &crate::scan_options())
             .await
-            .map(|v| {
-                v.into_iter()
-                    .map(|(id, sk, ts)| (t.to_string(), id, sk, ts))
-                    .collect()
-            })
-            .map_err(|e| DataFusionError::Execution(e.to_string())),
-        None => shard
-            .scan_all_jobs_with_status_kind(limit)
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string())),
+            .map_err(exec_err)?;
+        let mut sent = 0usize;
+        loop {
+            if limit.is_some_and(|l| sent >= l) {
+                break;
+            }
+            // Never pull more index keys than the LIMIT still needs.
+            let want = limit.map_or(batch_size, |l| batch_size.min(l - sent));
+            let chunk = cursor.next_kv_chunk(want).await.map_err(exec_err)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let mut rows: Vec<(String, String, String, i64)> = Vec::with_capacity(chunk.len());
+            for kv in &chunk {
+                let Some(p) = crate::keys::parse_status_time_index_key(&kv.key)
+                    .filter(|p| !p.job_id.is_empty())
+                else {
+                    continue;
+                };
+                let changed = p.changed_at_ms();
+                rows.push((p.tenant, p.job_id, p.status, changed));
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            if let Some(l) = limit {
+                let remaining = l - sent;
+                if rows.len() > remaining {
+                    rows.truncate(remaining);
+                }
+            }
+            let batch = build_status_index_batch(&projection, &shard_id, &rows)?;
+            sent += batch.num_rows();
+            yield batch;
+        }
     }
 }
 
@@ -851,240 +966,481 @@ fn build_status_index_batch(
         .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
-/// Resolves (tenant, job_id) pairs from the appropriate index, then batch-fetches job data.
-async fn stream_via_job_pairs(
-    shard: &Arc<JobStoreShard>,
-    projection: &SchemaRef,
-    strategy: &JobsScanStrategy,
-    needs: &ProjectionNeeds,
+/// FullScan + need_job_info path: streams `job_info` in bounded windows, joining
+/// each window against `job_status` via a lock-step merge (both keyspaces are
+/// ordered by `(tenant, job_id)`). Reads each KV exactly once and holds only one
+/// window in memory, so a full-tenant scan stays O(batch) instead of buffering
+/// every `JobView` — this is the path the editor's `ORDER BY enqueue_time_ms`
+/// query lands on, and the one that used to OOM the node.
+fn fullscan_join_stream(
+    shard: Arc<JobStoreShard>,
+    projection: SchemaRef,
+    needs: ProjectionNeeds,
+    strategy: JobsScanStrategy,
     batch_size: usize,
     limit: Option<usize>,
-    tx: &mpsc::Sender<DfResult<RecordBatch>>,
-) -> DfResult<()> {
-    // Fast path: FullScan + need_job_info — use combined range scans to avoid the
-    // double-read that would occur from scan_jobs (discards values) + get_jobs_batch
-    // (re-reads same KVs). Status records are also fetched via a sequential range scan
-    // instead of 79K+ random point-lookups.
-    if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
-        return stream_via_fullscan_range(
-            shard, projection, strategy, needs, batch_size, limit, tx,
-        )
-        .await;
-    }
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    async_stream::try_stream! {
+        let JobsScanStrategy::FullScan { tenant } = strategy else {
+            return; // guarded by the caller
+        };
+        let shard_id = shard.name().to_string();
 
-    // Standard path: collect (tenant, job_id) pairs then batch-fetch.
-    // Cap fetch batches so DataFusion can stop early for LIMIT queries.
-    // Full scans pay nearly identical total I/O (same ops, more smaller batches).
-    const POINT_LOOKUP_BATCH: usize = 256;
-    let fetch_batch_size = batch_size.min(POINT_LOOKUP_BATCH);
-
-    let job_pairs = collect_job_pairs(shard, strategy, limit).await?;
-    let shard_id = shard.name().to_string();
-    let mut sent = 0usize;
-    let mut i = 0usize;
-    while i < job_pairs.len() && limit.is_none_or(|l| sent < l) {
-        let end = (i + fetch_batch_size).min(job_pairs.len());
-        let batch_pairs = &job_pairs[i..end];
-        let (jobs_map, status_map) = fetch_batch_data(shard, batch_pairs, needs).await?;
-        // When we fetched job_info, use the map as the authoritative presence check.
-        // Otherwise the index scan is the source of truth (LSM scans skip tombstones).
-        let existing_pairs: Vec<&(String, String)> =
-            if needs.need_job_info || needs.needs_existence_check {
-                batch_pairs
-                    .iter()
-                    .filter(|(_, id)| jobs_map.contains_key(id))
-                    .collect()
-            } else {
-                batch_pairs.iter().collect()
-            };
-        if !existing_pairs.is_empty() {
-            let batch = build_job_pairs_batch(
-                projection,
-                &shard_id,
-                &existing_pairs,
-                &jobs_map,
-                &status_map,
-            )?;
-            sent += batch.num_rows();
-            if tx.send(Ok(batch)).await.is_err() {
-                return Ok(());
+        let (info_start, info_end) = match &tenant {
+            Some(t) => {
+                let s = crate::keys::job_info_prefix(t);
+                let e = crate::keys::end_bound(&s);
+                (s, e)
             }
-        }
-        i = end;
-    }
-    Ok(())
-}
-
-/// Fast path for FullScan + need_job_info: runs combined range scans to read each KV
-/// exactly once. Concurrently scans job_info and status ranges, builds in-memory maps,
-/// then emits batches without any point-lookups.
-async fn stream_via_fullscan_range(
-    shard: &Arc<JobStoreShard>,
-    projection: &SchemaRef,
-    strategy: &JobsScanStrategy,
-    needs: &ProjectionNeeds,
-    batch_size: usize,
-    limit: Option<usize>,
-    tx: &mpsc::Sender<DfResult<RecordBatch>>,
-) -> DfResult<()> {
-    let tenant = if let JobsScanStrategy::FullScan { tenant } = strategy {
-        tenant.as_deref()
-    } else {
-        return Ok(()); // unreachable: caller guards on FullScan
-    };
-
-    // Concurrently scan job_info values and (optionally) status records.
-    let (jobs_result, status_result) = tokio::join!(
-        async {
-            match tenant {
-                Some(t) => shard.scan_jobs_with_views(t, limit).await.map(|v| {
-                    v.into_iter()
-                        .map(|(id, view)| (t.to_string(), id, view))
-                        .collect::<Vec<_>>()
-                }),
-                None => shard.scan_all_jobs_with_views(limit).await,
+            None => {
+                let s = crate::keys::jobs_prefix();
+                let e = crate::keys::end_bound(&s);
+                (s, e)
             }
-            .map_err(|e: crate::job_store_shard::JobStoreShardError| {
-                DataFusionError::Execution(e.to_string())
-            })
-        },
-        async {
-            if needs.need_any_status() {
-                match tenant {
-                    Some(t) => shard
-                        .scan_jobs_status_records(t, limit)
-                        .await
-                        .map(|v| v.into_iter().collect::<HashMap<_, _>>()),
-                    None => shard.scan_all_jobs_status_records(limit).await.map(|v| {
-                        v.into_iter()
-                            .map(|(_, id, s)| (id, s))
-                            .collect::<HashMap<_, _>>()
-                    }),
+        };
+        let mut info_cursor = shard
+            .open_range_cursor(info_start, info_end, &crate::scan_options())
+            .await
+            .map_err(exec_err)?;
+
+        // Only open the status join cursor when a status column is projected.
+        let mut status_join = if needs.need_any_status() {
+            let (status_start, status_end) = match &tenant {
+                Some(t) => {
+                    let s = crate::keys::job_status_prefix(t);
+                    let e = crate::keys::end_bound(&s);
+                    (s, e)
                 }
-                .map_err(|e: crate::job_store_shard::JobStoreShardError| {
-                    DataFusionError::Execution(e.to_string())
-                })
-            } else {
-                Ok(HashMap::new())
+                None => {
+                    let s = crate::keys::jobs_status_prefix();
+                    let e = crate::keys::end_bound(&s);
+                    (s, e)
+                }
+            };
+            let cursor = shard
+                .open_range_cursor(status_start, status_end, &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
+            Some(StatusJoinCursor::new(cursor, batch_size))
+        } else {
+            None
+        };
+
+        let mut sent = 0usize;
+        loop {
+            if limit.is_some_and(|l| sent >= l) {
+                break;
             }
+            // Never pull more job_info keys than the LIMIT still needs.
+            let want = limit.map_or(batch_size, |l| batch_size.min(l - sent));
+            let info_chunk = info_cursor.next_kv_chunk(want).await.map_err(exec_err)?;
+            if info_chunk.is_empty() {
+                break;
+            }
+            // Decode the window's job_info values (range scans skip tombstones,
+            // so every entry is a live job).
+            let mut infos: Vec<(String, String, JobView)> = Vec::with_capacity(info_chunk.len());
+            for kv in info_chunk {
+                let Some(p) =
+                    crate::keys::parse_job_info_key(&kv.key).filter(|p| !p.job_id.is_empty())
+                else {
+                    continue;
+                };
+                infos.push((p.tenant, p.job_id, JobView::new(kv.value).map_err(exec_err)?));
+            }
+            if infos.is_empty() {
+                continue;
+            }
+            if let Some(l) = limit {
+                let remaining = l - sent;
+                if infos.len() > remaining {
+                    infos.truncate(remaining);
+                }
+            }
+
+            // Advance the status cursor up to this window's last key.
+            let mut status_map: HashMap<(String, String), JobStatus> = HashMap::new();
+            if let Some(join) = status_join.as_mut() {
+                let last = infos.last().expect("infos non-empty");
+                let window_end = (last.0.clone(), last.1.clone());
+                join.collect_window(&window_end, &mut status_map).await?;
+            }
+
+            let pairs: Vec<(String, String)> =
+                infos.iter().map(|(t, id, _)| (t.clone(), id.clone())).collect();
+            let jobs_map: HashMap<(String, String), JobView> = infos
+                .into_iter()
+                .map(|(t, id, view)| ((t, id), view))
+                .collect();
+            let pair_refs: Vec<&(String, String)> = pairs.iter().collect();
+            let batch =
+                build_job_pairs_batch(&projection, &shard_id, &pair_refs, &jobs_map, &status_map)?;
+            sent += batch.num_rows();
+            yield batch;
         }
-    );
-
-    let jobs_with_tenant: Vec<(String, String, JobView)> = jobs_result?;
-    let status_map: HashMap<String, JobStatus> = status_result?;
-
-    // Build the (tenant, job_id) pairs and jobs_map from the range scan results.
-    // Range scans skip tombstones, so all returned entries are live jobs.
-    let job_pairs: Vec<(String, String)> = jobs_with_tenant
-        .iter()
-        .map(|(t, id, _)| (t.clone(), id.clone()))
-        .collect();
-    let jobs_map: HashMap<String, JobView> = jobs_with_tenant
-        .into_iter()
-        .map(|(_, id, view)| (id, view))
-        .collect();
-
-    let shard_id = shard.name().to_string();
-    let mut sent = 0usize;
-    let mut i = 0usize;
-    while i < job_pairs.len() && limit.is_none_or(|l| sent < l) {
-        let end = (i + batch_size).min(job_pairs.len());
-        let batch_pairs: Vec<&(String, String)> = job_pairs[i..end].iter().collect();
-        let batch =
-            build_job_pairs_batch(projection, &shard_id, &batch_pairs, &jobs_map, &status_map)?;
-        sent += batch.num_rows();
-        if tx.send(Ok(batch)).await.is_err() {
-            return Ok(());
-        }
-        i = end;
     }
-    Ok(())
 }
 
-/// Dispatch to the appropriate index scan to resolve (tenant, job_id) pairs.
-async fn collect_job_pairs(
-    shard: &JobStoreShard,
-    strategy: &JobsScanStrategy,
-    limit: Option<usize>,
-) -> DfResult<Vec<(String, String)>> {
-    let result = match strategy {
-        JobsScanStrategy::ExactId { tenant, id } => {
-            if let Some(t) = tenant {
-                Ok(vec![(t.clone(), id.clone())])
-            } else {
-                shard
-                    .scan_all_jobs(limit)
+/// A `job_status` range cursor that a merge-join drives forward one window at a
+/// time. Buffers at most one pulled chunk of not-yet-consumed status rows, so a
+/// full scan stays O(batch) even though `job_info` and `job_status` are walked
+/// as two independent iterators.
+struct StatusJoinCursor {
+    cursor: crate::job_store_shard::scan::RangeScanCursor,
+    buffer: VecDeque<KeyValue>,
+    exhausted: bool,
+    batch_size: usize,
+}
+
+impl StatusJoinCursor {
+    fn new(cursor: crate::job_store_shard::scan::RangeScanCursor, batch_size: usize) -> Self {
+        Self {
+            cursor,
+            buffer: VecDeque::new(),
+            exhausted: false,
+            batch_size,
+        }
+    }
+
+    /// Insert into `out` (keyed by `(tenant, job_id)`) every status record whose
+    /// key is `<= window_end`. Status rows past the window are left buffered for
+    /// the next call. Both keyspaces encode `(tenant, job_id)` with the same
+    /// order-preserving tuple encoding, so Rust tuple comparison matches on-disk
+    /// key order.
+    async fn collect_window(
+        &mut self,
+        window_end: &(String, String),
+        out: &mut HashMap<(String, String), JobStatus>,
+    ) -> DfResult<()> {
+        loop {
+            if self.buffer.is_empty() {
+                if self.exhausted {
+                    break;
+                }
+                let chunk = self
+                    .cursor
+                    .next_kv_chunk(self.batch_size)
                     .await
-                    .map(|all| all.into_iter().filter(|(_, jid)| jid == id).collect())
+                    .map_err(exec_err)?;
+                if chunk.is_empty() {
+                    self.exhausted = true;
+                    break;
+                }
+                self.buffer.extend(chunk);
+            }
+            let front_key = {
+                let kv = self.buffer.front().expect("buffer non-empty");
+                crate::keys::parse_job_status_key(&kv.key)
+                    .filter(|p| !p.job_id.is_empty())
+                    .map(|p| (p.tenant, p.job_id))
+            };
+            match front_key {
+                None => {
+                    // Malformed/empty key — drop and continue.
+                    self.buffer.pop_front();
+                }
+                Some(key) if key <= *window_end => {
+                    let kv = self.buffer.pop_front().expect("buffer non-empty");
+                    let status =
+                        crate::job_store_shard::helpers::decode_job_status_owned(&kv.value)
+                            .map_err(exec_err)?;
+                    out.insert(key, status);
+                }
+                Some(_) => break, // front is past this window; keep it buffered
             }
         }
-        JobsScanStrategy::MetadataExact { tenant, key, value } => {
-            if let Some(t) = tenant {
-                shard
-                    .scan_jobs_by_metadata(t, key, value, limit)
-                    .await
-                    .map(|v| v.into_iter().map(|id| (t.clone(), id)).collect())
+        Ok(())
+    }
+}
+
+/// Non-FullScan path: resolves `(tenant, job_id)` pairs from an index in bounded
+/// chunks and hydrates each chunk with `fetch_batch_data`, yielding a batch per
+/// chunk. Covers ExactId, Metadata, and Status strategies.
+fn job_pairs_stream(
+    shard: Arc<JobStoreShard>,
+    projection: SchemaRef,
+    needs: ProjectionNeeds,
+    strategy: JobsScanStrategy,
+    batch_size: usize,
+    limit: Option<usize>,
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    // Cap hydration batches so DataFusion can stop early for LIMIT queries; full
+    // scans pay near-identical total I/O (same ops, more smaller batches).
+    const POINT_LOOKUP_BATCH: usize = 256;
+    async_stream::try_stream! {
+        let shard_id = shard.name().to_string();
+        let fetch_batch = batch_size.clamp(1, POINT_LOOKUP_BATCH);
+
+        // ExactId with a tenant: synthesize the single pair, no scan required.
+        if let JobsScanStrategy::ExactId { tenant: Some(tenant), id } = &strategy {
+            let pairs = vec![(tenant.clone(), id.clone())];
+            let (jobs_map, status_map) = fetch_batch_data(&shard, &pairs, &needs).await?;
+            let existing: Vec<&(String, String)> = if needs.need_job_info || needs.needs_existence_check {
+                pairs.iter().filter(|pair| jobs_map.contains_key(*pair)).collect()
             } else {
-                shard.scan_all_jobs(limit).await
+                pairs.iter().collect()
+            };
+            if !existing.is_empty() {
+                yield build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map)?;
             }
+            return;
+        }
+
+        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+        let (start, end, extractor) = pairs_scan_plan(&strategy, now_ms);
+        let mut cursor = shard
+            .open_range_cursor(start, end, &crate::scan_options())
+            .await
+            .map_err(exec_err)?;
+
+        let mut sent = 0usize;
+        let mut pending: Vec<(String, String)> = Vec::new();
+        let mut done = false;
+        loop {
+            if limit.is_some_and(|l| sent >= l) {
+                break;
+            }
+            // Fill `pending` up to a hydration batch, but never resolve more pairs
+            // than the LIMIT still needs (so a small LIMIT scans few index keys).
+            let want = limit.map_or(fetch_batch, |l| fetch_batch.min(l - sent));
+            while pending.len() < want && !done {
+                let chunk = cursor
+                    .next_kv_chunk(want - pending.len())
+                    .await
+                    .map_err(exec_err)?;
+                if chunk.is_empty() {
+                    done = true;
+                    break;
+                }
+                for kv in &chunk {
+                    match extractor(&kv.key) {
+                        ControlFlow::Continue(Some(pair)) => pending.push(pair),
+                        ControlFlow::Continue(None) => {}
+                        ControlFlow::Break(()) => {
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            if let Some(l) = limit {
+                let remaining = l - sent;
+                if pending.len() > remaining {
+                    pending.truncate(remaining);
+                }
+            }
+            let (jobs_map, status_map) = fetch_batch_data(&shard, &pending, &needs).await?;
+            // With job_info fetched, the map is the authoritative presence check;
+            // otherwise the index scan is the source of truth (scans skip tombstones).
+            let existing: Vec<&(String, String)> = if needs.need_job_info || needs.needs_existence_check {
+                pending.iter().filter(|pair| jobs_map.contains_key(*pair)).collect()
+            } else {
+                pending.iter().collect()
+            };
+            if !existing.is_empty() {
+                let batch =
+                    build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map)?;
+                sent += batch.num_rows();
+                yield batch;
+            }
+            pending.clear();
+            if done {
+                break;
+            }
+        }
+    }
+}
+
+/// Compute the `(start, end, extractor)` scan plan for a non-FullScan pair
+/// resolution. The extractor mirrors the `ControlFlow` contract of the
+/// collect-oriented `scan_*` helpers so early-exit and skip semantics are preserved.
+fn pairs_scan_plan(strategy: &JobsScanStrategy, now_ms: i64) -> (Vec<u8>, Vec<u8>, PairExtractor) {
+    use crate::keys;
+    match strategy {
+        JobsScanStrategy::ExactId { tenant: None, id } => {
+            let start = keys::jobs_prefix();
+            let end = keys::end_bound(&start);
+            let id = id.clone();
+            let f: PairExtractor = Box::new(move |key: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_job_info_key(key)
+                        .filter(|p| !p.job_id.is_empty() && p.job_id == id)
+                        .map(|p| (p.tenant, p.job_id)),
+                )
+            });
+            (start, end, f)
+        }
+        JobsScanStrategy::MetadataExact {
+            tenant: Some(t),
+            key,
+            value,
+        } => {
+            let start = keys::idx_metadata_prefix(t, key, value);
+            let end = keys::end_bound(&start);
+            let tenant = t.clone();
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_metadata_index_key(k)
+                        .filter(|p| !p.job_id.is_empty())
+                        .map(|p| (tenant.clone(), p.job_id)),
+                )
+            });
+            (start, end, f)
         }
         JobsScanStrategy::MetadataPrefix {
-            tenant,
+            tenant: Some(t),
             key,
             prefix,
         } => {
-            if let Some(t) = tenant {
-                shard
-                    .scan_jobs_by_metadata_prefix(t, key, prefix, limit)
-                    .await
-                    .map(|v| v.into_iter().map(|id| (t.clone(), id)).collect())
-            } else {
-                shard.scan_all_jobs(limit).await
-            }
+            let start = keys::idx_metadata_prefix(t, key, prefix);
+            let end = keys::end_bound(&keys::idx_metadata_key_only_prefix(t, key));
+            let tenant = t.clone();
+            let prefix = prefix.clone();
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                let Some(parsed) = keys::parse_metadata_index_key(k) else {
+                    return ControlFlow::Continue(None);
+                };
+                if parsed.value.starts_with(&prefix) && !parsed.job_id.is_empty() {
+                    ControlFlow::Continue(Some((tenant.clone(), parsed.job_id)))
+                } else if parsed.value.as_str() > prefix.as_str()
+                    && !parsed.value.starts_with(&prefix)
+                {
+                    // Values sort lexicographically; once past the prefix range, stop.
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(None)
+                }
+            });
+            (start, end, f)
         }
         JobsScanStrategy::Status { tenant, status } => {
-            collect_job_pairs_by_status(shard, tenant.as_deref(), *status, limit).await
+            status_pairs_scan_plan(tenant.as_deref(), *status, now_ms)
         }
-        JobsScanStrategy::FullScan { tenant } => {
-            if let Some(t) = tenant {
-                shard
-                    .scan_jobs(t, limit)
-                    .await
-                    .map(|v| v.into_iter().map(|id| (t.clone(), id)).collect())
-            } else {
-                shard.scan_all_jobs(limit).await
-            }
+        // No-tenant metadata filters have no tenant-scoped index, so scan all
+        // job_info and let DataFusion's FilterExec re-apply the (Inexact) filter.
+        // ExactId{Some} is handled by the caller; FullScan by other stream paths.
+        JobsScanStrategy::MetadataExact { tenant: None, .. }
+        | JobsScanStrategy::MetadataPrefix { tenant: None, .. }
+        | JobsScanStrategy::ExactId {
+            tenant: Some(_), ..
         }
-    };
-    result.map_err(|e| DataFusionError::Execution(e.to_string()))
+        | JobsScanStrategy::FullScan { .. } => all_jobs_pairs_plan(),
+    }
 }
 
-/// Resolve (tenant, job_id) pairs for status-filtered queries.
-async fn collect_job_pairs_by_status(
-    shard: &JobStoreShard,
+/// Scan-plan that walks all `job_info` keys and yields every `(tenant, job_id)`.
+fn all_jobs_pairs_plan() -> (Vec<u8>, Vec<u8>, PairExtractor) {
+    let start = crate::keys::jobs_prefix();
+    let end = crate::keys::end_bound(&start);
+    let f: PairExtractor = Box::new(|key: &[u8]| {
+        ControlFlow::Continue(
+            crate::keys::parse_job_info_key(key)
+                .filter(|p| !p.job_id.is_empty())
+                .map(|p| (p.tenant, p.job_id)),
+        )
+    });
+    (start, end, f)
+}
+
+/// Scan-plan for status-filtered pair resolution, covering the stored-status and
+/// virtual Waiting / FutureScheduled variants across tenant-scoped and
+/// cross-tenant scans. Mirrors `scan_jobs_by_status` / `scan_jobs_waiting` /
+/// `scan_jobs_future_scheduled`.
+fn status_pairs_scan_plan(
     tenant: Option<&str>,
     status: QueryStatusFilter,
-    limit: Option<usize>,
-) -> Result<Vec<(String, String)>, crate::job_store_shard::JobStoreShardError> {
-    let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+    now_ms: i64,
+) -> (Vec<u8>, Vec<u8>, PairExtractor) {
+    use crate::keys;
+    let inverted_now = u64::MAX - (now_ms.max(0) as u64);
     match (status, tenant) {
-        (QueryStatusFilter::Waiting, Some(t)) => shard
-            .scan_jobs_waiting(t, now_ms, limit)
-            .await
-            .map(|v| v.into_iter().map(|id| (t.to_string(), id)).collect()),
-        (QueryStatusFilter::Waiting, None) => shard.scan_all_jobs_waiting(now_ms, limit).await,
-        (QueryStatusFilter::FutureScheduled, Some(t)) => shard
-            .scan_jobs_future_scheduled(t, now_ms, limit)
-            .await
-            .map(|v| v.into_iter().map(|id| (t.to_string(), id)).collect()),
-        (QueryStatusFilter::FutureScheduled, None) => {
-            shard.scan_all_jobs_future_scheduled(now_ms, limit).await
+        (QueryStatusFilter::Stored(kind), Some(t)) => {
+            let start = keys::idx_status_time_prefix(t, kind.as_str());
+            let end = keys::end_bound(&start);
+            let tenant = t.to_string();
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_status_time_index_key(k)
+                        .filter(|p| !p.job_id.is_empty())
+                        .map(|p| (tenant.clone(), p.job_id)),
+                )
+            });
+            (start, end, f)
         }
-        (QueryStatusFilter::Stored(kind), Some(t)) => shard
-            .scan_jobs_by_status(t, kind, limit)
-            .await
-            .map(|v| v.into_iter().map(|id| (t.to_string(), id)).collect()),
-        (QueryStatusFilter::Stored(kind), None) => shard.scan_all_jobs_by_status(kind, limit).await,
+        (QueryStatusFilter::Stored(kind), None) => {
+            let start = keys::idx_status_time_all_prefix();
+            let end = keys::end_bound(&start);
+            let status_str = kind.as_str().to_string();
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_status_time_index_key(k)
+                        .filter(|p| p.status == status_str && !p.job_id.is_empty())
+                        .map(|p| (p.tenant, p.job_id)),
+                )
+            });
+            (start, end, f)
+        }
+        (QueryStatusFilter::Waiting, Some(t)) => {
+            let start = keys::idx_status_time_prefix_with_time(t, "Scheduled", inverted_now);
+            let end = keys::end_bound(&keys::idx_status_time_prefix(t, "Scheduled"));
+            let tenant = t.to_string();
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_status_time_index_key(k)
+                        .filter(|p| !p.job_id.is_empty())
+                        .map(|p| (tenant.clone(), p.job_id)),
+                )
+            });
+            (start, end, f)
+        }
+        (QueryStatusFilter::Waiting, None) => {
+            let start = keys::idx_status_time_all_prefix();
+            let end = keys::end_bound(&start);
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_status_time_index_key(k)
+                        .filter(|p| {
+                            p.status == "Scheduled"
+                                && p.inverted_timestamp >= inverted_now
+                                && !p.job_id.is_empty()
+                        })
+                        .map(|p| (p.tenant, p.job_id)),
+                )
+            });
+            (start, end, f)
+        }
+        (QueryStatusFilter::FutureScheduled, Some(t)) => {
+            let start = keys::idx_status_time_prefix(t, "Scheduled");
+            let end = keys::idx_status_time_prefix_with_time(t, "Scheduled", inverted_now);
+            let tenant = t.to_string();
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_status_time_index_key(k)
+                        .filter(|p| !p.job_id.is_empty())
+                        .map(|p| (tenant.clone(), p.job_id)),
+                )
+            });
+            (start, end, f)
+        }
+        (QueryStatusFilter::FutureScheduled, None) => {
+            let start = keys::idx_status_time_all_prefix();
+            let end = keys::end_bound(&start);
+            let f: PairExtractor = Box::new(move |k: &[u8]| {
+                ControlFlow::Continue(
+                    keys::parse_status_time_index_key(k)
+                        .filter(|p| {
+                            p.status == "Scheduled"
+                                && p.inverted_timestamp < inverted_now
+                                && !p.job_id.is_empty()
+                        })
+                        .map(|p| (p.tenant, p.job_id)),
+                )
+            });
+            (start, end, f)
+        }
     }
 }
 
@@ -1094,9 +1450,16 @@ async fn fetch_batch_data(
     shard: &JobStoreShard,
     pairs: &[(String, String)],
     needs: &ProjectionNeeds,
-) -> DfResult<(HashMap<String, JobView>, HashMap<String, JobStatus>)> {
-    let mut jobs_map: HashMap<String, JobView> = HashMap::new();
-    let mut status_map: HashMap<String, JobStatus> = HashMap::new();
+) -> DfResult<(
+    HashMap<(String, String), JobView>,
+    HashMap<(String, String), JobStatus>,
+)> {
+    // Keyed by (tenant, job_id): job ids are unique only per-tenant, so a
+    // cross-tenant scan (FullScan with no tenant filter) can surface the same id
+    // under two tenants in one batch. Keying by id alone would let one overwrite
+    // the other.
+    let mut jobs_map: HashMap<(String, String), JobView> = HashMap::new();
+    let mut status_map: HashMap<(String, String), JobStatus> = HashMap::new();
     if !needs.need_job_info && !needs.need_any_status() && !needs.needs_existence_check {
         return Ok((jobs_map, status_map));
     }
@@ -1133,8 +1496,16 @@ async fn fetch_batch_data(
                 }
             }
         );
-        jobs_map.extend(jobs_result?);
-        status_map.extend(status_result?);
+        jobs_map.extend(
+            jobs_result?
+                .into_iter()
+                .map(|(id, v)| ((tenant.clone(), id), v)),
+        );
+        status_map.extend(
+            status_result?
+                .into_iter()
+                .map(|(id, s)| ((tenant.clone(), id), s)),
+        );
     }
     Ok((jobs_map, status_map))
 }
@@ -1144,8 +1515,8 @@ fn build_job_pairs_batch(
     projection: &SchemaRef,
     shard_id: &str,
     pairs: &[&(String, String)],
-    jobs_map: &HashMap<String, JobView>,
-    status_map: &HashMap<String, JobStatus>,
+    jobs_map: &HashMap<(String, String), JobView>,
+    status_map: &HashMap<(String, String), JobStatus>,
 ) -> DfResult<RecordBatch> {
     let n = pairs.len();
     if projection.fields().is_empty() {
@@ -1164,13 +1535,13 @@ fn build_job_pairs_batch(
             "priority" => Arc::new(UInt8Array::from(
                 pairs
                     .iter()
-                    .map(|p| jobs_map.get(&p.1).map_or(0, |v| v.priority()))
+                    .map(|p| jobs_map.get(*p).map_or(0, |v| v.priority()))
                     .collect::<Vec<u8>>(),
             )),
             "enqueue_time_ms" => Arc::new(Int64Array::from(
                 pairs
                     .iter()
-                    .map(|p| jobs_map.get(&p.1).map_or(0, |v| v.enqueue_time_ms()))
+                    .map(|p| jobs_map.get(*p).map_or(0, |v| v.enqueue_time_ms()))
                     .collect::<Vec<i64>>(),
             )),
             "payload" => Arc::new(StringArray::from(
@@ -1178,7 +1549,7 @@ fn build_job_pairs_batch(
                     .iter()
                     .map(|p| {
                         jobs_map
-                            .get(&p.1)
+                            .get(*p)
                             .and_then(|v| v.payload_as_json().ok().map(|j| j.to_string()))
                     })
                     .collect::<Vec<Option<String>>>(),
@@ -1188,7 +1559,7 @@ fn build_job_pairs_batch(
                     .iter()
                     .map(|p| {
                         jobs_map
-                            .get(&p.1)
+                            .get(*p)
                             .map_or_else(String::new, |v| v.task_group().to_string())
                     })
                     .collect::<Vec<String>>(),
@@ -1196,19 +1567,19 @@ fn build_job_pairs_batch(
             "status_kind" => Arc::new(StringArray::from(
                 pairs
                     .iter()
-                    .map(|p| status_map.get(&p.1).map(display_status_kind))
+                    .map(|p| status_map.get(*p).map(display_status_kind))
                     .collect::<Vec<Option<String>>>(),
             )),
             "status_changed_at_ms" => Arc::new(Int64Array::from(
                 pairs
                     .iter()
-                    .map(|p| status_map.get(&p.1).map(|s| s.changed_at_ms))
+                    .map(|p| status_map.get(*p).map(|s| s.changed_at_ms))
                     .collect::<Vec<Option<i64>>>(),
             )),
             "current_attempt" => Arc::new(UInt32Array::from(
                 pairs
                     .iter()
-                    .map(|p| status_map.get(&p.1).and_then(|s| s.current_attempt))
+                    .map(|p| status_map.get(*p).and_then(|s| s.current_attempt))
                     .collect::<Vec<Option<u32>>>(),
             )),
             "next_attempt_starts_after_ms" => Arc::new(Int64Array::from(
@@ -1216,7 +1587,7 @@ fn build_job_pairs_batch(
                     .iter()
                     .map(|p| {
                         status_map
-                            .get(&p.1)
+                            .get(*p)
                             .and_then(|s| s.next_attempt_starts_after_ms)
                     })
                     .collect::<Vec<Option<i64>>>(),
@@ -1225,7 +1596,7 @@ fn build_job_pairs_batch(
             "limits" => Arc::new(StringArray::from(
                 pairs
                     .iter()
-                    .map(|p| jobs_map.get(&p.1).map(|v| limits_to_json(&v.limits())))
+                    .map(|p| jobs_map.get(*p).map(|v| limits_to_json(&v.limits())))
                     .collect::<Vec<Option<String>>>(),
             )),
             other => {
@@ -1271,7 +1642,7 @@ fn limits_to_json(limits: &[crate::job::Limit]) -> String {
 /// Build the Arrow `Map<Utf8, Utf8>` column for job metadata key/value pairs.
 fn build_metadata_column(
     pairs: &[&(String, String)],
-    jobs_map: &HashMap<String, JobView>,
+    jobs_map: &HashMap<(String, String), JobView>,
 ) -> DfResult<ArrayRef> {
     use datafusion::arrow::array::{MapArray, StructArray};
     let mut keys_builder = datafusion::arrow::array::StringBuilder::new();
@@ -1280,7 +1651,7 @@ fn build_metadata_column(
     offsets.push(0);
     let mut total = 0i32;
     for p in pairs {
-        let metadata = jobs_map.get(&p.1).map_or_else(Vec::new, |v| v.metadata());
+        let metadata = jobs_map.get(*p).map_or_else(Vec::new, |v| v.metadata());
         for (k, v) in &metadata {
             keys_builder.append_value(k);
             values_builder.append_value(v);
@@ -1484,97 +1855,61 @@ impl Scan for QueuesScanner {
             let queue = queue.clone();
             let shard = Arc::clone(&self.shard);
             let proj_for_stream = Arc::clone(&projection);
-            let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
-            tokio::spawn(async move {
-                let db = shard.db();
+            let stream = async_stream::try_stream! {
                 let counter_key = crate::keys::concurrency_requester_counter_key(&tenant, &queue);
-                let count = match db.get(&counter_key).await {
-                    Ok(Some(bytes)) => {
+                let counter = shard
+                    .db()
+                    .get(&counter_key)
+                    .await
+                    .map_err(|e| exec_err(format!("failed to read requester counter: {e}")))?;
+                let count = match counter {
+                    Some(bytes) => {
                         crate::job_store_shard::counters::decode_counter(&bytes).max(0) as usize
                     }
-                    Ok(None) => {
+                    None => {
+                        // Counter missing: fall back to counting request rows directly.
                         let prefix = crate::keys::concurrency_request_prefix(&tenant, &queue);
                         let end = crate::keys::end_bound(&prefix);
-                        let mut iter = match db
-                            .scan_with_options::<Vec<u8>, _>(prefix..=end, &crate::scan_options())
+                        let mut cursor = shard
+                            .open_range_cursor(prefix, end, &crate::scan_options())
                             .await
-                        {
-                            Ok(iter) => iter,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Err(DataFusionError::Execution(e.to_string())))
-                                    .await;
-                                return;
-                            }
-                        };
-
+                            .map_err(exec_err)?;
                         let mut scanned_count: usize = 0;
                         loop {
-                            match iter.next().await {
-                                Ok(Some(kv)) => {
-                                    if crate::keys::parse_concurrency_request_key(&kv.key).is_some()
-                                    {
-                                        scanned_count += 1;
-                                    }
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(Err(DataFusionError::Execution(e.to_string())))
-                                        .await;
-                                    return;
+                            let chunk =
+                                cursor.next_kv_chunk(DEFAULT_SCAN_CHUNK).await.map_err(exec_err)?;
+                            if chunk.is_empty() {
+                                break;
+                            }
+                            for kv in &chunk {
+                                if crate::keys::parse_concurrency_request_key(&kv.key).is_some() {
+                                    scanned_count += 1;
                                 }
                             }
                         }
                         scanned_count
                     }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(format!(
-                                "failed to read requester counter: {e}"
-                            ))))
-                            .await;
-                        return;
-                    }
                 };
 
                 match fast_path_projection {
                     QueueRequesterFastPathProjection::Empty => {
-                        let batch = make_empty_projection_batch(&proj_for_stream, count);
-                        let _ = tx.send(batch).await;
+                        yield make_empty_projection_batch(&proj_for_stream, count)?;
                     }
                     QueueRequesterFastPathProjection::ConstantColumns => {
                         let batch_rows = batch_size.max(1);
                         let shard_id = shard.name().to_string();
                         let mut remaining = count;
-
                         loop {
                             let rows = remaining.min(batch_rows);
                             if remaining == 0 && rows == 0 {
-                                let batch = make_queue_constant_projection_batch(
-                                    &proj_for_stream,
-                                    &shard_id,
-                                    &tenant,
-                                    &queue,
-                                    "requester",
-                                    0,
-                                );
-                                let _ = tx.send(batch).await;
+                                yield make_queue_constant_projection_batch(
+                                    &proj_for_stream, &shard_id, &tenant, &queue, "requester", 0,
+                                )?;
                                 break;
                             }
-
-                            let batch = make_queue_constant_projection_batch(
-                                &proj_for_stream,
-                                &shard_id,
-                                &tenant,
-                                &queue,
-                                "requester",
-                                rows,
-                            );
-                            if tx.send(batch).await.is_err() {
-                                break;
-                            }
-
+                            yield make_queue_constant_projection_batch(
+                                &proj_for_stream, &shard_id, &tenant, &queue, "requester", rows,
+                            )?;
                             remaining -= rows;
                             if remaining == 0 {
                                 break;
@@ -1582,18 +1917,13 @@ impl Scan for QueuesScanner {
                         }
                     }
                 }
-            });
-            return Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&projection),
-                ReceiverStream::new(rx).map(|r| r),
-            ));
+            };
+            return Box::pin(RecordBatchStreamAdapter::new(projection, Box::pin(stream)));
         }
 
-        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
         let shard = Arc::clone(&self.shard);
         let proj_for_stream = Arc::clone(&projection);
-        tokio::spawn(async move {
-            let db = shard.db();
+        let stream = async_stream::try_stream! {
             let mut entries: Vec<QueueEntry> = Vec::new();
 
             // Scan holders using binary storekey prefix
@@ -1603,27 +1933,27 @@ impl Scan for QueuesScanner {
                 (None, _) => crate::keys::concurrency_holders_prefix(),
             };
             let holders_end = crate::keys::end_bound(&holders_start);
-
-            if let Ok(mut iter) = db
-                .scan_with_options::<Vec<u8>, _>(
-                    holders_start..=holders_end,
-                    &crate::scan_options(),
-                )
+            let mut holder_cursor = shard
+                .open_range_cursor(holders_start, holders_end, &crate::scan_options())
                 .await
-            {
-                while let Ok(Some(kv)) = iter.next().await {
+                .map_err(exec_err)?;
+            'holders: loop {
+                let chunk = holder_cursor.next_kv_chunk(DEFAULT_SCAN_CHUNK).await.map_err(exec_err)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                for kv in &chunk {
                     if limit.is_some_and(|l| entries.len() >= l) {
-                        break;
+                        break 'holders;
                     }
                     if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key) {
-                        // Filter by queue if specified
                         if let Some(ref q) = queue_filter
                             && parsed.queue != *q
                         {
                             continue;
                         }
-                        let timestamp_ms = crate::codec::decode_holder_granted_at_ms(&kv.value)
-                            .unwrap_or_default();
+                        let timestamp_ms =
+                            crate::codec::decode_holder_granted_at_ms(&kv.value).unwrap_or_default();
                         entries.push(QueueEntry {
                             tenant: parsed.tenant,
                             queue_name: parsed.queue,
@@ -1644,20 +1974,20 @@ impl Scan for QueuesScanner {
                 (None, _) => crate::keys::concurrency_requests_prefix(),
             };
             let requests_end = crate::keys::end_bound(&requests_start);
-
-            if let Ok(mut iter) = db
-                .scan_with_options::<Vec<u8>, _>(
-                    requests_start..=requests_end,
-                    &crate::scan_options(),
-                )
+            let mut request_cursor = shard
+                .open_range_cursor(requests_start, requests_end, &crate::scan_options())
                 .await
-            {
-                while let Ok(Some(kv)) = iter.next().await {
+                .map_err(exec_err)?;
+            'requests: loop {
+                let chunk = request_cursor.next_kv_chunk(DEFAULT_SCAN_CHUNK).await.map_err(exec_err)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                for kv in &chunk {
                     if limit.is_some_and(|l| entries.len() >= l) {
-                        break;
+                        break 'requests;
                     }
                     if let Some(parsed) = crate::keys::parse_concurrency_request_key(&kv.key) {
-                        // Filter by queue if specified
                         if let Some(ref q) = queue_filter
                             && parsed.queue != *q
                         {
@@ -1679,6 +2009,7 @@ impl Scan for QueuesScanner {
             }
 
             // Build record batches
+            let shard_id = shard.name().to_string();
             let mut i: usize = 0;
             while i < entries.len() {
                 let start = i;
@@ -1687,29 +2018,16 @@ impl Scan for QueuesScanner {
 
                 // Handle empty projection (when DataFusion just needs row count)
                 if proj_for_stream.fields().is_empty() {
-                    let batch = match RecordBatch::try_new_with_options(
+                    yield RecordBatch::try_new_with_options(
                         Arc::clone(&proj_for_stream),
                         vec![],
                         &datafusion::arrow::record_batch::RecordBatchOptions::new()
                             .with_row_count(Some(batch_entries.len())),
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
-                    };
-                    if tx.send(Ok(batch)).await.is_err() {
-                        return;
-                    }
+                    )
+                    .map_err(exec_err)?;
                     i = end;
                     continue;
                 }
-
-                // Get shard_id from shard name (now a UUID string)
-                let shard_id = shard.name().to_string();
 
                 let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj_for_stream.fields().len());
                 for f in proj_for_stream.fields() {
@@ -1724,17 +2042,13 @@ impl Scan for QueuesScanner {
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "queue_name" => {
-                            let vals: Vec<&str> = batch_entries
-                                .iter()
-                                .map(|e| e.queue_name.as_str())
-                                .collect();
+                            let vals: Vec<&str> =
+                                batch_entries.iter().map(|e| e.queue_name.as_str()).collect();
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "entry_type" => {
-                            let vals: Vec<&str> = batch_entries
-                                .iter()
-                                .map(|e| e.entry_type.as_str())
-                                .collect();
+                            let vals: Vec<&str> =
+                                batch_entries.iter().map(|e| e.entry_type.as_str()).collect();
                             cols.push(Arc::new(StringArray::from(vals)));
                         }
                         "task_id" => {
@@ -1758,33 +2072,16 @@ impl Scan for QueuesScanner {
                             cols.push(Arc::new(Int64Array::from(vals)));
                         }
                         other => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(format!(
-                                    "unknown column {}",
-                                    other
-                                ))))
-                                .await;
-                            return;
+                            Err(DataFusionError::Execution(format!("unknown column {}", other)))?;
                         }
                     }
                 }
 
-                let batch = match RecordBatch::try_new(Arc::clone(&proj_for_stream), cols) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
-                    }
-                };
-                if tx.send(Ok(batch)).await.is_err() {
-                    return;
-                }
+                yield RecordBatch::try_new(Arc::clone(&proj_for_stream), cols).map_err(exec_err)?;
                 i = end;
             }
 
-            // If no entries, send an empty batch
+            // If no entries, emit a single empty batch so the schema is observed.
             if entries.is_empty() {
                 let empty_cols: Vec<ArrayRef> = proj_for_stream
                     .fields()
@@ -1801,16 +2098,11 @@ impl Scan for QueuesScanner {
                         }
                     })
                     .collect();
-                if let Ok(batch) = RecordBatch::try_new(Arc::clone(&proj_for_stream), empty_cols) {
-                    let _ = tx.send(Ok(batch)).await;
-                }
+                yield RecordBatch::try_new(Arc::clone(&proj_for_stream), empty_cols).map_err(exec_err)?;
             }
-        });
+        };
 
-        Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&projection),
-            ReceiverStream::new(rx).map(|r| r),
-        ))
+        Box::pin(RecordBatchStreamAdapter::new(projection, Box::pin(stream)))
     }
 }
 
@@ -1860,31 +2152,17 @@ impl Scan for TenantCountsScanner {
         let shard = Arc::clone(&self.shard);
         let proj = Arc::clone(&projection);
         let tenant_range = parse_tenant_counts_scan_range(filters);
-        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
 
-        tokio::spawn(async move {
-            let entries = match shard.scan_tenant_status_counters(tenant_range).await {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Execution(e.to_string())))
-                        .await;
-                    return;
-                }
-            };
-
+        let stream = async_stream::try_stream! {
+            let entries = shard
+                .scan_tenant_status_counters(tenant_range)
+                .await
+                .map_err(exec_err)?;
             let shard_id = shard.name().to_string();
             let n = entries.len();
 
             if proj.fields().is_empty() {
-                match make_empty_projection_batch(&proj, n) {
-                    Ok(batch) => {
-                        let _ = tx.send(Ok(batch)).await;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                    }
-                }
+                yield make_empty_projection_batch(&proj, n)?;
                 return;
             }
 
@@ -1893,49 +2171,23 @@ impl Scan for TenantCountsScanner {
                 let col: ArrayRef = match f.name().as_str() {
                     "shard_id" => Arc::new(StringArray::from(vec![shard_id.as_str(); n])),
                     "tenant" => Arc::new(StringArray::from(
-                        entries
-                            .iter()
-                            .map(|(t, _, _)| t.as_str())
-                            .collect::<Vec<_>>(),
+                        entries.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>(),
                     )),
                     "status_kind" => Arc::new(StringArray::from(
-                        entries
-                            .iter()
-                            .map(|(_, s, _)| s.as_str())
-                            .collect::<Vec<_>>(),
+                        entries.iter().map(|(_, s, _)| s.as_str()).collect::<Vec<_>>(),
                     )),
                     "cnt" => Arc::new(Int64Array::from(
                         entries.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
                     )),
-                    other => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(format!(
-                                "unknown column {}",
-                                other
-                            ))))
-                            .await;
-                        return;
-                    }
+                    other => Err(DataFusionError::Execution(format!("unknown column {}", other)))?,
                 };
                 cols.push(col);
             }
 
-            match RecordBatch::try_new(proj, cols) {
-                Ok(batch) => {
-                    let _ = tx.send(Ok(batch)).await;
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Execution(e.to_string())))
-                        .await;
-                }
-            }
-        });
+            yield RecordBatch::try_new(proj, cols).map_err(exec_err)?;
+        };
 
-        Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&projection),
-            ReceiverStream::new(rx).map(|r| r),
-        ))
+        Box::pin(RecordBatchStreamAdapter::new(projection, Box::pin(stream)))
     }
 }
 
@@ -2000,11 +2252,10 @@ impl Scan for QueueCountsScanner {
 
         let shard = Arc::clone(&self.shard);
         let proj = Arc::clone(&projection);
-        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(2);
 
-        tokio::spawn(async move {
+        let stream = async_stream::try_stream! {
             // Collect requester counts from pre-computed counters (fast)
-            // and holder counts by scanning holder entries (bounded by concurrency limits)
+            // and holder counts by scanning holder entries (bounded by concurrency limits).
             // queue_data: (tenant, queue) -> (holders, requesters)
             let mut queue_data: HashMap<(String, String), (i64, i64)> = HashMap::new();
 
@@ -2022,19 +2273,8 @@ impl Scan for QueueCountsScanner {
             } else {
                 shard.scan_all_concurrency_requester_counters().await
             };
-
-            match requester_results {
-                Ok(entries) => {
-                    for (tenant, queue, count) in entries {
-                        queue_data.entry((tenant, queue)).or_insert((0, 0)).1 = count;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Execution(e.to_string())))
-                        .await;
-                    return;
-                }
+            for (tenant, queue, count) in requester_results.map_err(exec_err)? {
+                queue_data.entry((tenant, queue)).or_insert((0, 0)).1 = count;
             }
 
             // Scan holder entries (bounded by concurrency limits, so fast)
@@ -2043,37 +2283,25 @@ impl Scan for QueueCountsScanner {
                 None => crate::keys::concurrency_holders_prefix(),
             };
             let holders_end = crate::keys::end_bound(&holders_start);
-
-            match shard
-                .db()
-                .scan_with_options::<Vec<u8>, _>(holders_start..holders_end, &crate::scan_options())
+            let mut holder_cursor = shard
+                .open_range_cursor(holders_start, holders_end, &crate::scan_options())
                 .await
-            {
-                Ok(mut iter) => loop {
-                    match iter.next().await {
-                        Ok(Some(kv)) => {
-                            if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key)
-                            {
-                                queue_data
-                                    .entry((parsed.tenant, parsed.queue))
-                                    .or_insert((0, 0))
-                                    .0 += 1;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(e.to_string())))
-                                .await;
-                            return;
-                        }
+                .map_err(exec_err)?;
+            loop {
+                let chunk = holder_cursor
+                    .next_kv_chunk(DEFAULT_SCAN_CHUNK)
+                    .await
+                    .map_err(exec_err)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                for kv in &chunk {
+                    if let Some(parsed) = crate::keys::parse_concurrency_holder_key(&kv.key) {
+                        queue_data
+                            .entry((parsed.tenant, parsed.queue))
+                            .or_insert((0, 0))
+                            .0 += 1;
                     }
-                },
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Execution(e.to_string())))
-                        .await;
-                    return;
                 }
             }
 
@@ -2102,14 +2330,7 @@ impl Scan for QueueCountsScanner {
             let n = entries.len();
 
             if proj.fields().is_empty() {
-                match make_empty_projection_batch(&proj, n) {
-                    Ok(batch) => {
-                        let _ = tx.send(Ok(batch)).await;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                    }
-                }
+                yield make_empty_projection_batch(&proj, n)?;
                 return;
             }
 
@@ -2118,16 +2339,10 @@ impl Scan for QueueCountsScanner {
                 let col: ArrayRef = match f.name().as_str() {
                     "shard_id" => Arc::new(StringArray::from(vec![shard_id.as_str(); n])),
                     "tenant" => Arc::new(StringArray::from(
-                        entries
-                            .iter()
-                            .map(|((t, _), _)| t.as_str())
-                            .collect::<Vec<_>>(),
+                        entries.iter().map(|((t, _), _)| t.as_str()).collect::<Vec<_>>(),
                     )),
                     "queue_name" => Arc::new(StringArray::from(
-                        entries
-                            .iter()
-                            .map(|((_, q), _)| q.as_str())
-                            .collect::<Vec<_>>(),
+                        entries.iter().map(|((_, q), _)| q.as_str()).collect::<Vec<_>>(),
                     )),
                     "holders" => Arc::new(Int64Array::from(
                         entries.iter().map(|(_, (h, _))| *h).collect::<Vec<_>>(),
@@ -2147,35 +2362,15 @@ impl Scan for QueueCountsScanner {
                             .map(|(key, _)| limit_info.get(key).map(|(_, lt)| *lt))
                             .collect::<Vec<_>>(),
                     )),
-                    other => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(format!(
-                                "unknown column {}",
-                                other
-                            ))))
-                            .await;
-                        return;
-                    }
+                    other => Err(DataFusionError::Execution(format!("unknown column {}", other)))?,
                 };
                 cols.push(col);
             }
 
-            match RecordBatch::try_new(proj, cols) {
-                Ok(batch) => {
-                    let _ = tx.send(Ok(batch)).await;
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Execution(e.to_string())))
-                        .await;
-                }
-            }
-        });
+            yield RecordBatch::try_new(proj, cols).map_err(exec_err)?;
+        };
 
-        Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&projection),
-            ReceiverStream::new(rx),
-        ))
+        Box::pin(RecordBatchStreamAdapter::new(projection, Box::pin(stream)))
     }
 }
 
@@ -2358,9 +2553,8 @@ impl Scan for TasksScanner {
         let strategy = parse_tasks_scan_strategy(filters);
         let shard = Arc::clone(&self.shard);
         let proj = Arc::clone(&projection);
-        let (tx, rx) = mpsc::channel::<DfResult<RecordBatch>>(4);
 
-        tokio::spawn(async move {
+        let stream = async_stream::try_stream! {
             // Determine scan range based on strategy
             let (start, end) = match &strategy {
                 TasksScanStrategy::TaskGroupScan {
@@ -2392,34 +2586,27 @@ impl Scan for TasksScanner {
                 _ => None,
             };
 
-            let iter_result = shard
-                .db()
-                .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
-                .await;
-            let mut iter = match iter_result {
-                Ok(i) => i,
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Execution(format!(
-                            "failed to scan tasks: {}",
-                            e
-                        ))))
-                        .await;
-                    return;
-                }
-            };
-
+            let mut cursor = shard
+                .open_range_cursor(start, end, &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
             let shard_id = shard.name().to_string();
+            let mut buf: VecDeque<KeyValue> = VecDeque::new();
+            let mut exhausted = false;
+            let mut stop = false; // set when the upper time bound is crossed
             let mut total_emitted: usize = 0;
 
             // Collect rows in batches
             loop {
+                if stop {
+                    break;
+                }
                 if limit.is_some_and(|l| total_emitted >= l) {
                     break;
                 }
 
                 let remaining = limit.map(|l| l - total_emitted).unwrap_or(batch_size);
-                let target = remaining.min(batch_size);
+                let target = remaining.min(batch_size).max(1);
 
                 let mut shard_ids = Vec::with_capacity(target);
                 let mut tenants = Vec::with_capacity(target);
@@ -2435,19 +2622,21 @@ impl Scan for TasksScanner {
                 let mut batch_count: usize = 0;
 
                 while batch_count < target {
-                    let kv = match iter.next().await {
-                        Ok(Some(kv)) => kv,
-                        Ok(None) => break,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(format!(
-                                    "task scan iteration error: {}",
-                                    e
-                                ))))
-                                .await;
-                            return;
+                    if buf.is_empty() {
+                        if exhausted {
+                            break;
                         }
-                    };
+                        let chunk = cursor
+                            .next_kv_chunk(batch_size.max(DEFAULT_SCAN_CHUNK))
+                            .await
+                            .map_err(exec_err)?;
+                        if chunk.is_empty() {
+                            exhausted = true;
+                            break;
+                        }
+                        buf.extend(chunk);
+                    }
+                    let kv = buf.pop_front().expect("buffer non-empty");
 
                     let Some(parsed) = crate::keys::parse_task_key(&kv.key) else {
                         continue;
@@ -2458,6 +2647,7 @@ impl Scan for TasksScanner {
                     if let Some(upper) = time_upper
                         && parsed.start_time_ms > upper as u64
                     {
+                        stop = true;
                         break;
                     }
 
@@ -2522,17 +2712,7 @@ impl Scan for TasksScanner {
                 total_emitted += batch_count;
 
                 if proj.fields().is_empty() {
-                    match make_empty_projection_batch(&proj, batch_count) {
-                        Ok(batch) => {
-                            if tx.send(Ok(batch)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e)).await;
-                            return;
-                        }
-                    }
+                    yield make_empty_projection_batch(&proj, batch_count)?;
                     continue;
                 }
 
@@ -2550,38 +2730,20 @@ impl Scan for TasksScanner {
                         "task_id" => Arc::new(StringArray::from(task_ids.clone())),
                         "held_queues" => Arc::new(StringArray::from(held_queues_strs.clone())),
                         other => {
-                            let _ = tx
-                                .send(Err(DataFusionError::Execution(format!(
-                                    "unknown tasks column: {}",
-                                    other
-                                ))))
-                                .await;
-                            return;
+                            Err(DataFusionError::Execution(format!(
+                                "unknown tasks column: {}",
+                                other
+                            )))?
                         }
                     };
                     cols.push(col);
                 }
 
-                match RecordBatch::try_new(Arc::clone(&proj), cols) {
-                    Ok(batch) => {
-                        if tx.send(Ok(batch)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(DataFusionError::Execution(e.to_string())))
-                            .await;
-                        return;
-                    }
-                }
+                yield RecordBatch::try_new(Arc::clone(&proj), cols).map_err(exec_err)?;
             }
-        });
+        };
 
-        Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&projection),
-            ReceiverStream::new(rx),
-        ))
+        Box::pin(RecordBatchStreamAdapter::new(projection, Box::pin(stream)))
     }
 }
 
