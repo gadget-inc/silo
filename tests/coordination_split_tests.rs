@@ -39,6 +39,22 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
     ))
 }
 
+/// Memory-backed factory for object-store split coverage: parent and children
+/// resolve under one shared store root. The unique root (the test's unique
+/// prefix) keeps the process-global in-memory store from bleeding across
+/// tests.
+fn make_memory_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: format!("silo-split-mem-{}-{}/%shard%", prefix, node_id),
+            ..Default::default()
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    ))
+}
+
 /// Test that request_split creates a split record
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_split_creates_split_record() {
@@ -533,6 +549,158 @@ async fn execute_split_completes_full_cycle() {
             "tenant should route to one of the children"
         );
     }
+
+    c1.shutdown().await.unwrap();
+    let _ = h1.abort();
+}
+
+/// A split whose clone produces an empty child must abort before the
+/// shard-map commit: the pre-commit verification detects the short child,
+/// the shard map keeps routing to the parent, and the parent is recovered
+/// and serves reads. Driven through the factory's test-only clone fault
+/// seam, since a correct clone cannot produce a short child.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_with_empty_child_aborts_before_commit_and_recovers_parent() {
+    let _guard = acquire_test_mutex().await;
+
+    let prefix = unique_prefix();
+    let num_shards: u32 = 1;
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let factory = make_memory_test_factory(&prefix, "n1");
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:7450",
+        num_shards,
+        10,
+        Arc::clone(&factory),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator");
+
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+
+    let shard_id = c1.owned_shards().await[0];
+
+    // Seed the parent with a job so a short child is detectable.
+    let parent_range = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        shard_map.get_shard(&shard_id).unwrap().range.clone()
+    };
+    let parent = factory
+        .open(&shard_id, &parent_range)
+        .await
+        .expect("open parent shard");
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("survivor-job".to_string()),
+            5,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            None,
+            rmp_serde::to_vec(&serde_json::json!({"k": "v"})).unwrap(),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
+    let split_point = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        silo::shard_range::format_hash_boundary(
+            shard_map
+                .get_shard(&shard_id)
+                .unwrap()
+                .range
+                .midpoint()
+                .unwrap(),
+        )
+    };
+    let split = splitter
+        .request_split(shard_id, split_point)
+        .await
+        .expect("request split should succeed");
+
+    // Make the left child's clone come up empty.
+    factory.inject_empty_child_clone(split.left_child_id);
+
+    // Capture the split state machine's logs to assert the verification
+    // markers.
+    silo::trace::start_log_capture();
+    let result = splitter
+        .execute_split(shard_id, || c1.get_shard_owner_map())
+        .await;
+    let logs = silo::trace::stop_log_capture();
+    assert!(
+        result.is_err(),
+        "split with an empty child must fail, got {result:?}"
+    );
+
+    assert!(
+        logs.contains("cloning complete, verifying children before commit"),
+        "verification-start marker must be logged, got:\n{logs}"
+    );
+    assert!(
+        logs.contains("post-clone child verification failed"),
+        "verification-failure marker must be logged, got:\n{logs}"
+    );
+
+    // The shard map was never committed: it still routes to the parent only.
+    let shard_map = c1.get_shard_map().await.expect("get shard map after abort");
+    assert_eq!(
+        shard_map.len(),
+        1,
+        "shard map must still hold only the parent"
+    );
+    assert!(
+        shard_map.get_shard(&shard_id).is_some(),
+        "parent must remain in the shard map"
+    );
+    assert!(
+        shard_map.get_shard(&split.left_child_id).is_none(),
+        "left child must not be committed to the shard map"
+    );
+    assert!(
+        shard_map.get_shard(&split.right_child_id).is_none(),
+        "right child must not be committed to the shard map"
+    );
+
+    // The split record is abandoned so the parent resumes normal operation.
+    let status = splitter
+        .get_split_status(shard_id)
+        .await
+        .expect("get split status");
+    assert!(status.is_none(), "split record should be abandoned");
+
+    // The parent is recovered and serves reads with its full data set.
+    let recovered = factory
+        .get(&shard_id)
+        .expect("parent shard reopened in factory after abort");
+    assert_eq!(
+        recovered
+            .get_counters()
+            .await
+            .expect("recovered parent counters")
+            .total_jobs,
+        1,
+        "recovered parent must hold its job"
+    );
+    assert!(
+        recovered
+            .get_job("test-tenant", "survivor-job")
+            .await
+            .expect("get job from recovered parent")
+            .is_some(),
+        "recovered parent must serve its job"
+    );
 
     c1.shutdown().await.unwrap();
     let _ = h1.abort();

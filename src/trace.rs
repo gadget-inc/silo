@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 use opentelemetry::KeyValue;
@@ -52,6 +53,84 @@ impl<'a> MakeWriter<'a> for DebugFileWriter {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// Whether the process-global log capture is armed. Checked per event by a
+/// cheap layer filter, so the capture layer costs one atomic load per event
+/// when disarmed.
+static LOG_CAPTURE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Buffer holding formatted log lines while capture is armed.
+static LOG_CAPTURE_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Writer that appends formatted events to the process-global capture buffer.
+#[derive(Clone)]
+struct LogCaptureWriter;
+
+impl std::io::Write for LogCaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOG_CAPTURE_BUF
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogCaptureWriter {
+    type Writer = LogCaptureWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogCaptureWriter
+    }
+}
+
+/// Begin capturing formatted log output into a process-global buffer.
+///
+/// Tests use this to assert on operational log markers (e.g. the split state
+/// machine's pre-commit verification markers) without swapping the global
+/// subscriber, which panics when spans cross subscriber registries. Capture
+/// is process-global: arm it only while holding whatever serialization the
+/// test suite uses, or expect interleaved output from concurrent tests.
+pub fn start_log_capture() {
+    LOG_CAPTURE_BUF
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    LOG_CAPTURE_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Disarm the log capture and return everything captured since
+/// [`start_log_capture`].
+pub fn stop_log_capture() -> String {
+    LOG_CAPTURE_ARMED.store(false, Ordering::SeqCst);
+    let mut buf = LOG_CAPTURE_BUF
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let captured = String::from_utf8_lossy(&buf).into_owned();
+    buf.clear();
+    captured
+}
+
+/// Layer that formats events into the capture buffer while capture is armed.
+/// Filtered by an atomic check so it does no formatting work when disarmed.
+fn log_capture_layer<S>() -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_level(true)
+        .with_ansi(false)
+        .compact()
+        .with_writer(LogCaptureWriter)
+        .with_filter(tracing_subscriber::filter::filter_fn(|_| {
+            LOG_CAPTURE_ARMED.load(Ordering::Relaxed)
+        }))
 }
 
 /// Initialize tracing once based on config and environment:
@@ -140,6 +219,7 @@ where
 {
     let base = tracing_subscriber::registry()
         .with(fmt_layer)
+        .with(log_capture_layer())
         .with(console_layer());
 
     if let Some(path) = std::env::var_os("SILO_PERFETTO") {
@@ -197,6 +277,7 @@ where
     let base = tracing_subscriber::registry()
         .with(fmt_layer)
         .with(file_layer)
+        .with(log_capture_layer())
         .with(console_layer());
 
     // Note: Perfetto and OTEL are not supported when using debug file logging
