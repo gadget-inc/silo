@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::OnceCell;
+use url::Url;
 
 use crate::concurrency::GrantScannerConfig;
 use crate::gubernator::RateLimitClient;
@@ -88,7 +89,9 @@ impl ShardFactory {
         Self {
             instances: DashMap::new(),
             template: DatabaseTemplate {
-                path: "/noop".to_string(),
+                // The root is unique per factory so the shared Memory store
+                // (the default backend) does not bleed across noop factories.
+                path: format!("noop-{}/%shard%", ShardId::new()),
                 apply_wal_on_close: false,
                 ..Default::default()
             },
@@ -277,8 +280,11 @@ impl ShardFactory {
     /// Resolve the object store at the storage root level.
     ///
     /// For Backend::Fs, this extracts the root path before the placeholder and
-    /// returns the shard name as the db_path. For cloud backends, this works
-    /// the same as before since the object store is already at bucket level.
+    /// returns the shard name as the db_path. For object-store backends, the
+    /// store resolves once at the shared template root with the
+    /// layout-preserving database path from [`Self::object_store_layout`], so
+    /// parent and children of a split share one store while every shard's
+    /// absolute object keys match what deployed binaries read and write.
     ///
     /// The returned `ResolvedStore.root_path` combined with `db_path` gives the
     /// full path where shard data is stored.
@@ -303,14 +309,66 @@ impl ShardFactory {
             let resolved = resolve_object_store(backend, root_path)?;
             Ok((resolved, shard_name.to_string()))
         } else {
-            // Object store backends (Memory, S3, GCS, URL): resolve full path
-            let full_path = template_path
-                .replace("%shard%", shard_name)
-                .replace("{shard}", shard_name);
-            let resolved = resolve_object_store(backend, &full_path)?;
-            let db_path = resolved.canonical_path.clone();
+            let (root, db_path) = Self::object_store_layout(backend, template_path, shard_name)?;
+            let resolved = resolve_object_store(backend, &root)?;
             Ok((resolved, db_path))
         }
+    }
+
+    /// Compute the shared store root and layout-preserving database path for a
+    /// shard on an object-store backend (Memory, S3, GCS, URL).
+    ///
+    /// The root is the template prefix before the first `%shard%`/`{shard}`
+    /// placeholder (trailing slashes trimmed), or the whole path when no
+    /// placeholder exists. Resolving every shard's store at this one root makes
+    /// clone destinations equal open paths: a split's children land in the same
+    /// store the parent resolved, exactly where each child's own `open` reads.
+    ///
+    /// The database path is the expanded template relative to the root,
+    /// followed by the store-path component of the expanded template (the URL's
+    /// path for URL-style backends, the raw expanded path for Memory). slatedb
+    /// roots URL-resolved stores at the URL's path component, so for a
+    /// `gs://bucket/silo/%shard%` template this puts absolute keys at
+    /// `silo/<shard>/silo/<shard>/…` — byte-for-byte the keys deployed shards
+    /// already use, so no data moves. Placeholder-free templates degenerate to
+    /// database path = store-path component, preserving their keys too.
+    pub fn object_store_layout(
+        backend: &crate::settings::Backend,
+        template_path: &str,
+        shard_name: &str,
+    ) -> Result<(String, String), JobStoreShardError> {
+        let placeholder_pos = template_path
+            .find("%shard%")
+            .or_else(|| template_path.find("{shard}"));
+        let root = match placeholder_pos {
+            Some(pos) => template_path[..pos].trim_end_matches('/'),
+            None => template_path,
+        };
+        let expanded = template_path
+            .replace("%shard%", shard_name)
+            .replace("{shard}", shard_name);
+        let store_path = match backend {
+            crate::settings::Backend::S3
+            | crate::settings::Backend::Gcs
+            | crate::settings::Backend::Url => {
+                let url = Url::parse(&expanded).map_err(|e| {
+                    JobStoreShardError::Codec(format!(
+                        "failed to parse object store URL '{}': {}. Expected format: gs://bucket/path or s3://bucket/path",
+                        expanded, e
+                    ))
+                })?;
+                let url_path = url.path();
+                url_path.strip_prefix('/').unwrap_or(url_path).to_string()
+            }
+            _ => expanded.clone(),
+        };
+        let relative = expanded[root.len()..].trim_start_matches('/');
+        let db_path = if relative.is_empty() {
+            store_path
+        } else {
+            format!("{relative}/{store_path}")
+        };
+        Ok((root.to_string(), db_path))
     }
 
     /// Resolve the WAL object store for a shard, if split WAL storage is configured.

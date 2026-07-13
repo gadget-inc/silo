@@ -339,6 +339,154 @@ async fn clone_closed_shard_with_split_wal() {
     );
 }
 
+// --- object-store layout tests ---
+
+/// Pins the absolute object keys for URL-style templates to the deployed
+/// double-nested layout, so shard resolution changes can never silently move
+/// existing shards' data.
+///
+/// slatedb roots a URL-resolved store at the URL's path component (a
+/// `PrefixStore`), so absolute keys are `<root-path>/<db-path>/…`. For a
+/// `gs://bucket/silo/%shard%` template every existing shard's objects live at
+/// `silo/<shard>/silo/<shard>/…`, which requires the store to resolve at the
+/// shared root `gs://bucket/silo` with database path `<shard>/silo/<shard>`.
+/// A bare-shard-name database path (keys `silo/<shard>/<shard>/…`) or a
+/// per-shard store root (keys `silo/<shard>/silo/<shard>/…` but with parent
+/// and children on distinct roots) both fail this pin.
+#[silo::test]
+fn url_template_resolves_shared_root_and_double_nested_db_path() {
+    let (root, db_path) = ShardFactory::object_store_layout(
+        &Backend::Gcs,
+        "gs://test-bucket/silo/%shard%",
+        "0a1b2c3d-0000-0000-0000-000000000000",
+    )
+    .expect("layout for gs template");
+    assert_eq!(root, "gs://test-bucket/silo");
+    assert_eq!(
+        db_path,
+        "0a1b2c3d-0000-0000-0000-000000000000/silo/0a1b2c3d-0000-0000-0000-000000000000"
+    );
+
+    // {shard} placeholder form resolves identically.
+    let (root, db_path) =
+        ShardFactory::object_store_layout(&Backend::Url, "s3://test-bucket/prefix/{shard}", "abc")
+            .expect("layout for s3 template");
+    assert_eq!(root, "s3://test-bucket/prefix");
+    assert_eq!(db_path, "abc/prefix/abc");
+}
+
+/// A template without a shard placeholder (test sentinels, the noop factory)
+/// degenerates to the whole path as the shared root and the store-path
+/// component as the database path — the same keys the template produces today.
+#[silo::test]
+fn url_template_without_placeholder_uses_store_path_component() {
+    let (root, db_path) = ShardFactory::object_store_layout(
+        &Backend::Gcs,
+        "gs://test-bucket/silo/fixed",
+        "ignored-shard",
+    )
+    .expect("layout for placeholder-free gs template");
+    assert_eq!(root, "gs://test-bucket/silo/fixed");
+    assert_eq!(db_path, "silo/fixed");
+
+    let (root, db_path) =
+        ShardFactory::object_store_layout(&Backend::Memory, "some-sentinel", "ignored-shard")
+            .expect("layout for placeholder-free memory template");
+    assert_eq!(root, "some-sentinel");
+    assert_eq!(db_path, "some-sentinel");
+}
+
+/// The Memory registry shares stores per root, so each noop factory needs a
+/// unique template root — otherwise every noop factory in the process would
+/// read and write one shared store.
+#[silo::test]
+fn noop_factories_use_unique_template_roots() {
+    let a = ShardFactory::new_noop();
+    let b = ShardFactory::new_noop();
+    assert_ne!(
+        a.template().path,
+        b.template().path,
+        "each noop factory must get its own template root"
+    );
+}
+
+/// Memory templates use the same layout arithmetic as URL backends — the
+/// store-path component is the raw expanded path — so in-memory tests exercise
+/// the production key nesting.
+#[silo::test]
+fn memory_template_layout_mirrors_url_arithmetic() {
+    let (root, db_path) =
+        ShardFactory::object_store_layout(&Backend::Memory, "mem-root/data/%shard%", "abc")
+            .expect("layout for memory template");
+    assert_eq!(root, "mem-root/data");
+    assert_eq!(db_path, "abc/mem-root/data/abc");
+}
+
+/// End-to-end pin of the Memory-backend key layout: objects written through a
+/// factory-opened shard land in the shared per-root store under the
+/// layout-preserving database path `<shard>/<root>/<shard>/…`, and are visible
+/// to a later independent resolution of the same root.
+#[silo::test]
+async fn memory_shard_objects_land_under_layout_preserving_keys() {
+    use futures::TryStreamExt;
+
+    let root = format!("layout-root-{}", ShardId::new());
+    let factory = Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: format!("{root}/%shard%"),
+            ..Default::default()
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    ));
+    let shard_id = ShardId::new();
+
+    let shard = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+    shard
+        .enqueue(
+            "test-tenant",
+            Some("layout-job".to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    factory.close(&shard_id).await.expect("close shard");
+
+    // An independent resolution of the same root sees the shard's objects —
+    // and every key sits under the double-nested layout-preserving prefix.
+    let resolved =
+        silo::storage::resolve_object_store(&Backend::Memory, &root).expect("resolve shared root");
+    let objects: Vec<_> = resolved
+        .store
+        .list(None)
+        .try_collect()
+        .await
+        .expect("list store");
+    assert!(
+        !objects.is_empty(),
+        "the shard's objects must be visible under the shared root"
+    );
+    let expected_prefix = format!("{shard_id}/{root}/{shard_id}/");
+    for obj in &objects {
+        assert!(
+            obj.location.as_ref().starts_with(&expected_prefix),
+            "object key {} must start with layout-preserving prefix {}",
+            obj.location,
+            expected_prefix
+        );
+    }
+}
+
 // --- template path validation tests ---
 
 #[silo::test]

@@ -5,11 +5,15 @@ use silo::coordination::{Coordinator, NoneCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::DatabaseTemplate;
+use silo::shard_range::ShardId;
 
 fn make_test_factory() -> Arc<ShardFactory> {
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
-            path: "unused".to_string(),
+            // Memory stores are shared per root, and NoneCoordinator opens
+            // every shard at startup — each factory needs its own root and a
+            // per-shard path so shards don't collide in one database.
+            path: format!("none-coord-{}/%shard%", ShardId::new()),
             ..Default::default()
         },
         MockGubernatorClient::new_arc(),
