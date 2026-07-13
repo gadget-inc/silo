@@ -44,6 +44,12 @@ pub struct ResolvedStore {
     pub root_path: String,
 }
 
+/// Resolve an object store for the given backend and path.
+///
+/// `Backend::Memory` returns the shared per-root store from the process-wide
+/// registry: callers that need isolation (independent factories, tests) must
+/// use a unique root path, while callers that need shared visibility (all
+/// shards of one template) resolve the same root.
 pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedStore, StorageError> {
     match backend {
         Backend::Fs => {

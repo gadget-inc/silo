@@ -640,7 +640,7 @@ async fn verify_cloned_children_detects_short_child() {
     // that held one job.
     let empty_child = ShardId::new();
     let result = factory
-        .verify_cloned_children_match_parent(parent_total, &[empty_child])
+        .verify_cloned_children_match_parent(&parent_id, &[empty_child])
         .await;
     assert!(
         result.is_err(),
@@ -690,7 +690,7 @@ async fn verify_cloned_children_accepts_full_clone_without_caching() {
         .expect("clone closed shard");
 
     factory
-        .verify_cloned_children_match_parent(parent_total, &[left_child_id, right_child_id])
+        .verify_cloned_children_match_parent(&parent_id, &[left_child_id, right_child_id])
         .await
         .expect("full clones should pass verification");
 
@@ -758,13 +758,14 @@ async fn parent_reopens_intact_after_verification_mismatch() {
         .await
         .expect("clone closed shard");
 
-    // Inject a mismatch by claiming the parent held more jobs than it did.
+    // Force a mismatch by verifying a child that was never cloned: it opens
+    // empty and cannot match the parent's job count.
     let result = factory
-        .verify_cloned_children_match_parent(99, &[left_child_id, right_child_id])
+        .verify_cloned_children_match_parent(&parent_id, &[ShardId::new()])
         .await;
     assert!(
         result.is_err(),
-        "inflated parent count must fail verification"
+        "a never-cloned child must fail verification"
     );
 
     // Recover the parent the way the split state machine does on a pre-commit
@@ -831,6 +832,27 @@ fn url_template_resolves_shared_root_and_double_nested_db_path() {
             .expect("layout for s3 template");
     assert_eq!(root, "s3://test-bucket/prefix");
     assert_eq!(db_path, "abc/prefix/abc");
+}
+
+/// URL-style templates must put the shard placeholder at a `/` boundary:
+/// off-boundary placeholders would resolve to different absolute keys than
+/// the per-shard resolution the deployed data was written under, silently
+/// moving every shard's data. Memory templates stay unrestricted — they are
+/// test sentinels with no deployed data.
+#[silo::test]
+fn url_template_with_non_boundary_placeholder_is_rejected() {
+    let result =
+        ShardFactory::object_store_layout(&Backend::Gcs, "gs://test-bucket/silo-%shard%", "abc");
+    assert!(
+        result.is_err(),
+        "off-boundary placeholder must be rejected for URL-style backends"
+    );
+
+    let (root, db_path) =
+        ShardFactory::object_store_layout(&Backend::Memory, "mem-0/shard-%shard%", "abc")
+            .expect("memory templates stay unrestricted");
+    assert_eq!(root, "mem-0/shard-");
+    assert_eq!(db_path, "abc/mem-0/shard-abc");
 }
 
 /// A template without a shard placeholder (test sentinels, the noop factory)

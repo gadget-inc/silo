@@ -113,7 +113,9 @@ impl ShardFactory {
     /// Arm the test-only clone fault: the next `clone_closed_shard` call skips
     /// cloning `child_id`, so that child opens empty. Lets tests drive the
     /// pre-commit verification abort path, which a correct clone cannot reach
-    /// through the public interface.
+    /// through the public interface. `pub` because integration tests compile
+    /// as a separate crate.
+    #[doc(hidden)]
     #[cfg(debug_assertions)]
     pub fn inject_empty_child_clone(&self, child_id: ShardId) {
         *self
@@ -377,6 +379,28 @@ impl ShardFactory {
         let placeholder_pos = template_path
             .find("%shard%")
             .or_else(|| template_path.find("{shard}"));
+        // For URL-style backends, a placeholder that is not at a `/` boundary
+        // would make the shared-root arithmetic produce different absolute
+        // keys than resolving the full expanded URL, silently moving every
+        // shard's data. Fail loudly instead. Memory templates stay
+        // unrestricted: they are test sentinels with no deployed data.
+        if let Some(pos) = placeholder_pos
+            && matches!(
+                backend,
+                crate::settings::Backend::S3
+                    | crate::settings::Backend::Gcs
+                    | crate::settings::Backend::Url
+            )
+            && pos > 0
+            && template_path.chars().nth(pos - 1) != Some('/')
+        {
+            return Err(JobStoreShardError::Codec(format!(
+                "shard placeholder in object-store database template path must be preceded by '/' \
+                 so shards resolve under a shared root with unchanged keys. \
+                 Got: '{}'. Change to something like 'gs://bucket/silo/%shard%'.",
+                template_path
+            )));
+        }
         let root = match placeholder_pos {
             Some(pos) => template_path[..pos].trim_end_matches('/'),
             None => template_path,
@@ -851,45 +875,50 @@ impl ShardFactory {
         Ok(())
     }
 
-    /// Verify that each freshly cloned child holds the parent's full job set.
+    /// Verify that each freshly cloned child holds the closed parent's full
+    /// job set.
     ///
-    /// A fresh SlateDB clone is a byte-for-byte copy of the parent, so
+    /// A fresh SlateDB clone is a byte-for-byte copy of the closed parent, so
     /// immediately after `clone_closed_shard` -- before post-commit cleanup
     /// trims each child to its range -- every child's whole-shard `total_jobs`
-    /// must equal the parent's pre-close count. An empty or mis-placed child
-    /// (the object-store split data-loss signature) reads `0` and trips this
-    /// check, letting the split abort before the shard-map commit point.
+    /// must equal the parent's. Both counts are read from raw post-close
+    /// opens of the same storage, so the comparison is exact by construction
+    /// (a count taken from the live parent could drift: background cleanup
+    /// decrements counters until close completes). An empty or mis-placed
+    /// child reads `0` (or fails to open at all, aborting via the open
+    /// error), letting the split abort before the shard-map commit point.
     ///
     /// This is a manifest-landed tripwire keyed on the empty-child signature,
     /// not a full row-integrity audit: a clone that landed the counter key but
     /// corrupted rows would still pass.
     pub async fn verify_cloned_children_match_parent(
         &self,
-        parent_total_jobs: i64,
+        parent_id: &ShardId,
         child_ids: &[ShardId],
     ) -> Result<(), ShardFactoryError> {
+        let parent_total_jobs = self.read_closed_shard_total_jobs(parent_id).await?;
         for child_id in child_ids {
-            let child_total_jobs = self.read_cloned_shard_total_jobs(child_id).await?;
+            let child_total_jobs = self.read_closed_shard_total_jobs(child_id).await?;
             if child_total_jobs != parent_total_jobs {
                 return Err(ShardFactoryError::ChildVerification(format!(
-                    "cloned child {child_id} holds {child_total_jobs} jobs but parent held \
-                     {parent_total_jobs}; aborting split before commit to avoid data loss"
+                    "cloned child {child_id} holds {child_total_jobs} jobs but parent {parent_id} \
+                     held {parent_total_jobs}; aborting split before commit to avoid data loss"
                 )));
             }
         }
         Ok(())
     }
 
-    /// Open a freshly cloned child's database with the raw `open_with_resolved_store`
+    /// Open a closed shard's database with the raw `open_with_resolved_store`
     /// primitive, read its whole-shard `total_jobs`, and close it.
     ///
-    /// Uses the raw open -- NOT `open` -- so the child is never registered in the
+    /// Uses the raw open -- NOT `open` -- so the shard is never registered in the
     /// `instances` map: `open` caches the instance in the per-shard OnceCell, and
     /// the post-commit `open(child)` would then return this stale pre-commit
     /// handle instead of opening the committed child. Hydration is disabled and
     /// `get_counters` reads single merged counter keys, so the check is O(1)
     /// even on a multi-million-job shard.
-    async fn read_cloned_shard_total_jobs(
+    async fn read_closed_shard_total_jobs(
         &self,
         shard_id: &ShardId,
     ) -> Result<i64, ShardFactoryError> {
@@ -937,9 +966,13 @@ impl ShardFactory {
         // Always close the raw handle, even if the counter read fails, so the
         // shard's SlateDB instance and its spawned background tasks (grant
         // scanner, reconcilers) are released -- JobStoreShard has no Drop.
+        // Surface the counter-read error (the verification signal) before any
+        // close error.
         let counters = shard.get_counters().await;
-        shard.close().await?;
-        Ok(counters?.total_jobs)
+        let close_result = shard.close().await;
+        let total_jobs = counters?.total_jobs;
+        close_result?;
+        Ok(total_jobs)
     }
 
     /// Get the database template used by this factory.

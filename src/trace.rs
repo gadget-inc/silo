@@ -1,3 +1,4 @@
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
@@ -55,18 +56,21 @@ impl<'a> MakeWriter<'a> for DebugFileWriter {
     }
 }
 
-/// Whether the process-global log capture is armed. Checked per event by a
-/// cheap layer filter, so the capture layer costs one atomic load per event
-/// when disarmed.
+/// Whether the process-global log capture is armed. Checked per event by the
+/// capture layer's filter.
+#[cfg(debug_assertions)]
 static LOG_CAPTURE_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Buffer holding formatted log lines while capture is armed.
+#[cfg(debug_assertions)]
 static LOG_CAPTURE_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 /// Writer that appends formatted events to the process-global capture buffer.
+#[cfg(debug_assertions)]
 #[derive(Clone)]
 struct LogCaptureWriter;
 
+#[cfg(debug_assertions)]
 impl std::io::Write for LogCaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         LOG_CAPTURE_BUF
@@ -81,6 +85,7 @@ impl std::io::Write for LogCaptureWriter {
     }
 }
 
+#[cfg(debug_assertions)]
 impl<'a> MakeWriter<'a> for LogCaptureWriter {
     type Writer = LogCaptureWriter;
 
@@ -96,6 +101,10 @@ impl<'a> MakeWriter<'a> for LogCaptureWriter {
 /// subscriber, which panics when spans cross subscriber registries. Capture
 /// is process-global: arm it only while holding whatever serialization the
 /// test suite uses, or expect interleaved output from concurrent tests.
+///
+/// Debug builds only: the capture layer's dynamic filter defeats tracing's
+/// callsite caching, so release builds do not register it (or this API).
+#[cfg(debug_assertions)]
 pub fn start_log_capture() {
     LOG_CAPTURE_BUF
         .lock()
@@ -106,6 +115,7 @@ pub fn start_log_capture() {
 
 /// Disarm the log capture and return everything captured since
 /// [`start_log_capture`].
+#[cfg(debug_assertions)]
 pub fn stop_log_capture() -> String {
     LOG_CAPTURE_ARMED.store(false, Ordering::SeqCst);
     let mut buf = LOG_CAPTURE_BUF
@@ -118,6 +128,7 @@ pub fn stop_log_capture() -> String {
 
 /// Layer that formats events into the capture buffer while capture is armed.
 /// Filtered by an atomic check so it does no formatting work when disarmed.
+#[cfg(debug_assertions)]
 fn log_capture_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
@@ -129,8 +140,15 @@ where
         .compact()
         .with_writer(LogCaptureWriter)
         .with_filter(tracing_subscriber::filter::filter_fn(|_| {
-            LOG_CAPTURE_ARMED.load(Ordering::Relaxed)
+            LOG_CAPTURE_ARMED.load(Ordering::SeqCst)
         }))
+}
+
+/// Release builds skip the capture layer entirely so callsite caching stays
+/// intact on hot log paths.
+#[cfg(not(debug_assertions))]
+fn log_capture_layer() -> tracing_subscriber::layer::Identity {
+    tracing_subscriber::layer::Identity::new()
 }
 
 /// Initialize tracing once based on config and environment:

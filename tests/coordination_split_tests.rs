@@ -42,7 +42,8 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
 /// Memory-backed factory for object-store split coverage: parent and children
 /// resolve under one shared store root. The unique root (the test's unique
 /// prefix) keeps the process-global in-memory store from bleeding across
-/// tests.
+/// tests. Debug-only like its sole caller, the fault-injected abort test.
+#[cfg(debug_assertions)]
 fn make_memory_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
     Arc::new(ShardFactory::new(
         DatabaseTemplate {
@@ -577,7 +578,9 @@ async fn execute_split_completes_full_cycle() {
 /// shard-map commit: the pre-commit verification detects the short child,
 /// the shard map keeps routing to the parent, and the parent is recovered
 /// and serves reads. Driven through the factory's test-only clone fault
-/// seam, since a correct clone cannot produce a short child.
+/// seam (debug builds only), since a correct clone cannot produce a short
+/// child.
+#[cfg(debug_assertions)]
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn split_with_empty_child_aborts_before_commit_and_recovers_parent() {
     let _guard = acquire_test_mutex().await;
@@ -664,11 +667,11 @@ async fn split_with_empty_child_aborts_before_commit_and_recovers_parent() {
     );
 
     assert!(
-        logs.contains("cloning complete, verifying children before commit"),
+        logs.contains(silo::coordination::split::MARKER_VERIFYING_CHILDREN),
         "verification-start marker must be logged, got:\n{logs}"
     );
     assert!(
-        logs.contains("post-clone child verification failed"),
+        logs.contains(silo::coordination::split::MARKER_CHILD_VERIFICATION_FAILED),
         "verification-failure marker must be logged, got:\n{logs}"
     );
 
@@ -722,7 +725,7 @@ async fn split_with_empty_child_aborts_before_commit_and_recovers_parent() {
     );
 
     c1.shutdown().await.unwrap();
-    let _ = h1.abort();
+    h1.abort();
 }
 
 /// Drive a full split on the shared-root Memory backend (an object store,
@@ -813,16 +816,21 @@ async fn execute_split_preserves_jobs_on_object_store() {
         .request_split(shard_id, split_point)
         .await
         .expect("request split should succeed");
+    #[cfg(debug_assertions)]
     silo::trace::start_log_capture();
     splitter
         .execute_split(shard_id, || c1.get_shard_owner_map())
         .await
         .expect("execute split should succeed and preserve data");
-    let logs = silo::trace::stop_log_capture();
-    assert!(
-        logs.contains("children verified, updating shard map"),
-        "verification success marker must be logged, got:\n{logs}"
-    );
+    // The capture layer (and its API) exists only in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        let logs = silo::trace::stop_log_capture();
+        assert!(
+            logs.contains(silo::coordination::split::MARKER_CHILDREN_VERIFIED),
+            "verification success marker must be logged, got:\n{logs}"
+        );
+    }
 
     // Every enqueued job must survive the split in the child that owns its
     // tenant's range. Children open as full copies of the parent; post-commit
@@ -851,7 +859,7 @@ async fn execute_split_preserves_jobs_on_object_store() {
     }
 
     c1.shutdown().await.unwrap();
-    let _ = h1.abort();
+    h1.abort();
 }
 
 /// Test that is_shard_paused returns true during pausing phases
