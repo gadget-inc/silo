@@ -583,8 +583,8 @@ impl ShardSplitter {
 
                     // Defense-in-depth: before the commit point, open each child
                     // and confirm it holds the parent's full job set. A child that
-                    // opens empty/short (the object-store resolution bug's data-loss
-                    // signature) fails here, aborting the split as
+                    // opens empty/short (a clone that landed somewhere the child's
+                    // open cannot see) fails here, aborting the split as
                     // PreCommitParentClosed so the shard map stays untouched and the
                     // parent is recovered/reopenable -- never silent data loss.
                     self.ctx
