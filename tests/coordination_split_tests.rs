@@ -39,6 +39,42 @@ fn make_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
     ))
 }
 
+/// Memory-backed factory for object-store split coverage: parent and children
+/// resolve under one shared store root. The unique root (the test's unique
+/// prefix) keeps the process-global in-memory store from bleeding across
+/// tests. Debug-only like its sole caller, the fault-injected abort test.
+#[cfg(debug_assertions)]
+fn make_memory_test_factory(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: format!("silo-split-mem-{}-{}/%shard%", prefix, node_id),
+            ..Default::default()
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    ))
+}
+
+/// Memory-backed factory with a separate Memory WAL store per shard,
+/// mirroring a real object-store deployment with split WAL.
+fn make_memory_test_factory_with_wal(prefix: &str, node_id: &str) -> Arc<ShardFactory> {
+    let root = format!("silo-split-mem-wal-{}-{}", prefix, node_id);
+    Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: format!("{root}/data/%shard%"),
+            wal: Some(silo::settings::WalConfig {
+                backend: Backend::Memory,
+                path: format!("{root}/wal/%shard%"),
+            }),
+            ..Default::default()
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    ))
+}
+
 /// Test that request_split creates a split record
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_split_creates_split_record() {
@@ -536,6 +572,294 @@ async fn execute_split_completes_full_cycle() {
 
     c1.shutdown().await.unwrap();
     let _ = h1.abort();
+}
+
+/// A split whose clone produces an empty child must abort before the
+/// shard-map commit: the pre-commit verification detects the short child,
+/// the shard map keeps routing to the parent, and the parent is recovered
+/// and serves reads. Driven through the factory's test-only clone fault
+/// seam (debug builds only), since a correct clone cannot produce a short
+/// child.
+#[cfg(debug_assertions)]
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_with_empty_child_aborts_before_commit_and_recovers_parent() {
+    let _guard = acquire_test_mutex().await;
+
+    let prefix = unique_prefix();
+    let num_shards: u32 = 1;
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let factory = make_memory_test_factory(&prefix, "n1");
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:7450",
+        num_shards,
+        10,
+        Arc::clone(&factory),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator");
+
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+
+    let shard_id = c1.owned_shards().await[0];
+
+    // Seed the parent with a job so a short child is detectable.
+    let parent_range = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        shard_map.get_shard(&shard_id).unwrap().range.clone()
+    };
+    let parent = factory
+        .open(&shard_id, &parent_range)
+        .await
+        .expect("open parent shard");
+    parent
+        .enqueue(
+            "test-tenant",
+            Some("survivor-job".to_string()),
+            5,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            None,
+            rmp_serde::to_vec(&serde_json::json!({"k": "v"})).unwrap(),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue to parent");
+
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
+    let split_point = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        silo::shard_range::format_hash_boundary(
+            shard_map
+                .get_shard(&shard_id)
+                .unwrap()
+                .range
+                .midpoint()
+                .unwrap(),
+        )
+    };
+    let split = splitter
+        .request_split(shard_id, split_point)
+        .await
+        .expect("request split should succeed");
+
+    // Make the left child's clone come up empty.
+    factory.inject_empty_child_clone(split.left_child_id);
+
+    // Capture the split state machine's logs to assert the verification
+    // markers.
+    silo::trace::start_log_capture();
+    let result = splitter
+        .execute_split(shard_id, || c1.get_shard_owner_map())
+        .await;
+    let logs = silo::trace::stop_log_capture();
+    assert!(
+        result.is_err(),
+        "split with an empty child must fail, got {result:?}"
+    );
+
+    assert!(
+        logs.contains(silo::coordination::split::MARKER_VERIFYING_CHILDREN),
+        "verification-start marker must be logged, got:\n{logs}"
+    );
+    assert!(
+        logs.contains(silo::coordination::split::MARKER_CHILD_VERIFICATION_FAILED),
+        "verification-failure marker must be logged, got:\n{logs}"
+    );
+
+    // The shard map was never committed: it still routes to the parent only.
+    let shard_map = c1.get_shard_map().await.expect("get shard map after abort");
+    assert_eq!(
+        shard_map.len(),
+        1,
+        "shard map must still hold only the parent"
+    );
+    assert!(
+        shard_map.get_shard(&shard_id).is_some(),
+        "parent must remain in the shard map"
+    );
+    assert!(
+        shard_map.get_shard(&split.left_child_id).is_none(),
+        "left child must not be committed to the shard map"
+    );
+    assert!(
+        shard_map.get_shard(&split.right_child_id).is_none(),
+        "right child must not be committed to the shard map"
+    );
+
+    // The split record is abandoned so the parent resumes normal operation.
+    let status = splitter
+        .get_split_status(shard_id)
+        .await
+        .expect("get split status");
+    assert!(status.is_none(), "split record should be abandoned");
+
+    // The parent is recovered and serves reads with its full data set.
+    let recovered = factory
+        .get(&shard_id)
+        .expect("parent shard reopened in factory after abort");
+    assert_eq!(
+        recovered
+            .get_counters()
+            .await
+            .expect("recovered parent counters")
+            .total_jobs,
+        1,
+        "recovered parent must hold its job"
+    );
+    assert!(
+        recovered
+            .get_job("test-tenant", "survivor-job")
+            .await
+            .expect("get job from recovered parent")
+            .is_some(),
+        "recovered parent must serve its job"
+    );
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
+}
+
+/// Drive a full split on the shared-root Memory backend (an object store,
+/// with a separate WAL store) and assert every enqueued job survives in the
+/// child that owns its tenant's range. This is the object-store analogue of
+/// the local-FS full-cycle split -- the state-machine-level guard against
+/// clone/open path divergence -- and proof the WAL + object-store split path
+/// opens children without "wal store reconfiguration unsupported". Also
+/// asserts the pre-commit verification's success marker so deployments can be
+/// probed for the check at runtime.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_split_preserves_jobs_on_object_store() {
+    let _guard = acquire_test_mutex().await;
+
+    let prefix = unique_prefix();
+    let num_shards: u32 = 1;
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    let factory = make_memory_test_factory_with_wal(&prefix, "n1");
+
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:7450",
+        num_shards,
+        10,
+        Arc::clone(&factory),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator");
+
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+
+    let shard_id = c1.owned_shards().await[0];
+
+    // Enqueue known jobs across several tenants into the parent before
+    // splitting.
+    let parent_range = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        shard_map.get_shard(&shard_id).unwrap().range.clone()
+    };
+    let parent = factory
+        .open(&shard_id, &parent_range)
+        .await
+        .expect("open parent shard");
+    let tenants = ["a", "b", "f", "m", "q", "t", "x", "z"];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for tenant in tenants {
+        parent
+            .enqueue(
+                tenant,
+                Some(format!("job-{tenant}")),
+                5,
+                now,
+                None,
+                rmp_serde::to_vec(&serde_json::json!({ "t": tenant })).unwrap(),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue to parent");
+    }
+    assert_eq!(
+        parent.get_counters().await.expect("counters").total_jobs,
+        tenants.len() as i64,
+    );
+
+    // Request and execute a balanced split, capturing the state machine's
+    // logs to assert the verification success marker.
+    let splitter = ShardSplitter::new(Arc::new(c1.clone()));
+    let split_point = {
+        let shard_map = c1.get_shard_map().await.expect("get shard map");
+        silo::shard_range::format_hash_boundary(
+            shard_map
+                .get_shard(&shard_id)
+                .unwrap()
+                .range
+                .midpoint()
+                .unwrap(),
+        )
+    };
+    let split = splitter
+        .request_split(shard_id, split_point)
+        .await
+        .expect("request split should succeed");
+    #[cfg(debug_assertions)]
+    silo::trace::start_log_capture();
+    splitter
+        .execute_split(shard_id, || c1.get_shard_owner_map())
+        .await
+        .expect("execute split should succeed and preserve data");
+    // The capture layer (and its API) exists only in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        let logs = silo::trace::stop_log_capture();
+        assert!(
+            logs.contains(silo::coordination::split::MARKER_CHILDREN_VERIFIED),
+            "verification success marker must be logged, got:\n{logs}"
+        );
+    }
+
+    // Every enqueued job must survive the split in the child that owns its
+    // tenant's range. Children open as full copies of the parent; post-commit
+    // cleanup only trims out-of-range rows, never the in-range job looked up
+    // here -- so this assertion is deterministic regardless of cleanup timing.
+    let shard_map = c1.get_shard_map().await.expect("get shard map after split");
+    for tenant in tenants {
+        let owner = shard_map
+            .shard_for_tenant(tenant)
+            .expect("tenant routes to a child");
+        assert!(
+            owner.id == split.left_child_id || owner.id == split.right_child_id,
+            "tenant {tenant} should route to one of the children",
+        );
+        let child = factory
+            .get(&owner.id)
+            .expect("child shard open after split");
+        assert!(
+            child
+                .get_job(tenant, &format!("job-{tenant}"))
+                .await
+                .expect("get_job")
+                .is_some(),
+            "job for tenant {tenant} must survive the split in its owning child",
+        );
+    }
+
+    c1.shutdown().await.unwrap();
+    h1.abort();
 }
 
 /// Test that is_shard_paused returns true during pausing phases

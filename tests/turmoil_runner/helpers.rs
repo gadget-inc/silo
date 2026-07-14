@@ -316,7 +316,18 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
         logging: LoggingConfig::default(),
         metrics: silo::settings::MetricsConfig::default(),
         database: silo::settings::DatabaseTemplate {
-            path: "mem://shard-{shard}".to_string(),
+            // The Memory backend shares stores per root process-wide, and every
+            // server here opens the same fixed TEST_SHARD_ID — so each server
+            // instance gets its own root, keeping hosts (and repeated sims in
+            // one process) isolated from each other's storage. A counter, not
+            // a UUID, so the root never depends on OS randomness; the value
+            // only namespaces storage.
+            path: {
+                static NEXT_STORAGE_ROOT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = NEXT_STORAGE_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("mem-{n}/shard-{{shard}}")
+            },
             slatedb: Some(dst_slatedb_settings()),
             ..Default::default()
         },

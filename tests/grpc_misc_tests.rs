@@ -1041,9 +1041,11 @@ async fn grpc_server_reset_shards_clears_memory_backend_data() -> anyhow::Result
     let _guard = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID;
 
-        // Use Memory backend to exercise the object store deletion path
+        // Use Memory backend to exercise the object store deletion path. The
+        // root is unique because Memory stores are shared per root
+        // process-wide and this test uses a fixed shard ID.
         let template = DatabaseTemplate {
-            path: "test-memory-%shard%".to_string(),
+            path: format!("test-memory-{}/%shard%", silo::shard_range::ShardId::new()),
             ..Default::default()
         };
         let rate_limiter = MockGubernatorClient::new_arc();

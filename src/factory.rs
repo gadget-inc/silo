@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::OnceCell;
+use url::Url;
 
 use crate::concurrency::GrantScannerConfig;
 use crate::gubernator::RateLimitClient;
@@ -60,6 +61,11 @@ pub struct ShardFactory {
     rate_limiter: Arc<dyn RateLimitClient>,
     metrics: Option<Metrics>,
     close_timeout: Duration,
+    /// Test-only clone fault: when armed, the next `clone_closed_shard` skips
+    /// cloning this child so it comes up empty. Debug builds only; inert
+    /// unless a test arms it.
+    #[cfg(debug_assertions)]
+    clone_skip_child: std::sync::Mutex<Option<ShardId>>,
 }
 
 impl ShardFactory {
@@ -74,6 +80,8 @@ impl ShardFactory {
             rate_limiter,
             metrics,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            #[cfg(debug_assertions)]
+            clone_skip_child: std::sync::Mutex::new(None),
         }
     }
 
@@ -88,13 +96,47 @@ impl ShardFactory {
         Self {
             instances: DashMap::new(),
             template: DatabaseTemplate {
-                path: "/noop".to_string(),
+                // The root is unique per factory so the shared Memory store
+                // (the default backend) does not bleed across noop factories.
+                path: format!("noop-{}/%shard%", ShardId::new()),
                 apply_wal_on_close: false,
                 ..Default::default()
             },
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            #[cfg(debug_assertions)]
+            clone_skip_child: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Arm the test-only clone fault: the next `clone_closed_shard` call skips
+    /// cloning `child_id`, so that child opens empty. Lets tests drive the
+    /// pre-commit verification abort path, which a correct clone cannot reach
+    /// through the public interface. `pub` because integration tests compile
+    /// as a separate crate.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn inject_empty_child_clone(&self, child_id: ShardId) {
+        *self
+            .clone_skip_child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child_id);
+    }
+
+    /// Disarm and return the injected clone fault, if any. Always `None` in
+    /// release builds.
+    fn take_injected_empty_child(&self) -> Option<ShardId> {
+        #[cfg(debug_assertions)]
+        {
+            self.clone_skip_child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
         }
     }
 
@@ -277,8 +319,11 @@ impl ShardFactory {
     /// Resolve the object store at the storage root level.
     ///
     /// For Backend::Fs, this extracts the root path before the placeholder and
-    /// returns the shard name as the db_path. For cloud backends, this works
-    /// the same as before since the object store is already at bucket level.
+    /// returns the shard name as the db_path. For object-store backends, the
+    /// store resolves once at the shared template root with the
+    /// layout-preserving database path from [`Self::object_store_layout`], so
+    /// parent and children of a split share one store while every shard's
+    /// absolute object keys match what deployed binaries read and write.
     ///
     /// The returned `ResolvedStore.root_path` combined with `db_path` gives the
     /// full path where shard data is stored.
@@ -303,14 +348,88 @@ impl ShardFactory {
             let resolved = resolve_object_store(backend, root_path)?;
             Ok((resolved, shard_name.to_string()))
         } else {
-            // Object store backends (Memory, S3, GCS, URL): resolve full path
-            let full_path = template_path
-                .replace("%shard%", shard_name)
-                .replace("{shard}", shard_name);
-            let resolved = resolve_object_store(backend, &full_path)?;
-            let db_path = resolved.canonical_path.clone();
+            let (root, db_path) = Self::object_store_layout(backend, template_path, shard_name)?;
+            let resolved = resolve_object_store(backend, &root)?;
             Ok((resolved, db_path))
         }
+    }
+
+    /// Compute the shared store root and layout-preserving database path for a
+    /// shard on an object-store backend (Memory, S3, GCS, URL).
+    ///
+    /// The root is the template prefix before the first `%shard%`/`{shard}`
+    /// placeholder (trailing slashes trimmed), or the whole path when no
+    /// placeholder exists. Resolving every shard's store at this one root makes
+    /// clone destinations equal open paths: a split's children land in the same
+    /// store the parent resolved, exactly where each child's own `open` reads.
+    ///
+    /// The database path is the expanded template relative to the root,
+    /// followed by the store-path component of the expanded template (the URL's
+    /// path for URL-style backends, the raw expanded path for Memory). slatedb
+    /// roots URL-resolved stores at the URL's path component, so for a
+    /// `gs://bucket/silo/%shard%` template this puts absolute keys at
+    /// `silo/<shard>/silo/<shard>/…` — byte-for-byte the keys deployed shards
+    /// already use, so no data moves. Placeholder-free templates degenerate to
+    /// database path = store-path component, preserving their keys too.
+    pub fn object_store_layout(
+        backend: &crate::settings::Backend,
+        template_path: &str,
+        shard_name: &str,
+    ) -> Result<(String, String), JobStoreShardError> {
+        let placeholder_pos = template_path
+            .find("%shard%")
+            .or_else(|| template_path.find("{shard}"));
+        // For URL-style backends, a placeholder that is not at a `/` boundary
+        // would make the shared-root arithmetic produce different absolute
+        // keys than resolving the full expanded URL, silently moving every
+        // shard's data. Fail loudly instead. Memory templates stay
+        // unrestricted: they are test sentinels with no deployed data.
+        if let Some(pos) = placeholder_pos
+            && matches!(
+                backend,
+                crate::settings::Backend::S3
+                    | crate::settings::Backend::Gcs
+                    | crate::settings::Backend::Url
+            )
+            && pos > 0
+            && template_path.chars().nth(pos - 1) != Some('/')
+        {
+            return Err(JobStoreShardError::Codec(format!(
+                "shard placeholder in object-store database template path must be preceded by '/' \
+                 so shards resolve under a shared root with unchanged keys. \
+                 Got: '{}'. Change to something like 'gs://bucket/silo/%shard%'.",
+                template_path
+            )));
+        }
+        let root = match placeholder_pos {
+            Some(pos) => template_path[..pos].trim_end_matches('/'),
+            None => template_path,
+        };
+        let expanded = template_path
+            .replace("%shard%", shard_name)
+            .replace("{shard}", shard_name);
+        let store_path = match backend {
+            crate::settings::Backend::S3
+            | crate::settings::Backend::Gcs
+            | crate::settings::Backend::Url => {
+                let url = Url::parse(&expanded).map_err(|e| {
+                    JobStoreShardError::Codec(format!(
+                        "failed to parse object store URL '{}': {}. Expected format: gs://bucket/path or s3://bucket/path",
+                        expanded, e
+                    ))
+                })?;
+                let url_path = url.path();
+                url_path.strip_prefix('/').unwrap_or(url_path).to_string()
+            }
+            _ => expanded.clone(),
+        };
+        let relative = expanded[root.len()..].trim_start_matches('/');
+        let db_path = if relative.is_empty() {
+            store_path
+        } else {
+            format!("{relative}/{store_path}")
+        };
+        Ok((root.to_string(), db_path))
     }
 
     /// Resolve the WAL object store for a shard, if split WAL storage is configured.
@@ -683,47 +802,57 @@ impl ShardFactory {
             "created checkpoint for shard cloning (from closed parent)"
         );
 
-        // Clone for left child
-        let mut left_admin_builder = slatedb::admin::Admin::builder(
-            left_child_db_path.as_str(),
-            Arc::clone(&parent_resolved.store),
-        );
-        if let Some(wal) = &left_child_wal_store {
-            left_admin_builder = left_admin_builder.with_wal_object_store(Arc::clone(wal));
-        }
-        let left_admin = left_admin_builder.build();
+        let injected_empty_child = self.take_injected_empty_child();
 
-        left_admin
-            .create_clone_builder(parent_db_path.as_str(), Some(checkpoint.id))
-            .build()
-            .await
-            .map_err(|e| {
-                ShardFactoryError::CloneError(format!(
-                    "failed to clone left child database: {} (parent={}, child={})",
-                    e, parent_db_path, left_child_db_path
-                ))
-            })?;
+        // Clone for left child
+        if injected_empty_child == Some(*left_child_id) {
+            tracing::warn!(child_id = %left_child_id, "test fault injection: skipping left child clone");
+        } else {
+            let mut left_admin_builder = slatedb::admin::Admin::builder(
+                left_child_db_path.as_str(),
+                Arc::clone(&parent_resolved.store),
+            );
+            if let Some(wal) = &left_child_wal_store {
+                left_admin_builder = left_admin_builder.with_wal_object_store(Arc::clone(wal));
+            }
+            let left_admin = left_admin_builder.build();
+
+            left_admin
+                .create_clone_builder(parent_db_path.as_str(), Some(checkpoint.id))
+                .build()
+                .await
+                .map_err(|e| {
+                    ShardFactoryError::CloneError(format!(
+                        "failed to clone left child database: {} (parent={}, child={})",
+                        e, parent_db_path, left_child_db_path
+                    ))
+                })?;
+        }
 
         // Clone for right child
-        let mut right_admin_builder = slatedb::admin::Admin::builder(
-            right_child_db_path.as_str(),
-            Arc::clone(&parent_resolved.store),
-        );
-        if let Some(wal) = &right_child_wal_store {
-            right_admin_builder = right_admin_builder.with_wal_object_store(Arc::clone(wal));
-        }
-        let right_admin = right_admin_builder.build();
+        if injected_empty_child == Some(*right_child_id) {
+            tracing::warn!(child_id = %right_child_id, "test fault injection: skipping right child clone");
+        } else {
+            let mut right_admin_builder = slatedb::admin::Admin::builder(
+                right_child_db_path.as_str(),
+                Arc::clone(&parent_resolved.store),
+            );
+            if let Some(wal) = &right_child_wal_store {
+                right_admin_builder = right_admin_builder.with_wal_object_store(Arc::clone(wal));
+            }
+            let right_admin = right_admin_builder.build();
 
-        right_admin
-            .create_clone_builder(parent_db_path.as_str(), Some(checkpoint.id))
-            .build()
-            .await
-            .map_err(|e| {
-                ShardFactoryError::CloneError(format!(
-                    "failed to clone right child database: {} (parent={}, child={})",
-                    e, parent_db_path, right_child_db_path
-                ))
-            })?;
+            right_admin
+                .create_clone_builder(parent_db_path.as_str(), Some(checkpoint.id))
+                .build()
+                .await
+                .map_err(|e| {
+                    ShardFactoryError::CloneError(format!(
+                        "failed to clone right child database: {} (parent={}, child={})",
+                        e, parent_db_path, right_child_db_path
+                    ))
+                })?;
+        }
 
         // Close the raw database
         db.close().await.map_err(|e| {
@@ -744,6 +873,106 @@ impl ShardFactory {
         );
 
         Ok(())
+    }
+
+    /// Verify that each freshly cloned child holds the closed parent's full
+    /// job set.
+    ///
+    /// A fresh SlateDB clone is a byte-for-byte copy of the closed parent, so
+    /// immediately after `clone_closed_shard` -- before post-commit cleanup
+    /// trims each child to its range -- every child's whole-shard `total_jobs`
+    /// must equal the parent's. Both counts are read from raw post-close
+    /// opens of the same storage, so the comparison is exact by construction
+    /// (a count taken from the live parent could drift: background cleanup
+    /// decrements counters until close completes). An empty or mis-placed
+    /// child reads `0` (or fails to open at all, aborting via the open
+    /// error), letting the split abort before the shard-map commit point.
+    ///
+    /// This is a manifest-landed tripwire keyed on the empty-child signature,
+    /// not a full row-integrity audit: a clone that landed the counter key but
+    /// corrupted rows would still pass.
+    pub async fn verify_cloned_children_match_parent(
+        &self,
+        parent_id: &ShardId,
+        child_ids: &[ShardId],
+    ) -> Result<(), ShardFactoryError> {
+        let parent_total_jobs = self.read_closed_shard_total_jobs(parent_id).await?;
+        for child_id in child_ids {
+            let child_total_jobs = self.read_closed_shard_total_jobs(child_id).await?;
+            if child_total_jobs != parent_total_jobs {
+                return Err(ShardFactoryError::ChildVerification(format!(
+                    "cloned child {child_id} holds {child_total_jobs} jobs but parent {parent_id} \
+                     held {parent_total_jobs}; aborting split before commit to avoid data loss"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a closed shard's database with the raw `open_with_resolved_store`
+    /// primitive, read its whole-shard `total_jobs`, and close it.
+    ///
+    /// Uses the raw open -- NOT `open` -- so the shard is never registered in the
+    /// `instances` map: `open` caches the instance in the per-shard OnceCell, and
+    /// the post-commit `open(child)` would then return this stale pre-commit
+    /// handle instead of opening the committed child. Hydration is disabled and
+    /// `get_counters` reads single merged counter keys, so the check is O(1)
+    /// even on a multi-million-job shard.
+    async fn read_closed_shard_total_jobs(
+        &self,
+        shard_id: &ShardId,
+    ) -> Result<i64, ShardFactoryError> {
+        let name = shard_id.to_string();
+        let (resolved, db_path) =
+            Self::resolve_at_root(&self.template.backend, &self.template.path, &name)?;
+        let wal_store = self.resolve_wal_store(&name)?;
+
+        let shard = JobStoreShard::open_with_resolved_store(
+            name.clone(),
+            &db_path,
+            OpenShardOptions {
+                store: resolved.store,
+                wal_store,
+                wal_close_config: None,
+                slatedb_settings: self.template.slatedb.clone(),
+                memory_cache: self.template.memory_cache.clone(),
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                metrics: self.metrics.clone(),
+                concurrency_reconcile_interval: Duration::from_millis(
+                    self.template.concurrency_reconcile_interval_ms.max(1),
+                ),
+                counter_reconciliation_seconds: None,
+                hydrate_all_at_startup: false,
+                grant_scanner: GrantScannerConfig {
+                    batch_size: self.template.grant_scanner_batch_size,
+                    buffer_size: self.template.grant_scanner_buffer_size,
+                    concurrency: self.template.grant_scanner_concurrency,
+                    cold_batch_size: self.template.grant_scanner_cold_batch_size,
+                    next_hop_skip_min_backlog: self
+                        .template
+                        .grant_scanner_next_hop_skip_min_backlog,
+                    live_headroom_fraction: self.template.grant_scanner_live_headroom_fraction,
+                },
+                concurrency_reconcile_scan_slice: self.template.concurrency_reconcile_scan_slice,
+                holder_drift_scan_slice: self.template.holder_drift_scan_slice,
+                completed_job_expire_s: self.template.completed_job_expire_s,
+                terminal_job_expire_s: self.template.terminal_job_expire_s,
+                count_from_status_counters: self.template.count_from_status_counters,
+            },
+            ShardRange::full(),
+        )
+        .await?;
+
+        // Always close the raw handle, even if the counter read fails, so the
+        // shard's SlateDB instance and its spawned background tasks (grant
+        // scanner, reconcilers) are released -- JobStoreShard has no Drop.
+        // Surface the counter-read error (the verification signal) before any
+        // close error.
+        let counters = shard.get_counters().await;
+        let close_result = shard.close().await;
+        let total_jobs = counters?.total_jobs;
+        close_result?;
+        Ok(total_jobs)
     }
 
     /// Get the database template used by this factory.
@@ -768,6 +997,9 @@ impl std::fmt::Display for CloseAllError {
 pub enum ShardFactoryError {
     #[error("clone error: {0}")]
     CloneError(String),
+
+    #[error("child verification error: {0}")]
+    ChildVerification(String),
 
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),

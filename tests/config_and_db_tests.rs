@@ -5,7 +5,7 @@ use silo::settings::{
     AppConfig, Backend, DatabaseConfig, DatabaseTemplate, GubernatorSettings, LoggingConfig,
     WalConfig, WebUiConfig, expand_env_vars_for_test,
 };
-use silo::shard_range::{ShardMap, ShardRange};
+use silo::shard_range::{ShardId, ShardMap, ShardRange};
 use silo::storage::resolve_object_store;
 use std::time::Duration;
 
@@ -485,6 +485,29 @@ fn resolve_object_store_memory_returns_same_path() {
 
     // Memory backend should return the path as-is
     assert_eq!(result.canonical_path, "my-test-path");
+}
+
+/// Memory shards under one root must share a single in-memory store — like a
+/// real object store, where every shard from one template lives in one bucket.
+/// Multi-shard operations (clone/split, close-then-reopen) depend on later
+/// resolutions of the same root seeing earlier resolutions' writes. Distinct
+/// roots stay isolated so unrelated factories don't bleed state.
+#[silo::test]
+fn resolve_object_store_memory_shares_store_per_root() {
+    let root = format!("shared-root-{}", ShardId::new());
+    let first = resolve_object_store(&Backend::Memory, &root).unwrap();
+    let second = resolve_object_store(&Backend::Memory, &root).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&first.store, &second.store),
+        "resolving the same Memory root twice must return the same store"
+    );
+
+    let other =
+        resolve_object_store(&Backend::Memory, &format!("other-root-{}", ShardId::new())).unwrap();
+    assert!(
+        !std::sync::Arc::ptr_eq(&first.store, &other.store),
+        "distinct Memory roots must resolve to distinct stores"
+    );
 }
 
 #[silo::test]
