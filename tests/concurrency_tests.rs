@@ -1439,7 +1439,7 @@ async fn concurrency_future_request_granted_after_time_passes() {
 }
 
 #[silo::test]
-async fn cannot_delete_job_with_future_request_ticket() {
+async fn delete_scheduled_job_with_future_request_ticket() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
     let future = now + 200;
@@ -1496,34 +1496,58 @@ async fn cannot_delete_job_with_future_request_ticket() {
         .expect("exists");
     assert_eq!(status.kind, silo::job::JobStatusKind::Scheduled);
 
-    // Attempt to delete job 2 while it's scheduled - should fail
-    let err = shard
+    // Delete job 2 while it's scheduled with a pending RequestTicket task
+    shard
         .delete_job("-", &j2)
         .await
-        .expect_err("delete should fail");
-    match err {
-        silo::job_store_shard::JobStoreShardError::JobInProgress(jid) => {
-            assert_eq!(jid, j2);
-        }
-        other => panic!("expected JobInProgress, got {:?}", other),
-    }
+        .expect("delete scheduled job with request ticket");
 
-    // Job still exists (can't delete while scheduled)
     let job2 = shard.get_job("-", &j2).await.expect("get job2");
-    assert!(
-        job2.is_some(),
-        "job 2 should still exist (can't delete while scheduled)"
-    );
+    assert!(job2.is_none(), "job 2 should be deleted");
+    let tasks_after = count_task_keys(shard.db()).await;
+    assert_eq!(tasks_after, 0, "RequestTicket task should be gone");
 
-    // Complete job 1, which will eventually allow job 2 to run
+    // Complete job 1 to free the slot, then verify the queue still grants
+    // to a fresh job (the deleted job leaked nothing)
     shard
         .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
+
+    let _j3 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue3");
+    let mut t3_vec = Vec::new();
+    for _ in 0..20 {
+        t3_vec = shard.dequeue("w", "default", 1).await.expect("deq3").tasks;
+        if !t3_vec.is_empty() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        t3_vec.len(),
+        1,
+        "queue slot should be grantable to a fresh job after the scheduled job was deleted"
+    );
 }
 
 #[silo::test]
-async fn cannot_delete_job_with_pending_request() {
+async fn delete_scheduled_job_with_pending_request() {
     let (_tmp, shard) = open_temp_shard().await;
     let now = now_ms();
     let queue = "delete-request-q".to_string();
@@ -1572,48 +1596,139 @@ async fn cannot_delete_job_with_pending_request() {
     let requests = count_concurrency_requests(shard.db()).await;
     assert_eq!(requests, 1, "should have 1 queued request");
 
-    // Attempt to delete job 2 while it's scheduled (has pending request) - should fail
-    let err = shard
+    // Delete job 2 while it's scheduled with a pending concurrency request
+    shard
         .delete_job("-", &j2)
         .await
-        .expect_err("delete should fail");
-    match err {
-        silo::job_store_shard::JobStoreShardError::JobInProgress(jid) => {
-            assert_eq!(jid, j2);
-        }
-        other => panic!("expected JobInProgress, got {:?}", other),
-    }
+        .expect("delete scheduled job with pending request");
 
-    // Job 2 should still exist
     let job2 = shard.get_job("-", &j2).await.expect("get job2");
-    assert!(
-        job2.is_some(),
-        "job 2 should still exist (can't delete while scheduled)"
+    assert!(job2.is_none(), "job 2 should be deleted");
+    let requests_after = count_concurrency_requests(shard.db()).await;
+    assert_eq!(requests_after, 0, "pending request record should be gone");
+    let requester_counter = shard
+        .db()
+        .get(&silo::keys::concurrency_requester_counter_key("-", &queue))
+        .await
+        .expect("get requester counter")
+        .map(|b| {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&b);
+            i64::from_be_bytes(arr)
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        requester_counter, 0,
+        "requester counter should be cleaned up"
     );
 
-    // Complete job 1 to allow job 2 to run
+    // Complete job 1 to free the slot, then verify a fresh job on the same
+    // queue is granted (nothing leaked to the deleted request)
     shard
         .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
 
-    // Job 2 should now be granted
+    let _j3 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 3})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue3");
+    let mut t3_vec = Vec::new();
+    for _ in 0..20 {
+        t3_vec = shard.dequeue("w", "default", 1).await.expect("deq3").tasks;
+        if !t3_vec.is_empty() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        t3_vec.len(),
+        1,
+        "queue slot should be grantable to a fresh job after the scheduled job was deleted"
+    );
+}
+
+#[silo::test]
+async fn cannot_delete_job_running_after_queued_request_grant() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "delete-running-q".to_string();
+
+    // Job 1 takes the slot
+    let _j1 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue1");
+    let t1_vec = shard.dequeue("w", "default", 1).await.expect("deq1").tasks;
+    let t1 = t1_vec[0].attempt().task_id().to_string();
+
+    // Job 2 queued as request behind job 1
+    let j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue2");
+
+    // Complete job 1 so job 2 is granted and starts running
+    shard
+        .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report1");
     let t2_vec = shard.dequeue("w", "default", 1).await.expect("deq2").tasks;
     assert_eq!(t2_vec.len(), 1);
 
-    // Attempt to delete while running - should still fail
-    let err2 = shard
+    // Delete while running - refused, and the error names the Running status
+    let err = shard
         .delete_job("-", &j2)
         .await
         .expect_err("delete should fail while running");
-    match err2 {
-        silo::job_store_shard::JobStoreShardError::JobInProgress(jid) => {
-            assert_eq!(jid, j2);
+    match &err {
+        silo::job_store_shard::JobStoreShardError::JobInProgress(jid, status) => {
+            assert_eq!(jid, &j2);
+            assert_eq!(*status, silo::job::JobStatusKind::Running);
         }
         other => panic!("expected JobInProgress, got {:?}", other),
     }
 
-    // Complete job 2
+    // Complete job 2; delete then succeeds (terminal-state behavior unchanged)
     shard
         .report_attempt_outcome(
             t2_vec[0].attempt().task_id(),
@@ -1621,14 +1736,10 @@ async fn cannot_delete_job_with_pending_request() {
         )
         .await
         .expect("report2");
-
-    // Now delete should succeed (job is in Succeeded state)
     shard
         .delete_job("-", &j2)
         .await
         .expect("delete should succeed now");
-
-    // Job should be gone
     let job2_final = shard.get_job("-", &j2).await.expect("get job2");
     assert!(job2_final.is_none(), "job 2 should be deleted");
 }

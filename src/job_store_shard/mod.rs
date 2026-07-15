@@ -2,6 +2,7 @@
 mod cancel;
 mod cleanup;
 pub(crate) mod counters;
+mod delete;
 mod dequeue;
 mod drop_tenant_holders;
 mod enqueue;
@@ -30,8 +31,6 @@ pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
 pub(crate) use enqueue::{LimitTaskParams, LimitTaskWriteResult};
-use helpers::DbWriteBatcher;
-use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
 use slatedb_common::metrics::DefaultMetricsRecorder;
@@ -259,8 +258,8 @@ pub enum JobStoreShardError {
     JobAlreadyExists(String),
     #[error("job not found with id {0}")]
     JobNotFound(String),
-    #[error("cannot delete job {0}: job is currently running or has pending requests")]
-    JobInProgress(String),
+    #[error("cannot delete job {0}: job is {1:?}; cancel it or wait for it to finish")]
+    JobInProgress(String, JobStatusKind),
     #[error("job already cancelled with id {0}")]
     JobAlreadyCancelled(String),
     #[error("cannot cancel job {0}: job is already in terminal state {1:?}")]
@@ -1605,100 +1604,6 @@ impl JobStoreShard {
     ) -> Result<Option<JobAttemptView>, JobStoreShardError> {
         let attempts = self.get_job_attempts(tenant, job_id).await?;
         Ok(attempts.into_iter().last())
-    }
-
-    /// Delete a job by id.
-    ///
-    /// Returns an error if the job is currently running (has active leases/holders) or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
-    pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        use crate::keys::idx_metadata_key;
-        use slatedb::WriteBatch;
-
-        // Check if job is running or has pending state
-        let status = self.get_job_status(tenant, id).await?;
-        if let Some(ref status) = status
-            && !status.is_terminal()
-        {
-            return Err(JobStoreShardError::JobInProgress(id.to_string()));
-        }
-
-        // Check if job even exists (status.is_none() means job doesn't exist)
-        // If job doesn't exist, just return Ok (idempotent delete)
-        let job_info_key_bytes = job_info_key(tenant, id);
-        if status.is_none() && self.db.get(&job_info_key_bytes).await?.is_none() {
-            return Ok(());
-        }
-
-        let job_status_key_bytes = job_status_key(tenant, id);
-        let mut batch = WriteBatch::new();
-        // Clean up secondary index entries if present
-        if let Some(ref status) = status {
-            let timek = crate::keys::idx_status_time_key(
-                tenant,
-                status.kind.as_str(),
-                status.changed_at_ms,
-                id,
-            );
-            batch.delete(&timek);
-        }
-        // Clean up metadata index entries (load job info to enumerate metadata)
-        let job_metric_info = if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
-            let view = JobView::new(raw)?;
-            for (mk, mv) in view.metadata().into_iter() {
-                let mkey = idx_metadata_key(tenant, &mk, &mv, id);
-                batch.delete(&mkey);
-            }
-            Some((view.task_group().to_string(), view.metadata()))
-        } else {
-            None
-        };
-        batch.delete(&job_info_key_bytes);
-        batch.delete(&job_status_key_bytes);
-        // Also delete cancellation record if present
-        batch.delete(crate::keys::job_cancelled_key(tenant, id));
-
-        // Update counters in the same batch
-        let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
-        self.decrement_total_jobs_counter(&mut writer)?;
-        if let Some(ref status) = status {
-            // Job was in terminal state (we already checked it's terminal above)
-            self.decrement_completed_jobs_counter(&mut writer)?;
-            // Decrement tenant status counter
-            let counter_key = crate::keys::tenant_status_counter_key(tenant, status.kind.as_str());
-            writer.merge(
-                &counter_key,
-                crate::job_store_shard::counters::encode_counter(-1),
-            )?;
-        }
-
-        if let (Some(status), Some((task_group, metadata))) =
-            (status.as_ref(), job_metric_info.as_ref())
-        {
-            self.apply_background_action_queue_counter_transition(
-                tenant,
-                task_group,
-                Some(status.kind),
-                JobStatusKind::Succeeded,
-                metadata,
-            );
-        }
-
-        if let Err(e) = self.db.write(batch).await {
-            if let (Some(status), Some((task_group, metadata))) =
-                (status.as_ref(), job_metric_info.as_ref())
-            {
-                self.rollback_background_action_queue_counter_transition(
-                    tenant,
-                    task_group,
-                    Some(status.kind),
-                    JobStatusKind::Succeeded,
-                    metadata,
-                );
-            }
-            return Err(e.into());
-        }
-
-        Ok(())
     }
 }
 
