@@ -1607,16 +1607,9 @@ async fn delete_scheduled_job_with_pending_request() {
     let requests_after = count_concurrency_requests(shard.db()).await;
     assert_eq!(requests_after, 0, "pending request record should be gone");
     let requester_counter = shard
-        .db()
-        .get(&silo::keys::concurrency_requester_counter_key("-", &queue))
+        .get_concurrency_requester_count("-", &queue)
         .await
-        .expect("get requester counter")
-        .map(|b| {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&b);
-            i64::from_be_bytes(arr)
-        })
-        .unwrap_or(0);
+        .expect("get requester counter");
     assert_eq!(
         requester_counter, 0,
         "requester counter should be cleaned up"
@@ -1707,12 +1700,20 @@ async fn cannot_delete_job_running_after_queued_request_grant() {
         .await
         .expect("enqueue2");
 
-    // Complete job 1 so job 2 is granted and starts running
+    // Complete job 1 so job 2 is granted and starts running (grants are
+    // signaled to an async scanner, so poll with the file's bounded loop)
     shard
         .report_attempt_outcome(&t1, AttemptOutcome::Success { result: vec![] })
         .await
         .expect("report1");
-    let t2_vec = shard.dequeue("w", "default", 1).await.expect("deq2").tasks;
+    let mut t2_vec = Vec::new();
+    for _ in 0..20 {
+        t2_vec = shard.dequeue("w", "default", 1).await.expect("deq2").tasks;
+        if !t2_vec.is_empty() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(t2_vec.len(), 1);
 
     // Delete while running - refused, and the error names the Running status
@@ -1728,7 +1729,7 @@ async fn cannot_delete_job_running_after_queued_request_grant() {
         other => panic!("expected JobInProgress, got {:?}", other),
     }
 
-    // Complete job 2; delete then succeeds (terminal-state behavior unchanged)
+    // Complete job 2; terminal jobs are deletable
     shard
         .report_attempt_outcome(
             t2_vec[0].attempt().task_id(),
@@ -2541,4 +2542,129 @@ async fn cancel_after_ticket_conversion_cleans_up_request() {
             "no phantom holder after cancelled requester's queue drains"
         );
     });
+}
+
+#[silo::test]
+async fn delete_scheduled_retry_job_cleans_attempts_holders_and_task() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    let queue = "delete-retry-q".to_string();
+
+    // Retrying job: attempt 1 fails, attempt 2 sits Scheduled far in the
+    // future carrying the concurrency holder on its pending task
+    let job_id = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now,
+            Some(silo::retry::RetryPolicy {
+                retry_count: 1,
+                initial_interval_ms: 60_000,
+                max_interval_ms: i64::MAX,
+                randomize_interval: false,
+                backoff_factor: 1.0,
+            }),
+            test_helpers::msgpack_payload(&serde_json::json!({"j": "retry"})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+
+    let t1 = shard.dequeue("w", "default", 1).await.expect("deq").tasks[0]
+        .attempt()
+        .task_id()
+        .to_string();
+    shard
+        .report_attempt_outcome(
+            &t1,
+            AttemptOutcome::Error {
+                error_code: "E".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report err");
+
+    // Job is Scheduled for attempt 2 with a persisted attempt row and a
+    // held concurrency slot on the pending task
+    let status = shard
+        .get_job_status("-", &job_id)
+        .await
+        .expect("get status")
+        .expect("exists");
+    assert_eq!(status.kind, silo::job::JobStatusKind::Scheduled);
+    assert_eq!(status.current_attempt, Some(2));
+    assert_eq!(
+        shard
+            .get_job_attempts("-", &job_id)
+            .await
+            .expect("attempts")
+            .len(),
+        1,
+        "attempt 1 row persisted"
+    );
+    assert_eq!(
+        count_task_keys(shard.db()).await,
+        1,
+        "retry task pending for attempt 2"
+    );
+
+    shard
+        .delete_job("-", &job_id)
+        .await
+        .expect("delete scheduled retry job");
+
+    assert!(
+        shard.get_job("-", &job_id).await.expect("get").is_none(),
+        "job info gone"
+    );
+    assert_eq!(count_task_keys(shard.db()).await, 0, "pending task gone");
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        0,
+        "held concurrency slot released"
+    );
+    assert_eq!(
+        shard
+            .get_job_attempts("-", &job_id)
+            .await
+            .expect("attempts")
+            .len(),
+        0,
+        "attempt rows deleted with the job"
+    );
+
+    // Freed slot grantable to a fresh job on the same queue
+    let _j2 = shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.clone(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue2");
+    let mut t2_vec = Vec::new();
+    for _ in 0..20 {
+        t2_vec = shard.dequeue("w", "default", 1).await.expect("deq2").tasks;
+        if !t2_vec.is_empty() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(t2_vec.len(), 1, "slot grantable after delete");
 }

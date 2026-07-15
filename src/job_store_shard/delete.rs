@@ -2,19 +2,16 @@
 
 use slatedb::IsolationLevel;
 
-use crate::codec::decode_task;
 use crate::job::{JobStatusKind, JobView};
 use crate::job_store_shard::counters::encode_counter;
 use crate::job_store_shard::helpers::{
-    DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, find_task_by_identity,
-    retry_on_txn_conflict,
+    DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
     idx_metadata_key, idx_status_time_key, job_cancelled_key, job_info_key, job_status_key,
     status_index_timestamp, tenant_status_counter_key,
 };
-use crate::task::Task;
 
 /// Outcome of one transactional scheduled-delete attempt.
 enum ScheduledDeleteRoute {
@@ -49,6 +46,7 @@ impl JobStoreShard {
     /// re-reads the status as its first operation and acts on that value — a
     /// concurrent dequeue can otherwise lease the task between the status
     /// check and the deletes, leaving a live lease pointing at deleted rows.
+    #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
         // The pre-transaction status read only routes; each branch authorizes
         // off its own re-read. The loop handles a status that flips between
@@ -115,91 +113,17 @@ impl JobStoreShard {
             None => None,
         };
 
-        // Track concurrency holders to release post-commit and the deleted
-        // task key for broker-buffer eviction.
-        let mut holders_to_release: Vec<(String, String)> = Vec::new();
-        let mut deleted_task_key: Option<Vec<u8>> = None;
-
-        if let Some(ref view) = job_view {
-            let task_group = view.task_group().to_string();
-            let priority = view.priority();
-            let limits = view.limits();
-            let attempt_number = status.current_attempt.unwrap_or(1);
-            let start_time_ms = status.next_attempt_starts_after_ms.unwrap_or(0);
-
-            // Locate the pending task by identity, with the time-0 fallback
-            // for immediate scheduling.
-            let task_found = match find_task_by_identity(
-                &txn,
-                &task_group,
-                start_time_ms,
-                priority,
-                id,
-                attempt_number,
-            )
-            .await?
-            {
-                Some(found) => Some(found),
-                None => {
-                    find_task_by_identity(&txn, &task_group, 0, priority, id, attempt_number)
-                        .await?
-                }
-            };
-
-            if let Some((found_key, task_raw)) = task_found {
-                let decoded = decode_task(&task_raw)
-                    .map_err(|e| JobStoreShardError::Codec(format!("delete task decode: {e}")))?;
-                txn.delete(&found_key)?;
-                deleted_task_key = Some(found_key);
-
-                // A pending task can carry chain-accumulated concurrency
-                // grants on its `held_queues`; those holders must be dropped
-                // with the task or the slots leak.
-                match decoded {
-                    Task::RunAttempt {
-                        id: tid,
-                        held_queues,
-                        ..
-                    }
-                    | Task::RequestTicket {
-                        task_id: tid,
-                        held_queues,
-                        ..
-                    }
-                    | Task::CheckRateLimit {
-                        task_id: tid,
-                        held_queues,
-                        ..
-                    } => {
-                        for queue in held_queues {
-                            txn.delete(crate::keys::concurrency_holder_key(tenant, &queue, &tid))?;
-                            holders_to_release.push((tid.clone(), queue));
-                        }
-                    }
-                    _ => {
-                        // Other task types carry no chain-accumulated
-                        // holders; deleting the task key is sufficient.
-                    }
-                }
-            } else {
-                // No task in the queue — TicketRequested case: request
-                // records exist instead. Deleting them also decrements the
-                // per-queue requester counters and recovers any upstream
-                // holders carried on the requests.
-                let released = self
-                    .delete_concurrency_requests_for_job(
-                        &txn,
-                        tenant,
-                        id,
-                        &limits,
-                        attempt_number,
-                        start_time_ms,
-                        priority,
-                    )
-                    .await?;
-                holders_to_release.extend(released);
+        // Pending task, concurrency holders, and request records — shared
+        // with the cancel path so the two cleanups cannot silently diverge.
+        // Returns the deleted task key for post-commit broker-buffer eviction
+        // and the holder pairs to release post-commit.
+        let (deleted_task_key, holders_to_release) = match job_view {
+            Some(ref view) => {
+                self.remove_scheduled_job_execution_state(&txn, tenant, id, &status, view)
+                    .await?
             }
-        }
+            None => (None, Vec::new()),
+        };
 
         // Index cleanup. Scheduled rows key the status-time index on the
         // next-attempt timestamp, not changed_at_ms.
@@ -217,6 +141,22 @@ impl JobStoreShard {
         txn.delete(&job_info_key_bytes)?;
         txn.delete(&status_key)?;
         txn.delete(job_cancelled_key(tenant, id))?;
+
+        // Attempt rows from prior attempts (retry case) carry no TTL until
+        // the job reaches a terminal status, which a deleted Scheduled job
+        // never does — sweep them here or they survive forever and resurface
+        // under a re-enqueued job with the same id.
+        let attempt_start = crate::keys::attempt_prefix(tenant, id);
+        let attempt_end = crate::keys::end_bound(&attempt_start);
+        let mut attempt_keys: Vec<Vec<u8>> = Vec::new();
+        let mut iter = txn.scan::<Vec<u8>, _>(attempt_start..attempt_end).await?;
+        while let Some(kv) = iter.next().await? {
+            attempt_keys.push(kv.key.to_vec());
+        }
+        drop(iter);
+        for key in &attempt_keys {
+            txn.delete(key)?;
+        }
 
         // Counter bookkeeping: total-jobs and the (Scheduled) tenant status
         // counter. No completed-jobs decrement — a Scheduled job was never

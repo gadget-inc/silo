@@ -161,127 +161,12 @@ impl JobStoreShard {
             let job_key = job_info_key(tenant, id);
             if let Some(job_bytes) = try_after_status!(txn.get(&job_key).await) {
                 let job_view = try_after_status!(JobView::new(job_bytes));
-                let task_group = job_view.task_group().to_string();
-                let priority = job_view.priority();
-                let limits = job_view.limits();
-
-                // Locate the pending task by identity (the trailing epoch_ms is
-                // write-only, so we prefix-scan instead of reconstructing the
-                // exact key).
-                let attempt_number = status.current_attempt.unwrap_or(1);
-                let start_time_ms = status.next_attempt_starts_after_ms.unwrap_or(0);
-                let task_found = match try_after_status!(
-                    find_task_by_identity(
-                        &txn,
-                        &task_group,
-                        start_time_ms,
-                        priority,
-                        id,
-                        attempt_number
-                    )
-                    .await
-                ) {
-                    Some(found) => Some(found),
-                    None => {
-                        // Fallback: try with time=0 (immediate scheduling case)
-                        try_after_status!(
-                            find_task_by_identity(
-                                &txn,
-                                &task_group,
-                                0,
-                                priority,
-                                id,
-                                attempt_number
-                            )
-                            .await
-                        )
-                    }
-                };
-
-                if let Some((found_key, task_raw)) = task_found {
-                    let decoded = try_after_status!(decode_task(&task_raw).map_err(|e| {
-                        JobStoreShardError::Codec(format!("cancel task decode: {e}"))
-                    }));
-
-                    // Delete the task from the DB queue
-                    try_after_status!(txn.delete(&found_key));
-                    deleted_task_key = Some(found_key);
-
-                    match decoded {
-                        Task::RunAttempt {
-                            id: tid,
-                            held_queues,
-                            ..
-                        } => {
-                            // Delete concurrency holders for each held queue
-                            for queue in held_queues {
-                                try_after_status!(
-                                    txn.delete(concurrency_holder_key(tenant, &queue, &tid))
-                                );
-                                holders_to_release.push((tid.clone(), queue));
-                            }
-                        }
-                        Task::RequestTicket {
-                            task_id: tid,
-                            held_queues,
-                            ..
-                        } => {
-                            // FutureRequestTaskWritten case: the RequestTicket
-                            // task is the pending request mechanism. Deleting
-                            // it stops the request. But a multi-limit chain
-                            // can reach this state with prior holders already
-                            // granted (carried on the ticket's `held_queues`);
-                            // those must be released or the slots leak.
-                            for queue in held_queues {
-                                try_after_status!(
-                                    txn.delete(concurrency_holder_key(tenant, &queue, &tid))
-                                );
-                                holders_to_release.push((tid.clone(), queue));
-                            }
-                        }
-                        Task::CheckRateLimit {
-                            task_id: tid,
-                            held_queues,
-                            ..
-                        } => {
-                            // A chain parked on a rate-limit step can carry
-                            // upstream concurrency grants on its
-                            // `held_queues`. Deleting the task stops the
-                            // chain, but the holders must be released too or
-                            // those slots leak.
-                            for queue in held_queues {
-                                try_after_status!(
-                                    txn.delete(concurrency_holder_key(tenant, &queue, &tid))
-                                );
-                                holders_to_release.push((tid.clone(), queue));
-                            }
-                        }
-                        _ => {
-                            // Other task types (RefreshFloatingLimit, etc.)
-                            // carry no chain-accumulated holders; deleting
-                            // the task key above is sufficient.
-                        }
-                    }
-                } else {
-                    // No task found - check for TicketRequested case (request record
-                    // exists but no task in DB queue). Scan for requests for this job.
-                    // A deferred concurrency request can carry `held_queues` from
-                    // upstream chain steps; those holders must be released too,
-                    // mirroring the future-RequestTicket path above.
-                    let released = self
-                        .delete_concurrency_requests_for_job(
-                            &txn,
-                            tenant,
-                            id,
-                            &limits,
-                            attempt_number,
-                            start_time_ms,
-                            priority,
-                        )
-                        .await;
-                    let released = try_after_status!(released);
-                    holders_to_release.extend(released);
-                }
+                let (task_key, released) = try_after_status!(
+                    self.remove_scheduled_job_execution_state(&txn, tenant, id, &status, &job_view)
+                        .await
+                );
+                deleted_task_key = task_key;
+                holders_to_release.extend(released);
             }
         }
         // For Running jobs, status stays Running - worker discovers on heartbeat.
@@ -338,6 +223,104 @@ impl JobStoreShard {
         }
 
         Ok(())
+    }
+
+    /// Remove a Scheduled job's pending execution state inside `txn`: locate
+    /// the pending task by identity (the trailing epoch_ms is write-only, so
+    /// this prefix-scans, with the time-0 fallback for immediate scheduling)
+    /// and delete it together with any chain-accumulated concurrency holders
+    /// on its `held_queues` — a multi-limit chain can park on a RequestTicket
+    /// or CheckRateLimit step with prior grants already held, and those slots
+    /// leak unless dropped with the task. When no task exists (TicketRequested
+    /// case), the job's concurrency request records are deleted and the
+    /// requester counters decremented instead.
+    ///
+    /// Shared by cancellation and scheduled-job deletion so the two paths
+    /// cannot silently diverge. Returns the deleted task key (for post-commit
+    /// broker-buffer eviction) and the `(task_id, queue)` holder pairs the
+    /// caller must release post-commit.
+    pub(crate) async fn remove_scheduled_job_execution_state(
+        &self,
+        txn: &crate::instrumented_db::InstrumentedDbTransaction,
+        tenant: &str,
+        id: &str,
+        status: &JobStatus,
+        job_view: &JobView,
+    ) -> Result<(Option<Vec<u8>>, Vec<(String, String)>), JobStoreShardError> {
+        let task_group = job_view.task_group().to_string();
+        let priority = job_view.priority();
+        let limits = job_view.limits();
+        let attempt_number = status.current_attempt.unwrap_or(1);
+        let start_time_ms = status.next_attempt_starts_after_ms.unwrap_or(0);
+
+        let mut holders_to_release: Vec<(String, String)> = Vec::new();
+        let mut deleted_task_key: Option<Vec<u8>> = None;
+
+        let task_found = match find_task_by_identity(
+            txn,
+            &task_group,
+            start_time_ms,
+            priority,
+            id,
+            attempt_number,
+        )
+        .await?
+        {
+            Some(found) => Some(found),
+            None => {
+                find_task_by_identity(txn, &task_group, 0, priority, id, attempt_number).await?
+            }
+        };
+
+        if let Some((found_key, task_raw)) = task_found {
+            let decoded = decode_task(&task_raw)
+                .map_err(|e| JobStoreShardError::Codec(format!("scheduled task decode: {e}")))?;
+            txn.delete(&found_key)?;
+            deleted_task_key = Some(found_key);
+
+            match decoded {
+                Task::RunAttempt {
+                    id: tid,
+                    held_queues,
+                    ..
+                }
+                | Task::RequestTicket {
+                    task_id: tid,
+                    held_queues,
+                    ..
+                }
+                | Task::CheckRateLimit {
+                    task_id: tid,
+                    held_queues,
+                    ..
+                } => {
+                    for queue in held_queues {
+                        txn.delete(concurrency_holder_key(tenant, &queue, &tid))?;
+                        holders_to_release.push((tid.clone(), queue));
+                    }
+                }
+                _ => {
+                    // Other task types (RefreshFloatingLimit, etc.) carry no
+                    // chain-accumulated holders; deleting the task key above
+                    // is sufficient.
+                }
+            }
+        } else {
+            let released = self
+                .delete_concurrency_requests_for_job(
+                    txn,
+                    tenant,
+                    id,
+                    &limits,
+                    attempt_number,
+                    start_time_ms,
+                    priority,
+                )
+                .await?;
+            holders_to_release.extend(released);
+        }
+
+        Ok((deleted_task_key, holders_to_release))
     }
 
     /// Delete concurrency request records for a specific job across all its concurrency queues.
@@ -434,7 +417,11 @@ impl JobStoreShard {
             attempt_number,
         );
         let end = end_bound(&prefix);
-        let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        // Scan through the transaction so the request enumeration reads the
+        // same snapshot as the deletes and joins the SSI read set — a
+        // concurrent grant of one of these requests then conflicts instead of
+        // racing the cleanup.
+        let mut iter = txn.scan::<Vec<u8>, _>(prefix..end).await?;
 
         let mut deleted_count: i64 = 0;
         while let Some(kv) = iter.next().await? {
@@ -459,7 +446,7 @@ impl JobStoreShard {
                         tracing::warn!(
                             job_id = %job_id,
                             queue = %queue_key,
-                            "cancel: concurrency request has unknown variant; holders (if any) cannot be recovered"
+                            "concurrency request has unknown variant; holders (if any) cannot be recovered"
                         );
                     }
                 }
@@ -468,7 +455,7 @@ impl JobStoreShard {
                         job_id = %job_id,
                         queue = %queue_key,
                         error = %e,
-                        "cancel: failed to decode concurrency request; holders (if any) cannot be recovered"
+                        "failed to decode concurrency request; holders (if any) cannot be recovered"
                     );
                 }
             }
@@ -477,7 +464,7 @@ impl JobStoreShard {
             tracing::debug!(
                 job_id = %job_id,
                 queue = %queue_key,
-                "cancel: deleted concurrency request for cancelled job"
+                "deleted concurrency request for job"
             );
         }
 

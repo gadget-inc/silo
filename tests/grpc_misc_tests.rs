@@ -1864,6 +1864,21 @@ async fn grpc_delete_job_deletes_scheduled_job_in_one_call() -> anyhow::Result<(
             .expect_err("job should be gone");
         assert_eq!(err.code(), tonic::Code::NotFound);
 
+        // The pending task went with the job -- nothing leasable remains
+        let lease = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.clone()),
+                worker_id: "w".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert!(
+            lease.tasks.is_empty(),
+            "deleted scheduled job must leave no leasable task"
+        );
+
         shutdown_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())
     })
@@ -1923,6 +1938,7 @@ async fn grpc_delete_job_refusal_names_running_status() -> anyhow::Result<()> {
             })
             .await
             .expect_err("delete of a running job should be refused");
+        assert_eq!(err.code(), tonic::Code::Internal);
         assert!(
             err.message().contains("Running"),
             "refusal should name the Running status, got: {}",

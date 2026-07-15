@@ -933,7 +933,7 @@ async fn scheduled_delete_purge_keeps_counters_exact() {
 }
 
 #[silo::test]
-async fn cancel_then_delete_scheduled_job_still_works() {
+async fn cancel_then_delete_scheduled_job_removes_job_and_counters() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
         let tenant = "cancel-delete-tenant";
