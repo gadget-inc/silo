@@ -14,8 +14,8 @@ use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned, n
 use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, concurrency_holder_key, job_info_key, job_status_key, leased_task_key,
-    parse_task_key,
+    ParsedTaskKey, attempt_key, concurrency_holder_key, job_info_key, job_status_key,
+    leased_task_key, parse_task_key,
 };
 use crate::shard_range::ShardRange;
 use crate::task::{
@@ -1214,10 +1214,15 @@ impl JobStoreShard {
             task_id.to_string(),
         ));
 
-        // Record ready-to-start latency metric
+        // Record ready-to-start and leasable-to-start latency metrics
         if let (Some(m), Some(parsed)) = (&self.metrics, parse_task_key(task_key)) {
             let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
             m.record_ready_to_start_latency_ms(self.name(), decoded.task_group(), latency_ms);
+            m.record_leasable_to_start_latency_ms(
+                self.name(),
+                decoded.task_group(),
+                leasable_to_start_latency_ms(&parsed, now_ms),
+            );
         }
 
         Ok(())
@@ -1280,6 +1285,21 @@ impl JobStoreShard {
 
         Ok((tasks, keys))
     }
+}
+
+/// Milliseconds a task spent leasable — eligible for a worker to pick up — before
+/// being leased at `now_ms`, clamped to ≥ 0.
+///
+/// The leasable moment is `max(start_time_ms, epoch_ms)`: `start_time_ms` is the
+/// scheduled start (preserved through concurrency-limit chains), and `epoch_ms` is
+/// the write-time disambiguator, so whichever is later is when the task actually
+/// became eligible. This relies on every `RunAttempt` key stamping `epoch_ms` at
+/// write time or later; `CheckRateLimit` keys may carry a back-dated
+/// `parent_epoch_ms + 1` via `rate_limit_retry_epoch_ms`, but those are never
+/// leased as `RunAttempt`.
+fn leasable_to_start_latency_ms(parsed: &ParsedTaskKey, now_ms: i64) -> f64 {
+    let leasable_ms = parsed.start_time_ms.max(parsed.epoch_ms) as i64;
+    (now_ms - leasable_ms).max(0) as f64
 }
 
 #[cfg(test)]
@@ -1382,5 +1402,48 @@ mod claimed_inflight_guard_tests {
             let _guard = ClaimedInflightGuard::new(&brokers, vec![]);
         }
         assert_eq!(brokers.inflight_len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod leasable_latency_tests {
+    //! Unit tests for [`leasable_to_start_latency_ms`], pinning which task-key
+    //! field the leasable moment is measured from for each key shape.
+    use crate::keys::ParsedTaskKey;
+
+    fn parsed_key(start_time_ms: u64, epoch_ms: u64) -> ParsedTaskKey {
+        ParsedTaskKey {
+            task_group: "default".to_string(),
+            start_time_ms,
+            priority: 0,
+            job_id: "job-1".to_string(),
+            attempt: 1,
+            epoch_ms,
+        }
+    }
+
+    /// Concurrency-granted shape: the task was re-emitted after a grant, so its
+    /// write-time `epoch_ms` exceeds the preserved original `start_time_ms`.
+    /// Latency measures from the grant, not the original schedule.
+    #[test]
+    fn epoch_dominant_key_measures_from_epoch() {
+        let parsed = parsed_key(1_000, 5_000);
+        assert_eq!(super::leasable_to_start_latency_ms(&parsed, 5_250), 250.0);
+    }
+
+    /// Future-scheduled shape: a directly-enqueued task whose scheduled start
+    /// is past its write time. Latency measures from the scheduled start.
+    #[test]
+    fn start_time_dominant_key_measures_from_start_time() {
+        let parsed = parsed_key(10_000, 2_000);
+        assert_eq!(super::leasable_to_start_latency_ms(&parsed, 10_100), 100.0);
+    }
+
+    /// A lease can race slightly ahead of the leasable moment (clock skew,
+    /// scheduled start still in the future); latency clamps to zero.
+    #[test]
+    fn latency_clamps_to_zero() {
+        let parsed = parsed_key(10_000, 2_000);
+        assert_eq!(super::leasable_to_start_latency_ms(&parsed, 9_900), 0.0);
     }
 }

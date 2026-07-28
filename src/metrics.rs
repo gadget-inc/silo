@@ -160,6 +160,7 @@ pub struct Metrics {
     // Lease metrics
     task_leases_active: GaugeVec,
     ready_to_start_latency_ms: HistogramVec,
+    leasable_to_start_latency_ms: HistogramVec,
     lease_reaper_duration: HistogramVec,
     lease_reaper_scans_total: CounterVec,
     lease_reaper_leases_reaped_total: CounterVec,
@@ -563,6 +564,21 @@ impl Metrics {
     /// Record the latency between when a task became ready and when it was first leased, in milliseconds.
     pub fn record_ready_to_start_latency_ms(&self, shard: &str, task_group: &str, latency_ms: f64) {
         self.ready_to_start_latency_ms
+            .with_label_values(&[shard, task_group])
+            .observe(latency_ms);
+    }
+
+    /// Record the time a task spent leasable — eligible for a worker to pick up — before it
+    /// was leased, in milliseconds. Excludes time waiting for concurrency tickets or
+    /// rate-limit clearance, so unlike `silo_ready_to_start_latency_ms` it only grows when
+    /// workers are the bottleneck.
+    pub fn record_leasable_to_start_latency_ms(
+        &self,
+        shard: &str,
+        task_group: &str,
+        latency_ms: f64,
+    ) {
+        self.leasable_to_start_latency_ms
             .with_label_values(&[shard, task_group])
             .observe(latency_ms);
     }
@@ -2098,6 +2114,18 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let leasable_to_start_latency_ms = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_leasable_to_start_latency_ms",
+                "Time a task spent leasable (eligible for a worker to pick up) before it was leased, in milliseconds — excludes waits for concurrency tickets or rate-limit clearance",
+            )
+            .buckets(READY_TO_START_LATENCY_MS_BUCKETS.to_vec()),
+            &["shard", "task_group"],
+        )?,
+    );
+
     let lease_reaper_duration = register(
         &registry,
         HistogramVec::new(
@@ -2424,6 +2452,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         poll_duration,
         task_leases_active,
         ready_to_start_latency_ms,
+        leasable_to_start_latency_ms,
         lease_reaper_duration,
         lease_reaper_scans_total,
         lease_reaper_leases_reaped_total,

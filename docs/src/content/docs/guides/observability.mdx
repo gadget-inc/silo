@@ -47,7 +47,8 @@ Leases represent tasks actively being processed by workers.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `silo_task_leases_active` | Gauge | `shard`, `task_group` | Number of tasks currently leased to workers |
-| `silo_ready_to_start_latency_ms` | Histogram | `shard`, `task_group` | Time between when a task became ready and when it was first leased (in milliseconds) |
+| `silo_ready_to_start_latency_ms` | Histogram | `shard`, `task_group` | Time between a task's original scheduled start and when it was leased, including any wait for concurrency tickets or rate-limit clearance (in milliseconds) |
+| `silo_leasable_to_start_latency_ms` | Histogram | `shard`, `task_group` | Time a task spent leasable — eligible for a worker to pick up — before it was leased, excluding waits for concurrency tickets or rate-limit clearance (in milliseconds) |
 | `silo_lease_reaper_duration_seconds` | Histogram | `shard` | Duration of expired lease reaper scan operations |
 | `silo_lease_reaper_scans_total` | Counter | `shard` | Total number of expired lease reaper scan operations |
 
@@ -55,7 +56,8 @@ Leases represent tasks actively being processed by workers.
 - `silo_task_leases_active` shows in-flight work at any given moment
 - Sudden drops may indicate worker crashes or network issues
 - Compare against worker count to understand utilization
-- `silo_ready_to_start_latency_ms` measures scheduling delay — high values indicate workers aren't polling fast enough or broker scan intervals are too long. Unlike `silo_job_wait_time_seconds` (which measures total time from enqueue), this metric isolates the time a task sat ready but unleased
+- `silo_ready_to_start_latency_ms` measures overall queue time from a task's original scheduled start to its lease. Silo preserves the original scheduled start through tenant concurrency-limit chains, so a task that waited on concurrency tickets or rate limits reports that wait here — high values can mean worker saturation, but can also mean a tenant is self-throttling behind its own limits
+- `silo_leasable_to_start_latency_ms` measures only the time a task was leasable (all grants held, eligible for pickup) before a worker leased it. Waits for concurrency tickets or rate-limit clearance are excluded, so this metric only grows when workers are the bottleneck — it is the worker-capacity signal, while `silo_ready_to_start_latency_ms` is the customer-perceived queue-time signal
 - `silo_lease_reaper_duration_seconds` tracks how long the expired lease reaper takes to scan all leases per shard. High values indicate a large number of active leases or database pressure, and can contribute to increased CPU usage
 
 ### Broker Metrics
