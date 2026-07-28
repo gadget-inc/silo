@@ -232,6 +232,9 @@ async fn test_metrics_all_recording_methods() {
     // record_ready_to_start_latency_ms
     metrics.record_ready_to_start_latency_ms("0", "default", 42.0);
 
+    // record_leasable_to_start_latency_ms
+    metrics.record_leasable_to_start_latency_ms("0", "default", 17.0);
+
     // record_broker_scan_duration
     metrics.record_broker_scan_duration("0", 0.01);
 
@@ -327,6 +330,12 @@ async fn test_metrics_all_recording_methods() {
     assert!(
         body_str.contains("silo_ready_to_start_latency_ms"),
         "should contain ready-to-start latency metric"
+    );
+
+    // Verify leasable-to-start latency histogram was recorded
+    assert!(
+        body_str.contains("silo_leasable_to_start_latency_ms"),
+        "should contain leasable-to-start latency metric"
     );
 
     // Verify broker scan duration
@@ -765,6 +774,113 @@ async fn test_metrics_ready_to_start_latency() {
         shard1_count.as_ref().map_or(false, |l| l.ends_with(" 1")),
         "should have 1 observation for shard 1 default, found: {:?}",
         shard1_count
+    );
+}
+
+#[silo::test]
+async fn test_metrics_leasable_to_start_latency() {
+    let (metrics, _app) = create_metrics_router();
+
+    // Record latency observations for different shards and task groups
+    metrics.record_leasable_to_start_latency_ms("0", "default", 5.0);
+    metrics.record_leasable_to_start_latency_ms("0", "default", 150.0);
+    metrics.record_leasable_to_start_latency_ms("0", "high-priority", 2.0);
+    metrics.record_leasable_to_start_latency_ms("1", "default", 1000.0);
+
+    // The ready-to-start metric stays registered alongside the new one
+    metrics.record_ready_to_start_latency_ms("0", "default", 7.0);
+
+    let body_str = gather_metrics_text(&metrics);
+
+    // Should contain TYPE and HELP metadata
+    assert!(
+        body_str.contains("# TYPE silo_leasable_to_start_latency_ms histogram"),
+        "should be a histogram type"
+    );
+    assert!(
+        body_str.contains("# HELP silo_leasable_to_start_latency_ms"),
+        "should have a HELP description"
+    );
+
+    let find_line = |substrings: &[&str]| -> Option<String> {
+        body_str
+            .lines()
+            .find(|l| substrings.iter().all(|s| l.contains(s)))
+            .map(|s| s.to_string())
+    };
+
+    // Verify count for shard 0, default task group (2 observations)
+    let count_line = find_line(&[
+        "silo_leasable_to_start_latency_ms_count",
+        "shard=\"0\"",
+        "task_group=\"default\"",
+    ]);
+    assert!(
+        count_line.as_ref().is_some_and(|l| l.ends_with(" 2")),
+        "should have 2 observations for shard 0 default, found: {:?}",
+        count_line
+    );
+
+    // Verify sum for shard 0, default task group (5.0 + 150.0 = 155.0)
+    let sum_line = find_line(&[
+        "silo_leasable_to_start_latency_ms_sum",
+        "shard=\"0\"",
+        "task_group=\"default\"",
+    ]);
+    assert!(
+        sum_line.as_ref().is_some_and(|l| l.ends_with(" 155")),
+        "sum should be 155 for shard 0 default, found: {:?}",
+        sum_line
+    );
+
+    // Verify bucket series exist with labels — the prometheus-adapter's
+    // seriesQuery selects on `_bucket`, so its presence is load-bearing
+    let bucket_line = find_line(&[
+        "silo_leasable_to_start_latency_ms_bucket",
+        "shard=\"0\"",
+        "task_group=\"default\"",
+        "le=\"10\"",
+    ]);
+    assert!(
+        bucket_line.as_ref().is_some_and(|l| l.ends_with(" 1")),
+        "le=10 bucket should hold the 5ms observation for shard 0 default, found: {:?}",
+        bucket_line
+    );
+
+    // Verify count for shard 0, high-priority task group (1 observation)
+    let hp_count_line = find_line(&[
+        "silo_leasable_to_start_latency_ms_count",
+        "shard=\"0\"",
+        "task_group=\"high-priority\"",
+    ]);
+    assert!(
+        hp_count_line.as_ref().is_some_and(|l| l.ends_with(" 1")),
+        "should have 1 observation for shard 0 high-priority, found: {:?}",
+        hp_count_line
+    );
+
+    // Verify shard 1 is tracked separately
+    let shard1_count = find_line(&[
+        "silo_leasable_to_start_latency_ms_count",
+        "shard=\"1\"",
+        "task_group=\"default\"",
+    ]);
+    assert!(
+        shard1_count.as_ref().is_some_and(|l| l.ends_with(" 1")),
+        "should have 1 observation for shard 1 default, found: {:?}",
+        shard1_count
+    );
+
+    // Both metrics are emitted side by side
+    let ready_count = find_line(&[
+        "silo_ready_to_start_latency_ms_count",
+        "shard=\"0\"",
+        "task_group=\"default\"",
+    ]);
+    assert!(
+        ready_count.as_ref().is_some_and(|l| l.ends_with(" 1")),
+        "ready-to-start series should still be emitted, found: {:?}",
+        ready_count
     );
 }
 
