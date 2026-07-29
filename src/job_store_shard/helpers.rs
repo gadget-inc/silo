@@ -2,6 +2,8 @@
 use slatedb::WriteBatch;
 use slatedb::bytes::Bytes;
 use slatedb::config::{PutOptions, Ttl};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::encode_task;
@@ -84,14 +86,37 @@ pub(crate) trait WriteBatcher {
 /// Wrapper around `&mut WriteBatch` that implements `WriteBatcher`
 ///
 /// This combines a database reference for reads with a write batch for writes, allowing batch-based code paths to use the same trait as transaction-based ones.
+///
+/// `read_cache` optionally overlays prefetched point reads: `get` serves a
+/// cached value instead of hitting the DB. The cache holds values read from
+/// the DB moments earlier by the caller (the grant scanner prefetches the
+/// rows its chain resumes will read), so serving from it preserves `get`'s
+/// existing semantics — `get` never saw this batch's uncommitted writes.
 pub(crate) struct DbWriteBatcher<'a> {
     pub db: &'a InstrumentedDb,
     pub batch: &'a mut WriteBatch,
+    read_cache: Option<Arc<HashMap<Vec<u8>, Bytes>>>,
 }
 
 impl<'a> DbWriteBatcher<'a> {
     pub fn new(db: &'a InstrumentedDb, batch: &'a mut WriteBatch) -> Self {
-        Self { db, batch }
+        Self {
+            db,
+            batch,
+            read_cache: None,
+        }
+    }
+
+    pub fn new_with_read_cache(
+        db: &'a InstrumentedDb,
+        batch: &'a mut WriteBatch,
+        read_cache: Arc<HashMap<Vec<u8>, Bytes>>,
+    ) -> Self {
+        Self {
+            db,
+            batch,
+            read_cache: Some(read_cache),
+        }
     }
 }
 
@@ -136,6 +161,11 @@ impl WriteBatcher for DbWriteBatcher<'_> {
     }
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
+        if let Some(cache) = &self.read_cache
+            && let Some(value) = cache.get(key)
+        {
+            return Ok(Some(value.clone()));
+        }
         self.db.get(key).await
     }
 

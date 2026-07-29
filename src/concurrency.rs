@@ -120,6 +120,12 @@ pub struct ResumeChainParams {
     /// `task_key(now_ms, …)` writes can't disagree with the `granted_at_ms`
     /// the scanner just wrote into the same batch.
     pub now_ms: i64,
+    /// Prefetched point reads (key → value as read from the DB) for rows the
+    /// chain walk is expected to read, e.g. downstream floating-limit state.
+    /// The resumer's writer serves `get`s from this overlay, letting the
+    /// scanner fetch many candidates' rows concurrently instead of paying one
+    /// object-store round trip per grant inside the serial reserve loop.
+    pub read_cache: Option<Arc<HashMap<Vec<u8>, slatedb::bytes::Bytes>>>,
 }
 
 /// Bridge between the grant scanner / `process_grants` and the shard-level
@@ -140,6 +146,12 @@ pub trait LimitChainResumer: Send + Sync {
         batch: &mut slatedb::WriteBatch,
         params: ResumeChainParams,
     ) -> Result<Vec<(String, String)>, ConcurrencyError>;
+
+    /// Wake the task brokers for `groups` after a durable grant commit, so
+    /// freshly written tasks become claimable without waiting for the grant
+    /// scanner's drain iteration to finish every other queue's pass. Default
+    /// is a no-op for resumers with no broker access.
+    fn wakeup_task_groups(&self, _groups: &[String]) {}
 }
 
 impl From<slatedb::Error> for ConcurrencyError {
@@ -813,6 +825,11 @@ pub struct GrantScannerConfig {
     /// Fraction of each queue's capacity the scanner leaves unfilled for
     /// immediate (live) grants.
     pub live_headroom_fraction: f64,
+    /// Max grants accumulated in a pass before their edits are committed and
+    /// their task groups' brokers woken. Smaller chunks stream grants out of a
+    /// long pass earlier (lower leasable latency); larger chunks amortize
+    /// commit overhead.
+    pub commit_chunk_size: usize,
 }
 
 impl Default for GrantScannerConfig {
@@ -825,6 +842,7 @@ impl Default for GrantScannerConfig {
             next_hop_skip_min_backlog:
                 crate::settings::DEFAULT_GRANT_SCANNER_NEXT_HOP_SKIP_MIN_BACKLOG,
             live_headroom_fraction: crate::settings::DEFAULT_GRANT_SCANNER_LIVE_HEADROOM_FRACTION,
+            commit_chunk_size: crate::settings::DEFAULT_GRANT_SCANNER_COMMIT_CHUNK_SIZE,
         }
     }
 }
@@ -955,6 +973,11 @@ pub struct ConcurrencyManager {
     /// `grant_scanner_live_headroom_fraction` (default 0.0); stored already
     /// clamped to `[0.0, 0.9]` with non-finite values treated as 0.0.
     grant_scanner_live_headroom_fraction: f64,
+    /// Max grants accumulated in a `process_grants` pass before their edits
+    /// are committed and their task groups' brokers woken. Configurable via
+    /// `grant_scanner_commit_chunk_size` (default 16); stored already clamped
+    /// to `>= 1`.
+    grant_scanner_commit_chunk_size: usize,
     /// State of the (possibly multi-tick) holder-drift pass. Maintained only
     /// by `report_holder_drift` (a single periodic task). See `DriftPass`.
     drift_pass: Mutex<DriftPass>,
@@ -1047,6 +1070,7 @@ impl ConcurrencyManager {
             } else {
                 0.0
             },
+            grant_scanner_commit_chunk_size: scanner.commit_chunk_size.max(1),
             drift_pass: Mutex::new(DriftPass::default()),
         }
     }
@@ -1245,13 +1269,8 @@ impl ConcurrencyManager {
         }
         // Look through rate limits to the next capacity-holding hop; a terminal
         // candidate (nothing, or only rate limits, after `limit_index`) never skips.
-        let mut probe = limit_index as usize + 1;
-        let next = loop {
-            match limits.get(probe) {
-                None => return false,
-                Some(Limit::RateLimit(_)) => probe += 1,
-                Some(other) => break other,
-            }
+        let Some(next) = Self::next_capacity_hop(limits, limit_index) else {
+            return false;
         };
         let next_queue = match next {
             Limit::Concurrency(cl) => cl.key.as_str(),
@@ -2342,7 +2361,6 @@ impl ConcurrencyManager {
             let needed = (count as usize - total_granted).min(self.grant_scanner_batch_size);
 
             let mut batch = WriteBatch::new();
-            let mut grants: Vec<(String, String)> = Vec::new();
             let mut stale_and_corrupt_count: usize = 0;
 
             // --- Scan batch of candidates ---
@@ -2513,48 +2531,6 @@ impl ConcurrencyManager {
                     max_concurrency = Some((l, lt));
                 }
 
-                // Defer candidates whose NEXT concurrency hop is saturated
-                // with a deep requester backlog: granting them cannot make
-                // the job runnable — the chain immediately parks a deferred
-                // request at that hop — so it only converts "waiting here"
-                // into a parked holder plus one more line entry (pure state
-                // inflation), while occupying this queue's slots with jobs
-                // that cannot run (the shared-queue wedge shape). The row is
-                // left in place — no grant, no delete, no counter decrement —
-                // and keeps its original start_time, so when it is eventually
-                // granted it parks at its age-correct position in the next
-                // hop's FIFO.
-                //
-                // A skipped row still consumed the per-invocation scan budget
-                // (`scanned_this_invocation` was already incremented above), so
-                // a front of >budget saturated candidates yields at the budget
-                // like any other non-grantable front and a grantable candidate
-                // anywhere within the budget window is still reached this
-                // invocation. Liveness for candidates past the window: the
-                // requester counter stays non-zero, so the periodic reconcile
-                // sweep re-drives this queue on its next cursor rotation. The
-                // min-backlog threshold is a heuristic that the hop stays
-                // saturated across that rotation — sound for a deep, slowly
-                // draining hop (the wedge shape this targets), but a small-cap
-                // hop that drains its whole line within a rotation is re-driven
-                // a rotation later than ideal (bounded staleness, no lost work;
-                // no reverse-edge nudge wakes upstream queues on desaturation).
-                if self
-                    .next_hop_should_skip(
-                        db,
-                        tenant,
-                        &limits,
-                        limit_index,
-                        &mut next_hop_skip_cache,
-                    )
-                    .await
-                {
-                    if let Some(ref m) = self.metrics {
-                        m.record_concurrency_grant_next_hop_skip(&self.shard);
-                    }
-                    continue;
-                }
-
                 scanned.push(ScannedRequest {
                     request_key: kv.key.to_vec(),
                     task_id: task_id_str,
@@ -2571,6 +2547,81 @@ impl ConcurrencyManager {
                     held_queues,
                     limits,
                 });
+            }
+
+            // --- Next-hop skip filter ---
+            // Defer candidates whose NEXT concurrency hop is saturated
+            // with a deep requester backlog: granting them cannot make
+            // the job runnable — the chain immediately parks a deferred
+            // request at that hop — so it only converts "waiting here"
+            // into a parked holder plus one more line entry (pure state
+            // inflation), while occupying this queue's slots with jobs
+            // that cannot run (the shared-queue wedge shape). The row is
+            // left in place — no grant, no delete, no counter decrement —
+            // and keeps its original start_time, so when it is eventually
+            // granted it parks at its age-correct position in the next
+            // hop's FIFO.
+            //
+            // A skipped row still consumed the per-invocation scan budget
+            // (`scanned_this_invocation` was incremented during the scan), so
+            // a front of >budget saturated candidates yields at the budget
+            // like any other non-grantable front and a grantable candidate
+            // anywhere within the budget window is still reached this
+            // invocation. Liveness for candidates past the window: the
+            // requester counter stays non-zero, so the periodic reconcile
+            // sweep re-drives this queue on its next cursor rotation. The
+            // min-backlog threshold is a heuristic that the hop stays
+            // saturated across that rotation — sound for a deep, slowly
+            // draining hop (the wedge shape this targets), but a small-cap
+            // hop that drains its whole line within a rotation is re-driven
+            // a rotation later than ideal (bounded staleness, no lost work;
+            // no reverse-edge nudge wakes upstream queues on desaturation).
+            //
+            // The per-hop durable reads are warmed for every distinct hop in
+            // this pass concurrently; the filter itself then runs against the
+            // warmed cache without further I/O in the common case.
+            if self.grant_scanner_next_hop_skip_min_backlog > 0 {
+                let mut new_hops: Vec<(String, Limit)> = Vec::new();
+                let mut seen_hops: HashSet<&str> = HashSet::new();
+                for req in &scanned {
+                    if let Some(hop) = Self::next_capacity_hop(&req.limits, req.limit_index) {
+                        let hop_queue = match hop {
+                            Limit::Concurrency(cl) => cl.key.as_str(),
+                            Limit::FloatingConcurrency(fl) => fl.key.as_str(),
+                            Limit::RateLimit(_) => continue,
+                        };
+                        if !next_hop_skip_cache.contains_key(hop_queue)
+                            && seen_hops.insert(hop_queue)
+                        {
+                            new_hops.push((hop_queue.to_string(), hop.clone()));
+                        }
+                    }
+                }
+                if !new_hops.is_empty() {
+                    self.prefetch_next_hop_reads(db, tenant, new_hops, &mut next_hop_skip_cache)
+                        .await;
+                }
+
+                let mut kept: Vec<ScannedRequest> = Vec::with_capacity(scanned.len());
+                for req in scanned {
+                    if self
+                        .next_hop_should_skip(
+                            db,
+                            tenant,
+                            &req.limits,
+                            req.limit_index,
+                            &mut next_hop_skip_cache,
+                        )
+                        .await
+                    {
+                        if let Some(ref m) = self.metrics {
+                            m.record_concurrency_grant_next_hop_skip(&self.shard);
+                        }
+                        continue;
+                    }
+                    kept.push(req);
+                }
+                scanned = kept;
             }
 
             // If the scan yielded no candidates, fall through to the per-pass
@@ -2657,6 +2708,65 @@ impl ConcurrencyManager {
                 }
             }
 
+            // --- Prefetch chain-resume reads ---
+            // The reserve loop below walks each grant's remaining limit chain
+            // serially. Rows that walk reads — downstream floating-limit
+            // state — and the downstream queue hydration each try_reserve
+            // consults are fetched here concurrently, so the serial loop runs
+            // against warm state instead of paying one object-store round
+            // trip per grant. The prefetched values are point-in-time DB
+            // reads served through the writer's read overlay, matching the
+            // writer's `get` semantics (batch edits are never visible to it).
+            let read_cache: Option<Arc<HashMap<Vec<u8>, slatedb::bytes::Bytes>>> =
+                if valid_requests.is_empty() {
+                    None
+                } else {
+                    // Owned keys/queues: the async closures below capture by
+                    // move, and borrowing across the stream's await points
+                    // trips HRTB inference.
+                    let mut floating_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+                    let mut downstream_queues: BTreeSet<String> = BTreeSet::new();
+                    for req in &valid_requests {
+                        for l in req.limits.iter().skip(req.limit_index as usize + 1) {
+                            match l {
+                                Limit::FloatingConcurrency(fl) => {
+                                    floating_keys.insert(floating_limit_state_key(tenant, &fl.key));
+                                    downstream_queues.insert(fl.key.clone());
+                                }
+                                Limit::Concurrency(cl) => {
+                                    downstream_queues.insert(cl.key.clone());
+                                }
+                                Limit::RateLimit(_) => {}
+                            }
+                        }
+                    }
+                    futures::stream::iter(downstream_queues.into_iter().map(|q| async move {
+                        if let Err(e) = self.counts.ensure_hydrated(db, range, tenant, &q).await {
+                            tracing::debug!(
+                                error = %e,
+                                queue = %q,
+                                "grant scanner: downstream hydration prefetch failed"
+                            );
+                        }
+                    }))
+                    .buffer_unordered(self.grant_scanner_buffer_size)
+                    .collect::<Vec<()>>()
+                    .await;
+                    let fetched: Vec<(Vec<u8>, Option<slatedb::bytes::Bytes>)> =
+                        futures::stream::iter(floating_keys.into_iter().map(|key| async move {
+                            let value = db.get(&key).await.ok().flatten();
+                            (key, value)
+                        }))
+                        .buffer_unordered(self.grant_scanner_buffer_size)
+                        .collect()
+                        .await;
+                    let cache: HashMap<Vec<u8>, slatedb::bytes::Bytes> = fetched
+                        .into_iter()
+                        .filter_map(|(key, value)| value.map(|v| (key, v)))
+                        .collect();
+                    (!cache.is_empty()).then(|| Arc::new(cache))
+                };
+
             // --- Reserve in-memory slots and accumulate grant edits ---
             //
             // For each valid request we: reserve the in-memory slot for this
@@ -2664,8 +2774,7 @@ impl ConcurrencyManager {
             // to the chain resumer to write the next limit step. The resumer
             // may make *additional* in-memory reservations (when a downstream
             // FloatingConcurrency/Concurrency limit grants immediately), so we
-            // collect all per-pass reservations into `pass_reservations` for
-            // rollback if the batch write fails.
+            // collect all reservations for rollback if a batch write fails.
             //
             // The scanner reserves against the headroom-reduced capacity so
             // the configured live share of slots stays reachable by immediate
@@ -2674,12 +2783,26 @@ impl ConcurrencyManager {
             // capacity — headroom applies only to the queue being scanned.
             let limit =
                 self.scanner_effective_capacity(max_concurrency.map(|(l, _)| l).unwrap_or(1));
-            // `(queue, task_id)` reservations to release if the per-pass batch
-            // write fails. Includes both the just-won queue and any further
-            // grants the chain resumer made.
-            let mut pass_reservations: Vec<(String, String)> = Vec::new();
+            // Grants stream out of the pass in chunks: every
+            // `grant_scanner_commit_chunk_size` grants, the accumulated batch
+            // is committed durably and the granted task groups' brokers are
+            // woken, so early grants in a long read-bound pass become
+            // leasable while later candidates are still being walked. Each
+            // chunk stamps a fresh `now_ms` so holder `granted_at_ms` and the
+            // resumed `task_key` epoch reflect commit-time reality rather
+            // than invocation start.
+            //
+            // `chunk_reservations` holds the `(queue, task_id)` in-memory
+            // reservations of the CURRENT (uncommitted) chunk only — both the
+            // just-won queue and any further grants the chain resumer made —
+            // for rollback if that chunk's write fails. Committed chunks
+            // stand.
+            let mut chunk_grants: Vec<(String, String)> = Vec::new();
+            let mut chunk_reservations: Vec<(String, String)> = Vec::new();
+            let mut chunk_stale = stale_and_corrupt_count;
+            let mut chunk_now = crate::job_store_shard::now_epoch_ms();
             for req in &valid_requests {
-                if total_granted + grants.len() >= count as usize {
+                if total_granted + chunk_grants.len() >= count as usize {
                     break;
                 }
 
@@ -2694,11 +2817,11 @@ impl ConcurrencyManager {
                     capacity_exhausted = true;
                     break;
                 }
-                pass_reservations.push((queue.to_string(), req.task_id.clone()));
+                chunk_reservations.push((queue.to_string(), req.task_id.clone()));
 
                 // [SILO-GRANT-3] Create holder for the just-won queue
                 let holder_val = encode_holder(&HolderRecord {
-                    granted_at_ms: now_ms,
+                    granted_at_ms: chunk_now,
                 });
                 batch.put(
                     concurrency_holder_key(tenant, queue, &req.task_id),
@@ -2712,21 +2835,19 @@ impl ConcurrencyManager {
                 // fresh deferred concurrency request (if next concurrency
                 // limit is full). It also accumulates further immediate
                 // grants on downstream Concurrency/FloatingConcurrency limits
-                // — those reservations are added to `pass_reservations`.
+                // — those reservations are added to `chunk_reservations`.
                 //
                 // If the chain resumer is unavailable (shard shutdown), abort
-                // this request: release the just-acquired slot and break out
-                // of the pass. The durable request key was already added to
-                // `batch` as a delete; restore it by NOT committing this
-                // pass's grants.
+                // this request: release the current chunk's reservations and
+                // bail. The uncommitted chunk's request deletes die with the
+                // uncommitted batch; committed chunks stand.
                 let Some(ref resumer) = chain_resumer else {
                     tracing::warn!(
                         queue = %queue,
                         task_id = %req.task_id,
                         "grant scanner: chain resumer not installed; aborting pass"
                     );
-                    // Release everything we reserved this pass and bail.
-                    for (q, tid) in &pass_reservations {
+                    for (q, tid) in &chunk_reservations {
                         self.counts.release_reservation(tenant, q, tid);
                     }
                     record_invocation(scanned_this_invocation, total_stale_deleted);
@@ -2747,23 +2868,24 @@ impl ConcurrencyManager {
                     held_queues: new_held,
                     task_group: req.task_group.clone(),
                     limits: req.limits.clone(),
-                    now_ms,
+                    now_ms: chunk_now,
+                    read_cache: read_cache.clone(),
                 };
 
                 match resumer.resume_chain(&mut batch, resume_params).await {
                     Ok(chain_grants) => {
                         // Each (queue, task_id) the chain reserved must roll back
-                        // alongside ours if the batch write fails.
-                        pass_reservations.extend(chain_grants);
+                        // alongside ours if this chunk's write fails.
+                        chunk_reservations.extend(chain_grants);
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
                             queue = %queue,
                             task_id = %req.task_id,
-                            "grant scanner: chain resume failed; rolling back pass"
+                            "grant scanner: chain resume failed; rolling back chunk"
                         );
-                        for (q, tid) in &pass_reservations {
+                        for (q, tid) in &chunk_reservations {
                             self.counts.release_reservation(tenant, q, tid);
                         }
                         record_invocation(scanned_this_invocation, total_stale_deleted);
@@ -2771,80 +2893,67 @@ impl ConcurrencyManager {
                     }
                 }
 
-                grants.push((req.task_id.clone(), req.task_group.clone()));
+                chunk_grants.push((req.task_id.clone(), req.task_group.clone()));
+
+                if chunk_grants.len() >= self.grant_scanner_commit_chunk_size {
+                    let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
+                    let stale_deletes = std::mem::take(&mut chunk_stale);
+                    if self
+                        .commit_grant_chunk(
+                            db,
+                            tenant,
+                            queue,
+                            commit_batch,
+                            &chunk_grants,
+                            &chunk_reservations,
+                            stale_deletes,
+                            total_granted,
+                            &chain_resumer,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        record_invocation(scanned_this_invocation, total_stale_deleted);
+                        return all_granted_groups;
+                    }
+                    total_granted += chunk_grants.len();
+                    total_stale_deleted += stale_deletes;
+                    all_granted_groups.extend(chunk_grants.drain(..).map(|(_, tg)| tg));
+                    chunk_reservations.clear();
+                    chunk_now = crate::job_store_shard::now_epoch_ms();
+                }
             }
 
-            // --- Per-pass commit ---
-            // Combined counter decrement for this pass's grants + stale/corrupt deletions.
-            let pass_decrement = grants.len() + stale_and_corrupt_count;
-            if pass_decrement > 0 {
-                batch.merge(
-                    concurrency_requester_counter_key(tenant, queue),
-                    encode_counter(-(pass_decrement as i64)),
-                );
-            }
-
-            // Skip the durable write if this pass produced no edits (e.g. every
-            // scanned status lookup returned an error). The iterator has still
+            // --- Final chunk commit ---
+            // Skip the durable write if nothing is pending (e.g. every scanned
+            // status lookup returned an error). The iterator has still
             // advanced, so the outer loop continues until iter_exhausted.
-            if grants.is_empty() && stale_and_corrupt_count == 0 {
+            if chunk_grants.is_empty() && chunk_stale == 0 {
                 continue;
             }
-
-            if let Err(e) = db
-                .write_with_options(
-                    batch,
-                    &WriteOptions {
-                        await_durable: true,
-                        ..Default::default()
-                    },
+            let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
+            let stale_deletes = std::mem::take(&mut chunk_stale);
+            if self
+                .commit_grant_chunk(
+                    db,
+                    tenant,
+                    queue,
+                    commit_batch,
+                    &chunk_grants,
+                    &chunk_reservations,
+                    stale_deletes,
+                    total_granted,
+                    &chain_resumer,
                 )
                 .await
+                .is_err()
             {
-                // Roll back ALL reservations made this pass — both the gating
-                // queue grants and any further reservations the chain resumer
-                // made on downstream limits. Prior committed passes stand.
-                for (q, tid) in &pass_reservations {
-                    self.counts.release_reservation(tenant, q, tid);
-                }
-                // The batch did not commit, so this queue's durable request
-                // rows and requester counter are untouched — the freed slots
-                // are grantable again immediately. Re-nudge the hot lane so the
-                // retry happens on the next drain iteration rather than waiting
-                // for the sliced reconcile sweep to rotate back to this queue
-                // (release_reservation alone does not wake the scanner).
-                self.request_grant(tenant, queue);
-                tracing::warn!(
-                    error = %e,
-                    pass_grants = grants.len(),
-                    pass_reservations = pass_reservations.len(),
-                    prior_grants = total_granted,
-                    "grant scanner: batch write failed, rolled back this pass's reservations"
-                );
                 record_invocation(scanned_this_invocation, total_stale_deleted);
                 return all_granted_groups;
             }
-
-            for (request_id, task_group) in &grants {
-                tracing::debug!(
-                    queue = %queue,
-                    request_id = %request_id,
-                    task_group = %task_group,
-                    "grant scanner: granted concurrency ticket"
-                );
-            }
-
-            if let Some(ref m) = self.metrics {
-                m.record_concurrency_tickets_granted(
-                    &self.shard,
-                    crate::metrics::GrantPath::Scanned,
-                    grants.len() as u64,
-                );
-            }
-
-            total_granted += grants.len();
-            total_stale_deleted += stale_and_corrupt_count;
-            all_granted_groups.extend(grants.into_iter().map(|(_, tg)| tg));
+            total_granted += chunk_grants.len();
+            total_stale_deleted += stale_deletes;
+            all_granted_groups.extend(chunk_grants.into_iter().map(|(_, tg)| tg));
         }
 
         // No silent cap: surface invocations that yielded on the scan budget so
@@ -2864,6 +2973,159 @@ impl ConcurrencyManager {
 
         record_invocation(scanned_this_invocation, total_stale_deleted);
         all_granted_groups
+    }
+
+    /// Durably commit one chunk of scanner grants: folds the requester-counter
+    /// decrement for the chunk's grants and carried stale deletes into
+    /// `batch`, writes it with `await_durable`, and wakes the granted task
+    /// groups' brokers so the tasks become claimable immediately.
+    ///
+    /// On write failure, rolls back the chunk's in-memory reservations and
+    /// re-nudges the queue's hot lane; previously committed chunks stand.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_grant_chunk(
+        &self,
+        db: &Arc<InstrumentedDb>,
+        tenant: &str,
+        queue: &str,
+        mut batch: WriteBatch,
+        chunk_grants: &[(String, String)],
+        chunk_reservations: &[(String, String)],
+        stale_deletes: usize,
+        prior_grants: usize,
+        chain_resumer: &Option<Arc<dyn LimitChainResumer>>,
+    ) -> Result<(), ()> {
+        let decrement = chunk_grants.len() + stale_deletes;
+        if decrement > 0 {
+            batch.merge(
+                concurrency_requester_counter_key(tenant, queue),
+                encode_counter(-(decrement as i64)),
+            );
+        }
+
+        if let Err(e) = db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            for (q, tid) in chunk_reservations {
+                self.counts.release_reservation(tenant, q, tid);
+            }
+            // The batch did not commit, so this chunk's durable request rows
+            // and counter decrement are untouched — the freed slots are
+            // grantable again immediately. Re-nudge the hot lane so the retry
+            // happens on the next drain iteration rather than waiting for the
+            // sliced reconcile sweep to rotate back to this queue
+            // (release_reservation alone does not wake the scanner).
+            self.request_grant(tenant, queue);
+            tracing::warn!(
+                error = %e,
+                chunk_grants = chunk_grants.len(),
+                chunk_reservations = chunk_reservations.len(),
+                prior_grants,
+                "grant scanner: chunk write failed, rolled back this chunk's reservations"
+            );
+            return Err(());
+        }
+
+        for (request_id, task_group) in chunk_grants {
+            tracing::debug!(
+                queue = %queue,
+                request_id = %request_id,
+                task_group = %task_group,
+                "grant scanner: granted concurrency ticket"
+            );
+        }
+
+        if let Some(ref m) = self.metrics {
+            m.record_concurrency_tickets_granted(
+                &self.shard,
+                crate::metrics::GrantPath::Scanned,
+                chunk_grants.len() as u64,
+            );
+        }
+
+        // Wake the brokers for this chunk's task groups now that the tasks
+        // are durable; without this the tasks wait for a broker scan or for
+        // the drain iteration's post-fan-out wakeup.
+        if !chunk_grants.is_empty()
+            && let Some(resumer) = chain_resumer
+        {
+            let mut groups: Vec<String> = chunk_grants.iter().map(|(_, tg)| tg.clone()).collect();
+            groups.sort_unstable();
+            groups.dedup();
+            resumer.wakeup_task_groups(&groups);
+        }
+
+        Ok(())
+    }
+
+    /// The next capacity-holding hop after `limit_index`, looking through
+    /// rate limits. `None` when the chain is terminal from there.
+    fn next_capacity_hop(limits: &[Limit], limit_index: u32) -> Option<&Limit> {
+        let mut probe = limit_index as usize + 1;
+        loop {
+            match limits.get(probe) {
+                None => return None,
+                Some(Limit::RateLimit(_)) => probe += 1,
+                Some(other) => return Some(other),
+            }
+        }
+    }
+
+    /// Concurrently warm `next_hop_should_skip`'s per-hop durable reads for
+    /// every hop in `hops` (each not yet present in `cache`): the floating
+    /// capacity read, and — when the hop is saturated per that read — the
+    /// requester-counter depth read. Fixed hops compute saturation against
+    /// the supplied limit's embedded capacity; a candidate carrying a
+    /// different embedded value falls back to the skip check's own read.
+    async fn prefetch_next_hop_reads(
+        &self,
+        db: &Arc<InstrumentedDb>,
+        tenant: &str,
+        hops: Vec<(String, Limit)>,
+        cache: &mut HashMap<String, NextHopReads>,
+    ) {
+        let fetched: Vec<(String, NextHopReads)> =
+            futures::stream::iter(hops.into_iter().map(|(hop_queue, hop)| async move {
+                let mut reads = NextHopReads::default();
+                let capacity = match &hop {
+                    Limit::Concurrency(cl) => Some(cl.max_concurrency as usize),
+                    Limit::FloatingConcurrency(fl) => {
+                        let capacity = Self::floating_state_capacity(db, tenant, &hop_queue)
+                            .await
+                            .unwrap_or(fl.default_max_concurrency as usize);
+                        reads.floating_capacity = Some(capacity);
+                        Some(capacity)
+                    }
+                    Limit::RateLimit(_) => None,
+                };
+                if let Some(capacity) = capacity
+                    && self.counts.holder_count(tenant, &hop_queue) >= capacity
+                {
+                    reads.depth = Some(
+                        match db
+                            .get(&concurrency_requester_counter_key(tenant, &hop_queue))
+                            .await
+                        {
+                            Ok(Some(raw)) => decode_counter(&raw),
+                            _ => 0,
+                        },
+                    );
+                }
+                (hop_queue, reads)
+            }))
+            .buffer_unordered(self.grant_scanner_buffer_size)
+            .collect()
+            .await;
+        for (hop_queue, reads) in fetched {
+            cache.entry(hop_queue).or_insert(reads);
+        }
     }
 }
 

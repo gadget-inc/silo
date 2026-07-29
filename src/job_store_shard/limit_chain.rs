@@ -72,7 +72,13 @@ impl LimitChainResumer for ShardChainResumer {
         // `handle_request_ticket` (dequeue.rs) — see
         // `project_broker_tombstone_chain_continuation`.
         let task_key_epoch_ms = now_ms;
-        let mut writer = DbWriteBatcher::new(&shard.db, batch);
+        // Serve chain-walk point reads from the scanner's prefetched overlay
+        // when one was supplied; the overlay holds point-in-time DB reads, so
+        // `get` semantics are unchanged.
+        let mut writer = match &params.read_cache {
+            Some(cache) => DbWriteBatcher::new_with_read_cache(&shard.db, batch, Arc::clone(cache)),
+            None => DbWriteBatcher::new(&shard.db, batch),
+        };
         let result = shard
             .enqueue_limit_task_at_index(
                 &mut writer,
@@ -106,6 +112,12 @@ impl LimitChainResumer for ShardChainResumer {
         }
 
         Ok(result.grants)
+    }
+
+    fn wakeup_task_groups(&self, groups: &[String]) {
+        if let Some(shard) = self.shard.upgrade() {
+            shard.brokers.wakeup_groups(groups);
+        }
     }
 }
 

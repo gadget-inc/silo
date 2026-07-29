@@ -252,6 +252,7 @@ impl ShardFactory {
                             next_hop_skip_min_backlog: template
                                 .grant_scanner_next_hop_skip_min_backlog,
                             live_headroom_fraction: template.grant_scanner_live_headroom_fraction,
+                            commit_chunk_size: template.grant_scanner_commit_chunk_size,
                         },
                         concurrency_reconcile_scan_slice: template.concurrency_reconcile_scan_slice,
                         holder_drift_scan_slice: template.holder_drift_scan_slice,
@@ -952,6 +953,7 @@ impl ShardFactory {
                         .template
                         .grant_scanner_next_hop_skip_min_backlog,
                     live_headroom_fraction: self.template.grant_scanner_live_headroom_fraction,
+                    commit_chunk_size: self.template.grant_scanner_commit_chunk_size,
                 },
                 concurrency_reconcile_scan_slice: self.template.concurrency_reconcile_scan_slice,
                 holder_drift_scan_slice: self.template.holder_drift_scan_slice,
