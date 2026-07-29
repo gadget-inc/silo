@@ -166,6 +166,10 @@ required-features = ["server"]
 name = "task_scanner_profile"
 harness = false
 
+[[bench]]
+name = "grant_latency"
+harness = false
+
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"
