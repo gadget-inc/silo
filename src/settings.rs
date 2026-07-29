@@ -255,6 +255,17 @@ fn default_grant_scanner_live_headroom_fraction() -> f64 {
     DEFAULT_GRANT_SCANNER_LIVE_HEADROOM_FRACTION
 }
 
+/// Default for `grant_scanner_commit_chunk_size`: max grants a
+/// `process_grants` pass accumulates before committing their edits durably
+/// and waking the granted task groups' brokers. Smaller chunks stream grants
+/// out of a long read-bound pass earlier (lower leasable latency); larger
+/// chunks amortize commit overhead.
+pub const DEFAULT_GRANT_SCANNER_COMMIT_CHUNK_SIZE: usize = 16;
+
+fn default_grant_scanner_commit_chunk_size() -> usize {
+    DEFAULT_GRANT_SCANNER_COMMIT_CHUNK_SIZE
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseTemplate {
     pub backend: Backend,
@@ -346,6 +357,11 @@ pub struct DatabaseTemplate {
     /// Defaults to 0.0 (scanner may fill every slot).
     #[serde(default = "default_grant_scanner_live_headroom_fraction")]
     pub grant_scanner_live_headroom_fraction: f64,
+    /// Max grants a `process_grants` pass accumulates before committing their
+    /// edits durably and waking the granted task groups' brokers. Values
+    /// below 1 are treated as 1. Defaults to 16.
+    #[serde(default = "default_grant_scanner_commit_chunk_size")]
+    pub grant_scanner_commit_chunk_size: usize,
     /// When set, jobs that finished successfully (Succeeded) have all of their
     /// associated KV records re-put with a SlateDB row TTL expiring this many
     /// seconds in the future. `None` (the default) disables the behaviour for
@@ -420,6 +436,7 @@ impl Default for DatabaseTemplate {
             grant_scanner_next_hop_skip_min_backlog:
                 default_grant_scanner_next_hop_skip_min_backlog(),
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
+            grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
@@ -775,6 +792,11 @@ pub struct DatabaseConfig {
     /// Defaults to 0.0.
     #[serde(default = "default_grant_scanner_live_headroom_fraction")]
     pub grant_scanner_live_headroom_fraction: f64,
+    /// Max grants per durable commit chunk in a `process_grants` pass. See
+    /// `DatabaseTemplate::grant_scanner_commit_chunk_size` for details.
+    /// Defaults to 16.
+    #[serde(default = "default_grant_scanner_commit_chunk_size")]
+    pub grant_scanner_commit_chunk_size: usize,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
     /// `DatabaseTemplate::completed_job_expire_s` for details.
     #[serde(default)]
@@ -825,6 +847,7 @@ impl Default for DatabaseConfig {
             grant_scanner_next_hop_skip_min_backlog:
                 default_grant_scanner_next_hop_skip_min_backlog(),
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
+            grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: default_count_from_status_counters(),
