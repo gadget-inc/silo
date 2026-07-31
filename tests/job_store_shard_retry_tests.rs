@@ -1036,8 +1036,16 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("get a1")
         .expect("a1 exists");
     match a1.state() {
-        AttemptStatus::Failed { error_code, .. } => {
-            assert_eq!(error_code, "WORKER_CRASHED")
+        AttemptStatus::Failed {
+            error_code, error, ..
+        } => {
+            assert_eq!(error_code, "WORKER_CRASHED");
+            let message: String = rmp_serde::from_slice(&error)
+                .expect("reaped attempt error bytes should decode as a msgpack string");
+            assert!(
+                message.contains("lease expired"),
+                "unexpected reaped error message: {message}"
+            );
         }
         _ => panic!("expected Failed"),
     }
