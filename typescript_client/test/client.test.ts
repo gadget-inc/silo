@@ -20,6 +20,7 @@ import {
   isConnectivityError,
   encodeBytes,
   decodeBytes,
+  tolerantDecodeAttemptBytes,
   type EnqueueJobOptions,
   type SiloGRPCClientOptions,
   type AwaitJobOptions,
@@ -28,6 +29,13 @@ import {
   type QueryColumnInfo,
 } from "../src/client";
 import { JobHandle } from "../src/JobHandle";
+import {
+  JobStatus as ProtoJobStatus,
+  AttemptStatus as ProtoAttemptStatus,
+  type GetJobResponse,
+  type JobAttempt as ProtoJobAttempt,
+  type SerializedBytes,
+} from "../src/pb/silo";
 
 describe("encodeBytes", () => {
   it("encodes a string as msgpack bytes", () => {
@@ -90,6 +98,28 @@ describe("decodeBytes", () => {
     expect(() => decodeBytes(new Uint8Array(0), "test")).toThrow(
       "No bytes to decode for field test",
     );
+  });
+});
+
+describe("tolerantDecodeAttemptBytes", () => {
+  it("decodes valid msgpack bytes normally", () => {
+    const bytes = encodeBytes({ foo: "bar", count: 42 });
+    expect(tolerantDecodeAttemptBytes(bytes, "errorData")).toEqual({ foo: "bar", count: 42 });
+  });
+
+  it("falls back to the UTF-8 string for undecodable bytes", () => {
+    const raw = new TextEncoder().encode("lease expired at 123 (now 456), worker=w1");
+    expect(tolerantDecodeAttemptBytes(raw, "errorData")).toBe(
+      "lease expired at 123 (now 456), worker=w1",
+    );
+  });
+
+  it("returns undefined for empty bytes", () => {
+    expect(tolerantDecodeAttemptBytes(new Uint8Array(0), "errorData")).toBeUndefined();
+  });
+
+  it("returns undefined for undefined bytes", () => {
+    expect(tolerantDecodeAttemptBytes(undefined, "errorData")).toBeUndefined();
   });
 });
 
@@ -400,6 +430,122 @@ describe("SiloGRPCClient", () => {
       await expect(client.heartbeat("worker-a", "task-404", "shard-1")).rejects.toThrow(
         TaskNotFoundError,
       );
+    });
+  });
+
+  describe("attempt blob decode tolerance", () => {
+    const rawErrorText = "lease expired at 123 (now 456), worker=w1";
+    const rawErrorBytes = new TextEncoder().encode(rawErrorText);
+
+    const msgpackBytes = (value: unknown): SerializedBytes => ({
+      encoding: { oneofKind: "msgpack", msgpack: encodeBytes(value) },
+    });
+
+    const protoAttempt = (
+      attemptNumber: number,
+      overrides?: Partial<ProtoJobAttempt>,
+    ): ProtoJobAttempt => ({
+      jobId: "job-1",
+      attemptNumber,
+      taskId: `task-${attemptNumber}`,
+      status: ProtoAttemptStatus.FAILED,
+      startedAtMs: 1n,
+      finishedAtMs: 2n,
+      errorCode: "WORKER_CRASHED",
+      ...overrides,
+    });
+
+    const jobResponse = (overrides?: Partial<GetJobResponse>): GetJobResponse => ({
+      id: "job-1",
+      priority: 10,
+      enqueueTimeMs: 1n,
+      payload: msgpackBytes({ k: "v" }),
+      limits: [],
+      metadata: {},
+      status: ProtoJobStatus.FAILED,
+      statusChangedAtMs: 2n,
+      attempts: [],
+      taskGroup: "default",
+      ...overrides,
+    });
+
+    // Stubs topology + transport but NOT _withShardRetry, so getJob's decode
+    // body actually executes.
+    const stubTransport = (client: SiloGRPCClient, methods: Record<string, unknown>) => {
+      (client as any)._ensureTopology = vi.fn().mockResolvedValue(undefined);
+      (client as any)._getClientForTenant = vi
+        .fn()
+        .mockReturnValue({ shard: "shard-1", client: methods });
+    };
+
+    it("returns all attempts when one attempt's errorData is not msgpack", async () => {
+      const client = createClient({ servers: "localhost:7450", ...defaultOptions });
+      const response = jobResponse({
+        attempts: [
+          protoAttempt(1, {
+            errorData: { encoding: { oneofKind: "msgpack", msgpack: rawErrorBytes } },
+          }),
+          protoAttempt(2, { errorData: msgpackBytes({ code: "E", message: "boom" }) }),
+        ],
+      });
+      stubTransport(client, {
+        getJob: vi.fn().mockReturnValue({ response: Promise.resolve(response) }),
+      });
+
+      const job = await client.getJob("job-1", "tenant-a", { includeAttempts: true });
+
+      expect(job.attempts).toHaveLength(2);
+      expect(job.attempts?.[0].errorData).toBe(rawErrorText);
+      expect(job.attempts?.[1].errorData).toEqual({ code: "E", message: "boom" });
+    });
+
+    it("returns result undefined for a Succeeded job with zero-length result bytes", async () => {
+      const client = createClient({ servers: "localhost:7450", ...defaultOptions });
+      const response = jobResponse({
+        status: ProtoJobStatus.SUCCEEDED,
+        result: { encoding: { oneofKind: "msgpack", msgpack: new Uint8Array(0) } },
+        attempts: [
+          protoAttempt(1, {
+            status: ProtoAttemptStatus.SUCCEEDED,
+            errorCode: undefined,
+            result: { encoding: { oneofKind: "msgpack", msgpack: new Uint8Array(0) } },
+          }),
+        ],
+      });
+      stubTransport(client, {
+        getJob: vi.fn().mockReturnValue({ response: Promise.resolve(response) }),
+      });
+
+      const job = await client.getJob("job-1", "tenant-a", { includeAttempts: true });
+
+      expect(job.result).toBeUndefined();
+      expect(job.attempts?.[0].result).toBeUndefined();
+    });
+
+    it("returns the UTF-8 string when getJobResult failure data is not msgpack", async () => {
+      const client = createClient({ servers: "localhost:7450", ...defaultOptions });
+      stubTransport(client, {
+        getJobResult: vi.fn().mockReturnValue({
+          response: Promise.resolve({
+            id: "job-1",
+            status: ProtoJobStatus.FAILED,
+            finishedAtMs: 2n,
+            result: {
+              oneofKind: "failure",
+              failure: {
+                errorCode: "WORKER_CRASHED",
+                errorData: { encoding: { oneofKind: "msgpack", msgpack: rawErrorBytes } },
+              },
+            },
+          }),
+        }),
+      });
+
+      const result = await client.getJobResult("job-1", "tenant-a");
+
+      expect(result.status).toBe(JobStatus.Failed);
+      expect(result.errorCode).toBe("WORKER_CRASHED");
+      expect(result.errorData).toBe(rawErrorText);
     });
   });
 });

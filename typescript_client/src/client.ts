@@ -602,7 +602,7 @@ export interface JobAttempt<Result = unknown> {
   /** Error code if attempt failed */
   errorCode?: string;
   /** Error data if attempt failed */
-  errorData?: Record<string, unknown>;
+  errorData?: unknown;
 }
 
 /** Options for getJob */
@@ -1184,12 +1184,12 @@ function protoAttemptToPublic(attempt: ProtoJobAttempt): JobAttempt {
     finishedAtMs: attempt.finishedAtMs,
     result:
       attempt.result?.encoding.oneofKind === "msgpack"
-        ? decodeBytes(attempt.result.encoding.msgpack, "result")
+        ? tolerantDecodeAttemptBytes(attempt.result.encoding.msgpack, "result")
         : undefined,
     errorCode: attempt.errorCode,
     errorData:
       attempt.errorData?.encoding.oneofKind === "msgpack"
-        ? decodeBytes(attempt.errorData.encoding.msgpack, "errorData")
+        ? tolerantDecodeAttemptBytes(attempt.errorData.encoding.msgpack, "errorData")
         : undefined,
   };
 }
@@ -1993,7 +1993,7 @@ export class SiloGRPCClient {
           nextAttemptStartsAfterMs: response.nextAttemptStartsAfterMs,
           taskGroup: response.taskGroup,
           result: response.result
-            ? decodeBytes(
+            ? tolerantDecodeAttemptBytes(
                 response.result.encoding.oneofKind === "msgpack"
                   ? response.result.encoding.msgpack
                   : undefined,
@@ -2199,10 +2199,12 @@ export class SiloGRPCClient {
           let result: T | undefined;
           if (
             response.result.oneofKind === "successData" &&
-            response.result.successData.encoding.oneofKind === "msgpack" &&
-            response.result.successData.encoding.msgpack.length > 0
+            response.result.successData.encoding.oneofKind === "msgpack"
           ) {
-            result = decodeBytes<T>(response.result.successData.encoding.msgpack, "successData");
+            result = tolerantDecodeAttemptBytes<T>(
+              response.result.successData.encoding.msgpack,
+              "successData",
+            );
           }
           return { status: JobStatus.Succeeded, result };
         }
@@ -2211,10 +2213,12 @@ export class SiloGRPCClient {
           let errorData: unknown;
           if (
             response.result.oneofKind === "failure" &&
-            response.result.failure.errorData?.encoding.oneofKind === "msgpack" &&
-            response.result.failure.errorData.encoding.msgpack.length > 0
+            response.result.failure.errorData?.encoding.oneofKind === "msgpack"
           ) {
-            errorData = decodeBytes(response.result.failure.errorData.encoding.msgpack, "failure");
+            errorData = tolerantDecodeAttemptBytes(
+              response.result.failure.errorData.encoding.msgpack,
+              "failure",
+            );
           }
           return {
             status: JobStatus.Failed,
@@ -2613,4 +2617,29 @@ export function decodeBytes<T = unknown>(bytes: Uint8Array | undefined, field: s
     throw new Error(`No bytes to decode for field ${field}`);
   }
   return unpack(bytes) as T;
+}
+
+/**
+ * Decode attempt result/error bytes without failing the containing call.
+ * Stored attempt blobs are not guaranteed to be well-formed msgpack (some at
+ * rest are absent or raw UTF-8), and one bad blob must never fail a whole
+ * getJob/listing response. Empty or absent bytes decode to undefined; bytes
+ * that msgpack can't parse fall back to their UTF-8 string. Job payloads are
+ * always client-encoded msgpack and stay on the strict decodeBytes path.
+ * @param bytes The stored bytes to decode.
+ * @param _field The field name, kept for call-site symmetry with decodeBytes.
+ * @returns The decoded value, the UTF-8 fallback string, or undefined.
+ */
+export function tolerantDecodeAttemptBytes<T = unknown>(
+  bytes: Uint8Array | undefined,
+  _field: string,
+): T | undefined {
+  if (!bytes || bytes.length === 0) {
+    return undefined;
+  }
+  try {
+    return unpack(bytes) as T;
+  } catch {
+    return new TextDecoder().decode(bytes) as T;
+  }
 }
