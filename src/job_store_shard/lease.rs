@@ -584,15 +584,20 @@ impl JobStoreShard {
                 // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
                 // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
                 // SILO-REAP-4: Post: Set attempt status to AttemptFailed
+                let message = format!(
+                    "lease expired at {} (now {}), worker={}",
+                    decoded.expiry_ms(),
+                    now_ms,
+                    decoded.worker_id()
+                );
+                // Readers treat attempt error bytes as msgpack, so encode the
+                // message as a msgpack string rather than raw UTF-8.
+                let mut error = Vec::new();
+                rmp::encode::write_str(&mut error, &message)
+                    .expect("msgpack encoding into a Vec cannot fail");
                 AttemptOutcome::Error {
                     error_code: "WORKER_CRASHED".to_string(),
-                    error: format!(
-                        "lease expired at {} (now {}), worker={}",
-                        decoded.expiry_ms(),
-                        now_ms,
-                        decoded.worker_id()
-                    )
-                    .into_bytes(),
+                    error,
                 }
             };
 
