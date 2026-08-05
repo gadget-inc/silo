@@ -2880,22 +2880,172 @@ async fn strategy_or_arm_without_status_pin_stays_fullscan() {
 }
 
 #[silo::test]
-async fn strategy_or_of_and_stays_fullscan_for_now() {
+async fn strategy_or_of_and_with_status_pins_unionizes_and_stays_inexact() {
     let (_tmp, shard) = open_temp_shard().await;
     enqueue_job(&shard, "j1", 5, now_ms()).await;
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
 
-    // OR-of-AND state-filter shapes are not unionized yet; they stay FullScan.
+    // The combined state-filter shape: every OR arm pins status_kind, one arm
+    // carries a non-status residue. The pins union; the residue means the whole
+    // predicate must be re-applied, so it is never classified Exact.
+    let query = "SELECT id FROM jobs WHERE tenant='-' AND (status_kind IN ('Waiting','Running','Succeeded','Failed') OR (status_kind='Scheduled' AND current_attempt > 1))";
+    let strategy = strategy_for(&sql, query).await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::StatusUnion {
+            tenant: "-".to_string(),
+            statuses: vec![
+                QueryStatusFilter::Waiting,
+                QueryStatusFilter::Stored(JobStatusKind::Running),
+                QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+                QueryStatusFilter::Stored(JobStatusKind::Failed),
+                QueryStatusFilter::FutureScheduled,
+            ],
+        }
+    );
+    let classes = classifications_for(&sql, query).await;
+    let or_class = classes
+        .iter()
+        .find(|(text, _)| text.contains("current_attempt"))
+        .expect("state-shape predicate should be pushed");
+    assert_eq!(
+        or_class.1,
+        TableProviderFilterPushDown::Inexact,
+        "residue-carrying predicate must stay a post-filter"
+    );
+}
+
+#[silo::test]
+async fn strategy_or_of_and_with_composite_pins_unionizes() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // An arm's pin may itself be an OR-of-equalities (or an IN-list); the store
+    // emits such arms for state filters spanning several simple states.
     let strategy = strategy_for(
         &sql,
-        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind IN ('Waiting','Running','Succeeded','Failed') OR (status_kind='Scheduled' AND current_attempt > 1))",
+        "SELECT id FROM jobs WHERE tenant='-' AND (((status_kind='Succeeded' OR status_kind='Failed') AND current_attempt > 0) OR status_kind='Running')",
     )
     .await;
     assert_eq!(
         strategy,
-        JobsScanStrategy::FullScan {
-            tenant: Some("-".to_string()),
+        JobsScanStrategy::StatusUnion {
+            tenant: "-".to_string(),
+            statuses: vec![
+                QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+                QueryStatusFilter::Stored(JobStatusKind::Failed),
+                QueryStatusFilter::Stored(JobStatusKind::Running),
+            ],
         }
+    );
+}
+
+#[silo::test]
+async fn sql_state_filter_shape_applies_residue_on_seeded_shard() {
+    // Jobs matching an arm's status pin but failing its residue must be excluded:
+    // the union only bounds the scan; the whole predicate is re-applied.
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // retrying1: fails once with a retry budget and a long backoff → stored
+    // Scheduled with current_attempt = 2 and a future start time.
+    let policy = silo::retry::RetryPolicy {
+        retry_count: 3,
+        initial_interval_ms: 3_600_000,
+        max_interval_ms: i64::MAX,
+        randomize_interval: false,
+        backoff_factor: 2.0,
+    };
+    shard
+        .enqueue(
+            "-",
+            Some("retrying1".to_string()),
+            1,
+            now,
+            Some(policy),
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Error {
+                error_code: "TEST_ERROR".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report error");
+    // future1: never attempted, future start → matches the Scheduled pin but
+    // fails the current_attempt residue.
+    enqueue_job(&shard, "future1", 10, now + 3_600_000).await;
+    enqueue_job(&shard, "waiting1", 10, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Waiting' OR (status_kind='Scheduled' AND current_attempt > 1)) ORDER BY id",
+    )
+    .await;
+    assert_eq!(got, vec!["retrying1", "waiting1"]);
+}
+
+#[silo::test]
+async fn sql_state_filter_shape_scanned_keys_bounded_by_matches() {
+    // The combined state-filter shape must visit only the pinned status ranges,
+    // not the tenant's terminal bulk.
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+
+    // Bulk: 40 Succeeded jobs outside the pinned statuses.
+    for i in 0..40 {
+        enqueue_job(&shard, &format!("done{i:02}"), 1, now).await;
+    }
+    let tasks = shard
+        .dequeue("w", "default", 40)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 40);
+    for task in &tasks {
+        shard
+            .report_attempt_outcome(
+                task.attempt().task_id(),
+                silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("report success");
+    }
+    // Matching ranges: 2 Waiting + 1 future-Scheduled.
+    enqueue_job(&shard, "w1", 10, now).await;
+    enqueue_job(&shard, "w2", 10, now).await;
+    enqueue_job(&shard, "sched1", 10, now + 3_600_000).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let before = metrics.query_scanned_keys_value(shard.name());
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Waiting' OR (status_kind='Scheduled' AND current_attempt > 1)) ORDER BY id",
+    )
+    .await;
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - before;
+
+    // sched1 sits in the pinned Scheduled range (scanned) but fails the residue.
+    assert_eq!(got, vec!["w1", "w2"]);
+    assert!(
+        scanned < 20.0,
+        "state-filter shape scanned {scanned} keys; expected the ~3 pinned entries, not the 43-job tenant"
     );
 }
 

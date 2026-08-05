@@ -634,6 +634,7 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
     let mut tenant_filter: Option<String> = None;
     let mut status_filter: Option<QueryStatusFilter> = None;
     let mut multi_status_filter: Option<Vec<QueryStatusFilter>> = None;
+    let mut state_shape_filter: Option<Vec<QueryStatusFilter>> = None;
     let mut id_filter: Option<String> = None;
     let mut metadata_filter: Option<(String, String)> = None;
     let mut metadata_prefix_filter: Option<(String, String)> = None;
@@ -648,6 +649,8 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
             }
         } else if let Some(statuses) = parse_multi_status_predicate(f) {
             multi_status_filter = Some(statuses);
+        } else if let Some(statuses) = parse_or_of_and_status_pins(f) {
+            state_shape_filter = Some(statuses);
         } else if metadata_filter.is_none() && metadata_prefix_filter.is_none() {
             if let Some((k, v)) = parse_metadata_eq_filter(f) {
                 metadata_filter = Some((k, v));
@@ -684,7 +687,9 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
             tenant: tenant_filter,
             status,
         }
-    } else if let Some(statuses) = multi_status_filter {
+    } else if let Some(statuses) = multi_status_filter.or(state_shape_filter) {
+        // Pure multi-status predicates take precedence over residue-carrying
+        // state shapes: their Exact classification saves the post-filter.
         match (statuses.len(), &tenant_filter) {
             // A one-element predicate is just the single-status strategy.
             (1, _) => JobsScanStrategy::Status {
@@ -725,6 +730,74 @@ fn parse_multi_status_predicate(expr: &Expr) -> Option<Vec<QueryStatusFilter>> {
     let mut statuses = Vec::new();
     collect_multi_status(expr, &mut statuses)?;
     (!statuses.is_empty()).then_some(statuses)
+}
+
+/// Parse the state-filter shape: an OR chain where every arm pins `status_kind` —
+/// directly (an equality, IN-list, or OR-of-equalities) or inside an AND group
+/// alongside non-status residue (e.g. `current_attempt` predicates). Returns the
+/// union of pinned statuses.
+///
+/// The residue is not answered by a union scan, so callers must keep the whole
+/// predicate Inexact: the union only bounds which index ranges are visited.
+/// Over-coverage (an arm with several pins unions them all) is safe under the
+/// post-filter; an arm with no pin makes the shape unusable (returns None),
+/// since its rows could live under any status.
+fn parse_or_of_and_status_pins(expr: &Expr) -> Option<Vec<QueryStatusFilter>> {
+    let is_or = matches!(
+        expr,
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Or,
+            ..
+        })
+    );
+    if !is_or {
+        return None;
+    }
+    let mut statuses = Vec::new();
+    collect_state_shape_arm(expr, &mut statuses)?;
+    (!statuses.is_empty()).then_some(statuses)
+}
+
+/// Recursive worker for `parse_or_of_and_status_pins`: descends OR chains; each
+/// arm is either a pure status pin or an AND group containing at least one pin.
+fn collect_state_shape_arm(expr: &Expr, out: &mut Vec<QueryStatusFilter>) -> Option<()> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Or => {
+            collect_state_shape_arm(left, out)?;
+            collect_state_shape_arm(right, out)
+        }
+        Expr::BinaryExpr(BinaryExpr { op, .. }) if *op == Operator::And => {
+            let mut conjuncts = Vec::new();
+            flatten_and(expr, &mut conjuncts);
+            let mut arm_pinned = false;
+            for conjunct in conjuncts {
+                let mut pin = Vec::new();
+                if collect_multi_status(conjunct, &mut pin).is_some() && !pin.is_empty() {
+                    arm_pinned = true;
+                    for status in pin {
+                        if !out.contains(&status) {
+                            out.push(status);
+                        }
+                    }
+                }
+            }
+            arm_pinned.then_some(())
+        }
+        // A bare arm must be a pure pin (equality or IN-list).
+        other => collect_multi_status(other, out),
+    }
+}
+
+/// Flatten an AND chain into its conjunct expressions.
+fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr
+        && *op == Operator::And
+    {
+        flatten_and(left, out);
+        flatten_and(right, out);
+    } else {
+        out.push(expr);
+    }
 }
 
 /// Recursive worker for `parse_multi_status_predicate`: descends OR chains and
