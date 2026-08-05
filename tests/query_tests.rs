@@ -1488,8 +1488,11 @@ async fn sql_multiple_order_by() {
     assert_eq!(got, vec!["c", "b", "a"]);
 }
 
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use silo::job::{ConcurrencyLimit, JobStatusKind, Limit};
-use silo::query::{JobsScanStrategy, QueryStatusFilter, parse_jobs_scan_strategy};
+use silo::query::{
+    JobsScanStrategy, QueryStatusFilter, classify_jobs_filters, parse_jobs_scan_strategy,
+};
 
 // Helper to query queues table and extract queue names
 async fn query_queue_names(sql: &ShardQueryEngine, query: &str) -> Vec<String> {
@@ -2738,6 +2741,649 @@ async fn strategy_id_takes_priority_over_metadata() {
             tenant: Some("-".to_string()),
             id: "combo".to_string(),
         }
+    );
+}
+
+// ===== Status-union strategy tests =====
+// Multi-status predicates (IN-lists and OR-of-equalities on status_kind) plan as a
+// tenant-gated union of per-status index range scans instead of a FullScan, so
+// point-lookups scale with matching rows rather than tenant size.
+
+/// Helper: parse the strategy for a query's pushed-down filters.
+async fn strategy_for(sql: &ShardQueryEngine, query: &str) -> JobsScanStrategy {
+    let plan = sql.get_physical_plan(query).await.expect("plan");
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    parse_jobs_scan_strategy(&exprs)
+}
+
+/// Helper: classify each pushed-down filter, returning (expr-string, pushdown) pairs.
+async fn classifications_for(
+    sql: &ShardQueryEngine,
+    query: &str,
+) -> Vec<(String, TableProviderFilterPushDown)> {
+    let plan = sql.get_physical_plan(query).await.expect("plan");
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    let refs: Vec<&datafusion::prelude::Expr> = exprs.iter().collect();
+    let classes = classify_jobs_filters(&refs);
+    exprs.iter().map(|e| format!("{e}")).zip(classes).collect()
+}
+
+#[silo::test]
+async fn strategy_status_in_list_unionizes() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // 4+ elements so the SQL optimizer keeps the literal IN-list (<=3 lowers to ORs)
+    let strategy = strategy_for(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Succeeded','Failed','Cancelled','Running')",
+    )
+    .await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::StatusUnion {
+            tenant: "-".to_string(),
+            statuses: vec![
+                QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+                QueryStatusFilter::Stored(JobStatusKind::Failed),
+                QueryStatusFilter::Stored(JobStatusKind::Cancelled),
+                QueryStatusFilter::Stored(JobStatusKind::Running),
+            ],
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_status_or_of_equalities_unionizes() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    let strategy = strategy_for(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Succeeded' OR status_kind='Failed')",
+    )
+    .await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::StatusUnion {
+            tenant: "-".to_string(),
+            statuses: vec![
+                QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+                QueryStatusFilter::Stored(JobStatusKind::Failed),
+            ],
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_status_union_maps_virtual_statuses() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // Waiting and Scheduled are virtual splits of the stored Scheduled status; the
+    // union must preserve the per-element mapping.
+    let strategy = strategy_for(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Waiting' OR status_kind='Scheduled')",
+    )
+    .await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::StatusUnion {
+            tenant: "-".to_string(),
+            statuses: vec![
+                QueryStatusFilter::Waiting,
+                QueryStatusFilter::FutureScheduled
+            ],
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_tenantless_multi_status_stays_fullscan() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // Without a tenant, a union would make N full index passes where FullScan makes one.
+    let strategy = strategy_for(
+        &sql,
+        "SELECT id FROM jobs WHERE status_kind IN ('Succeeded','Failed','Cancelled','Running')",
+    )
+    .await;
+    assert_eq!(strategy, JobsScanStrategy::FullScan { tenant: None });
+}
+
+#[silo::test]
+async fn strategy_or_arm_without_status_pin_stays_fullscan() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // An OR arm that doesn't pin status_kind cannot be unionized (permanently).
+    let strategy = strategy_for(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Failed' OR id='some-id')",
+    )
+    .await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::FullScan {
+            tenant: Some("-".to_string()),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_or_of_and_stays_fullscan_for_now() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // OR-of-AND state-filter shapes are not unionized yet; they stay FullScan.
+    let strategy = strategy_for(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind IN ('Waiting','Running','Succeeded','Failed') OR (status_kind='Scheduled' AND current_attempt > 1))",
+    )
+    .await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::FullScan {
+            tenant: Some("-".to_string()),
+        }
+    );
+}
+
+#[silo::test]
+async fn strategy_single_status_equality_stays_single_status() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_job(&shard, "j1", 5, now_ms()).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // A lone equality keeps the existing single-status strategy, not a 1-element union.
+    let strategy = strategy_for(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind='Succeeded'",
+    )
+    .await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+        }
+    );
+}
+
+#[silo::test]
+async fn classify_anded_status_predicates_scans_one_keeps_other_inexact() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Seed: succeeded1 (Succeeded), fail-free job stays Scheduled
+    enqueue_job(&shard, "succeeded1", 5, now).await;
+    enqueue_job(&shard, "waiting1", 10, now).await;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report success");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = "SELECT id FROM jobs WHERE tenant='-' AND status_kind='Succeeded' AND status_kind IN ('Succeeded','Failed','Cancelled','Running')";
+
+    // The single-equality predicate drives the scan; the IN predicate must stay an
+    // Inexact post-filter (never silently dropped).
+    let strategy = strategy_for(&sql, query).await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::Status {
+            tenant: Some("-".to_string()),
+            status: QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+        }
+    );
+    let classes = classifications_for(&sql, query).await;
+    let in_class = classes
+        .iter()
+        .find(|(text, _)| text.contains("IN"))
+        .expect("IN predicate should be pushed");
+    assert_eq!(in_class.1, TableProviderFilterPushDown::Inexact);
+
+    // Results match the AND of both predicates.
+    let got = query_ids(&sql, query).await;
+    assert_eq!(got, vec!["succeeded1"]);
+}
+
+#[silo::test]
+async fn classify_metadata_with_multi_status_keeps_status_inexact() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    // Two jobs share the metadata key; only one is pending. Marking the status
+    // predicate Exact for the metadata strategy would silently drop it (the
+    // bulk-cancel-preview shape).
+    enqueue_job_with_metadata(
+        &shard,
+        "meta-pending",
+        10,
+        now,
+        vec![("queue".to_string(), "q1".to_string())],
+    )
+    .await;
+    enqueue_job_with_metadata(
+        &shard,
+        "meta-done",
+        5,
+        now,
+        vec![("queue".to_string(), "q1".to_string())],
+    )
+    .await;
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report success");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'queue'), 'q1') AND status_kind IN ('Waiting','Scheduled','Running','Failed')";
+
+    let strategy = strategy_for(&sql, query).await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::MetadataExact {
+            tenant: Some("-".to_string()),
+            key: "queue".to_string(),
+            value: "q1".to_string(),
+        }
+    );
+    let classes = classifications_for(&sql, query).await;
+    let in_class = classes
+        .iter()
+        .find(|(text, _)| text.contains("IN"))
+        .expect("IN predicate should be pushed");
+    assert_eq!(in_class.1, TableProviderFilterPushDown::Inexact);
+
+    let got = query_ids(&sql, query).await;
+    assert_eq!(got, vec!["meta-pending"]);
+}
+
+/// Seed a mixed-status tenant on `-`: waiting1, waiting2 (Waiting),
+/// future1 (Scheduled, +1h), running1 (Running), succeeded1 (Succeeded),
+/// failed1 (Failed). Priorities force the dequeue order used to reach each state.
+async fn seed_mixed_status_jobs(shard: &Arc<JobStoreShard>) {
+    let now = now_ms();
+    enqueue_job(shard, "succeeded1", 1, now).await;
+    enqueue_job(shard, "failed1", 2, now).await;
+    enqueue_job(shard, "running1", 3, now).await;
+    enqueue_job(shard, "waiting1", 10, now).await;
+    enqueue_job(shard, "waiting2", 10, now).await;
+    // Scheduled start far from the clock so the virtual Waiting/Scheduled labels
+    // stay deterministic mid-test.
+    enqueue_job(shard, "future1", 10, now + 3_600_000).await;
+
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report success");
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Error {
+                error_code: "TEST_ERROR".to_string(),
+                error: vec![],
+            },
+        )
+        .await
+        .expect("report error");
+    // running1 stays leased (Running)
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1, "running1 should be leased");
+}
+
+/// Extract (string, i64) column pairs from result batches (e.g. GROUP BY output).
+fn extract_string_i64_pairs(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 column");
+        for i in 0..keys.len() {
+            out.push((keys.value(i).to_string(), vals.value(i)));
+        }
+    }
+    out
+}
+
+#[silo::test]
+async fn sql_multi_status_union_returns_expected_rows() {
+    // The correctness oracle is the hand-specified expected set — there is no way
+    // to force the same SQL through FullScan post-change.
+    let (_tmp, shard) = open_temp_shard().await;
+    seed_mixed_status_jobs(&shard).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // Listing shape (sorts on a job_info column → point-lookup hydration path).
+    // future1 is excluded: its virtual status is Scheduled, not Waiting.
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Waiting','Running','Succeeded','Failed') ORDER BY enqueue_time_ms DESC, id ASC",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec!["failed1", "running1", "succeeded1", "waiting1", "waiting2"]
+    );
+
+    // Virtual-status split on the index-only path: Waiting and Scheduled are
+    // disjoint halves of the stored Scheduled range.
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Waiting' OR status_kind='Scheduled') ORDER BY id",
+    )
+    .await;
+    assert_eq!(got, vec!["future1", "waiting1", "waiting2"]);
+
+    // OR shape across a stored and a virtual status, hydration path.
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Succeeded' OR status_kind='Scheduled') ORDER BY enqueue_time_ms DESC, id ASC",
+    )
+    .await;
+    assert_eq!(got, vec!["future1", "succeeded1"]);
+}
+
+#[silo::test]
+async fn sql_multi_status_group_by_stays_index_only() {
+    // Aggregate shapes over a multi-status filter must ride the index-only union
+    // path — regressing to per-row status lookups would put queue-stats rollups
+    // back on the point-lookup treadmill.
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    seed_mixed_status_jobs(&shard).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    let lookups_before = metrics.query_point_lookups_value(shard.name());
+    let scanned_before = metrics.query_scanned_keys_value(shard.name());
+    let batches = sql
+        .sql("SELECT status_kind, COUNT(*) as cnt FROM jobs WHERE tenant='-' AND status_kind IN ('Waiting','Scheduled','Running','Succeeded') GROUP BY status_kind ORDER BY status_kind")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let lookups_after = metrics.query_point_lookups_value(shard.name());
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - scanned_before;
+
+    assert_eq!(
+        extract_string_i64_pairs(&batches),
+        vec![
+            ("Running".to_string(), 1),
+            ("Scheduled".to_string(), 1),
+            ("Succeeded".to_string(), 1),
+            ("Waiting".to_string(), 2),
+        ]
+    );
+    assert_eq!(
+        lookups_after, lookups_before,
+        "index-only union must not hydrate rows via point-lookups"
+    );
+    // Only the matching status ranges are visited: 5 matching index entries, not
+    // the tenant's whole status prefix (failed1's range is skipped).
+    assert!(
+        scanned <= 10.0,
+        "index-only union scanned {scanned} keys; expected only the 5 matching entries"
+    );
+}
+
+#[silo::test]
+async fn sql_queue_stats_pending_shape_scans_only_matching_entries() {
+    // The queue-stats pending breakdown (2-element IN + metadata projection) must
+    // visit only the matching pending index entries, not the tenant's terminal bulk.
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+
+    // Bulk: 40 terminal (Succeeded) jobs.
+    for i in 0..40 {
+        enqueue_job(&shard, &format!("done{i:02}"), 1, now).await;
+    }
+    let tasks = shard
+        .dequeue("w", "default", 40)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 40);
+    for task in &tasks {
+        shard
+            .report_attempt_outcome(
+                task.attempt().task_id(),
+                silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("report success");
+    }
+    // Matching: 2 waiting + 1 future-scheduled, all in queue q1.
+    let queue_meta = vec![("queue".to_string(), "q1".to_string())];
+    enqueue_job_with_metadata(&shard, "p1", 10, now, queue_meta.clone()).await;
+    enqueue_job_with_metadata(&shard, "p2", 10, now, queue_meta.clone()).await;
+    enqueue_job_with_metadata(&shard, "p3", 10, now + 3_600_000, queue_meta).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let scanned_before = metrics.query_scanned_keys_value(shard.name());
+    let lookups_before = metrics.query_point_lookups_value(shard.name());
+    let batches = sql
+        .sql(
+            "SELECT queue_name, COUNT(*) as cnt FROM (SELECT array_any_value(element_at(metadata, 'queue')) as queue_name FROM jobs WHERE tenant='-' AND status_kind IN ('Waiting','Scheduled') LIMIT 10000) GROUP BY queue_name",
+        )
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - scanned_before;
+    let lookups = metrics.query_point_lookups_value(shard.name()) - lookups_before;
+
+    assert_eq!(
+        extract_string_i64_pairs(&batches),
+        vec![("q1".to_string(), 3)]
+    );
+    assert!(
+        scanned < 20.0,
+        "pending breakdown scanned {scanned} keys; expected ~3 matching, not the 43-job tenant"
+    );
+    assert!(
+        lookups <= 3.0,
+        "pending breakdown hydrated {lookups} rows; only the 3 matches should be point-looked-up"
+    );
+}
+
+#[silo::test]
+async fn sql_multi_status_scanned_keys_bounded_by_matches() {
+    // A multi-status query's scan work scales with matching index entries, not
+    // tenant size — the property that makes admin listings safe on huge tenants.
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+
+    // Bulk: 60 Waiting jobs that must NOT be visited.
+    for i in 0..60 {
+        enqueue_job(&shard, &format!("bulk{i:02}"), 50, now).await;
+    }
+    // Matching: 3 Succeeded + 2 Failed.
+    for i in 0..5 {
+        enqueue_job(&shard, &format!("term{i}"), 1, now).await;
+    }
+    let tasks = shard
+        .dequeue("w", "default", 5)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 5);
+    for (i, task) in tasks.iter().enumerate() {
+        let outcome = if i < 3 {
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] }
+        } else {
+            silo::job_attempt::AttemptOutcome::Error {
+                error_code: "TEST_ERROR".to_string(),
+                error: vec![],
+            }
+        };
+        shard
+            .report_attempt_outcome(task.attempt().task_id(), outcome)
+            .await
+            .expect("report outcome");
+    }
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let before = metrics.query_scanned_keys_value(shard.name());
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Succeeded','Failed','Cancelled','Running') ORDER BY id",
+    )
+    .await;
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - before;
+
+    assert_eq!(got, vec!["term0", "term1", "term2", "term3", "term4"]);
+    assert!(
+        scanned < 30.0,
+        "multi-status scan visited {scanned} keys; expected ~5 matching, not the 65-job tenant"
+    );
+}
+
+#[silo::test]
+async fn sql_multi_status_limit_stops_early_across_ranges() {
+    // A scan limit short-circuits across union arms: rows already emitted by an
+    // earlier arm count against the limit, and no arm over-scans past it.
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+
+    // 3 Failed + 30 Succeeded.
+    for i in 0..3 {
+        enqueue_job(&shard, &format!("f{i}"), 1, now).await;
+    }
+    for i in 0..30 {
+        enqueue_job(&shard, &format!("s{i:02}"), 2, now).await;
+    }
+    let tasks = shard
+        .dequeue("w", "default", 3)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 3);
+    for task in &tasks {
+        shard
+            .report_attempt_outcome(
+                task.attempt().task_id(),
+                silo::job_attempt::AttemptOutcome::Error {
+                    error_code: "TEST_ERROR".to_string(),
+                    error: vec![],
+                },
+            )
+            .await
+            .expect("report error");
+    }
+    let tasks = shard
+        .dequeue("w", "default", 30)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 30);
+    for task in &tasks {
+        shard
+            .report_attempt_outcome(
+                task.attempt().task_id(),
+                silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("report success");
+    }
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // Limit spanning both arms: the Failed arm exhausts (3), Succeeded fills the rest.
+    let before = metrics.query_scanned_keys_value(shard.name());
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Failed','Succeeded') LIMIT 10",
+    )
+    .await;
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - before;
+    assert_eq!(got.len(), 10, "LIMIT 10 should return 10 rows");
+    assert!(
+        scanned < 25.0,
+        "LIMIT 10 scanned {scanned} keys; expected ~10, not all 33 matching rows"
+    );
+
+    // Limit satisfied inside the first arm: later arms must not be scanned.
+    let before = metrics.query_scanned_keys_value(shard.name());
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Failed','Succeeded') LIMIT 2",
+    )
+    .await;
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - before;
+    assert_eq!(got.len(), 2, "LIMIT 2 should return 2 rows");
+    assert!(
+        scanned < 10.0,
+        "LIMIT 2 scanned {scanned} keys; the Succeeded arm should not be visited"
+    );
+
+    // Same short-circuit on the point-lookup hydration path (projects a status
+    // record column, so rows are hydrated in bounded batches).
+    let lookups_before = metrics.query_point_lookups_value(shard.name());
+    let batches = sql
+        .sql("SELECT id, current_attempt FROM jobs WHERE tenant='-' AND status_kind IN ('Failed','Succeeded') LIMIT 4")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let lookups = metrics.query_point_lookups_value(shard.name()) - lookups_before;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 4, "LIMIT 4 should return 4 rows");
+    assert!(
+        lookups <= 4.0,
+        "LIMIT 4 hydrated {lookups} rows; hydration must not run ahead of the limit"
     );
 }
 
