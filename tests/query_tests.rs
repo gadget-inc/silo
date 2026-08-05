@@ -3128,19 +3128,22 @@ async fn classify_metadata_with_multi_status_keeps_status_inexact() {
 
     // Two jobs share the metadata key; only one is pending. Marking the status
     // predicate Exact for the metadata strategy would silently drop it (the
-    // bulk-cancel-preview shape).
+    // bulk-cancel-preview shape). meta-done is enqueued first with an earlier
+    // start time: the broker ingests task writes asynchronously, so dequeue
+    // order between concurrently-enqueued jobs is only guaranteed when arrival
+    // order and task-key order agree.
     enqueue_job_with_metadata(
         &shard,
-        "meta-pending",
-        10,
-        now,
+        "meta-done",
+        5,
+        now - 60_000,
         vec![("queue".to_string(), "q1".to_string())],
     )
     .await;
     enqueue_job_with_metadata(
         &shard,
-        "meta-done",
-        5,
+        "meta-pending",
+        10,
         now,
         vec![("queue".to_string(), "q1".to_string())],
     )
@@ -3150,6 +3153,11 @@ async fn classify_metadata_with_multi_status_keeps_status_inexact() {
         .await
         .expect("dequeue")
         .tasks;
+    assert_eq!(
+        tasks[0].job().id(),
+        "meta-done",
+        "expected meta-done (earlier start, lower priority value) to dequeue first"
+    );
     shard
         .report_attempt_outcome(
             tasks[0].attempt().task_id(),
