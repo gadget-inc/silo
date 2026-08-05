@@ -570,41 +570,20 @@ fn classify_filter_pushdown(
     if let Some((col, val)) = parse_eq_filter(expr) {
         let col_name = col.rsplit('.').next().unwrap_or(&col);
         return match (col_name, strategy) {
-            // Tenant scopes every strategy's scan range when present.
-            (
-                "tenant",
-                JobsScanStrategy::ExactId {
-                    tenant: Some(_), ..
-                },
-            )
-            | (
-                "tenant",
-                JobsScanStrategy::MetadataExact {
-                    tenant: Some(_), ..
-                },
-            )
-            | (
-                "tenant",
-                JobsScanStrategy::MetadataPrefix {
-                    tenant: Some(_), ..
-                },
-            )
-            | (
-                "tenant",
-                JobsScanStrategy::Status {
-                    tenant: Some(_), ..
-                },
-            )
-            | ("tenant", JobsScanStrategy::StatusUnion { .. })
-            | ("tenant", JobsScanStrategy::FullScan { tenant: Some(_) }) => Exact,
+            // An equality is Exact only when its value is the one the strategy
+            // actually planned — with conflicting duplicates (tenant='a' AND
+            // tenant='b') last-write-wins picks one, and the loser must stay an
+            // Inexact post-filter rather than being silently dropped.
+            ("tenant", _) if strategy_tenant(strategy) == Some(val.as_str()) => Exact,
             // ExactId with tenant: direct pair construction answers both filters.
             // Without tenant it falls back to scan_all_jobs + in-memory filter.
             (
                 "id",
                 JobsScanStrategy::ExactId {
-                    tenant: Some(_), ..
+                    tenant: Some(_),
+                    id,
                 },
-            ) => Exact,
+            ) if *id == val => Exact,
             ("status_kind", JobsScanStrategy::Status { status, .. })
                 if parse_status_kind(&val) == Some(*status) =>
             {
@@ -628,6 +607,18 @@ fn classify_filter_pushdown(
         };
     }
     Inexact
+}
+
+/// The tenant a strategy's scan is actually scoped to, if any.
+fn strategy_tenant(strategy: &JobsScanStrategy) -> Option<&str> {
+    match strategy {
+        JobsScanStrategy::ExactId { tenant, .. }
+        | JobsScanStrategy::MetadataExact { tenant, .. }
+        | JobsScanStrategy::MetadataPrefix { tenant, .. }
+        | JobsScanStrategy::Status { tenant, .. }
+        | JobsScanStrategy::FullScan { tenant } => tenant.as_deref(),
+        JobsScanStrategy::StatusUnion { tenant, .. } => Some(tenant),
+    }
 }
 
 pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
@@ -1089,23 +1080,14 @@ fn status_index_stream(
                     Some(scan_now),
                 )
             }
+            JobsScanStrategy::FullScan { tenant: Some(t) } => {
+                let start = crate::keys::idx_status_time_tenant_prefix(t);
+                let end = crate::keys::end_bound(&start);
+                (vec![(start, end)], None)
+            }
             _ => {
-                let tenant = match &strategy {
-                    JobsScanStrategy::FullScan { tenant } => tenant.clone(),
-                    _ => None,
-                };
-                let (start, end) = match &tenant {
-                    Some(t) => {
-                        let s = crate::keys::idx_status_time_tenant_prefix(t);
-                        let e = crate::keys::end_bound(&s);
-                        (s, e)
-                    }
-                    None => {
-                        let s = crate::keys::idx_status_time_all_prefix();
-                        let e = crate::keys::end_bound(&s);
-                        (s, e)
-                    }
-                };
+                let start = crate::keys::idx_status_time_all_prefix();
+                let end = crate::keys::end_bound(&start);
                 (vec![(start, end)], None)
             }
         };
@@ -1545,23 +1527,16 @@ fn pairs_scan_plans(
     now_ms: i64,
 ) -> Vec<(Vec<u8>, Vec<u8>, PairExtractor)> {
     if let JobsScanStrategy::StatusUnion { tenant, statuses } = strategy {
-        // Per-status ranges are disjoint at any instant (a job has exactly one
-        // stored status; the Waiting/FutureScheduled split partitions by time
-        // against the shared `now_ms` snapshot), so no cross-range dedup is needed.
+        // Per-status byte ranges are disjoint against the shared `now_ms`
+        // snapshot (a job has exactly one stored status; the virtual
+        // Waiting/FutureScheduled split partitions by time), so no cross-range
+        // dedup is performed. Each arm still opens its own cursor at its own DB
+        // snapshot, so a job transitioning between two union statuses mid-scan
+        // can straddle arms — the same tolerance today's index streams have for
+        // mid-scan transitions.
         return statuses
             .iter()
-            .map(|status| {
-                let (start, end) = status_index_range(tenant, *status, now_ms);
-                let tenant = tenant.clone();
-                let f: PairExtractor = Box::new(move |k: &[u8]| {
-                    ControlFlow::Continue(
-                        crate::keys::parse_status_time_index_key(k)
-                            .filter(|p| !p.job_id.is_empty())
-                            .map(|p| (tenant.clone(), p.job_id)),
-                    )
-                });
-                (start, end, f)
-            })
+            .map(|status| status_pairs_scan_plan(Some(tenant), *status, now_ms))
             .collect();
     }
     vec![single_pairs_scan_plan(strategy, now_ms)]

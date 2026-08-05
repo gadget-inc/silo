@@ -142,7 +142,7 @@ pub struct Metrics {
     /// stops early (LIMIT reached, deadline fired, stream dropped) stops
     /// advancing this counter — the signal that a query is not running as a zombie.
     query_scanned_keys: CounterVec,
-    /// Rows hydrated via job_info/status point-lookups by query scans, per
+    /// Point-lookup keys requested from job_info/status by query scans, per
     /// shard. Stays flat for index-only scans — the signal that an aggregate
     /// shape rode the index-only path instead of per-row hydration.
     query_point_lookups: CounterVec,
@@ -438,7 +438,8 @@ impl Metrics {
     }
 
     /// Add `n` to the per-shard query point-lookup counter. Called by the jobs
-    /// scanner for every batch of rows it hydrates via point-lookups.
+    /// scanner for every batch of keys it requests via point-lookups (whether or
+    /// not each key resolves to a live row).
     pub fn record_query_point_lookups(&self, shard: &str, n: u64) {
         self.query_point_lookups
             .with_label_values(&[shard])
@@ -2007,7 +2008,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         CounterVec::new(
             Opts::new(
                 "silo_query_point_lookups_total",
-                "Rows hydrated via job_info/status point-lookups by query scans per shard",
+                "Point-lookup keys requested from job_info/status by query scans per shard",
             ),
             &["shard"],
         )?,

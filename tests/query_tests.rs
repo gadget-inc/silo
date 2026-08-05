@@ -2777,11 +2777,8 @@ async fn strategy_status_in_list_unionizes() {
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
 
     // 4+ elements so the SQL optimizer keeps the literal IN-list (<=3 lowers to ORs)
-    let strategy = strategy_for(
-        &sql,
-        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Succeeded','Failed','Cancelled','Running')",
-    )
-    .await;
+    let query = "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Succeeded','Failed','Cancelled','Running')";
+    let strategy = strategy_for(&sql, query).await;
     assert_eq!(
         strategy,
         JobsScanStrategy::StatusUnion {
@@ -2794,6 +2791,14 @@ async fn strategy_status_in_list_unionizes() {
             ],
         }
     );
+    // The pure IN predicate is fully answered by the union scan, so it is
+    // classified Exact — no redundant post-filter.
+    let classes = classifications_for(&sql, query).await;
+    let in_class = classes
+        .iter()
+        .find(|(text, _)| text.contains("IN"))
+        .expect("IN predicate should be pushed");
+    assert_eq!(in_class.1, TableProviderFilterPushDown::Exact);
 }
 
 #[silo::test]
@@ -3195,6 +3200,11 @@ async fn seed_mixed_status_jobs(shard: &Arc<JobStoreShard>) {
         .await
         .expect("dequeue")
         .tasks;
+    assert_eq!(
+        tasks[0].job().id(),
+        "succeeded1",
+        "expected succeeded1 (priority 1) to dequeue first"
+    );
     shard
         .report_attempt_outcome(
             tasks[0].attempt().task_id(),
@@ -3207,6 +3217,11 @@ async fn seed_mixed_status_jobs(shard: &Arc<JobStoreShard>) {
         .await
         .expect("dequeue")
         .tasks;
+    assert_eq!(
+        tasks[0].job().id(),
+        "failed1",
+        "expected failed1 (priority 2) to dequeue second"
+    );
     shard
         .report_attempt_outcome(
             tasks[0].attempt().task_id(),
@@ -3224,6 +3239,11 @@ async fn seed_mixed_status_jobs(shard: &Arc<JobStoreShard>) {
         .expect("dequeue")
         .tasks;
     assert_eq!(tasks.len(), 1, "running1 should be leased");
+    assert_eq!(
+        tasks[0].job().id(),
+        "running1",
+        "expected running1 (priority 3) to dequeue third"
+    );
 }
 
 /// Extract (string, i64) column pairs from result batches (e.g. GROUP BY output).
@@ -3286,6 +3306,51 @@ async fn sql_multi_status_union_returns_expected_rows() {
 }
 
 #[silo::test]
+async fn sql_tenant_scoped_not_in_stays_fullscan_and_returns_complement() {
+    // NOT IN must never unionize — a union of the listed statuses would return
+    // exactly the rows the predicate excludes. It stays a tenant-scoped FullScan
+    // with the predicate re-applied.
+    let (_tmp, shard) = open_temp_shard().await;
+    seed_mixed_status_jobs(&shard).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    let query = "SELECT id FROM jobs WHERE tenant='-' AND status_kind NOT IN ('Succeeded','Failed','Cancelled') ORDER BY id";
+    let strategy = strategy_for(&sql, query).await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::FullScan {
+            tenant: Some("-".to_string()),
+        }
+    );
+    let got = query_ids(&sql, query).await;
+    assert_eq!(got, vec!["future1", "running1", "waiting1", "waiting2"]);
+}
+
+#[silo::test]
+async fn sql_overlapping_union_arms_dedupe_statuses_and_rows() {
+    // Arms pinning the same status collapse to one range scan, so a matching job
+    // appears exactly once even when several arms cover it.
+    let (_tmp, shard) = open_temp_shard().await;
+    seed_mixed_status_jobs(&shard).await;
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    let query = "SELECT id FROM jobs WHERE tenant='-' AND (status_kind='Failed' OR (status_kind='Failed' AND current_attempt > 0) OR status_kind='Succeeded') ORDER BY id";
+    let strategy = strategy_for(&sql, query).await;
+    assert_eq!(
+        strategy,
+        JobsScanStrategy::StatusUnion {
+            tenant: "-".to_string(),
+            statuses: vec![
+                QueryStatusFilter::Stored(JobStatusKind::Failed),
+                QueryStatusFilter::Stored(JobStatusKind::Succeeded),
+            ],
+        }
+    );
+    let got = query_ids(&sql, query).await;
+    assert_eq!(got, vec!["failed1", "succeeded1"]);
+}
+
+#[silo::test]
 async fn sql_multi_status_group_by_stays_index_only() {
     // Aggregate shapes over a multi-status filter must ride the index-only union
     // path — regressing to per-row status lookups would put queue-stats rollups
@@ -3319,11 +3384,12 @@ async fn sql_multi_status_group_by_stays_index_only() {
         lookups_after, lookups_before,
         "index-only union must not hydrate rows via point-lookups"
     );
-    // Only the matching status ranges are visited: 5 matching index entries, not
-    // the tenant's whole status prefix (failed1's range is skipped).
+    // Only the matching status ranges are visited: exactly the 5 matching index
+    // entries. The bound sits below the 6-entry tenant total so a regression to
+    // the whole-prefix FullScan (which would also visit failed1's entry) fails.
     assert!(
-        scanned <= 10.0,
-        "index-only union scanned {scanned} keys; expected only the 5 matching entries"
+        scanned < 6.0,
+        "index-only union scanned {scanned} keys; expected only the 5 matching entries, not failed1's range"
     );
 }
 
