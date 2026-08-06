@@ -82,6 +82,9 @@ pub fn stream_with_deadline(
 /// closure so streaming scans can early-exit (`Break`) and skip (`Continue(None)`).
 type PairExtractor = Box<dyn Fn(&[u8]) -> ControlFlow<(), Option<(String, String)>> + Send>;
 
+/// An inclusive-start / exclusive-end key range for a range scan.
+type KeyRange = (Vec<u8>, Vec<u8>);
+
 /// Map any displayable error into a DataFusion execution error.
 fn exec_err(e: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Execution(e.to_string())
@@ -456,6 +459,14 @@ pub enum JobsScanStrategy {
         tenant: Option<String>,
         status: QueryStatusFilter,
     },
+    /// Union of per-status index range scans for a multi-status predicate
+    /// (a literal IN-list or an OR of equalities on status_kind). Tenant-gated:
+    /// without a tenant filter a union would make N full index passes where a
+    /// FullScan makes one, so it is never selected tenant-less.
+    StatusUnion {
+        tenant: String,
+        statuses: Vec<QueryStatusFilter>,
+    },
     /// Full scan (no index-backed filter)
     FullScan { tenant: Option<String> },
 }
@@ -487,6 +498,18 @@ impl std::fmt::Display for JobsScanStrategy {
             JobsScanStrategy::Status { tenant, status } => {
                 write!(f, "Status(tenant={:?}, status={})", tenant, status)
             }
+            JobsScanStrategy::StatusUnion { tenant, statuses } => {
+                let statuses = statuses
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write!(
+                    f,
+                    "StatusUnion(tenant={:?}, statuses=[{}])",
+                    tenant, statuses
+                )
+            }
             JobsScanStrategy::FullScan { tenant } => {
                 write!(f, "FullScan(tenant={:?})", tenant)
             }
@@ -504,16 +527,9 @@ pub fn classify_jobs_filters(filters: &[&Expr]) -> Vec<TableProviderFilterPushDo
     let unqualified_filters: Vec<Expr> = filters.iter().map(|f| unqualify_expr(f)).collect();
     let strategy = parse_jobs_scan_strategy(&unqualified_filters);
 
-    filters
+    unqualified_filters
         .iter()
-        .map(|f| {
-            if let Some((col, _)) = parse_eq_filter(f) {
-                let col_name = col.rsplit('.').next().unwrap_or(&col);
-                classify_filter_pushdown(col_name, &strategy)
-            } else {
-                TableProviderFilterPushDown::Inexact
-            }
-        })
+        .map(|f| classify_filter_pushdown(f, &strategy))
         .collect()
 }
 
@@ -526,50 +542,90 @@ fn unqualify_expr(expr: &Expr) -> Expr {
             op: *op,
             right: Box::new(unqualify_expr(right)),
         }),
+        Expr::InList(inlist) => Expr::InList(datafusion::logical_expr::expr::InList {
+            expr: Box::new(unqualify_expr(&inlist.expr)),
+            list: inlist.list.iter().map(unqualify_expr).collect(),
+            negated: inlist.negated,
+        }),
         Expr::Column(col) => Expr::Column(datafusion::common::Column::new_unqualified(&col.name)),
         other => other.clone(),
     }
 }
 
-/// Determine if a specific filter column is Exact (fully handled) for the given strategy.
-/// A filter is Exact when the scan guarantees correct results without post-filtering.
+/// Determine if a filter expression is Exact (fully handled) for the given strategy.
+/// A filter is Exact only when the chosen scan guarantees correct results without
+/// re-applying it; everything else stays Inexact so DataFusion adds a post-filter.
+///
+/// Status predicates are matched against the strategy they produced: a status
+/// equality is Exact only under the single-status strategy for that same status,
+/// and a multi-status predicate (IN / OR-of-equalities) is Exact only when it is
+/// the union the strategy actually scans. When several status predicates are
+/// ANDed, only the one driving the scan is Exact — the rest must be re-applied,
+/// never silently dropped.
 fn classify_filter_pushdown(
-    col_name: &str,
+    expr: &Expr,
     strategy: &JobsScanStrategy,
 ) -> TableProviderFilterPushDown {
+    use TableProviderFilterPushDown::{Exact, Inexact};
+    if let Some((col, val)) = parse_eq_filter(expr) {
+        let col_name = col.rsplit('.').next().unwrap_or(&col);
+        return match (col_name, strategy) {
+            // An equality is Exact only when its value is the one the strategy
+            // actually planned — with conflicting duplicates (tenant='a' AND
+            // tenant='b') last-write-wins picks one, and the loser must stay an
+            // Inexact post-filter rather than being silently dropped.
+            ("tenant", _) if strategy_tenant(strategy) == Some(val.as_str()) => Exact,
+            // ExactId with tenant: direct pair construction answers both filters.
+            // Without tenant it falls back to scan_all_jobs + in-memory filter.
+            (
+                "id",
+                JobsScanStrategy::ExactId {
+                    tenant: Some(_),
+                    id,
+                },
+            ) if *id == val => Exact,
+            ("status_kind", JobsScanStrategy::Status { status, .. })
+                if parse_status_kind(&val) == Some(*status) =>
+            {
+                Exact
+            }
+            _ => Inexact,
+        };
+    }
+    if let Some(statuses) = parse_multi_status_predicate(expr) {
+        return match strategy {
+            JobsScanStrategy::StatusUnion {
+                statuses: chosen, ..
+            } if *chosen == statuses => Exact,
+            // A one-element predicate collapses to the single-status strategy.
+            JobsScanStrategy::Status { status, .. }
+                if statuses.len() == 1 && statuses[0] == *status =>
+            {
+                Exact
+            }
+            _ => Inexact,
+        };
+    }
+    Inexact
+}
+
+/// The tenant a strategy's scan is actually scoped to, if any.
+fn strategy_tenant(strategy: &JobsScanStrategy) -> Option<&str> {
     match strategy {
-        // ExactId with tenant: both filters are handled exactly (direct pair construction).
-        // ExactId without tenant: the scan falls back to scan_all_jobs + in-memory filter,
-        // so neither filter is exact (limit pushdown would truncate before filtering).
-        JobsScanStrategy::ExactId { tenant, .. } => match col_name {
-            "id" if tenant.is_some() => TableProviderFilterPushDown::Exact,
-            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
-            _ => TableProviderFilterPushDown::Inexact,
-        },
-        // Status: tenant scopes the scan, status_kind selects the index range.
-        JobsScanStrategy::Status { tenant, .. } => match col_name {
-            "status_kind" => TableProviderFilterPushDown::Exact,
-            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
-            _ => TableProviderFilterPushDown::Inexact,
-        },
-        // Metadata strategies: tenant is handled, but status_kind is NOT filtered
-        // by the metadata index scan, so it must remain Inexact.
-        JobsScanStrategy::MetadataExact { tenant, .. }
-        | JobsScanStrategy::MetadataPrefix { tenant, .. } => match col_name {
-            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
-            _ => TableProviderFilterPushDown::Inexact,
-        },
-        // FullScan: tenant scopes the scan range but no other filters are handled.
-        JobsScanStrategy::FullScan { tenant } => match col_name {
-            "tenant" if tenant.is_some() => TableProviderFilterPushDown::Exact,
-            _ => TableProviderFilterPushDown::Inexact,
-        },
+        JobsScanStrategy::ExactId { tenant, .. }
+        | JobsScanStrategy::MetadataExact { tenant, .. }
+        | JobsScanStrategy::MetadataPrefix { tenant, .. }
+        | JobsScanStrategy::Status { tenant, .. }
+        | JobsScanStrategy::FullScan { tenant } => tenant.as_deref(),
+        JobsScanStrategy::StatusUnion { tenant, .. } => Some(tenant),
     }
 }
 
 pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
     let mut tenant_filter: Option<String> = None;
     let mut status_filter: Option<QueryStatusFilter> = None;
+    let mut multi_status_filter: Option<Vec<QueryStatusFilter>> = None;
+    let mut state_shape_filter: Option<Vec<QueryStatusFilter>> = None;
     let mut id_filter: Option<String> = None;
     let mut metadata_filter: Option<(String, String)> = None;
     let mut metadata_prefix_filter: Option<(String, String)> = None;
@@ -582,6 +638,10 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
                 "id" => id_filter = Some(val),
                 _ => {}
             }
+        } else if let Some(statuses) = parse_multi_status_predicate(f) {
+            multi_status_filter = Some(statuses);
+        } else if let Some(statuses) = parse_or_of_and_status_pins(f) {
+            state_shape_filter = Some(statuses);
         } else if metadata_filter.is_none() && metadata_prefix_filter.is_none() {
             if let Some((k, v)) = parse_metadata_eq_filter(f) {
                 metadata_filter = Some((k, v));
@@ -611,13 +671,162 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
             prefix,
         }
     } else if let Some(status) = status_filter {
+        // When a single-status equality is ANDed with a multi-status predicate,
+        // the equality drives the scan (its range is a subset of any union) and
+        // the multi-status predicate stays an Inexact post-filter.
         JobsScanStrategy::Status {
             tenant: tenant_filter,
             status,
         }
+    } else if let Some(statuses) = multi_status_filter.or(state_shape_filter) {
+        // Pure multi-status predicates take precedence over residue-carrying
+        // state shapes: their Exact classification saves the post-filter.
+        match (statuses.len(), &tenant_filter) {
+            // A one-element predicate is just the single-status strategy.
+            (1, _) => JobsScanStrategy::Status {
+                tenant: tenant_filter,
+                status: statuses[0],
+            },
+            // Tenant-gated: a tenant-less union would make N full index passes
+            // where a single FullScan makes one.
+            (_, Some(tenant)) => JobsScanStrategy::StatusUnion {
+                tenant: tenant.clone(),
+                statuses,
+            },
+            (_, None) => JobsScanStrategy::FullScan {
+                tenant: tenant_filter,
+            },
+        }
     } else {
         JobsScanStrategy::FullScan {
             tenant: tenant_filter,
+        }
+    }
+}
+
+/// Parse a multi-status predicate on `status_kind`: a non-negated literal
+/// IN-list, or an OR chain of pure `status_kind = '<literal>'` equalities.
+/// Returns the per-element status filters in predicate order (deduped), or
+/// None when the expression is any other shape — including any OR arm that is
+/// not a pure status equality, or any element that is not a recognized status.
+fn parse_multi_status_predicate(expr: &Expr) -> Option<Vec<QueryStatusFilter>> {
+    let is_candidate = match expr {
+        Expr::InList(inlist) => !inlist.negated,
+        Expr::BinaryExpr(BinaryExpr { op, .. }) => *op == Operator::Or,
+        _ => false,
+    };
+    if !is_candidate {
+        return None;
+    }
+    let mut statuses = Vec::new();
+    collect_multi_status(expr, &mut statuses)?;
+    (!statuses.is_empty()).then_some(statuses)
+}
+
+/// Parse the state-filter shape: an OR chain where every arm pins `status_kind` —
+/// directly (an equality, IN-list, or OR-of-equalities) or inside an AND group
+/// alongside non-status residue (e.g. `current_attempt` predicates). Returns the
+/// union of pinned statuses.
+///
+/// The residue is not answered by a union scan, so callers must keep the whole
+/// predicate Inexact: the union only bounds which index ranges are visited.
+/// Over-coverage (an arm with several pins unions them all) is safe under the
+/// post-filter; an arm with no pin makes the shape unusable (returns None),
+/// since its rows could live under any status.
+fn parse_or_of_and_status_pins(expr: &Expr) -> Option<Vec<QueryStatusFilter>> {
+    let is_or = matches!(
+        expr,
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Or,
+            ..
+        })
+    );
+    if !is_or {
+        return None;
+    }
+    let mut statuses = Vec::new();
+    collect_state_shape_arm(expr, &mut statuses)?;
+    (!statuses.is_empty()).then_some(statuses)
+}
+
+/// Recursive worker for `parse_or_of_and_status_pins`: descends OR chains; each
+/// arm is either a pure status pin or an AND group containing at least one pin.
+fn collect_state_shape_arm(expr: &Expr, out: &mut Vec<QueryStatusFilter>) -> Option<()> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Or => {
+            collect_state_shape_arm(left, out)?;
+            collect_state_shape_arm(right, out)
+        }
+        Expr::BinaryExpr(BinaryExpr { op, .. }) if *op == Operator::And => {
+            let mut conjuncts = Vec::new();
+            flatten_and(expr, &mut conjuncts);
+            let mut arm_pinned = false;
+            for conjunct in conjuncts {
+                let mut pin = Vec::new();
+                if collect_multi_status(conjunct, &mut pin).is_some() && !pin.is_empty() {
+                    arm_pinned = true;
+                    for status in pin {
+                        if !out.contains(&status) {
+                            out.push(status);
+                        }
+                    }
+                }
+            }
+            arm_pinned.then_some(())
+        }
+        // A bare arm must be a pure pin (equality or IN-list).
+        other => collect_multi_status(other, out),
+    }
+}
+
+/// Flatten an AND chain into its conjunct expressions.
+fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr
+        && *op == Operator::And
+    {
+        flatten_and(left, out);
+        flatten_and(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// Recursive worker for `parse_multi_status_predicate`: descends OR chains and
+/// IN-lists, requiring every leaf to pin `status_kind` to a recognized status.
+fn collect_multi_status(expr: &Expr, out: &mut Vec<QueryStatusFilter>) -> Option<()> {
+    let mut push = |status: QueryStatusFilter| {
+        if !out.contains(&status) {
+            out.push(status);
+        }
+    };
+    match expr {
+        Expr::InList(inlist) if !inlist.negated => {
+            let Expr::Column(col) = inlist.expr.as_ref() else {
+                return None;
+            };
+            if col.name != "status_kind" {
+                return None;
+            }
+            for item in &inlist.list {
+                let Expr::Literal(s, _) = item else {
+                    return None;
+                };
+                push(parse_status_kind(&literal_to_string(s)?)?);
+            }
+            Some(())
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Or => {
+            collect_multi_status(left, out)?;
+            collect_multi_status(right, out)
+        }
+        _ => {
+            let (col, val) = parse_eq_filter(expr)?;
+            let col_name = col.rsplit('.').next().unwrap_or(&col);
+            if col_name != "status_kind" {
+                return None;
+            }
+            push(parse_status_kind(&val)?);
+            Some(())
         }
     }
 }
@@ -722,10 +931,14 @@ fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> Pr
     // When no job_info fields or status point-lookup fields are needed (including the
     // empty-projection case for COUNT(*)), scan the status/time index directly and skip
     // all get_jobs_batch / get_jobs_status_batch point-lookups.
-    // Only valid for FullScan — other strategies already have a bounded pair list.
+    // Valid for FullScan (whole index prefix) and StatusUnion (per-status ranges of the
+    // same index) — other strategies already have a bounded pair list.
     let use_status_index_path = !need_job_info
         && !need_status_point_lookup
-        && matches!(strategy, JobsScanStrategy::FullScan { .. });
+        && matches!(
+            strategy,
+            JobsScanStrategy::FullScan { .. } | JobsScanStrategy::StatusUnion { .. }
+        );
     // ExactId with a tenant synthesises the pair without scanning the DB, so we must
     // verify existence via get_jobs_batch even when job_info columns aren't projected.
     let needs_existence_check = matches!(
@@ -841,7 +1054,9 @@ fn count_from_counters_stream(
 /// Streams the status/time index in bounded chunks, emitting RecordBatches with
 /// no point-lookups. Used when the projection only needs tenant, id,
 /// status_kind, or status_changed_at_ms (including the COUNT(*) fallback when
-/// counter-based counting is disabled).
+/// counter-based counting is disabled). Serves FullScan (one whole-prefix range)
+/// and StatusUnion (one range per status arm, all planned from a single clock
+/// snapshot that also fixes the emitted virtual-status labels).
 fn status_index_stream(
     shard: Arc<JobStoreShard>,
     projection: SchemaRef,
@@ -850,69 +1065,112 @@ fn status_index_stream(
     limit: Option<usize>,
 ) -> impl Stream<Item = DfResult<RecordBatch>> {
     async_stream::try_stream! {
-        let tenant = match &strategy {
-            JobsScanStrategy::FullScan { tenant } => tenant.clone(),
-            _ => None,
-        };
-        let (start, end) = match &tenant {
-            Some(t) => {
-                let s = crate::keys::idx_status_time_tenant_prefix(t);
-                let e = crate::keys::end_bound(&s);
-                (s, e)
+        // FullScan keeps its per-batch label clock (`None`); a union plans every
+        // arm's range from one snapshot and labels rows with that same snapshot,
+        // so a job crossing its scheduled-start time mid-scan cannot appear in
+        // two arms or carry a label inconsistent with the arm that produced it.
+        let (ranges, label_now): (Vec<KeyRange>, Option<i64>) = match &strategy {
+            JobsScanStrategy::StatusUnion { tenant, statuses } => {
+                let scan_now = crate::job_store_shard::helpers::now_epoch_ms();
+                (
+                    statuses
+                        .iter()
+                        .map(|status| status_index_range(tenant, *status, scan_now))
+                        .collect(),
+                    Some(scan_now),
+                )
             }
-            None => {
-                let s = crate::keys::idx_status_time_all_prefix();
-                let e = crate::keys::end_bound(&s);
-                (s, e)
+            JobsScanStrategy::FullScan { tenant: Some(t) } => {
+                let start = crate::keys::idx_status_time_tenant_prefix(t);
+                let end = crate::keys::end_bound(&start);
+                (vec![(start, end)], None)
+            }
+            _ => {
+                let start = crate::keys::idx_status_time_all_prefix();
+                let end = crate::keys::end_bound(&start);
+                (vec![(start, end)], None)
             }
         };
         let shard_id = shard.name().to_string();
-        let mut cursor = shard
-            .open_range_cursor(start, end, &crate::scan_options())
-            .await
-            .map_err(exec_err)?;
         let mut sent = 0usize;
-        loop {
-            if limit.is_some_and(|l| sent >= l) {
-                break;
-            }
-            // Never pull more index keys than the LIMIT still needs.
-            let want = limit.map_or(batch_size, |l| batch_size.min(l - sent));
-            let chunk = cursor.next_kv_chunk(want).await.map_err(exec_err)?;
-            if chunk.is_empty() {
-                break;
-            }
-            let mut rows: Vec<(String, String, String, i64)> = Vec::with_capacity(chunk.len());
-            for kv in &chunk {
-                let Some(p) = crate::keys::parse_status_time_index_key(&kv.key)
-                    .filter(|p| !p.job_id.is_empty())
-                else {
-                    continue;
-                };
-                let changed = p.changed_at_ms();
-                rows.push((p.tenant, p.job_id, p.status, changed));
-            }
-            if rows.is_empty() {
-                continue;
-            }
-            if let Some(l) = limit {
-                let remaining = l - sent;
-                if rows.len() > remaining {
-                    rows.truncate(remaining);
+        'ranges: for (start, end) in ranges {
+            let mut cursor = shard
+                .open_range_cursor(start, end, &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
+            loop {
+                // Scan-limit short-circuit counts rows already emitted by prior arms.
+                if limit.is_some_and(|l| sent >= l) {
+                    break 'ranges;
                 }
+                // Never pull more index keys than the LIMIT still needs.
+                let want = limit.map_or(batch_size, |l| batch_size.min(l - sent));
+                let chunk = cursor.next_kv_chunk(want).await.map_err(exec_err)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let mut rows: Vec<(String, String, String, i64)> = Vec::with_capacity(chunk.len());
+                for kv in &chunk {
+                    let Some(p) = crate::keys::parse_status_time_index_key(&kv.key)
+                        .filter(|p| !p.job_id.is_empty())
+                    else {
+                        continue;
+                    };
+                    let changed = p.changed_at_ms();
+                    rows.push((p.tenant, p.job_id, p.status, changed));
+                }
+                if rows.is_empty() {
+                    continue;
+                }
+                if let Some(l) = limit {
+                    let remaining = l - sent;
+                    if rows.len() > remaining {
+                        rows.truncate(remaining);
+                    }
+                }
+                let batch_now =
+                    label_now.unwrap_or_else(crate::job_store_shard::helpers::now_epoch_ms);
+                let batch = build_status_index_batch(&projection, &shard_id, &rows, batch_now)?;
+                sent += batch.num_rows();
+                yield batch;
             }
-            let batch = build_status_index_batch(&projection, &shard_id, &rows)?;
-            sent += batch.num_rows();
-            yield batch;
+        }
+    }
+}
+
+/// Tenant-scoped status/time index range for one status filter arm. `now_ms`
+/// fixes the virtual Waiting / FutureScheduled boundary within the stored
+/// Scheduled range, so all arms of a union planned from the same snapshot
+/// partition the index without overlap.
+fn status_index_range(tenant: &str, status: QueryStatusFilter, now_ms: i64) -> KeyRange {
+    use crate::keys;
+    let inverted_now = u64::MAX - (now_ms.max(0) as u64);
+    match status {
+        QueryStatusFilter::Stored(kind) => {
+            let start = keys::idx_status_time_prefix(tenant, kind.as_str());
+            let end = keys::end_bound(&start);
+            (start, end)
+        }
+        QueryStatusFilter::Waiting => {
+            let start = keys::idx_status_time_prefix_with_time(tenant, "Scheduled", inverted_now);
+            let end = keys::end_bound(&keys::idx_status_time_prefix(tenant, "Scheduled"));
+            (start, end)
+        }
+        QueryStatusFilter::FutureScheduled => {
+            let start = keys::idx_status_time_prefix(tenant, "Scheduled");
+            let end = keys::idx_status_time_prefix_with_time(tenant, "Scheduled", inverted_now);
+            (start, end)
         }
     }
 }
 
 /// Build a RecordBatch for the status-index fast path from a chunk of index entries.
+/// `now_ms` is the clock used for the virtual Waiting/Scheduled label split.
 fn build_status_index_batch(
     projection: &SchemaRef,
     shard_id: &str,
     chunk: &[(String, String, String, i64)],
+    now_ms: i64,
 ) -> DfResult<RecordBatch> {
     let n = chunk.len();
     if projection.fields().is_empty() {
@@ -938,7 +1196,6 @@ fn build_status_index_batch(
                 // Apply the same Waiting/Scheduled logic as display_status_kind.
                 // For Scheduled jobs, the index timestamp is next_attempt_starts_after_ms
                 // (see status_index_timestamp). If that time has passed, the job is Waiting.
-                let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
                 Arc::new(StringArray::from(
                     chunk
                         .iter()
@@ -1186,78 +1443,110 @@ fn job_pairs_stream(
             return;
         }
 
+        // All plans (one per union arm; a single plan otherwise) are computed from
+        // one clock snapshot, so a job crossing its scheduled-start time mid-scan
+        // cannot fall into two arms' ranges even on a quiescent shard.
         let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
-        let (start, end, extractor) = pairs_scan_plan(&strategy, now_ms);
-        let mut cursor = shard
-            .open_range_cursor(start, end, &crate::scan_options())
-            .await
-            .map_err(exec_err)?;
+        let plans = pairs_scan_plans(&strategy, now_ms);
 
         let mut sent = 0usize;
-        let mut pending: Vec<(String, String)> = Vec::new();
-        let mut done = false;
-        loop {
-            if limit.is_some_and(|l| sent >= l) {
-                break;
-            }
-            // Fill `pending` up to a hydration batch, but never resolve more pairs
-            // than the LIMIT still needs (so a small LIMIT scans few index keys).
-            let want = limit.map_or(fetch_batch, |l| fetch_batch.min(l - sent));
-            while pending.len() < want && !done {
-                let chunk = cursor
-                    .next_kv_chunk(want - pending.len())
-                    .await
-                    .map_err(exec_err)?;
-                if chunk.is_empty() {
-                    done = true;
-                    break;
+        'plans: for (start, end, extractor) in plans {
+            let mut cursor = shard
+                .open_range_cursor(start, end, &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
+
+            let mut pending: Vec<(String, String)> = Vec::new();
+            let mut done = false;
+            loop {
+                // Scan-limit short-circuit counts rows already emitted by prior arms.
+                if limit.is_some_and(|l| sent >= l) {
+                    break 'plans;
                 }
-                for kv in &chunk {
-                    match extractor(&kv.key) {
-                        ControlFlow::Continue(Some(pair)) => pending.push(pair),
-                        ControlFlow::Continue(None) => {}
-                        ControlFlow::Break(()) => {
-                            done = true;
-                            break;
+                // Fill `pending` up to a hydration batch, but never resolve more pairs
+                // than the LIMIT still needs (so a small LIMIT scans few index keys).
+                let want = limit.map_or(fetch_batch, |l| fetch_batch.min(l - sent));
+                while pending.len() < want && !done {
+                    let chunk = cursor
+                        .next_kv_chunk(want - pending.len())
+                        .await
+                        .map_err(exec_err)?;
+                    if chunk.is_empty() {
+                        done = true;
+                        break;
+                    }
+                    for kv in &chunk {
+                        match extractor(&kv.key) {
+                            ControlFlow::Continue(Some(pair)) => pending.push(pair),
+                            ControlFlow::Continue(None) => {}
+                            ControlFlow::Break(()) => {
+                                done = true;
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            if pending.is_empty() {
-                break;
-            }
-            if let Some(l) = limit {
-                let remaining = l - sent;
-                if pending.len() > remaining {
-                    pending.truncate(remaining);
+                if pending.is_empty() {
+                    break;
                 }
-            }
-            let (jobs_map, status_map) = fetch_batch_data(&shard, &pending, &needs).await?;
-            // With job_info fetched, the map is the authoritative presence check;
-            // otherwise the index scan is the source of truth (scans skip tombstones).
-            let existing: Vec<&(String, String)> = if needs.need_job_info || needs.needs_existence_check {
-                pending.iter().filter(|pair| jobs_map.contains_key(*pair)).collect()
-            } else {
-                pending.iter().collect()
-            };
-            if !existing.is_empty() {
-                let batch =
-                    build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map)?;
-                sent += batch.num_rows();
-                yield batch;
-            }
-            pending.clear();
-            if done {
-                break;
+                if let Some(l) = limit {
+                    let remaining = l - sent;
+                    if pending.len() > remaining {
+                        pending.truncate(remaining);
+                    }
+                }
+                let (jobs_map, status_map) = fetch_batch_data(&shard, &pending, &needs).await?;
+                // With job_info fetched, the map is the authoritative presence check;
+                // otherwise the index scan is the source of truth (scans skip tombstones).
+                let existing: Vec<&(String, String)> = if needs.need_job_info || needs.needs_existence_check {
+                    pending.iter().filter(|pair| jobs_map.contains_key(*pair)).collect()
+                } else {
+                    pending.iter().collect()
+                };
+                if !existing.is_empty() {
+                    let batch =
+                        build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map)?;
+                    sent += batch.num_rows();
+                    yield batch;
+                }
+                pending.clear();
+                if done {
+                    break;
+                }
             }
         }
     }
 }
 
-/// Compute the `(start, end, extractor)` scan plan for a non-FullScan pair
-/// resolution. The extractor mirrors the `ControlFlow` contract of the
+/// Compute the `(start, end, extractor)` scan plans for a non-FullScan pair
+/// resolution — one plan per union arm for StatusUnion, a single plan for every
+/// other strategy. The extractor mirrors the `ControlFlow` contract of the
 /// collect-oriented `scan_*` helpers so early-exit and skip semantics are preserved.
-fn pairs_scan_plan(strategy: &JobsScanStrategy, now_ms: i64) -> (Vec<u8>, Vec<u8>, PairExtractor) {
+fn pairs_scan_plans(
+    strategy: &JobsScanStrategy,
+    now_ms: i64,
+) -> Vec<(Vec<u8>, Vec<u8>, PairExtractor)> {
+    if let JobsScanStrategy::StatusUnion { tenant, statuses } = strategy {
+        // Per-status byte ranges are disjoint against the shared `now_ms`
+        // snapshot (a job has exactly one stored status; the virtual
+        // Waiting/FutureScheduled split partitions by time), so no cross-range
+        // dedup is performed. Each arm still opens its own cursor at its own DB
+        // snapshot, so a job transitioning between two union statuses mid-scan
+        // can straddle arms — the same tolerance today's index streams have for
+        // mid-scan transitions.
+        return statuses
+            .iter()
+            .map(|status| status_pairs_scan_plan(Some(tenant), *status, now_ms))
+            .collect();
+    }
+    vec![single_pairs_scan_plan(strategy, now_ms)]
+}
+
+/// Single-range scan plan for every non-union strategy.
+fn single_pairs_scan_plan(
+    strategy: &JobsScanStrategy,
+    now_ms: i64,
+) -> (Vec<u8>, Vec<u8>, PairExtractor) {
     use crate::keys;
     match strategy {
         JobsScanStrategy::ExactId { tenant: None, id } => {
@@ -1328,6 +1617,13 @@ fn pairs_scan_plan(strategy: &JobsScanStrategy, now_ms: i64) -> (Vec<u8>, Vec<u8
             tenant: Some(_), ..
         }
         | JobsScanStrategy::FullScan { .. } => all_jobs_pairs_plan(),
+        // Unions are expanded into per-arm plans by `pairs_scan_plans` before this
+        // function is reached. Falling through to the all-jobs plan would silently
+        // scan every tenant while the union predicate is classified Exact — a
+        // correctness bug, not a perf bug — so fail loudly instead.
+        JobsScanStrategy::StatusUnion { .. } => {
+            unreachable!("StatusUnion is expanded by pairs_scan_plans")
+        }
     }
 }
 
@@ -1357,9 +1653,10 @@ fn status_pairs_scan_plan(
     use crate::keys;
     let inverted_now = u64::MAX - (now_ms.max(0) as u64);
     match (status, tenant) {
-        (QueryStatusFilter::Stored(kind), Some(t)) => {
-            let start = keys::idx_status_time_prefix(t, kind.as_str());
-            let end = keys::end_bound(&start);
+        // Tenant-scoped arms share one range planner with the union paths; the
+        // range fully constrains status and time, so the extractor is a plain parse.
+        (status, Some(t)) => {
+            let (start, end) = status_index_range(t, status, now_ms);
             let tenant = t.to_string();
             let f: PairExtractor = Box::new(move |k: &[u8]| {
                 ControlFlow::Continue(
@@ -1383,19 +1680,6 @@ fn status_pairs_scan_plan(
             });
             (start, end, f)
         }
-        (QueryStatusFilter::Waiting, Some(t)) => {
-            let start = keys::idx_status_time_prefix_with_time(t, "Scheduled", inverted_now);
-            let end = keys::end_bound(&keys::idx_status_time_prefix(t, "Scheduled"));
-            let tenant = t.to_string();
-            let f: PairExtractor = Box::new(move |k: &[u8]| {
-                ControlFlow::Continue(
-                    keys::parse_status_time_index_key(k)
-                        .filter(|p| !p.job_id.is_empty())
-                        .map(|p| (tenant.clone(), p.job_id)),
-                )
-            });
-            (start, end, f)
-        }
         (QueryStatusFilter::Waiting, None) => {
             let start = keys::idx_status_time_all_prefix();
             let end = keys::end_bound(&start);
@@ -1408,19 +1692,6 @@ fn status_pairs_scan_plan(
                                 && !p.job_id.is_empty()
                         })
                         .map(|p| (p.tenant, p.job_id)),
-                )
-            });
-            (start, end, f)
-        }
-        (QueryStatusFilter::FutureScheduled, Some(t)) => {
-            let start = keys::idx_status_time_prefix(t, "Scheduled");
-            let end = keys::idx_status_time_prefix_with_time(t, "Scheduled", inverted_now);
-            let tenant = t.to_string();
-            let f: PairExtractor = Box::new(move |k: &[u8]| {
-                ControlFlow::Continue(
-                    keys::parse_status_time_index_key(k)
-                        .filter(|p| !p.job_id.is_empty())
-                        .map(|p| (tenant.clone(), p.job_id)),
                 )
             });
             (start, end, f)
@@ -1474,6 +1745,11 @@ async fn fetch_batch_data(
     for (tenant, ids) in &by_tenant {
         let need_jobs = needs.need_job_info || needs.needs_existence_check;
         let need_status = needs.need_any_status();
+        if (need_jobs || need_status)
+            && let Some(metrics) = &shard.metrics
+        {
+            metrics.record_query_point_lookups(shard.name(), ids.len() as u64);
+        }
         let (jobs_result, status_result) = tokio::join!(
             async {
                 if need_jobs {

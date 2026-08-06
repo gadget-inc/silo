@@ -142,6 +142,10 @@ pub struct Metrics {
     /// stops early (LIMIT reached, deadline fired, stream dropped) stops
     /// advancing this counter — the signal that a query is not running as a zombie.
     query_scanned_keys: CounterVec,
+    /// Point-lookup keys requested from job_info/status by query scans, per
+    /// shard. Stays flat for index-only scans — the signal that an aggregate
+    /// shape rode the index-only path instead of per-row hydration.
+    query_point_lookups: CounterVec,
 
     // Shard/broker metrics
     shards_owned: Gauge,
@@ -431,6 +435,21 @@ impl Metrics {
     /// operational assertions that a scan stopped early.
     pub fn query_scanned_keys_value(&self, shard: &str) -> f64 {
         self.query_scanned_keys.with_label_values(&[shard]).get()
+    }
+
+    /// Add `n` to the per-shard query point-lookup counter. Called by the jobs
+    /// scanner for every batch of keys it requests via point-lookups (whether or
+    /// not each key resolves to a live row).
+    pub fn record_query_point_lookups(&self, shard: &str, n: u64) {
+        self.query_point_lookups
+            .with_label_values(&[shard])
+            .inc_by(n as f64);
+    }
+
+    /// Read the current query point-lookup counter for a shard. Exposed for
+    /// tests and operational assertions that a scan stayed on the index-only path.
+    pub fn query_point_lookups_value(&self, shard: &str) -> f64 {
+        self.query_point_lookups.with_label_values(&[shard]).get()
     }
 
     /// Update the number of shards owned by this node (from coordinator).
@@ -1984,6 +2003,16 @@ pub fn init() -> anyhow::Result<Metrics> {
             &["shard"],
         )?,
     );
+    let query_point_lookups = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_query_point_lookups_total",
+                "Point-lookup keys requested from job_info/status by query scans per shard",
+            ),
+            &["shard"],
+        )?,
+    );
 
     // Shard/broker metrics
     let shards_owned = register(
@@ -2440,6 +2469,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         query_rejected,
         query_cancelled,
         query_scanned_keys,
+        query_point_lookups,
         shards_owned,
         coordination_shards_open,
         broker_buffer_size,
