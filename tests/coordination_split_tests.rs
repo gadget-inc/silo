@@ -1,3 +1,5 @@
+mod test_helpers;
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2461,5 +2463,686 @@ mod splitter_unit_tests {
             shard_recovered.get_job("test", "nonexistent").await.is_ok(),
             "shard should be usable after factory.close + factory.open"
         );
+    }
+
+    /// Guard-free harness for asserting exact child cleanup metadata: a
+    /// cloning-capable factory driven by the mock split backend, with no
+    /// coordinator or shard guards attached that could race the status.
+    struct CloningSplitHarness {
+        shard_map: Arc<Mutex<silo::shard_range::ShardMap>>,
+        owned: Arc<Mutex<HashSet<ShardId>>>,
+        factory: Arc<ShardFactory>,
+        splitter: ShardSplitter,
+        parent_id: ShardId,
+        parent_range: silo::shard_range::ShardRange,
+    }
+
+    /// Tenants with known hash placement relative to the full-range midpoint
+    /// boundary `8000000000000000`: three hash below it, three at or above.
+    const TENANTS_LOW_HALF: [&str; 3] = ["bbb", "mmm", "nnn"];
+    const TENANTS_HIGH_HALF: [&str; 3] = ["aaa", "lll", "yyy"];
+
+    async fn setup_cloning_harness(test_name: &str) -> CloningSplitHarness {
+        setup_cloning_harness_with_factory(make_test_factory_for_unit_test(test_name)).await
+    }
+
+    async fn setup_cloning_harness_with_factory(factory: Arc<ShardFactory>) -> CloningSplitHarness {
+        let shard_map = Arc::new(Mutex::new(
+            silo::shard_range::ShardMap::create_initial(1).unwrap(),
+        ));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let mock = Arc::new(MockSplitBackend::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory.clone(),
+        ));
+        let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
+
+        let parent_id = shard_map.lock().await.shard_ids()[0];
+        owned.lock().await.insert(parent_id);
+        let parent_range = shard_map
+            .lock()
+            .await
+            .get_shard(&parent_id)
+            .unwrap()
+            .range
+            .clone();
+        factory.open(&parent_id, &parent_range).await.unwrap();
+
+        CloningSplitHarness {
+            shard_map,
+            owned,
+            factory,
+            splitter,
+            parent_id,
+            parent_range,
+        }
+    }
+
+    /// Enqueue one job per tenant into the given open shard.
+    async fn seed_jobs(shard: &silo::job_store_shard::JobStoreShard, tenants: &[&str]) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        for tenant in tenants {
+            shard
+                .enqueue(
+                    tenant,
+                    Some(format!("{tenant}-job")),
+                    5,
+                    now_ms,
+                    None,
+                    rmp_serde::to_vec(&serde_json::json!({"k": "v"})).unwrap(),
+                    vec![],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue job");
+        }
+    }
+
+    /// Owner-map closure that assigns both children to `other-node`, away
+    /// from the mock initiator (`mock-node`), so the post-commit loop opens
+    /// no child and nothing can race the initialized metadata.
+    fn owner_map_assigning_children_away(
+        shard_map: Arc<Mutex<silo::shard_range::ShardMap>>,
+        left: ShardId,
+        right: ShardId,
+    ) -> impl Fn() -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ShardOwnerMap, CoordinationError>> + Send>,
+    > {
+        move || {
+            let shard_map = shard_map.clone();
+            Box::pin(async move {
+                let mut shard_to_node = HashMap::new();
+                shard_to_node.insert(left, "other-node".to_string());
+                shard_to_node.insert(right, "other-node".to_string());
+                Ok(ShardOwnerMap {
+                    shard_map: shard_map.lock().await.clone(),
+                    shard_to_node,
+                    shard_to_addr: HashMap::new(),
+                })
+            })
+        }
+    }
+
+    /// After the cloning phase commits, both children carry exactly
+    /// `CleanupPending` with fully reset cleanup metadata -- regardless of
+    /// which node will own them -- observed through the factory's raw
+    /// non-registering reader, and neither child is registered in the
+    /// factory's instance map.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_initializes_both_children_cleanup_metadata_before_commit() {
+        use silo::coordination::SplitCleanupStatus;
+
+        let h = setup_cloning_harness("children-init-pending").await;
+        let parent = h.factory.get(&h.parent_id).unwrap();
+        seed_jobs(
+            &parent,
+            &[TENANTS_LOW_HALF.as_slice(), TENANTS_HIGH_HALF.as_slice()].concat(),
+        )
+        .await;
+
+        let split_point = silo::shard_range::format_hash_boundary(
+            h.parent_range.midpoint().expect("full range has midpoint"),
+        );
+        let split = h
+            .splitter
+            .request_split(h.parent_id, split_point)
+            .await
+            .expect("request split");
+        h.splitter
+            .execute_split(
+                h.parent_id,
+                owner_map_assigning_children_away(
+                    h.shard_map.clone(),
+                    split.left_child_id,
+                    split.right_child_id,
+                ),
+            )
+            .await
+            .expect("execute split");
+
+        for child_id in [split.left_child_id, split.right_child_id] {
+            assert!(
+                h.factory.get(&child_id).is_none(),
+                "child {child_id} must not be registered in the factory after the cloning phase"
+            );
+            let meta = h
+                .factory
+                .read_closed_shard_cleanup_metadata(&child_id)
+                .await
+                .expect("read child cleanup metadata");
+            assert_eq!(
+                meta.status,
+                Some(SplitCleanupStatus::CleanupPending),
+                "child {child_id} must be initialized to CleanupPending, got {meta:?}"
+            );
+            assert!(
+                !meta.progress_key_present,
+                "child {child_id} must have no inherited cleanup progress"
+            );
+            assert!(
+                !meta.complete_marker_present,
+                "child {child_id} must have no inherited legacy complete marker"
+            );
+            assert_eq!(
+                meta.cleanup_completed_at_ms, None,
+                "child {child_id} must have no inherited completion timestamp"
+            );
+        }
+    }
+
+    /// The initialized `CleanupPending` metadata is durable in the SHARED
+    /// data store, not just the initiator's node-local WAL: a passive second
+    /// factory sharing the data root but carrying its own WAL root reads the
+    /// exact metadata. Guard-free with both children away from the initiator
+    /// and no coordinator on either factory, so nothing can manufacture the
+    /// key or fence the reader.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initialized_child_metadata_visible_through_passive_second_factory() {
+        use silo::coordination::SplitCleanupStatus;
+
+        let root = format!(
+            "silo-split-shared-root-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let initiator_factory =
+            super::test_helpers::make_shared_data_root_memory_factory(&root, "n1");
+        let h = setup_cloning_harness_with_factory(initiator_factory).await;
+        let parent = h.factory.get(&h.parent_id).unwrap();
+        seed_jobs(
+            &parent,
+            &[TENANTS_LOW_HALF.as_slice(), TENANTS_HIGH_HALF.as_slice()].concat(),
+        )
+        .await;
+
+        let split_point = silo::shard_range::format_hash_boundary(
+            h.parent_range.midpoint().expect("full range has midpoint"),
+        );
+        let split = h
+            .splitter
+            .request_split(h.parent_id, split_point)
+            .await
+            .expect("request split");
+        h.splitter
+            .execute_split(
+                h.parent_id,
+                owner_map_assigning_children_away(
+                    h.shard_map.clone(),
+                    split.left_child_id,
+                    split.right_child_id,
+                ),
+            )
+            .await
+            .expect("execute split");
+
+        // The initiator opened no post-commit child handles (both children
+        // are remote) and its raw pre-commit handles are closed, so the
+        // passive factory's open cannot fence a live writer.
+        let passive_factory =
+            super::test_helpers::make_shared_data_root_memory_factory(&root, "n2");
+        for child_id in [split.left_child_id, split.right_child_id] {
+            let meta = passive_factory
+                .read_closed_shard_cleanup_metadata(&child_id)
+                .await
+                .expect("read child cleanup metadata through passive factory");
+            assert_eq!(
+                meta.status,
+                Some(SplitCleanupStatus::CleanupPending),
+                "child {child_id} status must be visible through a factory that does not share \
+                 the initiator's WAL, got {meta:?}"
+            );
+            assert!(!meta.progress_key_present);
+            assert!(!meta.complete_marker_present);
+            assert_eq!(meta.cleanup_completed_at_ms, None);
+        }
+    }
+
+    /// Splitting a child whose own cleanup completed (status `CleanupDone`,
+    /// progress marker still present, completion timestamp set) yields
+    /// grandchildren with fresh metadata whose cleanup actually deletes
+    /// defunct keys -- not an inherited-"complete" no-op -- and the whole
+    /// two-generation flow emits no status-regression WARN.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_generation_split_yields_fresh_grandchild_metadata() {
+        use silo::coordination::SplitCleanupStatus;
+
+        // Capture discipline: the buffer is process-global, so hold the
+        // suite mutex and filter captured lines by this test's shard ids.
+        let _guard = super::acquire_test_mutex().await;
+
+        let h = setup_cloning_harness("second-generation-split").await;
+        let parent = h.factory.get(&h.parent_id).unwrap();
+        seed_jobs(
+            &parent,
+            &[TENANTS_LOW_HALF.as_slice(), TENANTS_HIGH_HALF.as_slice()].concat(),
+        )
+        .await;
+
+        silo::trace::start_log_capture();
+
+        // First generation: split the full-range parent at its midpoint.
+        let split_point = silo::shard_range::format_hash_boundary(
+            h.parent_range.midpoint().expect("full range has midpoint"),
+        );
+        let split = h
+            .splitter
+            .request_split(h.parent_id, split_point)
+            .await
+            .expect("request split");
+        h.splitter
+            .execute_split(
+                h.parent_id,
+                owner_map_assigning_children_away(
+                    h.shard_map.clone(),
+                    split.left_child_id,
+                    split.right_child_id,
+                ),
+            )
+            .await
+            .expect("execute first-generation split");
+
+        // Drive the left child's cleanup to completion: status CleanupDone,
+        // progress marker present (complete=true), completion timestamp set
+        // -- the exact state a to-be-split shard carries in production.
+        let left_id = split.left_child_id;
+        let left_range = h
+            .shard_map
+            .lock()
+            .await
+            .get_shard(&left_id)
+            .unwrap()
+            .range
+            .clone();
+        let left = h
+            .factory
+            .open(&left_id, &left_range)
+            .await
+            .expect("open left child");
+        let result = left
+            .after_split_cleanup_defunct_data(&left_range, 100)
+            .await
+            .expect("left child cleanup");
+        assert!(result.complete, "left child cleanup must complete");
+        assert!(
+            result.keys_deleted > 0,
+            "left child must have deleted the high-half tenants' keys"
+        );
+        assert_eq!(
+            left.get_cleanup_status_raw().await.expect("status"),
+            Some(SplitCleanupStatus::CleanupDone)
+        );
+        assert!(
+            left.get_cleanup_completed_at_ms()
+                .await
+                .expect("completed at")
+                .is_some(),
+            "left child must carry a completion timestamp before the second split"
+        );
+
+        // Second generation: split the cleaned left child at ITS midpoint.
+        h.owned.lock().await.insert(left_id);
+        let second_split_point = silo::shard_range::format_hash_boundary(
+            left_range.midpoint().expect("left range has midpoint"),
+        );
+        let second = h
+            .splitter
+            .request_split(left_id, second_split_point)
+            .await
+            .expect("request second-generation split");
+        h.splitter
+            .execute_split(
+                left_id,
+                owner_map_assigning_children_away(
+                    h.shard_map.clone(),
+                    second.left_child_id,
+                    second.right_child_id,
+                ),
+            )
+            .await
+            .expect("execute second-generation split");
+
+        // Both grandchildren must carry fresh metadata despite the parent's
+        // terminal state at clone time.
+        for grandchild_id in [second.left_child_id, second.right_child_id] {
+            let meta = h
+                .factory
+                .read_closed_shard_cleanup_metadata(&grandchild_id)
+                .await
+                .expect("read grandchild cleanup metadata");
+            assert_eq!(
+                meta.status,
+                Some(SplitCleanupStatus::CleanupPending),
+                "grandchild {grandchild_id} must be reset to CleanupPending, got {meta:?}"
+            );
+            assert!(
+                !meta.progress_key_present,
+                "grandchild {grandchild_id} must not inherit the complete progress record"
+            );
+            assert!(!meta.complete_marker_present);
+            assert_eq!(
+                meta.cleanup_completed_at_ms, None,
+                "grandchild {grandchild_id} must not inherit the completion timestamp"
+            );
+        }
+
+        // The low-half tenants all hash below the second split point, so the
+        // right grandchild holds only defunct keys -- its cleanup must
+        // actually delete them, not no-op on inherited state. The guard-free
+        // harness has no acquisition machinery, so drive cleanup directly on
+        // an opened grandchild handle.
+        let right_grandchild_id = second.right_child_id;
+        let right_range = h
+            .shard_map
+            .lock()
+            .await
+            .get_shard(&right_grandchild_id)
+            .unwrap()
+            .range
+            .clone();
+        let right_grandchild = h
+            .factory
+            .open(&right_grandchild_id, &right_range)
+            .await
+            .expect("open right grandchild");
+        let result = right_grandchild
+            .after_split_cleanup_defunct_data(&right_range, 100)
+            .await
+            .expect("right grandchild cleanup");
+        assert!(result.complete, "grandchild cleanup must run to completion");
+        assert!(
+            result.keys_deleted > 0,
+            "grandchild cleanup must delete the low-half tenants' defunct keys, not skip as \
+             inherited-complete"
+        );
+
+        let logs = silo::trace::stop_log_capture();
+        let own_ids = [
+            h.parent_id,
+            split.left_child_id,
+            split.right_child_id,
+            second.left_child_id,
+            second.right_child_id,
+        ];
+        let regressions: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("cleanup status regression"))
+            .filter(|l| own_ids.iter().any(|id| l.contains(&id.to_string())))
+            .collect();
+        assert!(
+            regressions.is_empty(),
+            "no status-regression WARN may fire across two split generations, got:\n{}",
+            regressions.join("\n")
+        );
+    }
+
+    /// A child cleanup-metadata initialization failure aborts the split
+    /// pre-commit: the shard map keeps routing to the parent, the split
+    /// record is abandoned, the parent is recovered with its own metadata
+    /// untouched, and neither child is registered in the factory. Driven
+    /// through the factory's init-failure fault seam and surfaced under the
+    /// dedicated init marker so a verification miscount cannot fake a pass.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_init_failure_aborts_split_pre_commit_and_recovers_parent() {
+        let h = setup_cloning_harness("child-init-failure-abort").await;
+        let parent = h.factory.get(&h.parent_id).unwrap();
+        seed_jobs(&parent, &TENANTS_LOW_HALF).await;
+
+        let split_point = silo::shard_range::format_hash_boundary(
+            h.parent_range.midpoint().expect("full range has midpoint"),
+        );
+        let split = h
+            .splitter
+            .request_split(h.parent_id, split_point)
+            .await
+            .expect("request split");
+
+        // Fail the SECOND child's initialization so the first child's
+        // count-check-then-initialize sequence has already run -- a
+        // pre-commit abort may leave one child initialized, which is
+        // harmless because the clones are discarded.
+        h.factory.inject_child_init_failure(split.right_child_id);
+
+        let result = h
+            .splitter
+            .execute_split(
+                h.parent_id,
+                owner_map_assigning_children_away(
+                    h.shard_map.clone(),
+                    split.left_child_id,
+                    split.right_child_id,
+                ),
+            )
+            .await;
+        let err = result.expect_err("split must abort on child initialization failure");
+        let err_text = format!("{err}");
+        assert!(
+            err_text.contains(silo::coordination::split::MARKER_CHILD_INIT_FAILED),
+            "abort must surface the dedicated init-failure marker, got: {err_text}"
+        );
+        assert!(
+            !err_text.contains(silo::coordination::split::MARKER_CHILD_VERIFICATION_FAILED),
+            "abort must not be attributed to a verification miscount, got: {err_text}"
+        );
+
+        // Pre-commit abort: the shard map still routes to the parent only.
+        {
+            let map = h.shard_map.lock().await;
+            assert!(map.get_shard(&h.parent_id).is_some());
+            assert!(map.get_shard(&split.left_child_id).is_none());
+            assert!(map.get_shard(&split.right_child_id).is_none());
+        }
+        assert!(
+            h.splitter
+                .get_split_status(h.parent_id)
+                .await
+                .expect("get split status")
+                .is_none(),
+            "split record must be abandoned"
+        );
+
+        // Neither child may linger in the factory's instance map.
+        assert!(h.factory.get(&split.left_child_id).is_none());
+        assert!(h.factory.get(&split.right_child_id).is_none());
+
+        // The parent is recovered, serves reads, and its own cleanup
+        // metadata is untouched -- no status key was ever written to it, so
+        // its next acquisition does not spuriously scan the keyspace.
+        let recovered = h
+            .factory
+            .get(&h.parent_id)
+            .expect("parent reopened in factory after abort");
+        assert_eq!(
+            recovered
+                .get_counters()
+                .await
+                .expect("recovered parent counters")
+                .total_jobs,
+            TENANTS_LOW_HALF.len() as i64,
+            "recovered parent must hold its jobs"
+        );
+        assert_eq!(
+            recovered
+                .get_cleanup_status_raw()
+                .await
+                .expect("parent raw status"),
+            None,
+            "parent cleanup status must be untouched by the aborted split"
+        );
+    }
+
+    /// A normal split's happy path emits no status-regression WARN, and the
+    /// observed statuses move forward only: `CleanupPending` at
+    /// post-commit-pre-cleanup, `CleanupDone` after cleanup completes.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn normal_split_emits_no_status_regression_warn() {
+        use silo::coordination::SplitCleanupStatus;
+
+        // Capture discipline: hold the suite mutex, filter by own shard ids.
+        let _guard = super::acquire_test_mutex().await;
+
+        let h = setup_cloning_harness("normal-split-no-warn").await;
+        let parent = h.factory.get(&h.parent_id).unwrap();
+        seed_jobs(
+            &parent,
+            &[TENANTS_LOW_HALF.as_slice(), TENANTS_HIGH_HALF.as_slice()].concat(),
+        )
+        .await;
+
+        silo::trace::start_log_capture();
+
+        let split_point = silo::shard_range::format_hash_boundary(
+            h.parent_range.midpoint().expect("full range has midpoint"),
+        );
+        let split = h
+            .splitter
+            .request_split(h.parent_id, split_point)
+            .await
+            .expect("request split");
+        h.splitter
+            .execute_split(
+                h.parent_id,
+                owner_map_assigning_children_away(
+                    h.shard_map.clone(),
+                    split.left_child_id,
+                    split.right_child_id,
+                ),
+            )
+            .await
+            .expect("execute split");
+
+        // Post-commit, pre-cleanup: both children sit at CleanupPending.
+        for child_id in [split.left_child_id, split.right_child_id] {
+            let meta = h
+                .factory
+                .read_closed_shard_cleanup_metadata(&child_id)
+                .await
+                .expect("read child cleanup metadata");
+            assert_eq!(meta.status, Some(SplitCleanupStatus::CleanupPending));
+        }
+
+        // The guard-free harness has no acquisition machinery to spawn
+        // cleanup, so drive it directly on an opened child handle.
+        let left_id = split.left_child_id;
+        let left_range = h
+            .shard_map
+            .lock()
+            .await
+            .get_shard(&left_id)
+            .unwrap()
+            .range
+            .clone();
+        let left = h
+            .factory
+            .open(&left_id, &left_range)
+            .await
+            .expect("open left child");
+        let result = left
+            .after_split_cleanup_defunct_data(&left_range, 100)
+            .await
+            .expect("left child cleanup");
+        assert!(result.complete);
+
+        // Post-cleanup-completion: forward progression landed on CleanupDone.
+        assert_eq!(
+            left.get_cleanup_status_raw().await.expect("status"),
+            Some(SplitCleanupStatus::CleanupDone)
+        );
+
+        let logs = silo::trace::stop_log_capture();
+        let own_ids = [h.parent_id, split.left_child_id, split.right_child_id];
+        let regressions: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("cleanup status regression"))
+            .filter(|l| own_ids.iter().any(|id| l.contains(&id.to_string())))
+            .collect();
+        assert!(
+            regressions.is_empty(),
+            "a normal split must not trip the status-regression WARN, got:\n{}",
+            regressions.join("\n")
+        );
+    }
+
+    /// When the initiator owns the children, the post-commit open returns
+    /// handles carrying the committed child ranges -- not the full range the
+    /// raw pre-commit opens used -- and the pre-commit initialization is
+    /// visible through those handles without any post-commit status write.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initiator_owned_children_open_with_committed_ranges() {
+        use silo::coordination::SplitCleanupStatus;
+
+        let h = setup_cloning_harness("initiator-owned-children").await;
+        let parent = h.factory.get(&h.parent_id).unwrap();
+        seed_jobs(
+            &parent,
+            &[TENANTS_LOW_HALF.as_slice(), TENANTS_HIGH_HALF.as_slice()].concat(),
+        )
+        .await;
+
+        let split_point = silo::shard_range::format_hash_boundary(
+            h.parent_range.midpoint().expect("full range has midpoint"),
+        );
+        let split = h
+            .splitter
+            .request_split(h.parent_id, split_point.clone())
+            .await
+            .expect("request split");
+
+        // Assign both children to the initiator ("mock-node") so the
+        // post-commit loop opens them.
+        let shard_map = h.shard_map.clone();
+        let (left_id, right_id) = (split.left_child_id, split.right_child_id);
+        h.splitter
+            .execute_split(h.parent_id, move || {
+                let shard_map = shard_map.clone();
+                async move {
+                    let mut shard_to_node = HashMap::new();
+                    shard_to_node.insert(left_id, "mock-node".to_string());
+                    shard_to_node.insert(right_id, "mock-node".to_string());
+                    Ok(ShardOwnerMap {
+                        shard_map: shard_map.lock().await.clone(),
+                        shard_to_node,
+                        shard_to_addr: HashMap::new(),
+                    })
+                }
+            })
+            .await
+            .expect("execute split");
+
+        for child_id in [left_id, right_id] {
+            let committed_range = h
+                .shard_map
+                .lock()
+                .await
+                .get_shard(&child_id)
+                .unwrap()
+                .range
+                .clone();
+            assert_ne!(
+                committed_range, h.parent_range,
+                "committed child range must be narrower than the parent's full range"
+            );
+            let child = h
+                .factory
+                .get(&child_id)
+                .expect("initiator-owned child must be registered post-commit");
+            assert_eq!(
+                child.get_range(),
+                committed_range,
+                "child {child_id} handle must carry the committed range, not the full range \
+                 the raw pre-commit open used"
+            );
+            assert_eq!(
+                child.get_cleanup_status_raw().await.expect("status"),
+                Some(SplitCleanupStatus::CleanupPending),
+                "pre-commit initialization must be visible through the post-commit handle"
+            );
+        }
     }
 }

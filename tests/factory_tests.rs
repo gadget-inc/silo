@@ -640,7 +640,7 @@ async fn verify_cloned_children_detects_short_child() {
     // that held one job.
     let empty_child = ShardId::new();
     let result = factory
-        .verify_cloned_children_match_parent(&parent_id, &[empty_child])
+        .verify_and_initialize_cloned_children(&parent_id, &[empty_child])
         .await;
     assert!(
         result.is_err(),
@@ -690,7 +690,7 @@ async fn verify_cloned_children_accepts_full_clone_without_caching() {
         .expect("clone closed shard");
 
     factory
-        .verify_cloned_children_match_parent(&parent_id, &[left_child_id, right_child_id])
+        .verify_and_initialize_cloned_children(&parent_id, &[left_child_id, right_child_id])
         .await
         .expect("full clones should pass verification");
 
@@ -761,7 +761,7 @@ async fn parent_reopens_intact_after_verification_mismatch() {
     // Force a mismatch by verifying a child that was never cloned: it opens
     // empty and cannot match the parent's job count.
     let result = factory
-        .verify_cloned_children_match_parent(&parent_id, &[ShardId::new()])
+        .verify_and_initialize_cloned_children(&parent_id, &[ShardId::new()])
         .await;
     assert!(
         result.is_err(),

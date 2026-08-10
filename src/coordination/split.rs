@@ -16,6 +16,8 @@ use crate::coordination::{CoordinationError, ShardOwnerMap};
 pub const MARKER_VERIFYING_CHILDREN: &str = "cloning complete, verifying children before commit";
 pub const MARKER_CHILDREN_VERIFIED: &str = "children verified, updating shard map";
 pub const MARKER_CHILD_VERIFICATION_FAILED: &str = "post-clone child verification failed";
+pub const MARKER_CHILD_INIT_FAILED: &str =
+    "post-clone child cleanup-metadata initialization failed";
 
 /// [SILO-COORD-INV-8] Status of post-split cleanup for a shard.
 ///
@@ -574,19 +576,30 @@ impl ShardSplitter {
                     // the child's open cannot see) fails here, aborting the split
                     // as PreCommitParentClosed so the shard map stays untouched
                     // and the parent is recovered/reopenable -- never silent data
-                    // loss.
+                    // loss. Each verified child then has its cleanup metadata
+                    // initialized to CleanupPending in the same pass, while the
+                    // initiator exclusively holds both cloned databases -- so
+                    // every acquirer, on any node, sees pending cleanup work. An
+                    // initialization failure aborts the same way, surfaced under
+                    // its own marker.
                     self.ctx
                         .factory
-                        .verify_cloned_children_match_parent(
+                        .verify_and_initialize_cloned_children(
                             &parent_shard_id,
                             &[split.left_child_id, split.right_child_id],
                         )
                         .await
                         .map_err(|e| {
+                            let marker = match &e {
+                                crate::factory::ShardFactoryError::ChildInitialization(_) => {
+                                    MARKER_CHILD_INIT_FAILED
+                                }
+                                _ => MARKER_CHILD_VERIFICATION_FAILED,
+                            };
                             SplitExecutionError::PreCommitParentClosed(
                                 CoordinationError::BackendError(format!(
                                     "{} for split of {}: {}",
-                                    MARKER_CHILD_VERIFICATION_FAILED, parent_shard_id, e
+                                    marker, parent_shard_id, e
                                 )),
                             )
                         })?;
@@ -678,7 +691,11 @@ impl ShardSplitter {
                         }
                     }
 
-                    // Open the child shards we own and set their cleanup status
+                    // Open the child shards we own. Their cleanup metadata was
+                    // already initialized pre-commit, so there is no status
+                    // write here -- which also means a concurrent shard-guard
+                    // acquisition cannot observe a child before its status
+                    // exists.
                     for child_id in children_we_own {
                         // Look up the child's range from the reloaded shard map
                         let range = {
@@ -699,20 +716,6 @@ impl ShardSplitter {
                                     format!("failed to open child shard {}: {}", child_id, e),
                                 ))
                             })?;
-
-                        if let Some(shard) = self.ctx.factory.get(&child_id) {
-                            shard
-                                .set_cleanup_status(SplitCleanupStatus::CleanupPending)
-                                .await
-                                .map_err(|e| {
-                                    SplitExecutionError::PostCommit(
-                                        CoordinationError::BackendError(format!(
-                                            "failed to set cleanup status for child shard {}: {}",
-                                            child_id, e
-                                        )),
-                                    )
-                                })?;
-                        }
 
                         info!(
                             child_shard_id = %child_id,

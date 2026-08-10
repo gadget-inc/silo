@@ -498,6 +498,40 @@ impl JobStoreShard {
         Ok(())
     }
 
+    /// Initialize split-cleanup metadata for a freshly cloned child shard.
+    ///
+    /// A clone is byte-for-byte, so a child inherits whichever cleanup keys
+    /// its parent carried; an inherited terminal status -- or the `complete`
+    /// flag inside inherited progress, which is what the cleanup loop
+    /// consults -- would short-circuit the child's own cleanup as "already
+    /// complete". This reset unconditionally overwrites the status to
+    /// `CleanupPending` (bypassing the forward-transition check; it runs only
+    /// pre-commit on a freshly cloned database the initiator exclusively
+    /// holds) and clears the progress, legacy complete-marker, and completion
+    /// timestamp keys.
+    ///
+    /// The explicit MemTable-type flush makes the write durable in shared
+    /// storage on the paths a clean close's built-in flush does not cover
+    /// (failed-state close, crash between write and close). The plain
+    /// `flush()` call would select a WAL flush when a WAL store is
+    /// configured -- with a node-local WAL that leaves the write invisible
+    /// to whichever node later acquires the child.
+    pub async fn initialize_split_cleanup_metadata(&self) -> Result<(), JobStoreShardError> {
+        let status_data = serde_json::to_vec(&SplitCleanupStatus::CleanupPending)?;
+        let mut batch = WriteBatch::new();
+        batch.put(keys::cleanup_status_key(), &status_data);
+        batch.delete(keys::cleanup_progress_key());
+        batch.delete(keys::cleanup_complete_key());
+        batch.delete(keys::cleanup_completed_at_key());
+        self.db.write(batch).await?;
+        self.db
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Get the timestamp (ms) when this shard was first created/initialized.
     /// Returns None if not set (e.g., older shards without this metadata).
     pub async fn get_created_at_ms(&self) -> Result<Option<i64>, JobStoreShardError> {

@@ -66,6 +66,11 @@ pub struct ShardFactory {
     /// unless a test arms it.
     #[cfg(debug_assertions)]
     clone_skip_child: std::sync::Mutex<Option<ShardId>>,
+    /// Test-only initialization fault: when armed, the pre-commit cleanup
+    /// metadata initialization for this child fails. Debug builds only;
+    /// inert unless a test arms it.
+    #[cfg(debug_assertions)]
+    init_fail_child: std::sync::Mutex<Option<ShardId>>,
 }
 
 impl ShardFactory {
@@ -82,6 +87,8 @@ impl ShardFactory {
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
             #[cfg(debug_assertions)]
             clone_skip_child: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            init_fail_child: std::sync::Mutex::new(None),
         }
     }
 
@@ -107,6 +114,8 @@ impl ShardFactory {
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
             #[cfg(debug_assertions)]
             clone_skip_child: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            init_fail_child: std::sync::Mutex::new(None),
         }
     }
 
@@ -137,6 +146,42 @@ impl ShardFactory {
         #[cfg(not(debug_assertions))]
         {
             None
+        }
+    }
+
+    /// Arm the test-only initialization fault: the pre-commit cleanup
+    /// metadata initialization for `child_id` fails, letting tests drive the
+    /// init-failure abort path, which a healthy shard cannot reach through
+    /// the public interface. `pub` because integration tests compile as a
+    /// separate crate.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn inject_child_init_failure(&self, child_id: ShardId) {
+        *self
+            .init_fail_child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child_id);
+    }
+
+    /// Disarm and report whether the initialization fault was armed for this
+    /// child. Always `false` in release builds.
+    fn take_injected_init_failure(&self, child_id: &ShardId) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            let mut armed = self
+                .init_fail_child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if armed.as_ref() == Some(child_id) {
+                armed.take();
+                return true;
+            }
+            false
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = child_id;
+            false
         }
     }
 
@@ -892,37 +937,156 @@ impl ShardFactory {
     /// This is a manifest-landed tripwire keyed on the empty-child signature,
     /// not a full row-integrity audit: a clone that landed the counter key but
     /// corrupted rows would still pass.
-    pub async fn verify_cloned_children_match_parent(
+    ///
+    /// After a child's count check passes, its cleanup metadata is initialized
+    /// in the same raw open (see
+    /// [`JobStoreShard::initialize_split_cleanup_metadata`]): every acquirer
+    /// of the committed child, on any node, then sees `CleanupPending` rather
+    /// than the absent-or-inherited state a byte-for-byte clone carries. The
+    /// per-child ordering (count check before initialize write) keeps the two
+    /// failure classes distinguishable. The parent is only counted, never
+    /// initialized -- resetting it to `CleanupPending` would make a
+    /// subsequently aborted split recover a parent that spuriously scans its
+    /// whole keyspace.
+    pub async fn verify_and_initialize_cloned_children(
         &self,
         parent_id: &ShardId,
         child_ids: &[ShardId],
     ) -> Result<(), ShardFactoryError> {
         let parent_total_jobs = self.read_closed_shard_total_jobs(parent_id).await?;
         for child_id in child_ids {
-            let child_total_jobs = self.read_closed_shard_total_jobs(child_id).await?;
+            self.verify_and_initialize_cloned_child(child_id, parent_id, parent_total_jobs)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Verify one freshly cloned child against the parent's job count, then
+    /// initialize its cleanup metadata -- a single raw open per child, count
+    /// check first.
+    async fn verify_and_initialize_cloned_child(
+        &self,
+        child_id: &ShardId,
+        parent_id: &ShardId,
+        parent_total_jobs: i64,
+    ) -> Result<(), ShardFactoryError> {
+        let shard = self.open_closed_shard_raw(child_id).await?;
+
+        let result = async {
+            let child_total_jobs = shard
+                .get_counters()
+                .await
+                .map_err(ShardFactoryError::ShardError)?
+                .total_jobs;
             if child_total_jobs != parent_total_jobs {
                 return Err(ShardFactoryError::ChildVerification(format!(
                     "cloned child {child_id} holds {child_total_jobs} jobs but parent {parent_id} \
                      held {parent_total_jobs}; aborting split before commit to avoid data loss"
                 )));
             }
+
+            if self.take_injected_init_failure(child_id) {
+                return Err(ShardFactoryError::ChildInitialization(format!(
+                    "injected cleanup-metadata initialization failure for child {child_id}"
+                )));
+            }
+
+            shard
+                .initialize_split_cleanup_metadata()
+                .await
+                .map_err(|e| {
+                    ShardFactoryError::ChildInitialization(format!(
+                        "failed to initialize cleanup metadata for cloned child {child_id}: {e}"
+                    ))
+                })
         }
+        .await;
+
+        // Always close the raw handle -- JobStoreShard has no Drop. Surface
+        // the verification/initialization error before any close error.
+        let close_result = shard.close().await;
+        result?;
+        close_result?;
         Ok(())
     }
 
     /// Open a closed shard's database with the raw `open_with_resolved_store`
     /// primitive, read its whole-shard `total_jobs`, and close it.
     ///
-    /// Uses the raw open -- NOT `open` -- so the shard is never registered in the
-    /// `instances` map: `open` caches the instance in the per-shard OnceCell, and
-    /// the post-commit `open(child)` would then return this stale pre-commit
-    /// handle instead of opening the committed child. Hydration is disabled and
-    /// `get_counters` reads single merged counter keys, so the check is O(1)
-    /// even on a multi-million-job shard.
+    /// Hydration is disabled and `get_counters` reads single merged counter
+    /// keys, so the check is O(1) even on a multi-million-job shard.
     async fn read_closed_shard_total_jobs(
         &self,
         shard_id: &ShardId,
     ) -> Result<i64, ShardFactoryError> {
+        let shard = self.open_closed_shard_raw(shard_id).await?;
+
+        // Always close the raw handle, even if the counter read fails, so the
+        // shard's SlateDB instance and its spawned background tasks (grant
+        // scanner, reconcilers) are released -- JobStoreShard has no Drop.
+        // Surface the counter-read error (the verification signal) before any
+        // close error.
+        let counters = shard.get_counters().await;
+        let close_result = shard.close().await;
+        let total_jobs = counters?.total_jobs;
+        close_result?;
+        Ok(total_jobs)
+    }
+
+    /// Read the split-cleanup metadata stored in a closed shard's database via
+    /// the raw non-registering open. `pub` because integration tests compile
+    /// as a separate crate and need to observe child metadata without
+    /// registering the child in the factory.
+    #[doc(hidden)]
+    pub async fn read_closed_shard_cleanup_metadata(
+        &self,
+        shard_id: &ShardId,
+    ) -> Result<ClosedShardCleanupMetadata, ShardFactoryError> {
+        let shard = self.open_closed_shard_raw(shard_id).await?;
+        let metadata = Self::collect_cleanup_metadata(&shard).await;
+        let close_result = shard.close().await;
+        let metadata = metadata?;
+        close_result?;
+        Ok(metadata)
+    }
+
+    async fn collect_cleanup_metadata(
+        shard: &JobStoreShard,
+    ) -> Result<ClosedShardCleanupMetadata, ShardFactoryError> {
+        let status = shard.get_cleanup_status_raw().await?;
+        let progress_key_present = shard
+            .db()
+            .get(&crate::keys::cleanup_progress_key())
+            .await
+            .map_err(JobStoreShardError::from)?
+            .is_some();
+        let complete_marker_present = shard
+            .db()
+            .get(&crate::keys::cleanup_complete_key())
+            .await
+            .map_err(JobStoreShardError::from)?
+            .is_some();
+        let cleanup_completed_at_ms = shard.get_cleanup_completed_at_ms().await?;
+        Ok(ClosedShardCleanupMetadata {
+            status,
+            progress_key_present,
+            complete_marker_present,
+            cleanup_completed_at_ms,
+        })
+    }
+
+    /// Open a closed shard's database with the raw `open_with_resolved_store`
+    /// primitive.
+    ///
+    /// Uses the raw open -- NOT `open` -- so the shard is never registered in the
+    /// `instances` map: `open` caches the instance in the per-shard OnceCell, and
+    /// the post-commit `open(child)` would then return this stale pre-commit
+    /// handle instead of opening the committed child. The caller MUST close the
+    /// returned handle -- JobStoreShard has no Drop.
+    async fn open_closed_shard_raw(
+        &self,
+        shard_id: &ShardId,
+    ) -> Result<Arc<JobStoreShard>, ShardFactoryError> {
         let name = shard_id.to_string();
         let (resolved, db_path) =
             Self::resolve_at_root(&self.template.backend, &self.template.path, &name)?;
@@ -965,22 +1129,29 @@ impl ShardFactory {
         )
         .await?;
 
-        // Always close the raw handle, even if the counter read fails, so the
-        // shard's SlateDB instance and its spawned background tasks (grant
-        // scanner, reconcilers) are released -- JobStoreShard has no Drop.
-        // Surface the counter-read error (the verification signal) before any
-        // close error.
-        let counters = shard.get_counters().await;
-        let close_result = shard.close().await;
-        let total_jobs = counters?.total_jobs;
-        close_result?;
-        Ok(total_jobs)
+        Ok(shard)
     }
 
     /// Get the database template used by this factory.
     pub fn template(&self) -> &DatabaseTemplate {
         &self.template
     }
+}
+
+/// Split-cleanup metadata read from a closed shard's database. Field-level
+/// key presence lets tests assert a full metadata reset without holding a
+/// live handle to the shard.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedShardCleanupMetadata {
+    /// Raw cleanup status: `None` when no status key is present.
+    pub status: Option<crate::coordination::SplitCleanupStatus>,
+    /// Whether the cleanup progress key is present.
+    pub progress_key_present: bool,
+    /// Whether the legacy cleanup complete-marker key is present.
+    pub complete_marker_present: bool,
+    /// Cleanup completion timestamp, if recorded.
+    pub cleanup_completed_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Error)]
@@ -1002,6 +1173,9 @@ pub enum ShardFactoryError {
 
     #[error("child verification error: {0}")]
     ChildVerification(String),
+
+    #[error("child initialization error: {0}")]
+    ChildInitialization(String),
 
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
