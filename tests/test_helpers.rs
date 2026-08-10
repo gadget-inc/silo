@@ -17,6 +17,26 @@ pub fn fast_flush_slatedb_settings() -> slatedb::config::Settings {
     }
 }
 
+/// Open a temp shard with a caller-chosen name, so captured log lines can be
+/// attributed to the calling test even when unrelated tests log concurrently.
+pub async fn open_temp_shard_with_name(
+    name: &str,
+    range: &ShardRange,
+) -> (tempfile::TempDir, Arc<JobStoreShard>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: name.to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        ..Default::default()
+    };
+    let shard = JobStoreShard::open(&cfg, MockGubernatorClient::new_arc(), None, range.clone())
+        .await
+        .expect("open shard");
+    (tmp, shard)
+}
+
 /// Factory for cross-node split tests: a shared DATA root with a PER-NODE WAL
 /// root, all on the process-global Memory store (memoized by exact path
 /// string). Two factories built with the same `root` but different `node`

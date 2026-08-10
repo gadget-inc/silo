@@ -1092,7 +1092,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                 }
             };
 
-            shard.maybe_spawn_background_cleanup(range, parent_shard_id);
+            let _ = shard.maybe_spawn_background_cleanup(range, parent_shard_id);
 
             {
                 let mut owned = self.base.owned.lock().await;
@@ -1729,8 +1729,8 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
                                 // Spawn background cleanup if this shard has pending cleanup work
                                 // (e.g., it's a split child or was re-acquired after a crash)
-                                shard
-                                    .maybe_spawn_background_cleanup(range.clone(), parent_shard_id);
+                                let _ =
+                                    shard.maybe_spawn_background_cleanup(range, parent_shard_id);
 
                                 // Check for shutdown BEFORE marking as Held. If shutdown was
                                 // triggered during the shard open, we should not claim ownership.

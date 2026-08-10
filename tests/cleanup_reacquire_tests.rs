@@ -103,7 +103,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             .expect("reopen shard");
 
         // Trigger the background cleanup (this is what coordination backends call)
-        shard.maybe_spawn_background_cleanup(range.clone(), None);
+        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
         // Poll until cleanup reaches its terminal state, rather than sleeping
         // for a fixed amount of time — under CI load the transition through
@@ -193,7 +193,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             .expect("reopen shard");
 
         // Trigger background cleanup
-        shard.maybe_spawn_background_cleanup(range.clone(), None);
+        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
         // Poll until cleanup reaches its terminal state, rather than sleeping
         // for a fixed amount of time — under CI load the transition through
@@ -271,7 +271,7 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             .expect("reopen shard");
 
         // Trigger background cleanup (should just run compaction since cleanup is done)
-        shard.maybe_spawn_background_cleanup(range.clone(), None);
+        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
         // Wait for compaction
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -337,7 +337,7 @@ async fn no_cleanup_when_already_complete() {
             .expect("reopen shard");
 
         // Trigger background cleanup
-        shard.maybe_spawn_background_cleanup(range.clone(), None);
+        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
         // Wait a bit
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -388,7 +388,7 @@ async fn cleanup_cancelled_on_shard_close() {
         .expect("set cleanup pending");
 
     // Start background cleanup
-    shard.maybe_spawn_background_cleanup(range.clone(), None);
+    let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
     // Immediately close the shard (should trigger cancellation)
     // Give a tiny bit of time for cleanup to start
@@ -598,7 +598,7 @@ async fn cleanup_handles_multiple_close_calls() {
         .expect("set cleanup pending");
 
     // Start background cleanup
-    shard.maybe_spawn_background_cleanup(range.clone(), None);
+    let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
     // First close
     shard.close().await.expect("first close");
@@ -657,7 +657,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
             .expect("reopen shard");
 
         // This is what the coordination backend would call after factory.open()
-        shard.maybe_spawn_background_cleanup(range.clone(), None);
+        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
         // Poll until cleanup reaches its terminal state, rather than sleeping
         // for a fixed amount of time — under CI load the transition through
@@ -707,7 +707,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         assert_eq!(status, SplitCleanupStatus::CompactionDone);
 
         // Trigger background cleanup - should be a no-op
-        shard.maybe_spawn_background_cleanup(range.clone(), None);
+        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
         // Jobs should be unchanged
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -771,7 +771,7 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
             .expect("reopen shard");
 
         // Background cleanup should complete the work
-        shard.maybe_spawn_background_cleanup(range.clone(), None);
+        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
 
         // Wait for completion
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -793,26 +793,6 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
 /// filtering alone cannot prevent.
 static LOG_CAPTURE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Open a shard with a unique name so captured log lines can be attributed
-/// to the calling test even when unrelated tests log concurrently.
-async fn open_named_shard(
-    name: &str,
-    range: &ShardRange,
-) -> (tempfile::TempDir, Arc<JobStoreShard>) {
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = DatabaseConfig {
-        name: name.to_string(),
-        backend: Backend::Fs,
-        path: tmp.path().to_string_lossy().to_string(),
-        slatedb: Some(fast_flush_slatedb_settings()),
-        ..Default::default()
-    };
-    let shard = JobStoreShard::open(&cfg, MockGubernatorClient::new_arc(), None, range.clone())
-        .await
-        .expect("open shard");
-    (tmp, shard)
-}
-
 /// A stranded split child -- no status key, a parent recorded in the shard
 /// map, no completion timestamp -- is backfilled to `CleanupPending` on
 /// acquisition (logged at info) and its defunct keys are actually deleted.
@@ -824,7 +804,7 @@ async fn stranded_split_child_is_backfilled_and_cleaned_on_acquisition() {
 
     let shard_name = "stranded-child-backfill-probe";
     let range = ShardRange::new("", RANGE_BOUNDARY);
-    let (_tmp, shard) = open_named_shard(shard_name, &range).await;
+    let (_tmp, shard) = test_helpers::open_temp_shard_with_name(shard_name, &range).await;
 
     // bbb/zzz are in range, aaa is out of range -- the defunct data.
     enqueue_jobs_for_tenants(&shard, &["bbb", "zzz", "aaa"], 3).await;
@@ -839,26 +819,17 @@ async fn stranded_split_child_is_backfilled_and_cleaned_on_acquisition() {
     );
 
     silo::trace::start_log_capture();
-    shard.maybe_spawn_background_cleanup(range.clone(), Some(ShardId::new()));
-
-    // Backfill writes CleanupPending and cleanup advances it to
-    // CompactionDone; poll the RAW reader so an absent key (spawn decided
-    // not to run) cannot satisfy the terminal check.
-    let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let status = shard.get_cleanup_status_raw().await.expect("raw status");
-        if status == Some(SplitCleanupStatus::CompactionDone) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < poll_deadline,
-            "cleanup did not reach CompactionDone within 30s; last raw status: {:?}",
-            status,
-        );
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
+    shard
+        .maybe_spawn_background_cleanup(range.clone(), Some(ShardId::new()))
+        .await
+        .expect("cleanup task");
     let logs = silo::trace::stop_log_capture();
 
+    assert_eq!(
+        shard.get_cleanup_status_raw().await.expect("raw status"),
+        Some(SplitCleanupStatus::CompactionDone),
+        "backfilled cleanup must run to its terminal status"
+    );
     shard.db().flush().await.unwrap();
     assert_eq!(
         count_job_info_keys(shard.db()).await,
@@ -871,6 +842,7 @@ async fn stranded_split_child_is_backfilled_and_cleaned_on_acquisition() {
         .lines()
         .filter(|l| l.contains("backfilling cleanup status for stranded split child"))
         .filter(|l| l.contains(shard_name))
+        .filter(|l| l.contains("INFO"))
         .collect();
     assert!(
         !backfill_lines.is_empty(),
@@ -878,22 +850,82 @@ async fn stranded_split_child_is_backfilled_and_cleaned_on_acquisition() {
     );
 }
 
+/// A stranded child can inherit its parent's cleanup progress record from
+/// the byte-for-byte clone; the `complete` flag inside it would short-circuit
+/// cleanup as "already complete". The backfill must reset that inherited
+/// state, not just write a status key.
+#[silo::test]
+async fn backfill_resets_inherited_complete_progress_before_cleaning() {
+    use silo::job_store_shard::CleanupProgress;
+    use silo::shard_range::ShardId;
+
+    let range = ShardRange::new("", RANGE_BOUNDARY);
+    let (_tmp, shard) =
+        test_helpers::open_temp_shard_with_name("inherited-progress-backfill-probe", &range).await;
+
+    enqueue_jobs_for_tenants(&shard, &["bbb", "zzz", "aaa"], 3).await;
+
+    // The inherited shape: a complete progress record without a status key,
+    // as cloned from a parent that had finished its own cleanup. The
+    // progress key is written directly -- no in-repo path writes progress
+    // without a status.
+    let inherited = CleanupProgress {
+        last_key: None,
+        keys_deleted: 0,
+        keys_scanned: 0,
+        complete: true,
+    };
+    shard
+        .db()
+        .put(
+            &silo::keys::cleanup_progress_key(),
+            &serde_json::to_vec(&inherited).unwrap(),
+        )
+        .await
+        .expect("write inherited progress");
+    shard.db().flush().await.unwrap();
+    assert_eq!(
+        shard.get_cleanup_status_raw().await.expect("raw status"),
+        None,
+        "precondition: no status key alongside the inherited progress"
+    );
+
+    shard
+        .maybe_spawn_background_cleanup(range.clone(), Some(ShardId::new()))
+        .await
+        .expect("cleanup task");
+
+    assert_eq!(
+        shard.get_cleanup_status_raw().await.expect("raw status"),
+        Some(SplitCleanupStatus::CompactionDone),
+        "backfilled cleanup must run to its terminal status"
+    );
+    shard.db().flush().await.unwrap();
+    assert_eq!(
+        count_job_info_keys(shard.db()).await,
+        6,
+        "backfilled cleanup must delete defunct jobs despite the inherited complete progress"
+    );
+    assert_eq!(count_job_info_keys_for_tenant(shard.db(), "aaa").await, 0);
+}
+
 /// An original shard -- no status key, no parent in the shard map -- is left
 /// completely untouched by the spawn decision: no status write, no scan.
 #[silo::test]
 async fn original_shard_without_status_is_untouched() {
     let range = ShardRange::new("", RANGE_BOUNDARY);
-    let (_tmp, shard) = open_named_shard("original-shard-noop-probe", &range).await;
+    let (_tmp, shard) =
+        test_helpers::open_temp_shard_with_name("original-shard-noop-probe", &range).await;
 
     // Out-of-range jobs that a spurious cleanup would delete.
     enqueue_jobs_for_tenants(&shard, &["bbb", "aaa"], 2).await;
     shard.db().flush().await.unwrap();
 
-    shard.maybe_spawn_background_cleanup(range.clone(), None);
+    shard
+        .maybe_spawn_background_cleanup(range.clone(), None)
+        .await
+        .expect("cleanup task");
 
-    // No observable side effect marks the no-op, so give the spawned task
-    // ample time to have run before asserting nothing changed.
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     assert_eq!(
         shard.get_cleanup_status_raw().await.expect("raw status"),
         None,
@@ -918,7 +950,7 @@ async fn absent_status_with_completion_timestamp_skips_cleanup_with_info_log() {
 
     let shard_name = "completed-timestamp-noop-probe";
     let range = ShardRange::new("", RANGE_BOUNDARY);
-    let (_tmp, shard) = open_named_shard(shard_name, &range).await;
+    let (_tmp, shard) = test_helpers::open_temp_shard_with_name(shard_name, &range).await;
 
     enqueue_jobs_for_tenants(&shard, &["bbb", "aaa"], 2).await;
     shard
@@ -933,8 +965,10 @@ async fn absent_status_with_completion_timestamp_skips_cleanup_with_info_log() {
     );
 
     silo::trace::start_log_capture();
-    shard.maybe_spawn_background_cleanup(range.clone(), Some(ShardId::new()));
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    shard
+        .maybe_spawn_background_cleanup(range.clone(), Some(ShardId::new()))
+        .await
+        .expect("cleanup task");
     let logs = silo::trace::stop_log_capture();
 
     assert_eq!(
@@ -951,6 +985,7 @@ async fn absent_status_with_completion_timestamp_skips_cleanup_with_info_log() {
         .lines()
         .filter(|l| l.contains("cleanup already completed"))
         .filter(|l| l.contains(shard_name))
+        .filter(|l| l.contains("INFO"))
         .collect();
     assert!(
         !skip_lines.is_empty(),
@@ -966,7 +1001,8 @@ async fn present_status_passes_through_needs_work_unchanged() {
     use silo::shard_range::ShardId;
 
     let range = ShardRange::new("", RANGE_BOUNDARY);
-    let (_tmp, shard) = open_named_shard("present-status-passthrough-probe", &range).await;
+    let (_tmp, shard) =
+        test_helpers::open_temp_shard_with_name("present-status-passthrough-probe", &range).await;
 
     enqueue_jobs_for_tenants(&shard, &["bbb", "aaa"], 2).await;
     shard
@@ -975,9 +1011,11 @@ async fn present_status_passes_through_needs_work_unchanged() {
         .expect("set terminal status");
     shard.db().flush().await.unwrap();
 
-    shard.maybe_spawn_background_cleanup(range.clone(), Some(ShardId::new()));
+    shard
+        .maybe_spawn_background_cleanup(range.clone(), Some(ShardId::new()))
+        .await
+        .expect("cleanup task");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     assert_eq!(
         shard.get_cleanup_status_raw().await.expect("raw status"),
         Some(SplitCleanupStatus::CompactionDone),

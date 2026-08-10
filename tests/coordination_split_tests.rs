@@ -2903,9 +2903,18 @@ mod splitter_unit_tests {
                 "child {child_id} status must be visible through a factory that does not share \
                  the initiator's WAL, got {meta:?}"
             );
-            assert!(!meta.progress_key_present);
-            assert!(!meta.complete_marker_present);
-            assert_eq!(meta.cleanup_completed_at_ms, None);
+            assert!(
+                !meta.progress_key_present,
+                "child {child_id} must have no inherited cleanup progress, got {meta:?}"
+            );
+            assert!(
+                !meta.complete_marker_present,
+                "child {child_id} must have no inherited legacy complete marker, got {meta:?}"
+            );
+            assert_eq!(
+                meta.cleanup_completed_at_ms, None,
+                "child {child_id} must have no inherited completion timestamp"
+            );
         }
     }
 
@@ -3030,7 +3039,10 @@ mod splitter_unit_tests {
                 !meta.progress_key_present,
                 "grandchild {grandchild_id} must not inherit the complete progress record"
             );
-            assert!(!meta.complete_marker_present);
+            assert!(
+                !meta.complete_marker_present,
+                "grandchild {grandchild_id} must not inherit the legacy complete marker"
+            );
             assert_eq!(
                 meta.cleanup_completed_at_ms, None,
                 "grandchild {grandchild_id} must not inherit the completion timestamp"

@@ -516,7 +516,7 @@ impl JobStoreShard {
     /// `flush()` call would select a WAL flush when a WAL store is
     /// configured -- with a node-local WAL that leaves the write invisible
     /// to whichever node later acquires the child.
-    pub async fn initialize_split_cleanup_metadata(&self) -> Result<(), JobStoreShardError> {
+    pub(crate) async fn initialize_split_cleanup_metadata(&self) -> Result<(), JobStoreShardError> {
         let status_data = serde_json::to_vec(&SplitCleanupStatus::CleanupPending)?;
         let mut batch = WriteBatch::new();
         batch.put(keys::cleanup_status_key(), &status_data);
@@ -594,11 +594,14 @@ impl JobStoreShard {
     /// * `parent_shard_id` - The parent recorded in this shard's map entry, if
     ///   any. Consulted only when the database has no status key, as a
     ///   backfill hint for split children stranded without one.
+    ///
+    /// Returns the spawned task's handle. Dropping it detaches the task;
+    /// tests await it to observe the decision deterministically.
     pub fn maybe_spawn_background_cleanup(
         self: &std::sync::Arc<Self>,
         range: ShardRange,
         parent_shard_id: Option<crate::shard_range::ShardId>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let shard = std::sync::Arc::clone(self);
         let shard_name = self.name.clone();
 
@@ -653,10 +656,11 @@ impl JobStoreShard {
                         parent_shard_id = %parent_shard_id,
                         "backfilling cleanup status for stranded split child"
                     );
-                    if let Err(e) = shard
-                        .set_cleanup_status(SplitCleanupStatus::CleanupPending)
-                        .await
-                    {
+                    // Full reset, not just a status write: the stranded child
+                    // may also have inherited its parent's progress record,
+                    // whose `complete` flag would short-circuit the cleanup
+                    // below as "already complete".
+                    if let Err(e) = shard.initialize_split_cleanup_metadata().await {
                         tracing::error!(
                             shard = %shard_name,
                             error = %e,
@@ -721,7 +725,7 @@ impl JobStoreShard {
                     );
                 }
             }
-        });
+        })
     }
 }
 

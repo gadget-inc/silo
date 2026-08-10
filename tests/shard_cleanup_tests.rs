@@ -819,32 +819,14 @@ fn lines_for_shard(logs: &str, shard_name: &str) -> Vec<String> {
 #[silo::test]
 async fn first_status_write_into_absent_key_does_not_warn() {
     use silo::coordination::SplitCleanupStatus;
-    use silo::gubernator::MockGubernatorClient;
-    use silo::job_store_shard::JobStoreShard;
-    use silo::settings::{Backend, DatabaseConfig};
-    use test_helpers::fast_flush_slatedb_settings;
 
     let _capture_guard = LOG_CAPTURE_MUTEX.lock().await;
 
     // Unique shard name so captured lines can be attributed to this test even
     // if unrelated tests log concurrently.
     let shard_name = "first-write-warn-probe";
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = DatabaseConfig {
-        name: shard_name.to_string(),
-        backend: Backend::Fs,
-        path: tmp.path().to_string_lossy().to_string(),
-        slatedb: Some(fast_flush_slatedb_settings()),
-        ..Default::default()
-    };
-    let shard = JobStoreShard::open(
-        &cfg,
-        MockGubernatorClient::new_arc(),
-        None,
-        ShardRange::full(),
-    )
-    .await
-    .expect("open shard");
+    let (_tmp, shard) =
+        test_helpers::open_temp_shard_with_name(shard_name, &ShardRange::full()).await;
 
     // First write into an absent status key: must land without a regression WARN.
     silo::trace::start_log_capture();

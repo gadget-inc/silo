@@ -970,9 +970,7 @@ impl ShardFactory {
         parent_id: &ShardId,
         parent_total_jobs: i64,
     ) -> Result<(), ShardFactoryError> {
-        let shard = self.open_closed_shard_raw(child_id).await?;
-
-        let result = async {
+        self.with_closed_shard_raw(child_id, |shard| async move {
             let child_total_jobs = shard
                 .get_counters()
                 .await
@@ -999,19 +997,34 @@ impl ShardFactory {
                         "failed to initialize cleanup metadata for cloned child {child_id}: {e}"
                     ))
                 })
-        }
-        .await;
-
-        // Always close the raw handle -- JobStoreShard has no Drop. Surface
-        // the verification/initialization error before any close error.
-        let close_result = shard.close().await;
-        result?;
-        close_result?;
-        Ok(())
+        })
+        .await
     }
 
-    /// Open a closed shard's database with the raw `open_with_resolved_store`
-    /// primitive, read its whole-shard `total_jobs`, and close it.
+    /// Open a closed shard raw, run `f` against it, and always close the
+    /// handle -- JobStoreShard has no Drop, so a leaked handle strands the
+    /// shard's SlateDB instance and its spawned background tasks (grant
+    /// scanner, reconcilers). The operation's error is surfaced before any
+    /// close error.
+    async fn with_closed_shard_raw<T, F, Fut>(
+        &self,
+        shard_id: &ShardId,
+        f: F,
+    ) -> Result<T, ShardFactoryError>
+    where
+        F: FnOnce(Arc<JobStoreShard>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ShardFactoryError>>,
+    {
+        let shard = self.open_closed_shard_raw(shard_id).await?;
+        let result = f(Arc::clone(&shard)).await;
+        let close_result = shard.close().await;
+        let value = result?;
+        close_result?;
+        Ok(value)
+    }
+
+    /// Read a closed shard's whole-shard `total_jobs` via the raw
+    /// non-registering open.
     ///
     /// Hydration is disabled and `get_counters` reads single merged counter
     /// keys, so the check is O(1) even on a multi-million-job shard.
@@ -1019,18 +1032,10 @@ impl ShardFactory {
         &self,
         shard_id: &ShardId,
     ) -> Result<i64, ShardFactoryError> {
-        let shard = self.open_closed_shard_raw(shard_id).await?;
-
-        // Always close the raw handle, even if the counter read fails, so the
-        // shard's SlateDB instance and its spawned background tasks (grant
-        // scanner, reconcilers) are released -- JobStoreShard has no Drop.
-        // Surface the counter-read error (the verification signal) before any
-        // close error.
-        let counters = shard.get_counters().await;
-        let close_result = shard.close().await;
-        let total_jobs = counters?.total_jobs;
-        close_result?;
-        Ok(total_jobs)
+        self.with_closed_shard_raw(shard_id, |shard| async move {
+            Ok(shard.get_counters().await?.total_jobs)
+        })
+        .await
     }
 
     /// Read the split-cleanup metadata stored in a closed shard's database via
@@ -1042,12 +1047,10 @@ impl ShardFactory {
         &self,
         shard_id: &ShardId,
     ) -> Result<ClosedShardCleanupMetadata, ShardFactoryError> {
-        let shard = self.open_closed_shard_raw(shard_id).await?;
-        let metadata = Self::collect_cleanup_metadata(&shard).await;
-        let close_result = shard.close().await;
-        let metadata = metadata?;
-        close_result?;
-        Ok(metadata)
+        self.with_closed_shard_raw(shard_id, |shard| async move {
+            Self::collect_cleanup_metadata(&shard).await
+        })
+        .await
     }
 
     async fn collect_cleanup_metadata(
