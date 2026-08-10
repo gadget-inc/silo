@@ -799,3 +799,131 @@ async fn cleanup_completed_at_only_set_on_actual_completion() {
         "cleanup_completed_at should be set after cleanup completes"
     );
 }
+
+/// Serializes tests that arm the process-global log capture buffer: a
+/// sibling's `stop_log_capture` drains the buffer mid-test, which shard-id
+/// filtering alone cannot prevent.
+static LOG_CAPTURE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Extract the captured log lines that mention the given shard name.
+fn lines_for_shard(logs: &str, shard_name: &str) -> Vec<String> {
+    logs.lines()
+        .filter(|l| l.contains(shard_name))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A first status write into a shard with no status key is a valid initial
+/// transition, not a regression; a genuine backward transition between two
+/// present statuses still warns and is still allowed.
+#[silo::test]
+async fn first_status_write_into_absent_key_does_not_warn() {
+    use silo::coordination::SplitCleanupStatus;
+    use silo::gubernator::MockGubernatorClient;
+    use silo::job_store_shard::JobStoreShard;
+    use silo::settings::{Backend, DatabaseConfig};
+    use test_helpers::fast_flush_slatedb_settings;
+
+    let _capture_guard = LOG_CAPTURE_MUTEX.lock().await;
+
+    // Unique shard name so captured lines can be attributed to this test even
+    // if unrelated tests log concurrently.
+    let shard_name = "first-write-warn-probe";
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: shard_name.to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        ..Default::default()
+    };
+    let shard = JobStoreShard::open(
+        &cfg,
+        MockGubernatorClient::new_arc(),
+        None,
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+
+    // First write into an absent status key: must land without a regression WARN.
+    silo::trace::start_log_capture();
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupPending)
+        .await
+        .expect("first status write");
+    let logs = silo::trace::stop_log_capture();
+
+    let own_lines = lines_for_shard(&logs, shard_name);
+    assert!(
+        !own_lines
+            .iter()
+            .any(|l| l.contains("cleanup status regression")),
+        "first write into an absent status key must not warn, got:\n{}",
+        own_lines.join("\n")
+    );
+    assert_eq!(
+        shard.get_cleanup_status().await.expect("get status"),
+        SplitCleanupStatus::CleanupPending,
+        "first write must land"
+    );
+
+    // Advance to a later status, then genuinely regress: the WARN fires and
+    // the write still lands (crash-recovery allowance).
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupDone)
+        .await
+        .expect("forward status write");
+
+    silo::trace::start_log_capture();
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupPending)
+        .await
+        .expect("backward status write");
+    let logs = silo::trace::stop_log_capture();
+
+    let own_lines = lines_for_shard(&logs, shard_name);
+    assert!(
+        own_lines
+            .iter()
+            .any(|l| l.contains("cleanup status regression")),
+        "a backward transition between present statuses must warn, got:\n{}",
+        own_lines.join("\n")
+    );
+    assert_eq!(
+        shard.get_cleanup_status().await.expect("get status"),
+        SplitCleanupStatus::CleanupPending,
+        "backward write must still land"
+    );
+}
+
+/// The raw reader distinguishes an absent status key from a present one,
+/// while the defaulted reader maps absence to `CompactionDone`.
+#[silo::test]
+async fn raw_cleanup_status_reader_distinguishes_absent_from_present() {
+    use silo::coordination::SplitCleanupStatus;
+
+    let (_tmp, shard) = open_temp_shard().await;
+
+    assert_eq!(
+        shard.get_cleanup_status_raw().await.expect("raw status"),
+        None,
+        "fresh shard has no status key"
+    );
+    assert_eq!(
+        shard.get_cleanup_status().await.expect("defaulted status"),
+        SplitCleanupStatus::CompactionDone,
+        "defaulted reader maps absence to CompactionDone"
+    );
+
+    shard
+        .set_cleanup_status(SplitCleanupStatus::CleanupRunning)
+        .await
+        .expect("set status");
+
+    assert_eq!(
+        shard.get_cleanup_status_raw().await.expect("raw status"),
+        Some(SplitCleanupStatus::CleanupRunning),
+        "raw reader returns the present status"
+    );
+}

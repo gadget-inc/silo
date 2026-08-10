@@ -442,34 +442,49 @@ impl JobStoreShard {
         Ok(progress.complete)
     }
 
-    /// Get the cleanup status stored in this shard's database.
+    /// Get the cleanup status stored in this shard's database, distinguishing
+    /// an absent status key (`None`) from a present one.
     ///
     /// This is the authoritative source of truth for the shard's cleanup state.
-    /// Returns `CompactionDone` if no status has been set (e.g., for shards that
-    /// were not created by a split).
-    pub async fn get_cleanup_status(&self) -> Result<SplitCleanupStatus, JobStoreShardError> {
+    /// The key is absent for shards that never had a status written (e.g.,
+    /// shards that were not created by a split).
+    pub async fn get_cleanup_status_raw(
+        &self,
+    ) -> Result<Option<SplitCleanupStatus>, JobStoreShardError> {
         match self.db.get(&keys::cleanup_status_key()).await? {
             Some(data) => {
                 let status: SplitCleanupStatus = serde_json::from_slice(&data)?;
-                Ok(status)
+                Ok(Some(status))
             }
-            None => Ok(SplitCleanupStatus::CompactionDone),
+            None => Ok(None),
         }
+    }
+
+    /// Get the cleanup status stored in this shard's database, defaulting an
+    /// absent status key to `CompactionDone` ("nothing to do").
+    pub async fn get_cleanup_status(&self) -> Result<SplitCleanupStatus, JobStoreShardError> {
+        Ok(self
+            .get_cleanup_status_raw()
+            .await?
+            .unwrap_or(SplitCleanupStatus::CompactionDone))
     }
 
     /// [SILO-COORD-INV-8] Set the cleanup status in this shard's database.
     ///
     /// This updates the authoritative cleanup status for this shard.
     /// Status can only progress forward: Pending -> Running -> Done -> CompactionDone.
-    /// Attempting to set a status that would regress is logged as a warning but
-    /// allowed (for crash recovery scenarios where we may re-process).
+    /// A write into a shard with no status key is a valid first transition.
+    /// Attempting to set a status that would regress from a present status is
+    /// logged as a warning but allowed (for crash recovery scenarios where we
+    /// may re-process).
     pub async fn set_cleanup_status(
         &self,
         status: SplitCleanupStatus,
     ) -> Result<(), JobStoreShardError> {
         // Check current status to validate forward progression
-        let current = self.get_cleanup_status().await?;
-        if !current.can_transition_to(status) {
+        if let Some(current) = self.get_cleanup_status_raw().await?
+            && !current.can_transition_to(status)
+        {
             tracing::warn!(
                 shard = %self.name,
                 current = %current,
