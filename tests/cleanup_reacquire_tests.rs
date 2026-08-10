@@ -103,7 +103,7 @@ async fn background_cleanup_spawns_when_cleanup_pending() {
             .expect("reopen shard");
 
         // Trigger the background cleanup (this is what coordination backends call)
-        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+        drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
         // Poll until cleanup reaches its terminal state, rather than sleeping
         // for a fixed amount of time — under CI load the transition through
@@ -193,7 +193,7 @@ async fn background_cleanup_resumes_when_cleanup_was_running() {
             .expect("reopen shard");
 
         // Trigger background cleanup
-        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+        drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
         // Poll until cleanup reaches its terminal state, rather than sleeping
         // for a fixed amount of time — under CI load the transition through
@@ -271,7 +271,7 @@ async fn background_cleanup_runs_compaction_when_cleanup_done() {
             .expect("reopen shard");
 
         // Trigger background cleanup (should just run compaction since cleanup is done)
-        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+        drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
         // Wait for compaction
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -337,7 +337,7 @@ async fn no_cleanup_when_already_complete() {
             .expect("reopen shard");
 
         // Trigger background cleanup
-        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+        drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
         // Wait a bit
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -388,7 +388,7 @@ async fn cleanup_cancelled_on_shard_close() {
         .expect("set cleanup pending");
 
     // Start background cleanup
-    let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+    drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
     // Immediately close the shard (should trigger cancellation)
     // Give a tiny bit of time for cleanup to start
@@ -598,7 +598,7 @@ async fn cleanup_handles_multiple_close_calls() {
         .expect("set cleanup pending");
 
     // Start background cleanup
-    let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+    drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
     // First close
     shard.close().await.expect("first close");
@@ -657,7 +657,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
             .expect("reopen shard");
 
         // This is what the coordination backend would call after factory.open()
-        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+        drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
         // Poll until cleanup reaches its terminal state, rather than sleeping
         // for a fixed amount of time — under CI load the transition through
@@ -707,7 +707,7 @@ async fn full_reacquisition_cycle_triggers_cleanup() {
         assert_eq!(status, SplitCleanupStatus::CompactionDone);
 
         // Trigger background cleanup - should be a no-op
-        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+        drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
         // Jobs should be unchanged
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -771,7 +771,7 @@ async fn interrupted_cleanup_resumes_on_reacquisition() {
             .expect("reopen shard");
 
         // Background cleanup should complete the work
-        let _ = shard.maybe_spawn_background_cleanup(range.clone(), None);
+        drop(shard.maybe_spawn_background_cleanup(range.clone(), None));
 
         // Wait for completion
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

@@ -67,10 +67,10 @@ impl NoneCoordinator {
                         ))
                     })?;
                 // Spawn background cleanup if this shard has pending cleanup work
-                let _ = shard.maybe_spawn_background_cleanup(
+                drop(shard.maybe_spawn_background_cleanup(
                     shard_info.range.clone(),
                     shard_info.parent_shard_id,
-                );
+                ));
                 owned.insert(shard_info.id);
             }
         }

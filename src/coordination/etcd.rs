@@ -401,7 +401,7 @@ impl EtcdCoordinator {
                 }
             };
 
-            let _ = shard.maybe_spawn_background_cleanup(range, parent_shard_id);
+            drop(shard.maybe_spawn_background_cleanup(range, parent_shard_id));
 
             {
                 let mut owned = self.base.owned.lock().await;
@@ -1151,8 +1151,12 @@ impl EtcdShardGuard {
 
                                     // Spawn background cleanup if this shard has pending cleanup work
                                     // (e.g., it's a split child or was re-acquired after a crash)
-                                    let _ = shard
-                                        .maybe_spawn_background_cleanup(range, parent_shard_id);
+                                    drop(
+                                        shard.maybe_spawn_background_cleanup(
+                                            range,
+                                            parent_shard_id,
+                                        ),
+                                    );
 
                                     {
                                         let mut st = self.ctx.state.lock().await;
