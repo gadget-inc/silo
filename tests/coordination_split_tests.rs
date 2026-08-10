@@ -730,6 +730,211 @@ async fn split_with_empty_child_aborts_before_commit_and_recovers_parent() {
     h1.abort();
 }
 
+/// End-to-end cross-node flow over a shared data root with per-node WAL
+/// roots: two live nodes, one parent shard. Bounded-load rendezvous caps
+/// each node at ceil(2 shards / 2 nodes) = 1 child, so after the split the
+/// initiator owns exactly one child and the OTHER node deterministically
+/// acquires the other -- a child the initiator never opened -- and its
+/// cleanup runs to completion, deleting the defunct half of the parent's
+/// data. The shared-data-root / per-node-WAL factory is load-bearing: with
+/// fully per-node roots the second node would open a fresh empty database
+/// and the test would pass vacuously.
+#[silo::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_initiator_node_cleans_children_after_split() {
+    use silo::coordination::SplitCleanupStatus;
+
+    let _guard = acquire_test_mutex().await;
+
+    let prefix = unique_prefix();
+    let root = format!("silo-cross-node-cleanup-{prefix}");
+    let num_shards: u32 = 1;
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+
+    let factory1 = test_helpers::make_shared_data_root_memory_factory(&root, "n1");
+    let factory2 = test_helpers::make_shared_data_root_memory_factory(&root, "n2");
+    let (c1, h1) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n1",
+        "http://127.0.0.1:7450",
+        num_shards,
+        10,
+        Arc::clone(&factory1),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator n1");
+    let (c2, h2) = EtcdCoordinator::start(
+        &cfg.coordination.etcd_endpoints,
+        &prefix,
+        "n2",
+        "http://127.0.0.1:7451",
+        num_shards,
+        10,
+        Arc::clone(&factory2),
+        Vec::new(),
+    )
+    .await
+    .expect("start coordinator n2");
+    assert!(c1.wait_converged(Duration::from_secs(10)).await);
+    assert!(c2.wait_converged(Duration::from_secs(10)).await);
+
+    // Whichever node owns the single parent shard is the initiator.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let (shard_id, initiator, init_factory, non_initiator, non_init_factory) = loop {
+        if let Some(&shard_id) = c1.owned_shards().await.first() {
+            break (shard_id, &c1, &factory1, &c2, &factory2);
+        }
+        if let Some(&shard_id) = c2.owned_shards().await.first() {
+            break (shard_id, &c2, &factory2, &c1, &factory1);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "neither node acquired the parent shard"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let parent_range = {
+        let map = initiator.get_shard_map().await.expect("get shard map");
+        map.get_shard(&shard_id).unwrap().range.clone()
+    };
+    let parent = loop {
+        if let Some(parent) = init_factory.get(&shard_id) {
+            break parent;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "initiator never opened the parent shard"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // Three tenants hash below the midpoint boundary, three at or above --
+    // each child inherits all sixty jobs and owes thirty deletions.
+    let low = ["bbb", "mmm", "nnn"];
+    let high = ["aaa", "lll", "yyy"];
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for tenant in low.iter().chain(high.iter()) {
+        for i in 0..10 {
+            parent
+                .enqueue(
+                    tenant,
+                    Some(format!("{tenant}-job-{i}")),
+                    5,
+                    now_ms,
+                    None,
+                    rmp_serde::to_vec(&serde_json::json!({"i": i})).unwrap(),
+                    vec![],
+                    None,
+                    "default",
+                )
+                .await
+                .expect("enqueue to parent");
+        }
+    }
+    let per_child_in_range = (low.len() + high.len()) * 10 / 2;
+
+    let splitter = ShardSplitter::new(Arc::new(initiator.clone()));
+    let split_point = silo::shard_range::format_hash_boundary(
+        parent_range.midpoint().expect("parent range has midpoint"),
+    );
+    let split = splitter
+        .request_split(shard_id, split_point.clone())
+        .await
+        .expect("request split");
+    let init_for_owner_map = initiator.clone();
+    splitter
+        .execute_split(shard_id, move || {
+            let c = init_for_owner_map.clone();
+            async move { c.get_shard_owner_map().await }
+        })
+        .await
+        .expect("execute split");
+
+    // Bounded-load rendezvous gives each node exactly one child. Find the
+    // non-initiator's child and which tenant set is in its range.
+    let poll_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let remote_child_id = loop {
+        let owned = non_initiator.owned_shards().await;
+        if let Some(&child_id) = owned
+            .iter()
+            .find(|id| **id == split.left_child_id || **id == split.right_child_id)
+        {
+            break child_id;
+        }
+        assert!(
+            std::time::Instant::now() < poll_deadline,
+            "the non-initiator node never acquired a child (owned: {owned:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let (in_range_tenants, out_of_range_tenants) = if remote_child_id == split.left_child_id {
+        (low, high)
+    } else {
+        (high, low)
+    };
+
+    // The initiator never desired, opened, or cleaned this child, so every
+    // deletion observed below is the non-initiator's work.
+    let child = loop {
+        if let Some(child) = non_init_factory.get(&remote_child_id) {
+            break child;
+        }
+        assert!(
+            std::time::Instant::now() < poll_deadline,
+            "the non-initiator node never opened its child"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    loop {
+        let status = child.get_cleanup_status_raw().await.expect("child status");
+        if matches!(
+            status,
+            Some(SplitCleanupStatus::CleanupDone | SplitCleanupStatus::CompactionDone)
+        ) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < poll_deadline,
+            "child {remote_child_id} cleanup did not complete on the non-initiator node; \
+             last status: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    child.db().flush().await.expect("flush child");
+
+    // The clone verification guaranteed this child held the parent's full
+    // job set at commit; retaining exactly the in-range jobs proves the
+    // non-initiator's cleanup deleted the defunct half.
+    assert_eq!(
+        test_helpers::count_job_info_keys(child.db()).await,
+        per_child_in_range,
+        "child {remote_child_id} must retain exactly its in-range jobs"
+    );
+    for tenant in in_range_tenants {
+        assert_eq!(
+            test_helpers::count_job_info_keys_for_tenant(child.db(), tenant).await,
+            10,
+            "child {remote_child_id} must keep tenant {tenant}'s jobs"
+        );
+    }
+    for tenant in out_of_range_tenants {
+        assert_eq!(
+            test_helpers::count_job_info_keys_for_tenant(child.db(), tenant).await,
+            0,
+            "child {remote_child_id} must have deleted tenant {tenant}'s defunct jobs"
+        );
+    }
+
+    c1.shutdown().await.expect("shutdown n1");
+    c2.shutdown().await.expect("shutdown n2");
+    h1.abort();
+    h2.abort();
+}
+
 /// Drive a full split on the shared-root Memory backend (an object store,
 /// with a separate WAL store) and assert every enqueued job survives in the
 /// child that owns its tenant's range. This is the object-store analogue of

@@ -591,13 +591,20 @@ impl JobStoreShard {
     ///
     /// # Arguments
     /// * `range` - The tenant range for this shard (used for cleanup filtering)
-    pub fn maybe_spawn_background_cleanup(self: &std::sync::Arc<Self>, range: ShardRange) {
+    /// * `parent_shard_id` - The parent recorded in this shard's map entry, if
+    ///   any. Consulted only when the database has no status key, as a
+    ///   backfill hint for split children stranded without one.
+    pub fn maybe_spawn_background_cleanup(
+        self: &std::sync::Arc<Self>,
+        range: ShardRange,
+        parent_shard_id: Option<crate::shard_range::ShardId>,
+    ) {
         let shard = std::sync::Arc::clone(self);
         let shard_name = self.name.clone();
 
         tokio::spawn(async move {
             // Check if cleanup is needed
-            let status = match shard.get_cleanup_status().await {
+            let status = match shard.get_cleanup_status_raw().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(
@@ -606,6 +613,58 @@ impl JobStoreShard {
                         "failed to check cleanup status"
                     );
                     return;
+                }
+            };
+
+            let status = match status {
+                Some(status) => status,
+                // No status key: consult the shard map's parent record. A
+                // split child with no status was stranded by an initiator
+                // that never wrote one -- backfill it so its cleanup runs.
+                None => {
+                    let Some(parent_shard_id) = parent_shard_id else {
+                        tracing::debug!(
+                            shard = %shard_name,
+                            "no cleanup status and no parent recorded; original shard needs no cleanup"
+                        );
+                        return;
+                    };
+                    let completed_at = match shard.get_cleanup_completed_at_ms().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(
+                                shard = %shard_name,
+                                error = %e,
+                                "failed to check cleanup completion timestamp"
+                            );
+                            return;
+                        }
+                    };
+                    if completed_at.is_some() {
+                        info!(
+                            shard = %shard_name,
+                            parent_shard_id = %parent_shard_id,
+                            "split child has no cleanup status but cleanup already completed; skipping"
+                        );
+                        return;
+                    }
+                    info!(
+                        shard = %shard_name,
+                        parent_shard_id = %parent_shard_id,
+                        "backfilling cleanup status for stranded split child"
+                    );
+                    if let Err(e) = shard
+                        .set_cleanup_status(SplitCleanupStatus::CleanupPending)
+                        .await
+                    {
+                        tracing::error!(
+                            shard = %shard_name,
+                            error = %e,
+                            "failed to backfill cleanup status"
+                        );
+                        return;
+                    }
+                    SplitCleanupStatus::CleanupPending
                 }
             };
 
