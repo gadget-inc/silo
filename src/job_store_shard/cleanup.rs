@@ -442,34 +442,49 @@ impl JobStoreShard {
         Ok(progress.complete)
     }
 
-    /// Get the cleanup status stored in this shard's database.
+    /// Get the cleanup status stored in this shard's database, distinguishing
+    /// an absent status key (`None`) from a present one.
     ///
     /// This is the authoritative source of truth for the shard's cleanup state.
-    /// Returns `CompactionDone` if no status has been set (e.g., for shards that
-    /// were not created by a split).
-    pub async fn get_cleanup_status(&self) -> Result<SplitCleanupStatus, JobStoreShardError> {
+    /// The key is absent for shards that never had a status written (e.g.,
+    /// shards that were not created by a split).
+    pub async fn get_cleanup_status_raw(
+        &self,
+    ) -> Result<Option<SplitCleanupStatus>, JobStoreShardError> {
         match self.db.get(&keys::cleanup_status_key()).await? {
             Some(data) => {
                 let status: SplitCleanupStatus = serde_json::from_slice(&data)?;
-                Ok(status)
+                Ok(Some(status))
             }
-            None => Ok(SplitCleanupStatus::CompactionDone),
+            None => Ok(None),
         }
+    }
+
+    /// Get the cleanup status stored in this shard's database, defaulting an
+    /// absent status key to `CompactionDone` ("nothing to do").
+    pub async fn get_cleanup_status(&self) -> Result<SplitCleanupStatus, JobStoreShardError> {
+        Ok(self
+            .get_cleanup_status_raw()
+            .await?
+            .unwrap_or(SplitCleanupStatus::CompactionDone))
     }
 
     /// [SILO-COORD-INV-8] Set the cleanup status in this shard's database.
     ///
     /// This updates the authoritative cleanup status for this shard.
     /// Status can only progress forward: Pending -> Running -> Done -> CompactionDone.
-    /// Attempting to set a status that would regress is logged as a warning but
-    /// allowed (for crash recovery scenarios where we may re-process).
+    /// A write into a shard with no status key is a valid first transition.
+    /// Attempting to set a status that would regress from a present status is
+    /// logged as a warning but allowed (for crash recovery scenarios where we
+    /// may re-process).
     pub async fn set_cleanup_status(
         &self,
         status: SplitCleanupStatus,
     ) -> Result<(), JobStoreShardError> {
         // Check current status to validate forward progression
-        let current = self.get_cleanup_status().await?;
-        if !current.can_transition_to(status) {
+        if let Some(current) = self.get_cleanup_status_raw().await?
+            && !current.can_transition_to(status)
+        {
             tracing::warn!(
                 shard = %self.name,
                 current = %current,
@@ -480,6 +495,40 @@ impl JobStoreShard {
 
         let data = serde_json::to_vec(&status)?;
         self.db.put(&keys::cleanup_status_key(), &data).await?;
+        Ok(())
+    }
+
+    /// Initialize split-cleanup metadata for a freshly cloned child shard.
+    ///
+    /// A clone is byte-for-byte, so a child inherits whichever cleanup keys
+    /// its parent carried; an inherited terminal status -- or the `complete`
+    /// flag inside inherited progress, which is what the cleanup loop
+    /// consults -- would short-circuit the child's own cleanup as "already
+    /// complete". This reset unconditionally overwrites the status to
+    /// `CleanupPending` (bypassing the forward-transition check; it runs only
+    /// pre-commit on a freshly cloned database the initiator exclusively
+    /// holds) and clears the progress, legacy complete-marker, and completion
+    /// timestamp keys.
+    ///
+    /// The explicit MemTable-type flush makes the write durable in shared
+    /// storage on the paths a clean close's built-in flush does not cover
+    /// (failed-state close, crash between write and close). The plain
+    /// `flush()` call would select a WAL flush when a WAL store is
+    /// configured -- with a node-local WAL that leaves the write invisible
+    /// to whichever node later acquires the child.
+    pub(crate) async fn initialize_split_cleanup_metadata(&self) -> Result<(), JobStoreShardError> {
+        let status_data = serde_json::to_vec(&SplitCleanupStatus::CleanupPending)?;
+        let mut batch = WriteBatch::new();
+        batch.put(keys::cleanup_status_key(), &status_data);
+        batch.delete(keys::cleanup_progress_key());
+        batch.delete(keys::cleanup_complete_key());
+        batch.delete(keys::cleanup_completed_at_key());
+        self.db.write(batch).await?;
+        self.db
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await?;
         Ok(())
     }
 
@@ -542,13 +591,23 @@ impl JobStoreShard {
     ///
     /// # Arguments
     /// * `range` - The tenant range for this shard (used for cleanup filtering)
-    pub fn maybe_spawn_background_cleanup(self: &std::sync::Arc<Self>, range: ShardRange) {
+    /// * `parent_shard_id` - The parent recorded in this shard's map entry, if
+    ///   any. Consulted only when the database has no status key, as a
+    ///   backfill hint for split children stranded without one.
+    ///
+    /// Returns the spawned task's handle. Dropping it detaches the task;
+    /// tests await it to observe the decision deterministically.
+    pub fn maybe_spawn_background_cleanup(
+        self: &std::sync::Arc<Self>,
+        range: ShardRange,
+        parent_shard_id: Option<crate::shard_range::ShardId>,
+    ) -> tokio::task::JoinHandle<()> {
         let shard = std::sync::Arc::clone(self);
         let shard_name = self.name.clone();
 
         tokio::spawn(async move {
             // Check if cleanup is needed
-            let status = match shard.get_cleanup_status().await {
+            let status = match shard.get_cleanup_status_raw().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(
@@ -557,6 +616,59 @@ impl JobStoreShard {
                         "failed to check cleanup status"
                     );
                     return;
+                }
+            };
+
+            let status = match status {
+                Some(status) => status,
+                // No status key: consult the shard map's parent record. A
+                // split child with no status was stranded by an initiator
+                // that never wrote one -- backfill it so its cleanup runs.
+                None => {
+                    let Some(parent_shard_id) = parent_shard_id else {
+                        tracing::debug!(
+                            shard = %shard_name,
+                            "no cleanup status and no parent recorded; original shard needs no cleanup"
+                        );
+                        return;
+                    };
+                    let completed_at = match shard.get_cleanup_completed_at_ms().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(
+                                shard = %shard_name,
+                                error = %e,
+                                "failed to check cleanup completion timestamp"
+                            );
+                            return;
+                        }
+                    };
+                    if completed_at.is_some() {
+                        info!(
+                            shard = %shard_name,
+                            parent_shard_id = %parent_shard_id,
+                            "split child has no cleanup status but cleanup already completed; skipping"
+                        );
+                        return;
+                    }
+                    info!(
+                        shard = %shard_name,
+                        parent_shard_id = %parent_shard_id,
+                        "backfilling cleanup status for stranded split child"
+                    );
+                    // Full reset, not just a status write: the stranded child
+                    // may also have inherited its parent's progress record,
+                    // whose `complete` flag would short-circuit the cleanup
+                    // below as "already complete".
+                    if let Err(e) = shard.initialize_split_cleanup_metadata().await {
+                        tracing::error!(
+                            shard = %shard_name,
+                            error = %e,
+                            "failed to backfill cleanup status"
+                        );
+                        return;
+                    }
+                    SplitCleanupStatus::CleanupPending
                 }
             };
 
@@ -613,7 +725,7 @@ impl JobStoreShard {
                     );
                 }
             }
-        });
+        })
     }
 }
 

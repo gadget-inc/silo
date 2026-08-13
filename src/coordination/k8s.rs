@@ -1072,11 +1072,11 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let mut opened_count = 0u32;
 
         for (shard_id, rv, uid) in &reclaimed {
-            // Look up range from shard map (short-lived lock)
-            let range = {
+            // Look up range and parent from shard map (short-lived lock)
+            let (range, parent_shard_id) = {
                 let shard_map = self.base.shard_map.lock().await;
                 match shard_map.get_shard(shard_id) {
-                    Some(info) => info.range.clone(),
+                    Some(info) => (info.range.clone(), info.parent_shard_id),
                     None => {
                         warn!(shard_id = %shard_id, "reclaim: shard not found in shard map, skipping");
                         continue;
@@ -1092,7 +1092,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                 }
             };
 
-            shard.maybe_spawn_background_cleanup(range);
+            drop(shard.maybe_spawn_background_cleanup(range, parent_shard_id));
 
             {
                 let mut owned = self.base.owned.lock().await;
@@ -1691,11 +1691,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                     elapsed_ms = lease_cas_started.elapsed().as_millis() as u64,
                                     "k8s acquire: lease CAS"
                                 );
-                                // Look up the shard's range from the shard map
-                                let range = {
+                                // Look up the shard's range and parent from the shard map
+                                let (range, parent_shard_id) = {
                                     let map = shard_map.lock().await;
                                     match map.get_shard(&self.ctx.shard_id) {
-                                        Some(info) => info.range.clone(),
+                                        Some(info) => (info.range.clone(), info.parent_shard_id),
                                         None => {
                                             tracing::error!(shard_id = %self.ctx.shard_id, "shard not found in shard map");
                                             let _ = self.release_lease_cas(&lease_name).await;
@@ -1729,7 +1729,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
                                 // Spawn background cleanup if this shard has pending cleanup work
                                 // (e.g., it's a split child or was re-acquired after a crash)
-                                shard.maybe_spawn_background_cleanup(range.clone());
+                                drop(shard.maybe_spawn_background_cleanup(range, parent_shard_id));
 
                                 // Check for shutdown BEFORE marking as Held. If shutdown was
                                 // triggered during the shard open, we should not claim ownership.

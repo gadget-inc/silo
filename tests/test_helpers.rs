@@ -17,6 +17,55 @@ pub fn fast_flush_slatedb_settings() -> slatedb::config::Settings {
     }
 }
 
+/// Open a temp shard with a caller-chosen name, so captured log lines can be
+/// attributed to the calling test even when unrelated tests log concurrently.
+pub async fn open_temp_shard_with_name(
+    name: &str,
+    range: &ShardRange,
+) -> (tempfile::TempDir, Arc<JobStoreShard>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: name.to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        ..Default::default()
+    };
+    let shard = JobStoreShard::open(&cfg, MockGubernatorClient::new_arc(), None, range.clone())
+        .await
+        .expect("open shard");
+    (tmp, shard)
+}
+
+/// Factory for cross-node split tests: a shared DATA root with a PER-NODE WAL
+/// root, all on the process-global Memory store (memoized by exact path
+/// string). Two factories built with the same `root` but different `node`
+/// share shard data while each keeps its own WAL -- like production nodes
+/// over shared object storage with node-local WALs. A fully shared root
+/// would share the WAL store too, making cross-node durability assertions
+/// vacuous (a write stranded in the WAL would still be visible); fully
+/// per-node roots would keep one node from seeing the other's shards at all.
+pub fn make_shared_data_root_memory_factory(
+    root: &str,
+    node: &str,
+) -> Arc<silo::factory::ShardFactory> {
+    use silo::settings::{DatabaseTemplate, WalConfig};
+
+    Arc::new(silo::factory::ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Memory,
+            path: format!("{root}/data/%shard%"),
+            wal: Some(WalConfig {
+                backend: Backend::Memory,
+                path: format!("{root}/wal-{node}/%shard%"),
+            }),
+            ..Default::default()
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    ))
+}
+
 // Helper: enforce a tight timeout for async tests likely to hang
 #[macro_export]
 macro_rules! with_timeout {
