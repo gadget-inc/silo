@@ -61,6 +61,11 @@ jobs:
         env:
           SILO_DEBUG_LOG_FILE: test-debug.log
         run: cargo test -- --skip k8s_ --skip etcd_ --skip coordination_split_tests --skip cluster_two_nodes
+      - name: Run silo-compactor tests
+        shell: bash
+        # Plain `cargo test` above only covers the workspace's root package, so
+        # the compactor crate needs its own invocation.
+        run: cargo test -p silo-compactor
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
