@@ -172,10 +172,7 @@ impl ObjectStore for ExternalSstReadRedirect {
         self.inner.list(prefix)
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
