@@ -137,17 +137,13 @@ async fn run_once(
         .is_some()
         .then(|| Arc::new(DefaultMetricsRecorder::new()));
 
-    let mut builder = slatedb::CompactorBuilder::new(canonical_path, Arc::clone(&store))
-        .with_merge_operator(silo::job_store_shard::counter_merge_operator());
-    if let Some(opts) = compactor_options {
-        builder = builder.with_options(opts);
-    }
-    if let Some(rec) = &recorder {
-        builder = builder.with_metrics_recorder(
-            Arc::clone(rec) as Arc<dyn slatedb_common::metrics::MetricsRecorder>
-        );
-    }
-    let compactor = builder.build();
+    let compactor = crate::external_sst::build_shard_compactor(
+        canonical_path,
+        Arc::clone(&store),
+        compactor_options,
+        recorder.clone(),
+    )
+    .await?;
 
     if let Some(m) = metrics {
         m.record_compactor_started(&shard_label);
