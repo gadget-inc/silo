@@ -98,3 +98,67 @@ pub fn resolve_object_store(backend: &Backend, path: &str) -> Result<ResolvedSto
 pub fn path_for_shard(template: &str, shard_id: &ShardId) -> String {
     template.replace("%shard%", &shard_id.to_string())
 }
+
+/// Resolve a shard's object store at the shared template root -- the store
+/// rooted at the template prefix before `%shard%`, with the shard's database
+/// path expressed relative to that root -- mirroring the serving factory's
+/// `ShardFactory::resolve_at_root`. A store scoped to the shard's own prefix
+/// cannot address the external-DB paths a clone's manifest records, so the
+/// compactor could never read clone-inherited SSTs regardless of how those
+/// paths are rewritten. Absolute object keys are unchanged by the re-rooting.
+pub fn resolve_object_store_at_root(
+    backend: &Backend,
+    path_template: &str,
+    shard_id: &ShardId,
+) -> Result<ResolvedStore, StorageError> {
+    let shard_name = shard_id.to_string();
+    match backend {
+        Backend::Fs => {
+            let Some(pos) = path_template.find("%shard%") else {
+                // Placeholder-free template: no shared root to resolve at.
+                return resolve_object_store(backend, path_template);
+            };
+            let root = path_template[..pos].trim_end_matches('/');
+            let root = if root.is_empty() { "/" } else { root };
+            let resolved = resolve_object_store(backend, root)?;
+            Ok(ResolvedStore {
+                store: resolved.store,
+                canonical_path: shard_name,
+                root_path: resolved.root_path,
+            })
+        }
+        // Memory stores are per-resolve sentinels used in tests; there is no
+        // shared root to re-root at.
+        Backend::Memory => resolve_object_store(backend, &path_for_shard(path_template, shard_id)),
+        Backend::S3 | Backend::Gcs | Backend::Url => {
+            let (root, db_path) = silo::factory::ShardFactory::object_store_layout(
+                &to_silo_backend(backend),
+                path_template,
+                &shard_name,
+            )
+            .map_err(|e| {
+                StorageError::InvalidUrl(format!(
+                    "shared-root layout for template '{path_template}': {e}"
+                ))
+            })?;
+            let store = Db::resolve_object_store(&root)?;
+            Ok(ResolvedStore {
+                store,
+                canonical_path: db_path,
+                root_path: root,
+            })
+        }
+    }
+}
+
+/// Map the compactor's backend enum onto silo's, which drives the shared-root
+/// layout arithmetic.
+fn to_silo_backend(backend: &Backend) -> silo::settings::Backend {
+    match backend {
+        Backend::Fs => silo::settings::Backend::Fs,
+        Backend::S3 => silo::settings::Backend::S3,
+        Backend::Gcs => silo::settings::Backend::Gcs,
+        Backend::Memory => silo::settings::Backend::Memory,
+        Backend::Url => silo::settings::Backend::Url,
+    }
+}

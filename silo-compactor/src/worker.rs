@@ -9,7 +9,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::error::CompactorError;
 use crate::metrics::CompactorMetrics;
 use crate::shard_map::ShardId;
-use crate::storage::{Backend, path_for_shard, resolve_object_store};
+use crate::storage::{Backend, resolve_object_store_at_root};
 
 /// Period at which per-shard slatedb stats are polled and translated into
 /// Prometheus instruments. Roughly matches silo's per-shard cadence.
@@ -118,8 +118,7 @@ async fn run_once(
     cancel: &CancellationToken,
 ) -> Result<(), CompactorError> {
     let shard_label = shard_id.to_string();
-    let shard_path = path_for_shard(path_template, shard_id);
-    let resolved = resolve_object_store(backend, &shard_path)?;
+    let resolved = resolve_object_store_at_root(backend, path_template, shard_id)?;
 
     info!(
         shard = %shard_id,
