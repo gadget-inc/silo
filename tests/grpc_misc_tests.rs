@@ -1642,7 +1642,7 @@ async fn grpc_worker_rpcs_require_tenant_when_tenancy_enabled() -> anyhow::Resul
 /// When tenancy is disabled, worker RPCs should work without tenant_id.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_worker_rpcs_skip_tenant_validation_when_tenancy_disabled() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+    tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.tenancy.enabled = false;
@@ -1726,7 +1726,7 @@ async fn grpc_worker_rpcs_skip_tenant_validation_when_tenancy_disabled() -> anyh
 /// When tenancy is enabled, worker RPCs should accept valid tenant_id and succeed.
 #[silo::test(flavor = "multi_thread")]
 async fn grpc_worker_rpcs_accept_valid_tenant_when_tenancy_enabled() -> anyhow::Result<()> {
-    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+    tokio::time::timeout(std::time::Duration::from_millis(10000), async {
         let (factory, _tmp) = create_test_factory().await?;
         let mut cfg = AppConfig::load(None).unwrap();
         cfg.tenancy.enabled = true;
@@ -1802,6 +1802,147 @@ async fn grpc_worker_rpcs_accept_valid_tenant_when_tenancy_enabled() -> anyhow::
             res.is_ok(),
             "report_outcome should succeed with valid tenant_id: {:?}",
             res.err()
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// A future-dated scheduled job deletes with a single DeleteJob RPC and a
+/// follow-up GetJob returns NotFound.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_delete_job_deletes_scheduled_job_in_one_call() -> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID.to_string();
+        let future_ms = silo::job_store_shard::now_epoch_ms() + 60_000;
+
+        let enq = client
+            .enqueue(EnqueueRequest {
+                shard: test_shard_id.clone(),
+                id: "scheduled-purge-target".to_string(),
+                priority: 5,
+                start_at_ms: future_ms,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"seed": true})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        // One DeleteJob RPC, no cancel first
+        client
+            .delete_job(DeleteJobRequest {
+                shard: test_shard_id.clone(),
+                id: enq.id.clone(),
+                tenant: None,
+            })
+            .await?;
+
+        let err = client
+            .get_job(GetJobRequest {
+                shard: test_shard_id.clone(),
+                id: enq.id.clone(),
+                tenant: None,
+                include_attempts: false,
+            })
+            .await
+            .expect_err("job should be gone");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // The pending task went with the job -- nothing leasable remains
+        let lease = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.clone()),
+                worker_id: "w".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert!(
+            lease.tasks.is_empty(),
+            "deleted scheduled job must leave no leasable task"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// DeleteJob on a running job returns an error whose message names the
+/// Running status.
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_delete_job_refusal_names_running_status() -> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let test_shard_id = crate::grpc_integration_helpers::TEST_SHARD_ID.to_string();
+
+        let enq = client
+            .enqueue(EnqueueRequest {
+                shard: test_shard_id.clone(),
+                id: "running-delete-target".to_string(),
+                priority: 5,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"seed": true})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        // Lease the task so the job transitions to Running
+        let lease = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: Some(test_shard_id.clone()),
+                worker_id: "w".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(lease.tasks.len(), 1);
+
+        let err = client
+            .delete_job(DeleteJobRequest {
+                shard: test_shard_id.clone(),
+                id: enq.id.clone(),
+                tenant: None,
+            })
+            .await
+            .expect_err("delete of a running job should be refused");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(
+            err.message().contains("Running"),
+            "refusal should name the Running status, got: {}",
+            err.message()
         );
 
         shutdown_server(shutdown_tx, server).await?;

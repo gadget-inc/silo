@@ -374,15 +374,23 @@ async fn cannot_delete_running_job() {
             .tasks;
         let task_id = tasks[0].attempt().task_id().to_string();
 
-        // Attempt to delete while running - should fail
+        // Attempt to delete while running - should fail with an error naming
+        // the job's actual status
         let err = shard
             .delete_job("-", &job_id)
             .await
             .expect_err("delete should fail");
-        match err {
-            JobStoreShardError::JobInProgress(jid) => assert_eq!(jid, job_id),
+        match &err {
+            JobStoreShardError::JobInProgress(jid, status) => {
+                assert_eq!(jid, &job_id);
+                assert_eq!(*status, JobStatusKind::Running);
+            }
             other => panic!("expected JobInProgress, got {:?}", other),
         }
+        assert!(
+            err.to_string().contains("Running"),
+            "refusal message should name the Running status, got: {err}"
+        );
 
         // Complete the job
         shard
@@ -408,18 +416,19 @@ async fn cannot_delete_running_job() {
 }
 
 #[silo::test]
-async fn cannot_delete_scheduled_job() {
+async fn delete_scheduled_job_removes_job_and_pending_task() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
         let payload_bytes = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
         let priority = 10u8;
-        let now = now_ms();
+        // Future-dated so the job stays Scheduled for the whole test
+        let future = now_ms() + 60_000;
         let job_id = shard
             .enqueue(
                 "-",
                 None,
                 priority,
-                now,
+                future,
                 None,
                 payload_bytes,
                 vec![],
@@ -429,46 +438,64 @@ async fn cannot_delete_scheduled_job() {
             .await
             .expect("enqueue");
 
-        // Job is scheduled but not yet dequeued
         let status = shard
             .get_job_status("-", &job_id)
             .await
             .expect("get status")
             .expect("exists");
         assert_eq!(status.kind, JobStatusKind::Scheduled);
+        assert_eq!(
+            count_task_keys(shard.db()).await,
+            1,
+            "pending task row should exist while scheduled"
+        );
 
-        // Attempt to delete - should fail
-        let err = shard
-            .delete_job("-", &job_id)
-            .await
-            .expect_err("delete should fail");
-        match err {
-            JobStoreShardError::JobInProgress(jid) => assert_eq!(jid, job_id),
-            other => panic!("expected JobInProgress, got {:?}", other),
-        }
-
-        // Complete the job first
-        let tasks = shard
-            .dequeue("w", "default", 1)
-            .await
-            .expect("dequeue")
-            .tasks;
-        let task_id = tasks[0].attempt().task_id().to_string();
-        shard
-            .report_attempt_outcome(
-                &task_id,
-                AttemptOutcome::Success {
-                    result: b"ok".to_vec(),
-                },
-            )
-            .await
-            .expect("report ok");
-
-        // Now delete should succeed
+        // A scheduled job deletes in one call
         shard
             .delete_job("-", &job_id)
             .await
-            .expect("delete after completion");
+            .expect("delete scheduled job");
+
+        assert!(
+            shard
+                .get_job("-", &job_id)
+                .await
+                .expect("get_job")
+                .is_none(),
+            "job info should be gone"
+        );
+        assert!(
+            shard
+                .get_job_status("-", &job_id)
+                .await
+                .expect("get status")
+                .is_none(),
+            "job status should be gone"
+        );
+        assert_eq!(
+            count_task_keys(shard.db()).await,
+            0,
+            "pending task row should be gone"
+        );
+        let scheduled_idx = shard
+            .scan_jobs_by_status("-", JobStatusKind::Scheduled, Some(10))
+            .await
+            .expect("scan by status");
+        assert!(
+            !scheduled_idx.contains(&job_id),
+            "status-time index entry should be gone"
+        );
+
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(
+            counters.total_jobs, 0,
+            "total jobs counter exact after delete"
+        );
+        assert_eq!(
+            counters.completed_jobs, 0,
+            "completed jobs counter untouched"
+        );
+        assert_eq!(counters.open_jobs(), 0, "open jobs derivation exact");
     });
 }
 

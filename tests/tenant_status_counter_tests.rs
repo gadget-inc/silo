@@ -821,3 +821,158 @@ async fn counter_scan_can_limit_to_exact_tenant() {
         assert_eq!(entries[0].2, 2);
     });
 }
+
+#[silo::test]
+async fn scheduled_delete_purge_keeps_counters_exact() {
+    with_timeout!(30000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let tenant = "purge-tenant";
+
+        // Seed 5 future-dated scheduled jobs carrying an explicit queue in
+        // metadata so the background-action queue gauge is exercised too.
+        let future = now_ms() + 60_000;
+        let mut job_ids = vec![];
+        for i in 0..5 {
+            let job_id = shard
+                .enqueue(
+                    tenant,
+                    None,
+                    10u8,
+                    future,
+                    None,
+                    msgpack_payload(&serde_json::json!({"i": i})),
+                    vec![],
+                    Some(vec![("queue".to_string(), "purge-q".to_string())]),
+                    "default",
+                )
+                .await
+                .expect("enqueue");
+            job_ids.push(job_id);
+        }
+
+        let counts = get_status_counts(&shard, tenant).await;
+        assert_eq!(counts.get("Scheduled").copied().unwrap_or(0), 5);
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 5);
+        assert_eq!(counters.completed_jobs, 0);
+        assert_eq!(counters.open_jobs(), 5);
+        let gauges = get_background_action_queue_counts(&shard, tenant).await;
+        let queue_size = gauges
+            .get(&(
+                "default".to_string(),
+                "queue_size".to_string(),
+                "explicit".to_string(),
+                "purge-q".to_string(),
+            ))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(queue_size, 5, "queue gauge counts the scheduled jobs");
+
+        // Purge in two waves: after the first 3 deletes the gauge must read
+        // exactly 2 — the gauge floors at zero and drops entries, so only a
+        // mid-purge checkpoint can catch a per-delete double-decrement.
+        for job_id in &job_ids[..3] {
+            shard
+                .delete_job(tenant, job_id)
+                .await
+                .expect("delete scheduled job");
+        }
+        let gauges = get_background_action_queue_counts(&shard, tenant).await;
+        let queue_size = gauges
+            .get(&(
+                "default".to_string(),
+                "queue_size".to_string(),
+                "explicit".to_string(),
+                "purge-q".to_string(),
+            ))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            queue_size, 2,
+            "queue gauge decrements exactly once per deleted job"
+        );
+        let counts = get_status_counts(&shard, tenant).await;
+        assert_eq!(
+            counts.get("Scheduled").copied().unwrap_or(0),
+            2,
+            "tenant Scheduled counter exact mid-purge"
+        );
+
+        for job_id in &job_ids[3..] {
+            shard
+                .delete_job(tenant, job_id)
+                .await
+                .expect("delete scheduled job");
+        }
+
+        let counts = get_status_counts(&shard, tenant).await;
+        assert_eq!(
+            counts.get("Scheduled").copied().unwrap_or(0),
+            0,
+            "tenant Scheduled counter exact after purge: {counts:?}"
+        );
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 0, "total jobs exact after purge");
+        assert_eq!(
+            counters.completed_jobs, 0,
+            "completed jobs untouched by scheduled deletes"
+        );
+        assert_eq!(counters.open_jobs(), 0, "open jobs derivation exact");
+        let gauges = get_background_action_queue_counts(&shard, tenant).await;
+        assert!(
+            gauges.is_empty(),
+            "queue gauge decremented exactly once per deleted job: {gauges:?}"
+        );
+
+        // Every job is gone
+        for job_id in &job_ids {
+            let job = shard.get_job(tenant, job_id).await.expect("get job");
+            assert!(job.is_none(), "job {job_id} should be deleted");
+        }
+    });
+}
+
+#[silo::test]
+async fn cancel_then_delete_scheduled_job_removes_job_and_counters() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let tenant = "cancel-delete-tenant";
+
+        let job_id = shard
+            .enqueue(
+                tenant,
+                None,
+                10u8,
+                now_ms() + 60_000,
+                None,
+                msgpack_payload(&serde_json::json!({"k": "v"})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Existing operator scripts cancel first, then delete
+        shard.cancel_job(tenant, &job_id).await.expect("cancel");
+        shard.delete_job(tenant, &job_id).await.expect("delete");
+
+        let job = shard.get_job(tenant, &job_id).await.expect("get job");
+        assert!(job.is_none(), "job should be deleted");
+        let counts = get_status_counts(&shard, tenant).await;
+        assert_eq!(
+            counts.get("Scheduled").copied().unwrap_or(0),
+            0,
+            "no Scheduled counter residue"
+        );
+        assert_eq!(
+            counts.get("Cancelled").copied().unwrap_or(0),
+            0,
+            "no Cancelled counter residue"
+        );
+        let counters = shard.get_counters().await.expect("get_counters");
+        assert_eq!(counters.total_jobs, 0);
+        assert_eq!(counters.completed_jobs, 0);
+        assert_eq!(counters.open_jobs(), 0);
+    });
+}
