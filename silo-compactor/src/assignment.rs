@@ -14,9 +14,7 @@ pub fn compute_assignment(
     mut shards: Vec<ShardId>,
     max_shards: usize,
 ) -> Vec<ShardId> {
-    let total_pods = pods.len();
-    let n = shards.len();
-    if n == 0 || total_pods == 0 {
+    if shards.is_empty() || pods.is_empty() {
         return Vec::new();
     }
 
@@ -24,6 +22,12 @@ pub fn compute_assignment(
     pods.dedup();
     shards.sort_by_key(|s| s.0);
     shards.dedup();
+
+    // Counts must be taken after dedup: the range arithmetic below indexes
+    // into the deduped vecs, and a duplicated pod count would shrink (or,
+    // for duplicated shards, overrun) every pod's slice.
+    let total_pods = pods.len();
+    let n = shards.len();
 
     let Some(my_idx) = pods.iter().position(|n| n == self_name) else {
         return Vec::new();

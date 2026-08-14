@@ -9,7 +9,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::error::CompactorError;
 use crate::metrics::CompactorMetrics;
 use crate::shard_map::ShardId;
-use crate::storage::{Backend, path_for_shard, resolve_object_store};
+use crate::storage::{Backend, resolve_object_store_at_root};
 
 /// Period at which per-shard slatedb stats are polled and translated into
 /// Prometheus instruments. Roughly matches silo's per-shard cadence.
@@ -118,8 +118,7 @@ async fn run_once(
     cancel: &CancellationToken,
 ) -> Result<(), CompactorError> {
     let shard_label = shard_id.to_string();
-    let shard_path = path_for_shard(path_template, shard_id);
-    let resolved = resolve_object_store(backend, &shard_path)?;
+    let resolved = resolve_object_store_at_root(backend, path_template, shard_id)?;
 
     info!(
         shard = %shard_id,
@@ -137,17 +136,13 @@ async fn run_once(
         .is_some()
         .then(|| Arc::new(DefaultMetricsRecorder::new()));
 
-    let mut builder = slatedb::CompactorBuilder::new(canonical_path, Arc::clone(&store))
-        .with_merge_operator(silo::job_store_shard::counter_merge_operator());
-    if let Some(opts) = compactor_options {
-        builder = builder.with_options(opts);
-    }
-    if let Some(rec) = &recorder {
-        builder = builder.with_metrics_recorder(
-            Arc::clone(rec) as Arc<dyn slatedb_common::metrics::MetricsRecorder>
-        );
-    }
-    let compactor = builder.build();
+    let compactor = crate::external_sst::build_shard_compactor(
+        canonical_path,
+        Arc::clone(&store),
+        compactor_options,
+        recorder.clone(),
+    )
+    .await?;
 
     if let Some(m) = metrics {
         m.record_compactor_started(&shard_label);

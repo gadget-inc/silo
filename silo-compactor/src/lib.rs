@@ -2,6 +2,7 @@ pub mod assignment;
 pub mod config;
 pub mod coordinator;
 pub mod error;
+pub mod external_sst;
 pub mod metrics;
 pub mod pod_discovery;
 pub mod shard_loader;
