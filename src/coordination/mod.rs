@@ -133,7 +133,7 @@ impl ShardOwnerMap {
     /// This is the desired assignment from current membership, so a shard
     /// appears here only when no member is eligible for its ring -- not while
     /// an eligible owner is still acquiring it.
-    pub fn unassigned_shards(&self) -> BTreeMap<ShardId, String> {
+    pub fn unassigned_shards(&self) -> UnassignedShards {
         self.shard_map
             .shards()
             .iter()
@@ -146,7 +146,16 @@ impl ShardOwnerMap {
     }
 }
 
+/// Unassigned shards keyed by id, each with the ring it is stranded on.
+pub type UnassignedShards = BTreeMap<ShardId, String>;
+
 /// Label under which default-ring shards are reported (metrics, logs).
+///
+/// A shard with no ring set and a shard explicitly pinned to a ring named
+/// `default` both render under this label, although [`member_in_ring`] treats
+/// them differently (members with no rings configured are eligible only for
+/// the former). Pinning a shard to the literal `default` is not a supported
+/// configuration, so the two are not distinguished here.
 pub const DEFAULT_RING_LABEL: &str = "default";
 
 /// Error type for coordination operations

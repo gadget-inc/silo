@@ -77,12 +77,15 @@ pub struct ShardUnownedError {
 
 impl std::fmt::Display for ShardUnownedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let advertised = if self.advertised_rings.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.advertised_rings.join(", ")
+        };
         write!(
             f,
             "shard `{}` has no owner; its placement ring `{}` has no members (members advertise: `{}`)",
-            self.shard_id,
-            self.ring,
-            self.advertised_rings.join(", ")
+            self.shard_id, self.ring, advertised
         )
     }
 }
