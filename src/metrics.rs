@@ -2017,7 +2017,14 @@ pub fn init() -> anyhow::Result<Metrics> {
     // Shard/broker metrics
     let shards_owned = register(
         &registry,
-        Gauge::new("silo_shards_owned", "Number of shards owned by this node")?,
+        Gauge::new(
+            "silo_shards_owned",
+            format!(
+                "Number of shards this node owns (acquired from the coordinator and opened); \
+                 sampled every {}s, which bounds staleness",
+                crate::placement_metrics::SAMPLE_INTERVAL.as_secs()
+            ),
+        )?,
     );
 
     let coordination_shards_open = register(

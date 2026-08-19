@@ -20,6 +20,7 @@ pub mod job_store_shard;
 pub mod keys;
 pub mod metrics;
 pub mod pb_convert;
+pub mod placement_metrics;
 #[cfg(feature = "server")]
 pub mod query;
 pub mod retry;
