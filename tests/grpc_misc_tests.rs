@@ -1944,3 +1944,40 @@ async fn configure_shard_accepts_ring_a_member_advertises() -> anyhow::Result<()
     shutdown_server(shutdown_tx, server).await?;
     Ok(())
 }
+
+#[silo::test(flavor = "multi_thread")]
+async fn configure_shard_treats_empty_ring_as_default() -> anyhow::Result<()> {
+    // The request field's contract is "empty/null = default ring", so an
+    // explicit empty string must behave exactly like omitting the ring: never
+    // validated, and recorded as the default ring.
+    let (mut client, shard_id, shutdown_tx, server, _tmp) = setup_ring_server(&["heavy"]).await?;
+
+    let response = client
+        .configure_shard(ConfigureShardRequest {
+            shard: shard_id.clone(),
+            placement_ring: Some(String::new()),
+            allow_unpopulated_ring: false,
+            tenant: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.current_ring, "", "shard is on the default ring");
+
+    let cluster_info = client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
+    let shard = cluster_info
+        .shard_owners
+        .iter()
+        .find(|s| s.shard_id == shard_id)
+        .expect("shard still listed");
+    assert_eq!(
+        shard.placement_ring.as_deref(),
+        None,
+        "an empty ring is stored as no ring, not as a ring named ''"
+    );
+
+    shutdown_server(shutdown_tx, server).await?;
+    Ok(())
+}

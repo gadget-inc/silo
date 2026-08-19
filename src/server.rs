@@ -2213,26 +2213,42 @@ impl Silo for SiloService {
     ) -> Result<Response<ConfigureShardResponse>, Status> {
         let r = req.into_inner();
         let shard_id = Self::parse_shard_id(&r.shard)?;
+        // The request contract is "empty/null = default ring", so an explicit
+        // empty string is the default ring, never a ring named ''.
+        let ring = r.placement_ring.as_deref().filter(|s| !s.is_empty());
 
         // Refuse a ring no current member is in: the shard would have no
         // eligible owner. Moving to the default ring is never refused -- it is
         // the recovery path, even when no member is on the default ring either.
-        if let Some(ring) = r
-            .placement_ring
-            .as_deref()
-            .filter(|_| !r.allow_unpopulated_ring)
-        {
+        if let Some(ring) = ring.filter(|_| !r.allow_unpopulated_ring) {
             let members = self
                 .coordinator
                 .get_members()
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
             if !members.iter().any(|m| member_in_ring(m, Some(ring))) {
+                let mut advertised: Vec<&str> = members
+                    .iter()
+                    .flat_map(|m| {
+                        if m.placement_rings.is_empty() {
+                            vec!["default"]
+                        } else {
+                            m.placement_rings.iter().map(String::as_str).collect()
+                        }
+                    })
+                    .collect();
+                advertised.sort_unstable();
+                advertised.dedup();
+                let advertised = if advertised.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    advertised.join(", ")
+                };
                 return Err(Status::failed_precondition(format!(
-                    "placement ring '{}' has no members: no current cluster member advertises it, \
-                     so the shard would have no eligible owner (pass allow_unpopulated_ring to \
-                     pin it anyway)",
-                    ring
+                    "placement ring '{}' has no members: no current cluster member advertises it \
+                     (members advertise: {}), so the shard would have no eligible owner; set \
+                     allow_unpopulated_ring to pin it anyway",
+                    ring, advertised
                 )));
             }
         }
@@ -2240,7 +2256,7 @@ impl Silo for SiloService {
         // Update the shard's placement ring via the coordinator
         let (previous, current) = self
             .coordinator
-            .update_shard_placement_ring(&shard_id, r.placement_ring.as_deref())
+            .update_shard_placement_ring(&shard_id, ring)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
