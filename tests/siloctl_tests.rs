@@ -1855,3 +1855,291 @@ async fn siloctl_job_result_not_terminal() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+// --- unowned (stranded) shard handling ---
+
+mod stranded {
+    //! A coordinator stub whose desired assignment leaves one shard with no
+    //! owner: its shard map pins one shard to a named ring while the only
+    //! member advertises the default ring, and the owner map comes from the
+    //! shared `compute_shard_owner_map`, so the cluster-info response carries a
+    //! genuinely ownerless shard (empty `grpc_addr`, `placement_ring` set).
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use silo::coordination::{
+        CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap,
+        SplitStorageBackend,
+    };
+    use silo::factory::ShardFactory;
+    use silo::server::run_server;
+    use silo::settings::AppConfig;
+    use silo::shard_range::{ShardId, ShardMap, SplitInProgress};
+    use tokio::net::TcpListener;
+
+    pub const STRANDED_RING: &str = "heavy";
+
+    pub struct StrandedCoordinator {
+        base: CoordinatorBase,
+    }
+
+    impl StrandedCoordinator {
+        /// Two shards; the first is pinned to [`STRANDED_RING`].
+        async fn new(grpc_addr: &str) -> (Self, ShardId) {
+            let mut shard_map = ShardMap::create_initial(2).expect("create shard map");
+            let stranded = shard_map.shard_ids()[0];
+            shard_map
+                .get_shard_mut(&stranded)
+                .expect("shard exists")
+                .set_placement_ring(Some(STRANDED_RING.to_string()));
+            let base = CoordinatorBase::new(
+                "stranded-test-node",
+                grpc_addr,
+                shard_map,
+                Arc::new(ShardFactory::new_noop()),
+                Vec::new(),
+            );
+            (Self { base }, stranded)
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Coordinator for StrandedCoordinator {
+        fn base(&self) -> &CoordinatorBase {
+            &self.base
+        }
+
+        async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
+            Ok(vec![MemberInfo {
+                node_id: self.base.node_id.clone(),
+                grpc_addr: self.base.grpc_addr.clone(),
+                hostname: None,
+                startup_time_ms: None,
+                placement_rings: Vec::new(),
+            }])
+        }
+
+        async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
+            let members = self.get_members().await?;
+            Ok(self.base.compute_shard_owner_map(&members).await)
+        }
+
+        async fn wait_converged(&self, _timeout: Duration) -> bool {
+            true
+        }
+
+        async fn shutdown(&self) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn update_shard_placement_ring(
+            &self,
+            shard_id: &ShardId,
+            ring: Option<&str>,
+        ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+            let mut shard_map = self.base.shard_map.lock().await;
+            let shard = shard_map
+                .get_shard_mut(shard_id)
+                .ok_or_else(|| CoordinationError::ShardNotFound(*shard_id))?;
+            let previous = shard.placement_ring.clone();
+            let current = ring.map(|s| s.to_string());
+            shard.placement_ring = current.clone();
+            Ok((previous, current))
+        }
+
+        async fn force_release_shard_lease(
+            &self,
+            _shard_id: &ShardId,
+        ) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tonic::async_trait]
+    impl SplitStorageBackend for StrandedCoordinator {
+        async fn load_split(
+            &self,
+            _parent_shard_id: &ShardId,
+        ) -> Result<Option<SplitInProgress>, CoordinationError> {
+            Ok(None)
+        }
+
+        async fn store_split(&self, _split: &SplitInProgress) -> Result<(), CoordinationError> {
+            Err(CoordinationError::NotSupported)
+        }
+
+        async fn delete_split(&self, _parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+            Err(CoordinationError::NotSupported)
+        }
+
+        async fn update_shard_map_for_split(
+            &self,
+            _split: &SplitInProgress,
+        ) -> Result<(), CoordinationError> {
+            Err(CoordinationError::NotSupported)
+        }
+
+        async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
+            Ok(())
+        }
+
+        async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Start a server backed by the stranded coordinator. Returns the shutdown
+    /// sender, the server task, its address and the stranded shard's id.
+    pub async fn setup_server() -> anyhow::Result<(
+        tokio::sync::broadcast::Sender<()>,
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+        SocketAddr,
+        String,
+    )> {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let (coordinator, stranded) = StrandedCoordinator::new(&format!("http://{}", addr)).await;
+        let server = tokio::spawn(run_server(
+            listener,
+            Arc::new(ShardFactory::new_noop()),
+            Arc::new(coordinator),
+            AppConfig::load(None).unwrap(),
+            None,
+            shutdown_rx,
+        ));
+        Ok((shutdown_tx, server, addr, stranded.to_string()))
+    }
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_shard_configure_recovers_unowned_shard() -> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (shutdown_tx, server, addr, stranded) = stranded::setup_server().await?;
+        let opts = opts_for_addr(&addr);
+
+        // Precondition: cluster info shows the shard with no owner.
+        let mut client = SiloClient::connect(format!("http://{}", addr)).await?;
+        let before = client
+            .get_cluster_info(GetClusterInfoRequest {})
+            .await?
+            .into_inner();
+        let owner = before
+            .shard_owners
+            .iter()
+            .find(|s| s.shard_id == stranded)
+            .expect("stranded shard is listed");
+        assert_eq!(owner.grpc_addr, "", "stranded shard has no owner address");
+        assert_eq!(
+            owner.placement_ring.as_deref(),
+            Some(stranded::STRANDED_RING)
+        );
+
+        // Clearing the ring must work even though the shard has no owner.
+        let mut output = Vec::new();
+        siloctl::shard_configure(&opts, &mut output, &stranded, None, false).await?;
+        let stdout = String::from_utf8(output)?;
+        assert!(
+            stdout.contains(&format!("Previous ring: {}", stranded::STRANDED_RING))
+                && stdout.contains("Current ring:  (default)"),
+            "output should show the ring cleared: {}",
+            stdout
+        );
+
+        // The next cluster info shows the shard with an owner.
+        let after = client
+            .get_cluster_info(GetClusterInfoRequest {})
+            .await?
+            .into_inner();
+        let owner = after
+            .shard_owners
+            .iter()
+            .find(|s| s.shard_id == stranded)
+            .expect("shard is still listed");
+        assert_eq!(
+            owner.grpc_addr,
+            format!("http://{}", addr),
+            "shard has an owner once it is back on the default ring"
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_query_on_unowned_shard_explains_no_owner() -> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (shutdown_tx, server, addr, stranded) = stranded::setup_server().await?;
+        let opts = opts_for_addr(&addr);
+
+        let mut output = Vec::new();
+        let err = siloctl::query(&opts, &mut output, &stranded, "SELECT 1")
+            .await
+            .expect_err("query on a shard with no owner must fail");
+        let err_str = err.to_string();
+
+        assert_eq!(
+            err_str,
+            format!(
+                "shard `{}` has no owner; its placement ring `{}` has no members (members advertise: `default`)",
+                stranded,
+                stranded::STRANDED_RING
+            )
+        );
+        assert!(
+            !err_str.contains("invalid format"),
+            "error must not read as a malformed argument: {}",
+            err_str
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_configure_unowned_shard_onto_unpopulated_ring_is_still_validated()
+-> anyhow::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (shutdown_tx, server, addr, stranded) = stranded::setup_server().await?;
+        let opts = opts_for_addr(&addr);
+
+        // The fallback route reaches the server; the server still refuses a
+        // ring no member advertises.
+        let mut output = Vec::new();
+        let err = siloctl::shard_configure(
+            &opts,
+            &mut output,
+            &stranded,
+            Some("another-empty-ring".to_string()),
+            false,
+        )
+        .await
+        .expect_err("moving a stranded shard onto another unpopulated ring must be refused");
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("another-empty-ring") && err_str.contains("no members"),
+            "error should carry the server's validation message: {}",
+            err_str
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
