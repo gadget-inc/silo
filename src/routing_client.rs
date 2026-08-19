@@ -356,13 +356,22 @@ impl RoutingClient {
 
     /// Get a client for a random shard (used by workers).
     /// Returns (client, shard_id).
-    pub fn client_for_random_shard(&self) -> anyhow::Result<(InterceptedSiloClient, String)> {
+    ///
+    /// Only shards with an owner address are drawn. When the topology has
+    /// shards but none is routable, the topology is marked stale so a later
+    /// call refreshes it; see [`client_for_tenant`](Self::client_for_tenant).
+    pub async fn client_for_random_shard(&self) -> anyhow::Result<(InterceptedSiloClient, String)> {
+        self.refresh_if_stale().await;
+
         let (shard_id, addr) = {
             let topo = self.topology.read().expect("topology lock poisoned");
-            let shard_id = topo
-                .random_shard()
-                .ok_or_else(|| anyhow::anyhow!("no shards available in topology"))?
-                .to_string();
+            let Some(shard_id) = topo.random_shard() else {
+                if !topo.shard_owners.is_empty() {
+                    self.topology_stale.store(true, Ordering::Release);
+                }
+                anyhow::bail!("no shards available in topology");
+            };
+            let shard_id = shard_id.to_string();
             let addr = topo
                 .address_for_shard(&shard_id)
                 .ok_or_else(|| anyhow::anyhow!("no address for shard '{}'", shard_id))?

@@ -243,7 +243,7 @@ async fn worker_loop(
     floating_default_max: u32,
 ) {
     while running.load(Ordering::Relaxed) {
-        let (mut silo_client, shard) = match client.client_for_random_shard() {
+        let (mut silo_client, shard) = match client.client_for_random_shard().await {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(worker_id = %worker_id, error = %e, "Worker failed to get client");

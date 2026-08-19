@@ -990,3 +990,44 @@ async fn routing_client_stale_refresh_is_rate_limited() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+#[silo::test(flavor = "multi_thread")]
+async fn routing_client_random_shard_recovers_once_a_shard_gets_an_owner() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_millis(15000), async {
+        let (shutdown_tx, server, addr, request_count, response, client) =
+            discover_stranded().await?;
+        let server_addr = format!("http://{}", addr);
+
+        // Every shard is unowned: nothing to draw from, and no RPC is made.
+        let err = client
+            .client_for_random_shard()
+            .await
+            .expect_err("no routable shard while every shard is unowned");
+        assert!(
+            err.to_string().contains("no shards available"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        // Once a shard has an owner, the next worker lookup re-discovers on
+        // its own (one refresh) and returns a client -- a worker-only client
+        // must not stay wedged on the cached unowned topology.
+        *response.lock().unwrap() = one_shard_response(&server_addr, &server_addr);
+        let (_silo_client, shard) = client
+            .client_for_random_shard()
+            .await
+            .expect("lookup succeeds once the shard has an owner");
+        assert_eq!(shard, "counting-shard");
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "exactly one topology refresh between the failure and the success"
+        );
+
+        shutdown_counting_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
