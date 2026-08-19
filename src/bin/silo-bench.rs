@@ -82,8 +82,8 @@ struct Args {
     #[arg(long, default_value = "1")]
     report_interval_secs: u64,
 
-    /// Tenant ID prefix for multi-tenant mode. When tenant_count > 1, tenants are
-    /// named "{tenant_prefix}-0", "{tenant_prefix}-1", etc.
+    /// Tenant ID prefix. Tenants are always named "{tenant_prefix}-0" through
+    /// "{tenant_prefix}-{tenant_count-1}", even when tenant_count is 1.
     #[arg(long, default_value = "bench")]
     tenant_prefix: String,
 
@@ -276,7 +276,7 @@ async fn worker_loop(
                 // grants against changing capacity.
                 for rt in refresh_tasks {
                     let report_shard = rt.shard.clone();
-                    let mut refresh_client = match client.client_for_shard(&report_shard) {
+                    let mut refresh_client = match client.client_for_shard(&report_shard).await {
                         Ok(c) => c,
                         Err(_) => silo_client.clone(),
                     };
@@ -332,7 +332,7 @@ async fn worker_loop(
                     let task_shard = task.shard.clone();
                     let task_tenant = task.tenant_id.clone();
 
-                    let mut report_client = match client.client_for_shard(&task_shard) {
+                    let mut report_client = match client.client_for_shard(&task_shard).await {
                         Ok(c) => c,
                         Err(_) => silo_client.clone(),
                     };
@@ -351,7 +351,9 @@ async fn worker_loop(
                             // Try handling routing error for outcome reporting
                             if client.handle_routing_error(&e, &task_shard).await.is_some() {
                                 // Retry once with updated routing
-                                if let Ok(mut retry_client) = client.client_for_shard(&task_shard) {
+                                if let Ok(mut retry_client) =
+                                    client.client_for_shard(&task_shard).await
+                                {
                                     let retry_req = make_success_outcome_request(
                                         task_shard,
                                         task.id.clone(),
@@ -454,7 +456,7 @@ async fn enqueuer_loop(
 
         let mut retries = 0u32;
         loop {
-            let (mut silo_client, shard) = match client.client_for_tenant(&tenant) {
+            let (mut silo_client, shard) = match client.client_for_tenant(&tenant).await {
                 Ok(pair) => pair,
                 Err(e) => {
                     warn!(enqueuer_id = %enqueuer_id, tenant = %tenant, error = %e, "No shard for tenant");
@@ -808,7 +810,7 @@ async fn audit_holder_leaks(client: &RoutingClient) -> anyhow::Result<HolderAudi
     let topo = client.topology();
     let mut audit = HolderAudit::default();
     for owner in &topo.shard_owners {
-        let mut silo_client = match client.client_for_shard(&owner.shard_id) {
+        let mut silo_client = match client.client_for_shard(&owner.shard_id).await {
             Ok(c) => c,
             Err(e) => {
                 warn!(shard = %owner.shard_id, error = %e, "audit: could not get client");

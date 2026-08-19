@@ -11,6 +11,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -71,28 +72,53 @@ impl ClusterTopology {
             .map(|owner| owner.grpc_addr.as_str())
     }
 
-    /// Get a random shard ID.
+    /// Get a random shard ID among the shards that have an effective address
+    /// (redirect override or owner). Unowned shards are never drawn.
     pub fn random_shard(&self) -> Option<&str> {
-        if self.shard_owners.is_empty() {
+        let routable: Vec<&str> = self
+            .shard_owners
+            .iter()
+            .map(|owner| owner.shard_id.as_str())
+            .filter(|shard_id| {
+                self.address_for_shard(shard_id)
+                    .is_some_and(|addr| !addr.is_empty())
+            })
+            .collect();
+        if routable.is_empty() {
             return None;
         }
-        let idx = rand::random_range(0..self.shard_owners.len());
-        Some(&self.shard_owners[idx].shard_id)
+        Some(routable[rand::random_range(0..routable.len())])
     }
 
-    /// Get all unique server addresses (including overrides).
+    /// Get all unique server addresses (including overrides). Shards with no
+    /// owner contribute nothing -- an empty address is not a server.
     pub fn all_addresses(&self) -> Vec<String> {
         let mut addrs: Vec<String> = self
             .shard_owners
             .iter()
             .map(|owner| owner.grpc_addr.clone())
             .chain(self.shard_addr_overrides.values().cloned())
+            .filter(|addr| !addr.is_empty())
             .collect();
         addrs.sort();
         addrs.dedup();
         addrs
     }
 }
+
+/// The shard exists in the topology but the cluster's desired assignment
+/// gives it no owner (no member is in its placement ring), so there is no
+/// address to connect to. The client marks its topology stale when it
+/// returns this, so a later call re-discovers once the shard has an owner.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("shard `{shard_id}` has no owner")]
+pub struct ShardUnownedError {
+    pub shard_id: String,
+}
+
+/// Minimum spacing between topology refreshes triggered by the stale flag, so
+/// a caller hammering an unowned shard re-discovers at most this often.
+pub const STALE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Result of classifying a gRPC error for retry purposes.
 #[derive(Debug)]
@@ -172,6 +198,14 @@ pub struct RoutingClient {
     /// Result of the most recent refresh attempt, used by waiters to reuse the
     /// in-flight refresh result instead of re-running discovery.
     last_refresh_succeeded: AtomicBool,
+    /// Set when a lookup hit a shard with no owner address; the next
+    /// `client_for_tenant` / `client_for_shard` refreshes the topology first
+    /// (rate-limited by [`STALE_REFRESH_MIN_INTERVAL`]) so a recovered shard
+    /// is picked up without an RPC having to fail.
+    topology_stale: AtomicBool,
+    /// When the last stale-triggered refresh started; `None` until the first
+    /// one, so the first stale call after a failure refreshes immediately.
+    last_stale_refresh: std::sync::Mutex<Option<Instant>>,
 }
 
 impl RoutingClient {
@@ -197,6 +231,8 @@ impl RoutingClient {
             refresh_mutex: Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             last_refresh_succeeded: AtomicBool::new(false),
+            topology_stale: AtomicBool::new(false),
+            last_stale_refresh: std::sync::Mutex::new(None),
         });
 
         // Pre-populate the connection pool for all known servers. Since connections
@@ -247,10 +283,16 @@ impl RoutingClient {
 
     /// Get a client and shard ID for the given tenant.
     /// Returns (client, shard_id).
-    pub fn client_for_tenant(
+    ///
+    /// Fails with [`ShardUnownedError`] when the tenant's shard has no owner
+    /// address; the topology is then marked stale so a later call refreshes
+    /// it before resolving.
+    pub async fn client_for_tenant(
         &self,
         tenant: &str,
     ) -> anyhow::Result<(InterceptedSiloClient, String)> {
+        self.refresh_if_stale().await;
+
         let (shard_id, addr) = {
             let topo = self.topology.read().expect("topology lock poisoned");
             let owner = topo
@@ -264,8 +306,52 @@ impl RoutingClient {
             (shard_id, addr)
         };
 
-        let client = self.get_or_connect(&addr)?;
+        let client = self.connect_to_owner(&shard_id, &addr)?;
         Ok((client, shard_id))
+    }
+
+    /// Connect to `addr` for `shard_id`, treating an empty address as an
+    /// unowned shard: mark the topology stale and return
+    /// [`ShardUnownedError`] instead of building a connection to nowhere.
+    fn connect_to_owner(
+        &self,
+        shard_id: &str,
+        addr: &str,
+    ) -> anyhow::Result<InterceptedSiloClient> {
+        if addr.is_empty() {
+            self.topology_stale.store(true, Ordering::Release);
+            return Err(ShardUnownedError {
+                shard_id: shard_id.to_string(),
+            }
+            .into());
+        }
+        self.get_or_connect(addr)
+    }
+
+    /// If a previous lookup found an unowned shard, refresh the topology
+    /// before resolving -- at most once per [`STALE_REFRESH_MIN_INTERVAL`].
+    /// The refresh itself is the coalesced [`refresh_topology`](Self::refresh_topology).
+    async fn refresh_if_stale(&self) {
+        if !self.topology_stale.load(Ordering::Acquire) {
+            return;
+        }
+        let due = {
+            let mut last = self
+                .last_stale_refresh
+                .lock()
+                .expect("stale refresh lock poisoned");
+            let due = last.is_none_or(|at| at.elapsed() >= STALE_REFRESH_MIN_INTERVAL);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if !due {
+            return;
+        }
+        self.topology_stale.store(false, Ordering::Release);
+        debug!("topology marked stale by an unowned shard, refreshing");
+        self.refresh_topology().await;
     }
 
     /// Get a client for a random shard (used by workers).
@@ -289,7 +375,12 @@ impl RoutingClient {
     }
 
     /// Get a client for a specific shard (used for report_outcome).
-    pub fn client_for_shard(&self, shard_id: &str) -> anyhow::Result<InterceptedSiloClient> {
+    ///
+    /// Fails with [`ShardUnownedError`] when the shard has no owner address;
+    /// see [`client_for_tenant`](Self::client_for_tenant).
+    pub async fn client_for_shard(&self, shard_id: &str) -> anyhow::Result<InterceptedSiloClient> {
+        self.refresh_if_stale().await;
+
         let addr = {
             let topo = self.topology.read().expect("topology lock poisoned");
             topo.address_for_shard(shard_id)
@@ -297,7 +388,7 @@ impl RoutingClient {
                 .to_string()
         };
 
-        self.get_or_connect(&addr)
+        self.connect_to_owner(shard_id, &addr)
     }
 
     /// Handle a routing error by updating internal state.
@@ -452,6 +543,13 @@ impl RoutingClient {
             .read()
             .expect("topology lock poisoned")
             .clone()
+    }
+
+    /// Number of pooled (lazy) connections. Exposed for tests that assert the
+    /// pool did not grow.
+    #[doc(hidden)]
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
     }
 
     /// Get or create a lazy connection to the given address.
