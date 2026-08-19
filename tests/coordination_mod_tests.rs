@@ -1,7 +1,7 @@
 //! Tests for coordination module types: ShardGuardState, ShardGuardContext,
 //! CoordinatorBase, and ShardOwnerMap.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,6 +163,74 @@ fn shard_owner_map_get_addr_and_node() {
     let unknown = ShardId::new();
     assert_eq!(owner_map.get_addr(&unknown), None);
     assert_eq!(owner_map.get_node(&unknown), None);
+}
+
+/// Build an owner map over `rings.len()` shards, pinning shard `i` to
+/// `rings[i]` (`None` = default ring) and assigning an owner to every shard
+/// except those listed in `unowned`.
+fn owner_map_with_rings(rings: &[Option<&str>], unowned: &[usize]) -> ShardOwnerMap {
+    let mut shard_map = ShardMap::create_initial(rings.len() as u32).expect("create shard map");
+    let shard_ids = shard_map.shard_ids();
+    for (i, ring) in rings.iter().enumerate() {
+        shard_map
+            .get_shard_mut(&shard_ids[i])
+            .expect("shard exists")
+            .set_placement_ring(ring.map(str::to_string));
+    }
+
+    let mut shard_to_addr = HashMap::new();
+    let mut shard_to_node = HashMap::new();
+    for (i, id) in shard_ids.iter().enumerate() {
+        if unowned.contains(&i) {
+            continue;
+        }
+        shard_to_addr.insert(*id, format!("http://node-{}", id));
+        shard_to_node.insert(*id, format!("node-{}", id));
+    }
+
+    ShardOwnerMap {
+        shard_map,
+        shard_to_addr,
+        shard_to_node,
+    }
+}
+
+#[silo::test]
+fn unassigned_shards_reports_named_ring_shard_absent_from_assignments() {
+    let owner_map = owner_map_with_rings(&[Some("heavy"), None], &[0]);
+    let stranded = owner_map.shard_ids()[0];
+
+    let unassigned = owner_map.unassigned_shards();
+
+    assert_eq!(
+        unassigned,
+        BTreeMap::from([(stranded, "heavy".to_string())]),
+        "only the heavy-ring shard lacks an owner"
+    );
+}
+
+#[silo::test]
+fn unassigned_shards_reports_default_ring_shard_under_default_label() {
+    let owner_map = owner_map_with_rings(&[Some("heavy"), None], &[1]);
+    let stranded = owner_map.shard_ids()[1];
+
+    let unassigned = owner_map.unassigned_shards();
+
+    assert_eq!(
+        unassigned,
+        BTreeMap::from([(stranded, "default".to_string())]),
+        "a default-ring shard is reported under the `default` label"
+    );
+}
+
+#[silo::test]
+fn unassigned_shards_is_empty_when_every_shard_is_assigned() {
+    let owner_map = owner_map_with_rings(&[Some("heavy"), None, None], &[]);
+
+    assert!(
+        owner_map.unassigned_shards().is_empty(),
+        "every shard has an owner"
+    );
 }
 
 // --- ShardGuardContext tests ---
