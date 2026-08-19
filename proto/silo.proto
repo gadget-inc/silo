@@ -538,6 +538,11 @@ message GetNodeInfoResponse {
 message ConfigureShardRequest {
   string shard = 1;                   // The shard ID (UUID) to configure.
   optional string placement_ring = 2; // The placement ring to assign (empty/null = default ring).
+  // A placement_ring that no current cluster member advertises is refused with
+  // FAILED_PRECONDITION, because the shard would have no eligible owner. Set
+  // this to override that check and pin the shard to a ring whose nodes have
+  // not joined yet. Ignored when placement_ring is unset.
+  bool allow_unpopulated_ring = 3;
   optional string tenant = 100;       // Optional tenant ID (for multi-tenant mode).
 }
 

@@ -26,7 +26,7 @@ use datafusion::common::{ParamValues, ScalarValue};
 /// File descriptor set for gRPC reflection
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
 
-use crate::coordination::{Coordinator, ShardSplitter};
+use crate::coordination::{Coordinator, ShardSplitter, member_in_ring};
 use crate::factory::ShardFactory;
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
@@ -2213,6 +2213,29 @@ impl Silo for SiloService {
     ) -> Result<Response<ConfigureShardResponse>, Status> {
         let r = req.into_inner();
         let shard_id = Self::parse_shard_id(&r.shard)?;
+
+        // Refuse a ring no current member is in: the shard would have no
+        // eligible owner. Moving to the default ring is never refused -- it is
+        // the recovery path, even when no member is on the default ring either.
+        if let Some(ring) = r
+            .placement_ring
+            .as_deref()
+            .filter(|_| !r.allow_unpopulated_ring)
+        {
+            let members = self
+                .coordinator
+                .get_members()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if !members.iter().any(|m| member_in_ring(m, Some(ring))) {
+                return Err(Status::failed_precondition(format!(
+                    "placement ring '{}' has no members: no current cluster member advertises it, \
+                     so the shard would have no eligible owner (pass allow_unpopulated_ring to \
+                     pin it anyway)",
+                    ring
+                )));
+            }
+        }
 
         // Update the shard's placement ring via the coordinator
         let (previous, current) = self

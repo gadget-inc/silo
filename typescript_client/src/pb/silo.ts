@@ -1447,6 +1447,15 @@ export interface ConfigureShardRequest {
      */
     placementRing?: string; // The placement ring to assign (empty/null = default ring).
     /**
+     * A placement_ring that no current cluster member advertises is refused with
+     * FAILED_PRECONDITION, because the shard would have no eligible owner. Set
+     * this to override that check and pin the shard to a ring whose nodes have
+     * not joined yet. Ignored when placement_ring is unset.
+     *
+     * @generated from protobuf field: bool allow_unpopulated_ring = 3
+     */
+    allowUnpopulatedRing: boolean;
+    /**
      * @generated from protobuf field: optional string tenant = 100
      */
     tenant?: string; // Optional tenant ID (for multi-tenant mode).
@@ -6234,12 +6243,14 @@ class ConfigureShardRequest$Type extends MessageType<ConfigureShardRequest> {
         super("silo.v1.ConfigureShardRequest", [
             { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "placement_ring", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "allow_unpopulated_ring", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
             { no: 100, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<ConfigureShardRequest>): ConfigureShardRequest {
         const message = globalThis.Object.create((this.messagePrototype!));
         message.shard = "";
+        message.allowUnpopulatedRing = false;
         if (value !== undefined)
             reflectionMergePartial<ConfigureShardRequest>(this, message, value);
         return message;
@@ -6254,6 +6265,9 @@ class ConfigureShardRequest$Type extends MessageType<ConfigureShardRequest> {
                     break;
                 case /* optional string placement_ring */ 2:
                     message.placementRing = reader.string();
+                    break;
+                case /* bool allow_unpopulated_ring */ 3:
+                    message.allowUnpopulatedRing = reader.bool();
                     break;
                 case /* optional string tenant */ 100:
                     message.tenant = reader.string();
@@ -6276,6 +6290,9 @@ class ConfigureShardRequest$Type extends MessageType<ConfigureShardRequest> {
         /* optional string placement_ring = 2; */
         if (message.placementRing !== undefined)
             writer.tag(2, WireType.LengthDelimited).string(message.placementRing);
+        /* bool allow_unpopulated_ring = 3; */
+        if (message.allowUnpopulatedRing !== false)
+            writer.tag(3, WireType.Varint).bool(message.allowUnpopulatedRing);
         /* optional string tenant = 100; */
         if (message.tenant !== undefined)
             writer.tag(100, WireType.LengthDelimited).string(message.tenant);

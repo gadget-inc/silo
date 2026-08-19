@@ -3,7 +3,9 @@ mod grpc_integration_helpers;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use grpc_integration_helpers::{create_test_factory, setup_test_server, shutdown_server};
+use grpc_integration_helpers::{
+    create_test_factory, setup_multi_shard_server_with_rings, setup_test_server, shutdown_server,
+};
 use silo::coordination::NoneCoordinator;
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
@@ -1809,5 +1811,136 @@ async fn grpc_worker_rpcs_accept_valid_tenant_when_tenancy_enabled() -> anyhow::
     })
     .await
     .expect("test timed out")?;
+    Ok(())
+}
+
+// --- configure_shard placement-ring validation ---
+
+/// Start a single-member server whose member advertises `member_rings`, and
+/// return a client plus the id of one of its shards (from cluster info).
+async fn setup_ring_server(
+    member_rings: &[&str],
+) -> anyhow::Result<(
+    SiloClient<tonic::transport::Channel>,
+    String,
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    tempfile::TempDir,
+)> {
+    let rings = member_rings.iter().map(|r| r.to_string()).collect();
+    let (shutdown_tx, server, addr, _factory, tmp) =
+        setup_multi_shard_server_with_rings(1, AppConfig::load(None).unwrap(), rings).await?;
+    let channel = tonic::transport::Endpoint::new(format!("http://{}", addr))?
+        .connect()
+        .await?;
+    let mut client = SiloClient::new(channel);
+    let cluster_info = client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
+    let shard_id = cluster_info.shard_owners[0].shard_id.clone();
+    Ok((client, shard_id, shutdown_tx, server, tmp))
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn configure_shard_refuses_ring_no_member_advertises() -> anyhow::Result<()> {
+    let (mut client, shard_id, shutdown_tx, server, _tmp) = setup_ring_server(&[]).await?;
+
+    let err = client
+        .configure_shard(ConfigureShardRequest {
+            shard: shard_id,
+            placement_ring: Some("nobody-is-in-this-ring".to_string()),
+            allow_unpopulated_ring: false,
+            tenant: None,
+        })
+        .await
+        .expect_err("configuring a ring no member advertises must fail");
+
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "status for an unadvertised ring: {err:?}"
+    );
+    assert!(
+        err.message().contains("nobody-is-in-this-ring"),
+        "message should name the ring: {}",
+        err.message()
+    );
+
+    shutdown_server(shutdown_tx, server).await?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn configure_shard_override_pins_to_unpopulated_ring() -> anyhow::Result<()> {
+    let (mut client, shard_id, shutdown_tx, server, _tmp) = setup_ring_server(&[]).await?;
+
+    let response = client
+        .configure_shard(ConfigureShardRequest {
+            shard: shard_id.clone(),
+            placement_ring: Some("staged-ring".to_string()),
+            allow_unpopulated_ring: true,
+            tenant: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.current_ring, "staged-ring");
+
+    let cluster_info = client
+        .get_cluster_info(GetClusterInfoRequest {})
+        .await?
+        .into_inner();
+    let shard = cluster_info
+        .shard_owners
+        .iter()
+        .find(|s| s.shard_id == shard_id)
+        .expect("shard still listed");
+    assert_eq!(
+        shard.placement_ring.as_deref(),
+        Some("staged-ring"),
+        "the override pins the ring even though no member is in it"
+    );
+
+    shutdown_server(shutdown_tx, server).await?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn configure_shard_clearing_ring_is_never_validated() -> anyhow::Result<()> {
+    // The member is on a named ring only, so nobody is on the default ring --
+    // clearing must still succeed (it is the recovery path).
+    let (mut client, shard_id, shutdown_tx, server, _tmp) = setup_ring_server(&["heavy"]).await?;
+
+    let response = client
+        .configure_shard(ConfigureShardRequest {
+            shard: shard_id,
+            placement_ring: None,
+            allow_unpopulated_ring: false,
+            tenant: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.current_ring, "", "shard moved to the default ring");
+
+    shutdown_server(shutdown_tx, server).await?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn configure_shard_accepts_ring_a_member_advertises() -> anyhow::Result<()> {
+    let (mut client, shard_id, shutdown_tx, server, _tmp) = setup_ring_server(&["heavy"]).await?;
+
+    let response = client
+        .configure_shard(ConfigureShardRequest {
+            shard: shard_id,
+            placement_ring: Some("heavy".to_string()),
+            allow_unpopulated_ring: false,
+            tenant: None,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.current_ring, "heavy");
+
+    shutdown_server(shutdown_tx, server).await?;
     Ok(())
 }
