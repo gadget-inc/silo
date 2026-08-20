@@ -2110,14 +2110,7 @@ async fn grant_scanner_handles_backlog_larger_than_status_lookup_concurrency() {
             .await
             .unwrap();
     }
-    let mut holder_tasks = Vec::with_capacity(N);
-    while holder_tasks.len() < N {
-        let tasks = shard.dequeue("w", "tg", N).await.unwrap().tasks;
-        assert!(!tasks.is_empty(), "dequeue should return holders");
-        for t in tasks {
-            holder_tasks.push(t.attempt().task_id().to_string());
-        }
-    }
+    let holder_tasks = dequeue_task_ids_until(&shard, "w", "tg", N).await;
 
     // Enqueue N more — capacity is full, so each becomes a request record.
     for i in 0..N {
@@ -2211,14 +2204,7 @@ async fn grant_scanner_drains_backlog_larger_than_max_per_pass() {
             .await
             .unwrap();
     }
-    let mut holder_tasks = Vec::with_capacity(N);
-    while holder_tasks.len() < N {
-        let tasks = shard.dequeue("w", "tg", N).await.unwrap().tasks;
-        assert!(!tasks.is_empty(), "dequeue should return holders");
-        for t in tasks {
-            holder_tasks.push(t.attempt().task_id().to_string());
-        }
-    }
+    let holder_tasks = dequeue_task_ids_until(&shard, "w", "tg", N).await;
 
     // Enqueue N waiters — each becomes a request (capacity is full).
     for i in 0..N {
@@ -2307,13 +2293,7 @@ async fn grant_scanner_full_queue_cleans_stale_bounded() {
             .await
             .unwrap();
     }
-    let mut holder_tasks = Vec::with_capacity(LIMIT);
-    while holder_tasks.len() < LIMIT {
-        let tasks = shard.dequeue("w", "tg", LIMIT).await.unwrap().tasks;
-        for t in tasks {
-            holder_tasks.push(t.attempt().task_id().to_string());
-        }
-    }
+    let holder_tasks = dequeue_task_ids_until(&shard, "w", "tg", LIMIT).await;
 
     // Inject a large backlog of stale requests (nonexistent jobs).
     for i in 0..BACKLOG {
@@ -2941,13 +2921,7 @@ async fn grant_scanner_caps_grants_at_free_capacity() {
             .await
             .unwrap();
     }
-    let mut holder_tasks = Vec::new();
-    while holder_tasks.len() < LIMIT {
-        let tasks = shard.dequeue("w", "tg", LIMIT).await.unwrap().tasks;
-        for t in tasks {
-            holder_tasks.push(t.attempt().task_id().to_string());
-        }
-    }
+    let holder_tasks = dequeue_task_ids_until(&shard, "w", "tg", LIMIT).await;
 
     // Enqueue WAITERS valid waiters — queue is full, so each becomes a request.
     for i in 0..WAITERS {
@@ -6783,8 +6757,7 @@ async fn grant_scanner_live_headroom_reserves_slots_for_immediate_grants() {
             .expect("enqueue");
     }
     assert_eq!(count_concurrency_holders(shard.db()).await, 10);
-    let tasks = shard.dequeue("w", "tg", 10).await.expect("dequeue").tasks;
-    assert_eq!(tasks.len(), 10);
+    let tasks = dequeue_task_ids_until(&shard, "w", "tg", 10).await;
 
     // Two deferred waiters for the scanner to drain later.
     for i in 0..2 {
@@ -6817,12 +6790,9 @@ async fn grant_scanner_live_headroom_reserves_slots_for_immediate_grants() {
 
     // Free four slots (holders 10 -> 6): the scanner grants only back up to
     // its effective cap of 8.
-    for task in tasks.iter().take(4) {
+    for task_id in tasks.iter().take(4) {
         shard
-            .report_attempt_outcome(
-                &task.attempt().task_id().to_string(),
-                AttemptOutcome::Success { result: vec![] },
-            )
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
             .await
             .expect("release");
     }
