@@ -673,3 +673,247 @@ async fn dequeue_ignores_recently_acked_task_keys() {
         );
     });
 }
+
+/// Dispatching a task whose lease key already holds a live lease is the
+/// double-dispatch anomaly: dequeue proceeds (overwrite semantics are
+/// unchanged) but warns and counts the overwrite so the grant-path bug that
+/// materializes duplicate RunAttempt tasks is visible from metrics.
+#[silo::test]
+async fn dequeue_over_live_lease_counts_stored_overwrite_and_still_delivers() {
+    with_timeout!(20000, {
+        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
+        let now = now_ms();
+
+        shard
+            .enqueue("-", None, 10, now, None, payload, vec![], None, "default")
+            .await
+            .expect("enqueue");
+
+        // Read the queued task to learn its enqueue-time task id
+        let (_key, task_bytes) = first_task_kv(shard.db()).await.expect("task present");
+        let decoded = silo::codec::decode_task(&task_bytes).expect("decode task");
+        let Task::RunAttempt {
+            id: task_id,
+            job_id,
+            ..
+        } = decoded
+        else {
+            panic!("expected RunAttempt task");
+        };
+
+        // Pre-write a live lease at the task's lease key, as a prior dispatch
+        // of the same task would have left behind
+        let lease = silo::task::LeaseRecord {
+            worker_id: "other-worker".to_string(),
+            task: Task::RunAttempt {
+                id: task_id.clone(),
+                tenant: "-".to_string(),
+                job_id: job_id.clone(),
+                attempt_number: 1,
+                relative_attempt_number: 1,
+                held_queues: vec![],
+                task_group: "default".to_string(),
+            },
+            expiry_ms: now + 60_000,
+            started_at_ms: now,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            &silo::keys::leased_task_key(&task_id),
+            &silo::codec::encode_lease(&lease),
+        );
+        shard.db().write(batch).await.expect("write lease");
+        shard.db().flush().await.expect("flush lease");
+
+        let result = shard
+            .dequeue("worker-2", "default", 1)
+            .await
+            .expect("dequeue");
+        assert_eq!(result.tasks.len(), 1, "task must still be delivered");
+
+        let body = gather_metrics_text(&metrics);
+        let overwrites = metric_value_or_zero(
+            &body,
+            &[
+                "silo_task_lease_overwrites_total",
+                "task_group=\"default\"",
+                "source=\"stored\"",
+            ],
+        );
+        assert_eq!(overwrites, 1.0, "stored-lease overwrite must be counted");
+
+        // The overwrite proceeded: the lease names the dequeuing worker with
+        // a fresh expiry
+        let lease_bytes = shard
+            .db()
+            .get(&silo::keys::leased_task_key(&task_id))
+            .await
+            .expect("get lease")
+            .expect("lease exists");
+        let lease = decode_lease(lease_bytes).expect("decode lease");
+        assert_eq!(lease.worker_id(), "worker-2");
+        let after = now_ms();
+        assert!(
+            lease.expiry_ms() >= now + silo::task::DEFAULT_LEASE_MS
+                && lease.expiry_ms() <= after + silo::task::DEFAULT_LEASE_MS,
+            "lease expiry {} should be ~now + DEFAULT_LEASE_MS",
+            lease.expiry_ms()
+        );
+    });
+}
+
+fn gather_metrics_text(metrics: &silo::metrics::Metrics) -> String {
+    use prometheus::{Encoder, TextEncoder};
+    let encoder = TextEncoder::new();
+    let metric_families = metrics.registry().gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
+}
+
+/// Value of the first metric line matching all substrings, or 0.0 when no
+/// line matches (a counter that never fired is absent from the scrape).
+fn metric_value_or_zero(body: &str, substrings: &[&str]) -> f64 {
+    body.lines()
+        .find(|l| !l.starts_with('#') && substrings.iter().all(|s| l.contains(s)))
+        .and_then(|line| line.rsplit_once(' '))
+        .and_then(|(_, v)| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// A repeat of the same task id within a single dequeue iteration cannot be
+/// seen by the pre-write point read (the first lease write is still in the
+/// uncommitted batch), so the guard tracks the iteration's leased task ids
+/// and counts the repeat under source="batch".
+#[silo::test]
+async fn dequeue_counts_batch_overwrite_for_repeated_task_id_in_one_iteration() {
+    with_timeout!(20000, {
+        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
+        let now = now_ms();
+
+        let job_id = shard
+            .enqueue("-", None, 10, now, None, payload, vec![], None, "default")
+            .await
+            .expect("enqueue");
+
+        // Learn the enqueue-time task id from the queued record
+        let (_key, task_bytes) = first_task_kv(shard.db()).await.expect("task present");
+        let decoded = silo::codec::decode_task(&task_bytes).expect("decode task");
+        let Task::RunAttempt { id: task_id, .. } = decoded else {
+            panic!("expected RunAttempt task");
+        };
+
+        // Hand-write a second queued RunAttempt sharing the task id (task ids
+        // are fresh UUIDs at enqueue, so this is not constructible through
+        // enqueue). A different attempt number gives it a distinct task key.
+        let duplicate = Task::RunAttempt {
+            id: task_id.clone(),
+            tenant: "-".to_string(),
+            job_id: job_id.clone(),
+            attempt_number: 2,
+            relative_attempt_number: 2,
+            held_queues: vec![],
+            task_group: "default".to_string(),
+        };
+        let dup_key = silo::keys::task_key("default", now, 10, &job_id, 2, now);
+        let mut batch = WriteBatch::new();
+        batch.put(&dup_key, &silo::codec::encode_task(&duplicate));
+        shard.db().write(batch).await.expect("write duplicate task");
+        shard.db().flush().await.expect("flush duplicate task");
+
+        // Both task records dequeue in one call, so the second lease write
+        // repeats a task id already leased in this iteration's batch
+        let result = shard
+            .dequeue("worker-1", "default", 2)
+            .await
+            .expect("dequeue");
+        assert_eq!(result.tasks.len(), 2, "both records must be delivered");
+
+        let body = gather_metrics_text(&metrics);
+        let batch_overwrites = metric_value_or_zero(
+            &body,
+            &[
+                "silo_task_lease_overwrites_total",
+                "task_group=\"default\"",
+                "source=\"batch\"",
+            ],
+        );
+        assert_eq!(batch_overwrites, 1.0, "batch overwrite must be counted");
+        let stored_overwrites = metric_value_or_zero(
+            &body,
+            &[
+                "silo_task_lease_overwrites_total",
+                "task_group=\"default\"",
+                "source=\"stored\"",
+            ],
+        );
+        assert_eq!(
+            stored_overwrites, 0.0,
+            "the repeat is invisible to the point read; only the batch branch fires"
+        );
+    });
+}
+
+/// An expired leftover lease at the task's lease key is routine (reap-and-
+/// retry territory), not a double dispatch -- the guard stays silent.
+#[silo::test]
+async fn dequeue_over_expired_lease_stays_silent() {
+    with_timeout!(20000, {
+        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
+        let now = now_ms();
+
+        shard
+            .enqueue("-", None, 10, now, None, payload, vec![], None, "default")
+            .await
+            .expect("enqueue");
+
+        let (_key, task_bytes) = first_task_kv(shard.db()).await.expect("task present");
+        let decoded = silo::codec::decode_task(&task_bytes).expect("decode task");
+        let Task::RunAttempt {
+            id: task_id,
+            job_id,
+            ..
+        } = decoded
+        else {
+            panic!("expected RunAttempt task");
+        };
+
+        let expired_lease = silo::task::LeaseRecord {
+            worker_id: "other-worker".to_string(),
+            task: Task::RunAttempt {
+                id: task_id.clone(),
+                tenant: "-".to_string(),
+                job_id: job_id.clone(),
+                attempt_number: 1,
+                relative_attempt_number: 1,
+                held_queues: vec![],
+                task_group: "default".to_string(),
+            },
+            expiry_ms: now - 60_000,
+            started_at_ms: now - 120_000,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            &silo::keys::leased_task_key(&task_id),
+            &silo::codec::encode_lease(&expired_lease),
+        );
+        shard.db().write(batch).await.expect("write expired lease");
+        shard.db().flush().await.expect("flush expired lease");
+
+        let result = shard
+            .dequeue("worker-2", "default", 1)
+            .await
+            .expect("dequeue");
+        assert_eq!(result.tasks.len(), 1, "task must still be delivered");
+
+        let body = gather_metrics_text(&metrics);
+        let overwrites = metric_value_or_zero(
+            &body,
+            &["silo_task_lease_overwrites_total", "task_group=\"default\""],
+        );
+        assert_eq!(overwrites, 0.0, "expired leftover lease must not count");
+    });
+}
