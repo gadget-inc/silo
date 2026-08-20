@@ -520,3 +520,35 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// Dequeue from `task_group` until `n` tasks have been collected, returning
+/// their task_ids. The broker buffer is filled asynchronously by a background
+/// DB scan, so a single `dequeue` call can return a partial or empty batch
+/// under CPU load; this accumulates across calls, bounded by a deadline so a
+/// real task loss fails loudly instead of hanging.
+pub async fn dequeue_task_ids_until(
+    shard: &JobStoreShard,
+    worker: &str,
+    task_group: &str,
+    n: usize,
+) -> Vec<String> {
+    let mut task_ids = Vec::with_capacity(n);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while task_ids.len() < n {
+        let batch = shard
+            .dequeue(worker, task_group, n - task_ids.len())
+            .await
+            .expect("dequeue")
+            .tasks;
+        task_ids.extend(batch.iter().map(|t| t.attempt().task_id().to_string()));
+        if task_ids.len() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} ready tasks; got {}",
+                task_ids.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    task_ids
+}
