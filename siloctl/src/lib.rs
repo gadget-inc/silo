@@ -1027,12 +1027,14 @@ pub async fn shard_split_status<W: Write>(
 ///
 /// This command changes which placement ring a shard belongs to. After changing
 /// the ring, the shard will be handed off to a node that participates in the
-/// new ring.
+/// new ring. The server refuses a ring no current member advertises unless
+/// `allow_unpopulated_ring` is set (for staging a ring before its nodes join).
 pub async fn shard_configure<W: Write>(
     opts: &GlobalOptions,
     out: &mut W,
     shard: &str,
     ring: Option<String>,
+    allow_unpopulated_ring: bool,
 ) -> anyhow::Result<()> {
     let mut client =
         connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
@@ -1042,6 +1044,7 @@ pub async fn shard_configure<W: Write>(
             tenant: opts.tenant.clone(),
             shard: shard.to_string(),
             placement_ring: ring.clone(),
+            allow_unpopulated_ring,
         })
         .await?
         .into_inner();

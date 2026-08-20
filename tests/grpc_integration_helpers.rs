@@ -93,6 +93,23 @@ pub async fn setup_multi_shard_server(
     Arc<ShardFactory>,
     tempfile::TempDir,
 )> {
+    setup_multi_shard_server_with_rings(initial_shard_count, config, Vec::new()).await
+}
+
+/// Like [`setup_multi_shard_server`], but the single `none`-coordinator member
+/// advertises `placement_rings` (empty = default ring only), so tests can
+/// exercise ring-aware behaviour such as `configure_shard` validation.
+pub async fn setup_multi_shard_server_with_rings(
+    initial_shard_count: u32,
+    config: AppConfig,
+    placement_rings: Vec<String>,
+) -> anyhow::Result<(
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    SocketAddr,
+    Arc<ShardFactory>,
+    tempfile::TempDir,
+)> {
     let tmp = tempfile::tempdir()?;
     let template = DatabaseTemplate {
         backend: Backend::Fs,
@@ -112,7 +129,7 @@ pub async fn setup_multi_shard_server(
             format!("http://{}", addr),
             initial_shard_count,
             factory.clone(),
-            Vec::new(),
+            placement_rings,
         )
         .await
         .unwrap(),

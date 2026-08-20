@@ -906,7 +906,8 @@ async fn siloctl_shard_configure() -> anyhow::Result<()> {
         let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
-        // Test shard configure command - set a ring
+        // Test shard configure command - set a ring. The test member advertises
+        // no rings, so pinning a named ring needs the unpopulated-ring override.
         let opts = opts_for_addr(&addr);
         let mut output = Vec::new();
         siloctl::shard_configure(
@@ -914,6 +915,7 @@ async fn siloctl_shard_configure() -> anyhow::Result<()> {
             &mut output,
             crate::grpc_integration_helpers::TEST_SHARD_ID,
             Some("gpu-ring".to_string()),
+            true,
         )
         .await?;
         let stdout = String::from_utf8(output)?;
@@ -941,6 +943,7 @@ async fn siloctl_shard_configure() -> anyhow::Result<()> {
             &mut output2,
             crate::grpc_integration_helpers::TEST_SHARD_ID,
             None,
+            false,
         )
         .await?;
         let stdout2 = String::from_utf8(output2)?;
@@ -976,7 +979,8 @@ async fn siloctl_shard_configure_json_output() -> anyhow::Result<()> {
         let (_client, shutdown_tx, server, addr) =
             setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
 
-        // Test shard configure command with JSON output - set a ring
+        // Test shard configure command with JSON output - set a ring. The test
+        // member advertises no rings, so named rings need the override.
         let opts = opts_for_addr_json(&addr);
         let mut output = Vec::new();
         siloctl::shard_configure(
@@ -984,6 +988,7 @@ async fn siloctl_shard_configure_json_output() -> anyhow::Result<()> {
             &mut output,
             crate::grpc_integration_helpers::TEST_SHARD_ID,
             Some("high-memory".to_string()),
+            true,
         )
         .await?;
         let stdout = String::from_utf8(output)?;
@@ -1012,6 +1017,7 @@ async fn siloctl_shard_configure_json_output() -> anyhow::Result<()> {
             &mut output2,
             crate::grpc_integration_helpers::TEST_SHARD_ID,
             Some("gpu-ring".to_string()),
+            true,
         )
         .await?;
         let stdout2 = String::from_utf8(output2)?;
@@ -1051,6 +1057,7 @@ async fn siloctl_shard_configure_invalid_shard() -> anyhow::Result<()> {
             &mut output,
             "ffffffff-ffff-ffff-ffff-ffffffffffff",
             Some("test-ring".to_string()),
+            false,
         )
         .await;
 
@@ -1063,6 +1070,64 @@ async fn siloctl_shard_configure_invalid_shard() -> anyhow::Result<()> {
                 || err_str.contains("ShardNotFound"),
             "error should mention shard not found: {}",
             err_str
+        );
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn siloctl_shard_configure_unpopulated_ring_needs_override() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(30000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (_client, shutdown_tx, server, addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+        let opts = opts_for_addr(&addr);
+        let shard = crate::grpc_integration_helpers::TEST_SHARD_ID;
+
+        // Without the override the server refuses the ring and siloctl
+        // surfaces the server's message.
+        let mut output = Vec::new();
+        let err = siloctl::shard_configure(
+            &opts,
+            &mut output,
+            shard,
+            Some("nobody-is-in-this-ring".to_string()),
+            false,
+        )
+        .await
+        .expect_err("an unadvertised ring must be refused without the override");
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("nobody-is-in-this-ring") && err_str.contains("no members"),
+            "error should carry the server's validation message: {}",
+            err_str
+        );
+        assert!(
+            output.is_empty(),
+            "nothing should be printed on failure: {}",
+            String::from_utf8_lossy(&output)
+        );
+
+        // With the override the same request succeeds and the ring is set.
+        let mut output = Vec::new();
+        siloctl::shard_configure(
+            &opts,
+            &mut output,
+            shard,
+            Some("nobody-is-in-this-ring".to_string()),
+            true,
+        )
+        .await?;
+        let stdout = String::from_utf8(output)?;
+        assert!(
+            stdout.contains("Current ring:  nobody-is-in-this-ring"),
+            "output should show the pinned ring: {}",
+            stdout
         );
 
         shutdown_server(shutdown_tx, server).await?;

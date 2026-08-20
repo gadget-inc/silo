@@ -149,6 +149,10 @@ enum ShardAction {
         /// Placement ring name (omit to move to default ring)
         #[arg(long)]
         ring: Option<String>,
+        /// Pin the shard to --ring even if no current member advertises that
+        /// ring (the shard has no eligible owner until one joins)
+        #[arg(long, requires = "ring")]
+        allow_unpopulated_ring: bool,
     },
     /// Force-release a shard lease (for operator recovery when a node is permanently lost)
     ForceRelease {
@@ -312,8 +316,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ShardAction::SplitStatus { shard } => {
                 siloctl::shard_split_status(&opts, &mut stdout, shard).await
             }
-            ShardAction::Configure { shard, ring } => {
-                siloctl::shard_configure(&opts, &mut stdout, shard, ring.clone()).await
+            ShardAction::Configure {
+                shard,
+                ring,
+                allow_unpopulated_ring,
+            } => {
+                siloctl::shard_configure(
+                    &opts,
+                    &mut stdout,
+                    shard,
+                    ring.clone(),
+                    *allow_unpopulated_ring,
+                )
+                .await
             }
             ShardAction::ForceRelease { shard } => {
                 siloctl::shard_force_release(&opts, &mut stdout, shard).await
@@ -354,6 +369,56 @@ async fn main() -> ExitCode {
         Err(e) => {
             eprintln!("Error: {}", e);
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHARD: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+    #[test]
+    fn allow_unpopulated_ring_requires_ring() {
+        let err = Args::try_parse_from([
+            "siloctl",
+            "shard",
+            "configure",
+            SHARD,
+            "--allow-unpopulated-ring",
+        ])
+        .expect_err("--allow-unpopulated-ring without --ring must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn allow_unpopulated_ring_is_accepted_with_ring() {
+        let args = Args::try_parse_from([
+            "siloctl",
+            "shard",
+            "configure",
+            SHARD,
+            "--ring",
+            "heavy",
+            "--allow-unpopulated-ring",
+        ])
+        .expect("--allow-unpopulated-ring with --ring parses");
+
+        match args.command {
+            Command::Shard {
+                action:
+                    ShardAction::Configure {
+                        shard,
+                        ring,
+                        allow_unpopulated_ring,
+                    },
+            } => {
+                assert_eq!(shard, SHARD);
+                assert_eq!(ring.as_deref(), Some("heavy"));
+                assert!(allow_unpopulated_ring);
+            }
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 }
