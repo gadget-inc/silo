@@ -100,6 +100,8 @@ export class TaskExecution<
   private _cancelled: boolean = false;
   /** Whether the worker discovered mid-execution that it no longer holds the lease */
   private _leaseLost: boolean = false;
+  /** Whether the handler has settled (outcome reporting is underway or done) */
+  private _settled: boolean = false;
   /** The reason for cancellation if cancelled */
   private _cancellationReason: CancellationReason | undefined;
   /** Promise resolving when cancel RPC completes (if initiated by client) */
@@ -142,6 +144,20 @@ export class TaskExecution<
   /** Whether the lease for this task is known to be gone (no outcome may be reported) */
   get isLeaseLost(): boolean {
     return this._leaseLost;
+  }
+
+  /** Whether the handler has settled (outcome reporting is underway or done) */
+  get isSettled(): boolean {
+    return this._settled;
+  }
+
+  /**
+   * Mark the handler as settled. Heartbeat responses that land after this
+   * point are meaningless: outcome reporting releases the lease, so a late
+   * lease-gone rejection is the routine completion race, not a lost lease.
+   */
+  public markSettled(): void {
+    this._settled = true;
   }
 
   /**

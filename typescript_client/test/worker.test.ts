@@ -713,6 +713,50 @@ describe("SiloWorker", () => {
       expect(heartbeat.mock.calls.length).toBe(heartbeatCountAfterSettle);
     });
 
+    it("ignores an in-flight heartbeat that rejects lease-gone after normal completion", async () => {
+      const task = createTask("task-late-hb", "job-late-hb");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      // The heartbeat is on the wire when the handler settles: the server
+      // deletes the lease during reportOutcome, so the late response is a
+      // lease-gone rejection for a task that completed normally
+      const heartbeat = vi.fn().mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            setTimeout(() => reject(new TaskNotFoundError("task-late-hb", "lease not found")), 100);
+          }),
+      );
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      const handler: TaskHandler = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      // Handler settles at ~50ms; the ~30ms heartbeat's rejection lands at
+      // ~130ms, well after the outcome was reported
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await worker.stop();
+
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(onError).not.toHaveBeenCalled();
+    });
+
     it("issues no heartbeat after reportOutcome is invoked for a completing task", async () => {
       const task = createTask("task-hb-order", "job-hb-order");
       const leaseTasks = vi

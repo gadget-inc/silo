@@ -717,7 +717,11 @@ export class SiloWorker<
       };
     }
 
-    // The handler has settled: no report below may race a heartbeat
+    // The handler has settled: stop new heartbeat ticks, and mark the
+    // execution settled so heartbeats already on the wire are ignored when
+    // they land -- reporting the outcome releases the lease, so a late
+    // lease-gone rejection is the routine completion race, not a lost lease
+    execution.markSettled();
     stopHeartbeat();
 
     // The lease is gone, so any outcome report would fail NOT_FOUND
@@ -726,33 +730,23 @@ export class SiloWorker<
     }
 
     // If the task was cancelled (by server or client), report Cancelled outcome instead
-    try {
-      if (execution.shouldReportCancelled) {
-        await this._client.reportOutcome({
-          taskId: execution.task.id,
-          shard: execution.task.shard,
-          tenant: execution.task.tenantId,
-          outcome: { type: "cancelled" },
-        });
-        return;
-      }
-
-      // Report the outcome to the correct shard
+    if (execution.shouldReportCancelled) {
       await this._client.reportOutcome({
         taskId: execution.task.id,
         shard: execution.task.shard,
         tenant: execution.task.tenantId,
-        outcome,
+        outcome: { type: "cancelled" },
       });
-    } catch (error) {
-      // A heartbeat in flight when the handler settled can mark the lease
-      // lost while the report is on the wire; the report's failure is then
-      // expected noise -- the lease-lost event already surfaced via onError
-      if (execution.isLeaseLost) {
-        return;
-      }
-      throw error;
+      return;
     }
+
+    // Report the outcome to the correct shard
+    await this._client.reportOutcome({
+      taskId: execution.task.id,
+      shard: execution.task.shard,
+      tenant: execution.task.tenantId,
+      outcome,
+    });
   }
 
   /**
@@ -821,6 +815,13 @@ export class SiloWorker<
         execution.task.tenantId,
       );
     } catch (error) {
+      // The handler settled while this heartbeat was on the wire: outcome
+      // reporting releases the lease, so the late rejection carries no
+      // signal -- notably a lease-gone response here is the routine
+      // completion race, not a lost lease
+      if (execution.isSettled) {
+        return;
+      }
       if (isLeaseGoneError(error)) {
         this._handleLeaseLost(execution, error as Error, stopHeartbeat);
         return;
