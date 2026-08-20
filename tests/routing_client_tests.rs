@@ -17,7 +17,9 @@ use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 struct CountingClusterInfoService {
-    grpc_addr: String,
+    /// The response served to every `GetClusterInfo` call. Shared with the
+    /// test so it can swap the topology between calls.
+    response: Arc<std::sync::Mutex<GetClusterInfoResponse>>,
     request_count: Arc<AtomicUsize>,
     response_delay: Duration,
 }
@@ -39,20 +41,7 @@ impl Silo for CountingClusterInfoService {
         self.request_count.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.response_delay).await;
 
-        Ok(Response::new(GetClusterInfoResponse {
-            num_shards: 1,
-            shard_owners: vec![ShardOwner {
-                shard_id: "counting-shard".to_string(),
-                grpc_addr: self.grpc_addr.clone(),
-                node_id: "counting-node".to_string(),
-                range_start: String::new(),
-                range_end: String::new(),
-                placement_ring: None,
-            }],
-            this_node_id: "counting-node".to_string(),
-            this_grpc_addr: self.grpc_addr.clone(),
-            members: vec![],
-        }))
+        Ok(Response::new(self.response.lock().unwrap().clone()))
     }
 
     async fn get_node_info(
@@ -252,6 +241,29 @@ impl Silo for CountingClusterInfoService {
     }
 }
 
+/// A one-shard topology served by the counting server at `server_addr`, whose
+/// single shard covers the whole keyspace and is owned at `owner_addr` (empty
+/// = no owner).
+fn one_shard_response(server_addr: &str, owner_addr: &str) -> GetClusterInfoResponse {
+    GetClusterInfoResponse {
+        num_shards: 1,
+        shard_owners: vec![ShardOwner {
+            shard_id: "counting-shard".to_string(),
+            grpc_addr: owner_addr.to_string(),
+            node_id: "counting-node".to_string(),
+            range_start: String::new(),
+            range_end: String::new(),
+            placement_ring: None,
+        }],
+        this_node_id: "counting-node".to_string(),
+        this_grpc_addr: server_addr.to_string(),
+        members: vec![],
+    }
+}
+
+/// Start the counting cluster-info server. The returned response handle is
+/// what the server serves; a test can replace its contents between calls.
+/// Initially the single shard is owned by the server itself.
 async fn setup_counting_cluster_info_server(
     response_delay: Duration,
 ) -> anyhow::Result<(
@@ -259,12 +271,18 @@ async fn setup_counting_cluster_info_server(
     tokio::task::JoinHandle<anyhow::Result<()>>,
     SocketAddr,
     Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<GetClusterInfoResponse>>,
 )> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let addr = listener.local_addr()?;
     let request_count = Arc::new(AtomicUsize::new(0));
+    let server_addr = format!("http://{}", addr);
+    let response = Arc::new(std::sync::Mutex::new(one_shard_response(
+        &server_addr,
+        &server_addr,
+    )));
     let service = CountingClusterInfoService {
-        grpc_addr: format!("http://{}", addr),
+        response: response.clone(),
         request_count: request_count.clone(),
         response_delay,
     };
@@ -292,7 +310,7 @@ async fn setup_counting_cluster_info_server(
             .map_err(anyhow::Error::from)
     });
 
-    Ok((shutdown_tx, server, addr, request_count))
+    Ok((shutdown_tx, server, addr, request_count, response))
 }
 
 async fn shutdown_counting_server(
@@ -420,7 +438,7 @@ async fn routing_client_enqueue_correct_shard() -> anyhow::Result<()> {
 
         // Enqueue to correct shard for each tenant - should all succeed
         for tenant in &["bench-0", "bench-1", "bench-2", "bench-3"] {
-            let (mut silo_client, shard) = client.client_for_tenant(tenant)?;
+            let (mut silo_client, shard) = client.client_for_tenant(tenant).await?;
 
             let result = silo_client
                 .enqueue(EnqueueRequest {
@@ -491,7 +509,7 @@ async fn routing_client_handles_failed_precondition_with_refresh() -> anyhow::Re
         };
 
         // Send to the wrong shard deliberately
-        let (mut silo_client, _correct_shard) = client.client_for_tenant(wrong_tenant)?;
+        let (mut silo_client, _correct_shard) = client.client_for_tenant(wrong_tenant).await?;
 
         let result = silo_client
             .enqueue(EnqueueRequest {
@@ -532,7 +550,7 @@ async fn routing_client_handles_failed_precondition_with_refresh() -> anyhow::Re
         );
 
         // After refresh, routing to the correct shard via client_for_tenant should work
-        let (mut silo_client, shard) = client.client_for_tenant(wrong_tenant)?;
+        let (mut silo_client, shard) = client.client_for_tenant(wrong_tenant).await?;
         let result = silo_client
             .enqueue(EnqueueRequest {
                 shard: shard.clone(),
@@ -699,7 +717,7 @@ async fn routing_client_refreshes_via_redirect_discovery_address() -> anyhow::Re
 #[silo::test(flavor = "multi_thread")]
 async fn routing_client_coalesces_concurrent_refreshes() -> anyhow::Result<()> {
     tokio::time::timeout(std::time::Duration::from_millis(15000), async {
-        let (shutdown_tx, server, addr, request_count) =
+        let (shutdown_tx, server, addr, request_count, _response) =
             setup_counting_cluster_info_server(Duration::from_millis(150)).await?;
 
         let client = RoutingClient::discover(&format!("http://{}", addr)).await?;
@@ -759,7 +777,7 @@ async fn routing_client_connection_pool_reuse() -> anyhow::Result<()> {
 
         // Call client_for_tenant many times - all should succeed and reuse connections
         for _ in 0..20 {
-            let (_silo_client, _shard) = client.client_for_tenant("bench-0")?;
+            let (_silo_client, _shard) = client.client_for_tenant("bench-0").await?;
         }
 
         // The connection pool should have exactly the number of unique addresses
@@ -789,7 +807,7 @@ async fn routing_client_invalidate_connection() -> anyhow::Result<()> {
         let client = RoutingClient::discover(&server_addr).await?;
 
         // Ensure a connection exists by making a request
-        let (mut silo_client, _shard) = client.client_for_tenant("bench-0")?;
+        let (mut silo_client, _shard) = client.client_for_tenant("bench-0").await?;
         let topo = silo_client
             .get_cluster_info(silo::pb::GetClusterInfoRequest {})
             .await;
@@ -799,7 +817,7 @@ async fn routing_client_invalidate_connection() -> anyhow::Result<()> {
         client.invalidate_connection(&server_addr);
 
         // Next request should still work — a fresh lazy connection is created
-        let (mut silo_client, _shard) = client.client_for_tenant("bench-0")?;
+        let (mut silo_client, _shard) = client.client_for_tenant("bench-0").await?;
         let topo = silo_client
             .get_cluster_info(silo::pb::GetClusterInfoRequest {})
             .await;
@@ -810,6 +828,203 @@ async fn routing_client_invalidate_connection() -> anyhow::Result<()> {
         );
 
         shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+// --- unowned shards (empty owner address) ---
+
+/// Start the counting server with its single shard unowned, and discover it.
+async fn discover_stranded() -> anyhow::Result<(
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    SocketAddr,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<GetClusterInfoResponse>>,
+    Arc<RoutingClient>,
+)> {
+    let (shutdown_tx, server, addr, request_count, response) =
+        setup_counting_cluster_info_server(Duration::ZERO).await?;
+    let server_addr = format!("http://{}", addr);
+    *response.lock().unwrap() = one_shard_response(&server_addr, "");
+    let client = RoutingClient::discover(&server_addr).await?;
+    assert_eq!(request_count.load(Ordering::SeqCst), 1, "discovery RPC");
+    Ok((shutdown_tx, server, addr, request_count, response, client))
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn routing_client_tenant_on_unowned_shard_fails_without_connecting() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_millis(15000), async {
+        let (shutdown_tx, server, _addr, _request_count, _response, client) =
+            discover_stranded().await?;
+        let connections_before = client.connection_count();
+
+        let err = client
+            .client_for_tenant("bench-0")
+            .await
+            .expect_err("a tenant on a shard with no owner must not get a client");
+
+        assert_eq!(err.to_string(), "shard `counting-shard` has no owner");
+        assert_eq!(
+            client.connection_count(),
+            connections_before,
+            "no connection may be created for an empty address"
+        );
+
+        shutdown_counting_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn routing_client_recovers_once_unowned_shard_gets_an_owner() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_millis(15000), async {
+        let (shutdown_tx, server, addr, request_count, response, client) =
+            discover_stranded().await?;
+        let server_addr = format!("http://{}", addr);
+
+        client
+            .client_for_tenant("bench-0")
+            .await
+            .expect_err("shard has no owner yet");
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "the failing lookup itself makes no RPC"
+        );
+
+        // The shard gets an owner; the next lookup refreshes exactly once and
+        // resolves against the fresh topology.
+        *response.lock().unwrap() = one_shard_response(&server_addr, &server_addr);
+        let (_silo_client, shard) = client
+            .client_for_tenant("bench-0")
+            .await
+            .expect("lookup succeeds once the shard has an owner");
+
+        assert_eq!(shard, "counting-shard");
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "exactly one topology refresh between the failure and the success"
+        );
+        assert_eq!(
+            client.topology().address_for_shard("counting-shard"),
+            Some(server_addr.as_str()),
+            "topology now carries the owner address"
+        );
+
+        shutdown_counting_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn routing_client_shard_lookup_on_unowned_shard_behaves_like_tenant_lookup()
+-> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_millis(15000), async {
+        let (shutdown_tx, server, addr, request_count, response, client) =
+            discover_stranded().await?;
+        let server_addr = format!("http://{}", addr);
+        let connections_before = client.connection_count();
+
+        let err = client
+            .client_for_shard("counting-shard")
+            .await
+            .expect_err("a shard with no owner must not get a client");
+        assert_eq!(err.to_string(), "shard `counting-shard` has no owner");
+        assert_eq!(client.connection_count(), connections_before);
+
+        *response.lock().unwrap() = one_shard_response(&server_addr, &server_addr);
+        client
+            .client_for_shard("counting-shard")
+            .await
+            .expect("lookup succeeds once the shard has an owner");
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "exactly one topology refresh between the failure and the success"
+        );
+
+        shutdown_counting_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn routing_client_stale_refresh_is_rate_limited() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_millis(15000), async {
+        let (shutdown_tx, server, _addr, request_count, _response, client) =
+            discover_stranded().await?;
+
+        // First failure marks the topology stale; the second call refreshes
+        // (still unowned, so it fails again); the third is inside the minimum
+        // interval and must not refresh again.
+        for _ in 0..3 {
+            client
+                .client_for_tenant("bench-0")
+                .await
+                .expect_err("shard stays unowned");
+        }
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "one discovery plus at most one stale-triggered refresh inside the interval"
+        );
+
+        shutdown_counting_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn routing_client_random_shard_recovers_once_a_shard_gets_an_owner() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_millis(15000), async {
+        let (shutdown_tx, server, addr, request_count, response, client) =
+            discover_stranded().await?;
+        let server_addr = format!("http://{}", addr);
+
+        // Every shard is unowned: nothing to draw from, and no RPC is made.
+        let err = client
+            .client_for_random_shard()
+            .await
+            .expect_err("no routable shard while every shard is unowned");
+        assert!(
+            err.to_string().contains("no shards available"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        // Once a shard has an owner, the next worker lookup re-discovers on
+        // its own (one refresh) and returns a client -- a worker-only client
+        // must not stay wedged on the cached unowned topology.
+        *response.lock().unwrap() = one_shard_response(&server_addr, &server_addr);
+        let (_silo_client, shard) = client
+            .client_for_random_shard()
+            .await
+            .expect("lookup succeeds once the shard has an owner");
+        assert_eq!(shard, "counting-shard");
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "exactly one topology refresh between the failure and the success"
+        );
+
+        shutdown_counting_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())
     })
     .await
