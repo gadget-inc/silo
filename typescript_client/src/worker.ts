@@ -15,6 +15,7 @@ import type {
   RefreshOutcome,
   HeartbeatResult,
 } from "./client";
+import { DuplicateTaskDeliveryError } from "./client";
 import { Task, TaskExecution, transformTask } from "./TaskExecution";
 import { WorkerMetrics, getWorkerMeter } from "./metrics";
 
@@ -531,6 +532,15 @@ export class SiloWorker<
   private _enqueueTask(protoTask: ProtoTask): void {
     const task = transformTask<Payload, Metadata>(protoTask);
 
+    // Drop a delivery of a task that is already executing: the server
+    // double-dispatched (or a lost lease was re-delivered before this worker
+    // noticed). Running it twice would double-execute user code.
+    if (this._activeExecutions.has(task.id)) {
+      this._metrics.duplicateTaskDeliveriesCounter.add(1, this._metrics.defaultAttributes);
+      this._onError(new DuplicateTaskDeliveryError(task.id, task.jobId), { taskId: task.id });
+      return;
+    }
+
     // Open a per-task lifecycle span that covers heartbeats, the user
     // handler, and the eventual reportOutcome. LeaseTasks intentionally sits
     // outside this span — a single batch lease can produce N tasks and they
@@ -607,6 +617,14 @@ export class SiloWorker<
    */
   private _enqueueRefreshTask(task: RefreshTask): void {
     const shard = task.shard;
+
+    // Refresh tasks have no TaskExecution; their heartbeat-interval map entry
+    // doubles as the currently-active marker for dedup.
+    if (this._heartbeatIntervals.has(task.id)) {
+      this._metrics.duplicateTaskDeliveriesCounter.add(1, this._metrics.defaultAttributes);
+      this._onError(new DuplicateTaskDeliveryError(task.id), { taskId: task.id });
+      return;
+    }
 
     // Start heartbeat for this refresh task (no TaskExecution needed, refresh tasks can't be cancelled)
     const heartbeatInterval = setInterval(() => {

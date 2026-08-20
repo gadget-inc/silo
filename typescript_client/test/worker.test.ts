@@ -665,7 +665,7 @@ describe("SiloWorker", () => {
       expect(heartbeat.mock.calls.length).toBe(heartbeatCountAfterComplete);
     });
 
-    it("stops all heartbeats after the same task delivered in two polls settles twice", async () => {
+    it("stops all heartbeats when two intervals for one task id are concurrently live", async () => {
       const task = createTask("task-dup", "job-dup");
       const leaseTasks = vi
         .fn()
@@ -690,6 +690,13 @@ describe("SiloWorker", () => {
         pollIntervalMs: 10,
         heartbeatIntervalMs: 30,
       });
+
+      // Bypass the duplicate-delivery guard so the second poll registers a
+      // second live interval for the same task id, exercising interval
+      // cleanup under the exact overlap the guard normally prevents
+      const activeExecutions = (worker as unknown as { _activeExecutions: Map<string, unknown> })
+        ._activeExecutions;
+      vi.spyOn(activeExecutions, "has").mockReturnValue(false);
 
       worker.start();
 
@@ -798,6 +805,98 @@ describe("SiloWorker", () => {
         expect.objectContaining({ outcome: { type: "cancelled" } }),
       );
       expect(heartbeatsAfterReport).toBe(0);
+    });
+  });
+
+  describe("duplicate delivery", () => {
+    it("executes a task delivered twice only once and reports the duplicate", async () => {
+      const task = createTask("task-dedup", "job-dedup");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      // Long enough that the second delivery arrives while the first executes
+      const handler = vi.fn().mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { type: "success", result: {} };
+      });
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await worker.stop();
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_DUPLICATE_TASK_DELIVERY" }),
+        expect.objectContaining({ taskId: "task-dedup" }),
+      );
+    });
+
+    it("executes a task re-delivered after its first execution settled", async () => {
+      const task = createTask("task-redeliver", "job-redeliver");
+      let deliveredSecondCopy = false;
+      const leaseTasks = vi.fn().mockImplementation(async () => {
+        // First poll delivers the task; a later poll re-delivers it once the
+        // first execution has fully settled
+        if (leaseTasks.mock.calls.length === 1) {
+          return tasksResult([task]);
+        }
+        if (reportOutcome.mock.calls.length >= 1 && !deliveredSecondCopy) {
+          deliveredSecondCopy = true;
+          return tasksResult([task]);
+        }
+        return tasksResult([]);
+      });
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome });
+
+      const handler = vi.fn().mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { type: "success", result: {} };
+      });
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await worker.stop();
+
+      expect(handler).toHaveBeenCalledTimes(2);
+      expect(reportOutcome).toHaveBeenCalledTimes(2);
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    it("exports DuplicateTaskDeliveryError from the package barrel", async () => {
+      const barrel = await import("../src/index");
+      expect(barrel.DuplicateTaskDeliveryError).toBeDefined();
+      const err = new barrel.DuplicateTaskDeliveryError("task-1", "job-1");
+      expect(err.code).toBe("SILO_DUPLICATE_TASK_DELIVERY");
+      expect(err.taskId).toBe("task-1");
+      expect(err.jobId).toBe("job-1");
     });
   });
 

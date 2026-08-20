@@ -93,6 +93,27 @@ export class TaskNotFoundError extends Error {
 }
 
 /**
+ * Error reported when a worker receives a task it is already executing.
+ * The duplicate delivery is dropped; the original execution continues.
+ */
+export class DuplicateTaskDeliveryError extends Error {
+  code = "SILO_DUPLICATE_TASK_DELIVERY";
+
+  /** The task ID that was delivered twice */
+  public readonly taskId: string;
+  /** The job ID the task belongs to, if known */
+  public readonly jobId?: string;
+
+  constructor(taskId: string, jobId?: string) {
+    const jobMsg = jobId ? ` for job "${jobId}"` : "";
+    super(`Task "${taskId}"${jobMsg} delivered while already executing on this worker`);
+    this.name = "DuplicateTaskDeliveryError";
+    this.taskId = taskId;
+    this.jobId = jobId;
+  }
+}
+
+/**
  * Base class for errors translated from gRPC status codes.
  */
 export class SiloGrpcError extends Error {

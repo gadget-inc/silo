@@ -14,6 +14,8 @@ export class WorkerMetrics {
   readonly emptyPollCounter: Counter<Attributes>;
   /** Counter tracking the total number of tasks returned from polls. */
   readonly pollTasksReturnedCounter: Counter<Attributes>;
+  /** Counter incremented when a delivered task is dropped because it is already executing. */
+  readonly duplicateTaskDeliveriesCounter: Counter<Attributes>;
   /** Gauge reporting the number of available task slots (maxConcurrentTasks - active - queued). */
   readonly availableTaskSlots: ObservableGauge<Attributes>;
   /** Default attributes applied to all metric recordings. */
@@ -33,6 +35,13 @@ export class WorkerMetrics {
     this.pollTasksReturnedCounter = meter.createCounter("silo.worker.polls.tasks_returned", {
       description: "Total number of tasks returned from polls",
     });
+
+    this.duplicateTaskDeliveriesCounter = meter.createCounter(
+      "silo.worker.duplicate_task_deliveries",
+      {
+        description: "Number of delivered tasks dropped because the task was already executing",
+      },
+    );
 
     this.availableTaskSlots = meter.createObservableGauge("silo.worker.available_task_slots", {
       description: "Number of available task slots",

@@ -300,6 +300,44 @@ describe("SiloWorker metrics", () => {
     await worker.stop();
   });
 
+  it("increments duplicate task deliveries counter when a running task is re-delivered", async () => {
+    const task = createTask("task-dup-metric", "job-dup-metric");
+    const leaseTasks = vi
+      .fn()
+      .mockResolvedValueOnce(tasksResult([task]))
+      .mockResolvedValueOnce(tasksResult([task]))
+      .mockResolvedValue(tasksResult([]));
+    const client = createMockClient({ leaseTasks });
+    const handler: TaskHandler = async () => {
+      await new Promise((r) => setTimeout(r, 100));
+      return { type: "success", result: {} };
+    };
+    const meter = meterProvider.getMeter("test");
+
+    const worker = new SiloWorker({
+      client,
+      workerId: "test-worker",
+      taskGroup: "default",
+      handler,
+      pollIntervalMs: 10,
+      heartbeatIntervalMs: 100000,
+      onError: () => {},
+      meter,
+    });
+
+    worker.start();
+    while (leaseTasks.mock.calls.length < 3) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await worker.stop();
+
+    const allMetrics = await collectMetrics(metricReader);
+    expect(getMetricValue(allMetrics, "silo.worker.duplicate_task_deliveries")).toBe(1);
+    expect(getMetricAttributes(allMetrics, "silo.worker.duplicate_task_deliveries")).toEqual({
+      task_group: "default",
+    });
+  });
+
   it("includes task_group label on all metrics", async () => {
     let pollCount = 0;
     const leaseTasks = vi.fn().mockImplementation(async () => {
