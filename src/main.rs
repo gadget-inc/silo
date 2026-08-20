@@ -208,8 +208,8 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
-    // Periodic placement sample: reports the coordinator's owned shard set so
-    // dashboards and alerts see what this node actually owns.
+    // Periodic placement sample: owned-shard count, per-ring unassigned count,
+    // and a warn/info line when a shard is stranded / recovers.
     let placement_metrics_handle = metrics.as_ref().map(|m| {
         let shutdown = shutdown_tx.subscribe();
         tokio::spawn(silo::placement_metrics::run_sampler(

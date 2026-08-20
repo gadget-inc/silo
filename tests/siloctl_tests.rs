@@ -1887,7 +1887,7 @@ mod stranded {
 
     impl StrandedCoordinator {
         /// Two shards; the first is pinned to [`STRANDED_RING`].
-        async fn new(grpc_addr: &str) -> (Self, ShardId) {
+        fn new(grpc_addr: &str) -> (Self, ShardId) {
             let mut shard_map = ShardMap::create_initial(2).expect("create shard map");
             let stranded = shard_map.shard_ids()[0];
             shard_map
@@ -1942,7 +1942,7 @@ mod stranded {
             let mut shard_map = self.base.shard_map.lock().await;
             let shard = shard_map
                 .get_shard_mut(shard_id)
-                .ok_or_else(|| CoordinationError::ShardNotFound(*shard_id))?;
+                .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
             let previous = shard.placement_ring.clone();
             let current = ring.map(|s| s.to_string());
             shard.placement_ring = current.clone();
@@ -2005,7 +2005,7 @@ mod stranded {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        let (coordinator, stranded) = StrandedCoordinator::new(&format!("http://{}", addr)).await;
+        let (coordinator, stranded) = StrandedCoordinator::new(&format!("http://{}", addr));
         let server = tokio::spawn(run_server(
             listener,
             Arc::new(ShardFactory::new_noop()),
@@ -2131,8 +2131,9 @@ async fn siloctl_configure_unowned_shard_onto_unpopulated_ring_is_still_validate
         .expect_err("moving a stranded shard onto another unpopulated ring must be refused");
         let err_str = err.to_string();
         assert!(
-            err_str.contains("another-empty-ring") && err_str.contains("no members"),
-            "error should carry the server's validation message: {}",
+            err_str.contains("placement ring 'another-empty-ring' has no members")
+                && !err_str.contains("has no owner"),
+            "error should carry the server's validation message, not the client-side no-owner error: {}",
             err_str
         );
 

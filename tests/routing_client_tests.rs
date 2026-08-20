@@ -9,7 +9,7 @@ use futures::future::join_all;
 use grpc_integration_helpers::{setup_multi_shard_server, shutdown_server};
 use silo::pb::silo_server::{Silo, SiloServer};
 use silo::pb::*;
-use silo::routing_client::{ErrorAction, RoutingClient};
+use silo::routing_client::{ErrorAction, RoutingClient, ShardUnownedError};
 use silo::settings::AppConfig;
 use tokio::net::TcpListener;
 use tonic::transport::Server;
@@ -869,6 +869,13 @@ async fn routing_client_tenant_on_unowned_shard_fails_without_connecting() -> an
 
         assert_eq!(err.to_string(), "shard `counting-shard` has no owner");
         assert_eq!(
+            err.downcast_ref::<ShardUnownedError>(),
+            Some(&ShardUnownedError {
+                shard_id: "counting-shard".to_string()
+            }),
+            "the error is the typed no-owner error, not just its message"
+        );
+        assert_eq!(
             client.connection_count(),
             connections_before,
             "no connection may be created for an empty address"
@@ -970,7 +977,8 @@ async fn routing_client_stale_refresh_is_rate_limited() -> anyhow::Result<()> {
 
         // First failure marks the topology stale; the second call refreshes
         // (still unowned, so it fails again); the third is inside the minimum
-        // interval and must not refresh again.
+        // interval and must not refresh again. This assumes the three calls
+        // (one localhost round trip) complete within STALE_REFRESH_MIN_INTERVAL.
         for _ in 0..3 {
             client
                 .client_for_tenant("bench-0")
@@ -1023,6 +1031,62 @@ async fn routing_client_random_shard_recovers_once_a_shard_gets_an_owner() -> an
             2,
             "exactly one topology refresh between the failure and the success"
         );
+
+        shutdown_counting_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn routing_client_never_routes_to_an_unowned_shard() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_millis(15000), async {
+        let (shutdown_tx, server, addr, _request_count, response, client) =
+            discover_stranded().await?;
+        let server_addr = format!("http://{}", addr);
+
+        // With the only shard unowned there is no server address in the
+        // topology and nothing to draw a random shard from.
+        let topology = client.topology();
+        assert!(
+            topology.all_addresses().is_empty(),
+            "an empty owner address is not a server: {:?}",
+            topology.all_addresses()
+        );
+        assert_eq!(topology.random_shard(), None);
+        let err = client
+            .client_for_random_shard()
+            .await
+            .expect_err("no routable shard");
+        assert!(
+            err.to_string().contains("no shards available"),
+            "unexpected error: {err}"
+        );
+
+        // With one owned and one unowned shard, every draw lands on the owned one.
+        let mut two_shards = one_shard_response(&server_addr, &server_addr);
+        two_shards.shard_owners[0].range_end = "8000000000000000".to_string();
+        two_shards.shard_owners.push(ShardOwner {
+            shard_id: "stranded-shard".to_string(),
+            grpc_addr: String::new(),
+            node_id: String::new(),
+            range_start: "8000000000000000".to_string(),
+            range_end: String::new(),
+            placement_ring: Some("heavy".to_string()),
+        });
+        two_shards.num_shards = 2;
+        *response.lock().unwrap() = two_shards;
+        assert!(client.refresh_topology().await, "refresh succeeds");
+
+        let topology = client.topology();
+        assert_eq!(topology.all_addresses(), vec![server_addr.clone()]);
+        for _ in 0..50 {
+            assert_eq!(topology.random_shard(), Some("counting-shard"));
+            let (_client, shard) = client.client_for_random_shard().await?;
+            assert_eq!(shard, "counting-shard");
+        }
 
         shutdown_counting_server(shutdown_tx, server).await?;
         Ok::<(), anyhow::Error>(())

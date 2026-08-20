@@ -1869,6 +1869,11 @@ fn register<C: Collector + Clone + 'static>(registry: &Registry, metric: C) -> C
     metric
 }
 
+/// How often the placement sampler (`crate::placement_metrics`) reads the
+/// coordinator. Bounds the staleness of `silo_shards_owned` and
+/// `silo_shards_unassigned`; both HELP texts quote this value.
+pub const PLACEMENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Initialize the metrics system with a Prometheus registry.
 ///
 /// Returns a `Metrics` handle that can be cloned and passed to components.
@@ -2040,7 +2045,7 @@ pub fn init() -> anyhow::Result<Metrics> {
             format!(
                 "Number of shards this node owns (acquired from the coordinator and opened); \
                  sampled every {}s, which bounds staleness",
-                crate::placement_metrics::SAMPLE_INTERVAL.as_secs()
+                PLACEMENT_SAMPLE_INTERVAL.as_secs()
             ),
         )?,
     );
@@ -2056,7 +2061,7 @@ pub fn init() -> anyhow::Result<Metrics> {
                      because no current member is eligible for that ring -- this reflects \
                      desired assignment, not acquisition state; sampled every {}s, which \
                      bounds staleness",
-                    crate::placement_metrics::SAMPLE_INTERVAL.as_secs()
+                    PLACEMENT_SAMPLE_INTERVAL.as_secs()
                 ),
             ),
             &["ring"],

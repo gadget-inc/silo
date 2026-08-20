@@ -70,7 +70,7 @@ fn sample_sets_shards_owned_to_owned_count() {
     let owned = vec![ShardId::new(), ShardId::new(), ShardId::new()];
     let owner_map = owner_map_with_rings(&[None], &[]);
 
-    placement_metrics::sample(&metrics, &owned, &owner_map, &UnassignedShards::new());
+    placement_metrics::sample(&metrics, &owned, Some(&owner_map), &UnassignedShards::new());
 
     assert_eq!(
         gauge_value(&metrics, "silo_shards_owned", &[]),
@@ -89,10 +89,10 @@ fn later_pass_replaces_shards_owned() {
     placement_metrics::sample(
         &metrics,
         &[ShardId::new(), ShardId::new(), ShardId::new()],
-        &owner_map,
+        Some(&owner_map),
         &none,
     );
-    placement_metrics::sample(&metrics, &[ShardId::new()], &owner_map, &none);
+    placement_metrics::sample(&metrics, &[ShardId::new()], Some(&owner_map), &none);
 
     assert_eq!(
         gauge_value(&metrics, "silo_shards_owned", &[]),
@@ -107,7 +107,8 @@ fn sample_reports_unassigned_shard_under_its_ring_and_clears_when_assigned() {
     let stranded = owner_map_with_rings(&[Some("heavy"), None], &[0]);
     let recovered = owner_map_with_rings(&[Some("heavy"), None], &[]);
 
-    let unassigned = placement_metrics::sample(&metrics, &[], &stranded, &UnassignedShards::new());
+    let unassigned =
+        placement_metrics::sample(&metrics, &[], Some(&stranded), &UnassignedShards::new());
 
     assert_eq!(
         gauge_value(&metrics, "silo_shards_unassigned", &[("ring", "heavy")]),
@@ -120,7 +121,7 @@ fn sample_reports_unassigned_shard_under_its_ring_and_clears_when_assigned() {
         "the pass returns the unassigned set for the next pass to diff against"
     );
 
-    let unassigned = placement_metrics::sample(&metrics, &[], &recovered, &unassigned);
+    let unassigned = placement_metrics::sample(&metrics, &[], Some(&recovered), &unassigned);
 
     let heavy = gauge_value(&metrics, "silo_shards_unassigned", &[("ring", "heavy")]);
     assert!(
@@ -128,6 +129,66 @@ fn sample_reports_unassigned_shard_under_its_ring_and_clears_when_assigned() {
         "silo_shards_unassigned{{ring=\"heavy\"}} after the shard regains an owner: expected absent or 0, got {heavy:?}"
     );
     assert!(unassigned.is_empty(), "no shard is unassigned any more");
+}
+
+#[silo::test]
+fn sample_clears_only_the_ring_that_recovered() {
+    let metrics = metrics::init().expect("init metrics");
+    let both_stranded = owner_map_with_rings(&[Some("heavy"), None], &[0, 1]);
+    let heavy_recovered = owner_map_with_rings(&[Some("heavy"), None], &[1]);
+
+    let unassigned = placement_metrics::sample(
+        &metrics,
+        &[],
+        Some(&both_stranded),
+        &UnassignedShards::new(),
+    );
+    assert_eq!(
+        gauge_value(&metrics, "silo_shards_unassigned", &[("ring", "heavy")]),
+        Some(1.0)
+    );
+    assert_eq!(
+        gauge_value(&metrics, "silo_shards_unassigned", &[("ring", "default")]),
+        Some(1.0)
+    );
+
+    placement_metrics::sample(&metrics, &[], Some(&heavy_recovered), &unassigned);
+
+    let heavy = gauge_value(&metrics, "silo_shards_unassigned", &[("ring", "heavy")]);
+    assert!(
+        heavy.is_none_or(|v| v == 0.0),
+        "heavy ring clears once its shard has an owner, got {heavy:?}"
+    );
+    assert_eq!(
+        gauge_value(&metrics, "silo_shards_unassigned", &[("ring", "default")]),
+        Some(1.0),
+        "the default ring's series is retained while its shard is still unassigned"
+    );
+}
+
+#[silo::test]
+fn sample_without_owner_map_still_updates_shards_owned() {
+    let metrics = metrics::init().expect("init metrics");
+    let stranded = owner_map_with_rings(&[Some("heavy")], &[0]);
+    let previous =
+        placement_metrics::sample(&metrics, &[], Some(&stranded), &UnassignedShards::new());
+
+    let returned = placement_metrics::sample(&metrics, &[ShardId::new()], None, &previous);
+
+    assert_eq!(
+        gauge_value(&metrics, "silo_shards_owned", &[]),
+        Some(1.0),
+        "the owned gauge is set even when the owner map could not be read"
+    );
+    assert_eq!(
+        gauge_value(&metrics, "silo_shards_unassigned", &[("ring", "heavy")]),
+        Some(1.0),
+        "the unassigned gauge is left as it was"
+    );
+    assert_eq!(
+        returned, previous,
+        "the previous unassigned set carries over to the next pass"
+    );
 }
 
 #[silo::test]

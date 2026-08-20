@@ -75,19 +75,18 @@ impl ClusterTopology {
     /// Get a random shard ID among the shards that have an effective address
     /// (redirect override or owner). Unowned shards are never drawn.
     pub fn random_shard(&self) -> Option<&str> {
-        let routable: Vec<&str> = self
-            .shard_owners
+        use rand::seq::IteratorRandom;
+        self.shard_owners
             .iter()
-            .map(|owner| owner.shard_id.as_str())
-            .filter(|shard_id| {
-                self.address_for_shard(shard_id)
-                    .is_some_and(|addr| !addr.is_empty())
+            .filter(|owner| {
+                let effective = self
+                    .shard_addr_overrides
+                    .get(&owner.shard_id)
+                    .unwrap_or(&owner.grpc_addr);
+                !effective.is_empty()
             })
-            .collect();
-        if routable.is_empty() {
-            return None;
-        }
-        Some(routable[rand::random_range(0..routable.len())])
+            .map(|owner| owner.shard_id.as_str())
+            .choose(&mut rand::rng())
     }
 
     /// Get all unique server addresses (including overrides). Shards with no
