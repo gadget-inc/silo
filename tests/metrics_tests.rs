@@ -1,5 +1,9 @@
 //! Tests for the Prometheus metrics endpoint.
 
+mod test_helpers;
+
+use test_helpers::{extract_metric_value, gather_metrics_text};
+
 use axum::{
     Router,
     body::Body,
@@ -882,28 +886,4 @@ async fn test_metrics_leasable_to_start_latency() {
         "ready-to-start series should still be emitted, found: {:?}",
         ready_count
     );
-}
-
-/// Gather metrics text from the Prometheus registry.
-fn gather_metrics_text(metrics: &metrics::Metrics) -> String {
-    use prometheus::{Encoder, TextEncoder};
-    let encoder = TextEncoder::new();
-    let metric_families = metrics.registry().gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
-}
-
-/// Extract a numeric metric value from Prometheus text output, finding the line
-/// that contains all given substrings.
-fn extract_metric_value(body: &str, substrings: &[&str]) -> f64 {
-    let line = body
-        .lines()
-        .find(|l| !l.starts_with('#') && substrings.iter().all(|s| l.contains(s)))
-        .unwrap_or_else(|| panic!("metric line not found for substrings {:?}", substrings));
-    line.rsplit_once(' ')
-        .unwrap_or_else(|| panic!("no space-separated value in line: {}", line))
-        .1
-        .parse::<f64>()
-        .unwrap_or_else(|_| panic!("failed to parse metric value from line: {}", line))
 }

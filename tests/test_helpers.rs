@@ -552,3 +552,37 @@ pub async fn dequeue_task_ids_until(
     }
     task_ids
 }
+
+/// Render the Prometheus registry as text exposition format.
+pub fn gather_metrics_text(metrics: &silo::metrics::Metrics) -> String {
+    use prometheus::{Encoder, TextEncoder};
+    let encoder = TextEncoder::new();
+    let metric_families = metrics.registry().gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
+}
+
+/// Value of the first metric line matching all substrings; panics when no
+/// line matches. Use `metric_value_or_zero` for counters that may never fire.
+pub fn extract_metric_value(body: &str, substrings: &[&str]) -> f64 {
+    let line = body
+        .lines()
+        .find(|l| !l.starts_with('#') && substrings.iter().all(|s| l.contains(s)))
+        .unwrap_or_else(|| panic!("metric line not found for substrings {:?}", substrings));
+    line.rsplit_once(' ')
+        .unwrap_or_else(|| panic!("no space-separated value in line: {}", line))
+        .1
+        .parse::<f64>()
+        .unwrap_or_else(|_| panic!("could not parse metric value from line: {}", line))
+}
+
+/// Value of the first metric line matching all substrings, or 0.0 when no
+/// line matches (a counter that never fired is absent from the scrape).
+pub fn metric_value_or_zero(body: &str, substrings: &[&str]) -> f64 {
+    body.lines()
+        .find(|l| !l.starts_with('#') && substrings.iter().all(|s| l.contains(s)))
+        .and_then(|line| line.rsplit_once(' '))
+        .and_then(|(_, v)| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}

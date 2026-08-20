@@ -763,25 +763,6 @@ async fn dequeue_over_live_lease_counts_stored_overwrite_and_still_delivers() {
     });
 }
 
-fn gather_metrics_text(metrics: &silo::metrics::Metrics) -> String {
-    use prometheus::{Encoder, TextEncoder};
-    let encoder = TextEncoder::new();
-    let metric_families = metrics.registry().gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
-}
-
-/// Value of the first metric line matching all substrings, or 0.0 when no
-/// line matches (a counter that never fired is absent from the scrape).
-fn metric_value_or_zero(body: &str, substrings: &[&str]) -> f64 {
-    body.lines()
-        .find(|l| !l.starts_with('#') && substrings.iter().all(|s| l.contains(s)))
-        .and_then(|line| line.rsplit_once(' '))
-        .and_then(|(_, v)| v.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
 /// A repeat of the same task id within a single dequeue iteration cannot be
 /// seen by the pre-write point read (the first lease write is still in the
 /// uncommitted batch), so the guard tracks the iteration's leased task ids
@@ -822,6 +803,28 @@ async fn dequeue_counts_batch_overwrite_for_repeated_task_id_in_one_iteration() 
         batch.put(&dup_key, &silo::codec::encode_task(&duplicate));
         shard.db().write(batch).await.expect("write duplicate task");
         shard.db().flush().await.expect("flush duplicate task");
+
+        // The enqueue already woke the broker, whose scanner may have
+        // buffered the first record before the duplicate was flushed. Wait
+        // until the buffer holds both so the dequeue claims them in ONE
+        // iteration -- split iterations would commit the first lease and
+        // trip the stored branch instead of the batch branch.
+        let buffered = poll_until(
+            || async {
+                let body = gather_metrics_text(&metrics);
+                metric_value_or_zero(
+                    &body,
+                    &["silo_broker_buffer_size", "task_group=\"default\""],
+                )
+            },
+            |v| *v >= 2.0,
+            10_000,
+        )
+        .await;
+        assert!(
+            buffered >= 2.0,
+            "broker never buffered both task records (buffered={buffered})"
+        );
 
         // Both task records dequeue in one call, so the second lease write
         // repeats a task id already leased in this iteration's batch
