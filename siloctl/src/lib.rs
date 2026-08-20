@@ -56,6 +56,39 @@ fn ensure_http_scheme(addr: &str) -> String {
 
 type AuthSiloClient = SiloClient<InterceptedService<Channel, AuthInterceptor>>;
 
+/// How the default placement ring is named in the no-owner error.
+const DEFAULT_RING: &str = "default";
+
+/// The shard exists but the cluster's desired assignment gives it no owner:
+/// no current member is in its placement ring.
+///
+/// Commands that need the owner surface this as their error; `shard configure`
+/// catches it and sends the request to the connected node instead, which is
+/// how an operator moves a stranded shard back onto a populated ring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardUnownedError {
+    pub shard_id: String,
+    /// The shard's placement ring, `default` when unset.
+    pub ring: String,
+    /// Every ring some member advertises, deduplicated and sorted; a member
+    /// with no rings configured advertises `default`.
+    pub advertised_rings: Vec<String>,
+}
+
+impl std::fmt::Display for ShardUnownedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shard `{}` has no owner; its placement ring `{}` has no members (members advertise: `{}`)",
+            self.shard_id,
+            self.ring,
+            self.advertised_rings.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ShardUnownedError {}
+
 async fn connect(address: &str, auth_token: Option<&str>) -> anyhow::Result<AuthSiloClient> {
     let url = ensure_http_scheme(address);
     let channel = Channel::from_shared(url)?.connect().await?;
@@ -85,6 +118,34 @@ async fn connect_to_shard_owner(
         .iter()
         .find(|s| s.shard_id == shard_id)
         .ok_or_else(|| anyhow::anyhow!("shard '{}' not found in cluster", shard_id))?;
+
+    // An empty owner address means the desired assignment gave the shard no
+    // owner: no member is in its ring.
+    if owner.grpc_addr.is_empty() {
+        let mut advertised_rings: Vec<String> = response
+            .members
+            .iter()
+            .flat_map(|m| {
+                if m.placement_rings.is_empty() {
+                    vec![DEFAULT_RING.to_string()]
+                } else {
+                    m.placement_rings.clone()
+                }
+            })
+            .collect();
+        advertised_rings.sort();
+        advertised_rings.dedup();
+        return Err(ShardUnownedError {
+            shard_id: shard_id.to_string(),
+            ring: owner
+                .placement_ring
+                .clone()
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| DEFAULT_RING.to_string()),
+            advertised_rings,
+        }
+        .into());
+    }
 
     // If the shard is on this node, reuse the existing connection
     if owner.grpc_addr == response.this_grpc_addr {
@@ -1036,8 +1097,17 @@ pub async fn shard_configure<W: Write>(
     ring: Option<String>,
     allow_unpopulated_ring: bool,
 ) -> anyhow::Result<()> {
+    // The server's configure_shard handler has no ownership requirement, so a
+    // shard with no owner (nobody in its ring) is configured through the node
+    // we are connected to -- this is how a stranded shard is recovered.
     let mut client =
-        connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await?;
+        match connect_to_shard_owner(&opts.address, shard, opts.auth_token.as_deref()).await {
+            Ok(client) => client,
+            Err(e) if e.is::<ShardUnownedError>() => {
+                connect(&opts.address, opts.auth_token.as_deref()).await?
+            }
+            Err(e) => return Err(e),
+        };
 
     let response = client
         .configure_shard(ConfigureShardRequest {
