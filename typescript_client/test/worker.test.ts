@@ -664,6 +664,141 @@ describe("SiloWorker", () => {
       // Heartbeat count should not have increased after task completed
       expect(heartbeat.mock.calls.length).toBe(heartbeatCountAfterComplete);
     });
+
+    it("stops all heartbeats after the same task delivered in two polls settles twice", async () => {
+      const task = createTask("task-dup", "job-dup");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi.fn().mockResolvedValue({ cancelled: false });
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      // Long enough that both copies are executing concurrently
+      const handler: TaskHandler = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+      });
+
+      worker.start();
+
+      // Wait for both executions to settle
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const heartbeatCountAfterSettle = heartbeat.mock.calls.length;
+
+      // Wait several heartbeat intervals - no interval may still be live
+      await new Promise((resolve) => setTimeout(resolve, 120));
+
+      await worker.stop();
+
+      expect(heartbeat.mock.calls.length).toBe(heartbeatCountAfterSettle);
+    });
+
+    it("issues no heartbeat after reportOutcome is invoked for a completing task", async () => {
+      const task = createTask("task-hb-order", "job-hb-order");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+
+      let reportOutcomeInvoked = false;
+      let heartbeatsAfterReport = 0;
+      // Hold the report pending across several heartbeat intervals so any
+      // still-live interval would fire while it is in flight
+      const reportOutcome = vi.fn().mockImplementation(async () => {
+        reportOutcomeInvoked = true;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      });
+      const heartbeat = vi.fn().mockImplementation(async () => {
+        if (reportOutcomeInvoked) {
+          heartbeatsAfterReport++;
+        }
+        return { cancelled: false };
+      });
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      const handler: TaskHandler = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await worker.stop();
+
+      // The interval was live during execution...
+      expect(heartbeat).toHaveBeenCalled();
+      // ...but stopped before the outcome report went out
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(heartbeatsAfterReport).toBe(0);
+    });
+
+    it("issues no heartbeat after the cancelled outcome report is invoked", async () => {
+      const task = createTask("task-hb-cancel", "job-hb-cancel");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+
+      let reportOutcomeInvoked = false;
+      let heartbeatsAfterReport = 0;
+      const reportOutcome = vi.fn().mockImplementation(async () => {
+        reportOutcomeInvoked = true;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      });
+      const heartbeat = vi.fn().mockImplementation(async () => {
+        if (reportOutcomeInvoked) {
+          heartbeatsAfterReport++;
+        }
+        return { cancelled: false };
+      });
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      const handler: TaskHandler = async (ctx) => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        await ctx.cancel();
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await worker.stop();
+
+      expect(reportOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: { type: "cancelled" } }),
+      );
+      expect(heartbeatsAfterReport).toBe(0);
+    });
   });
 
   describe("error handling", () => {

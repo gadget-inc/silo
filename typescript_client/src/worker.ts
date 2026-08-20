@@ -500,7 +500,10 @@ export class SiloWorker<
     if (totalTasksReturned === 0) {
       this._metrics.emptyPollCounter.add(1, this._metrics.defaultAttributes);
     } else {
-      this._metrics.pollTasksReturnedCounter.add(totalTasksReturned, this._metrics.defaultAttributes);
+      this._metrics.pollTasksReturnedCounter.add(
+        totalTasksReturned,
+        this._metrics.defaultAttributes,
+      );
     }
 
     // Add regular job tasks to the queue
@@ -565,12 +568,16 @@ export class SiloWorker<
     });
     const heartbeatInterval = setInterval(heartbeatFn, this._heartbeatIntervalMs);
     this._heartbeatIntervals.set(task.id, heartbeatInterval);
+    // Passed into the execute function so the interval stops the moment the
+    // handler settles, before the outcome report goes out — a heartbeat racing
+    // an in-flight report would NOT_FOUND against the already-deleted lease.
+    const stopHeartbeat = (): void => clearInterval(heartbeatInterval);
 
     // Add task to the queue for execution. Bind the queued callback so the
     // await chain inside (handler invocation + reportOutcome) inherits
     // taskContext even though p-queue defers execution to a future microtask.
     const queuedFn = otelContext.bind(taskContext, async () => {
-      await this._executeTaskWithExecution(execution);
+      await this._executeTaskWithExecution(execution, stopHeartbeat);
     });
     this._taskQueue
       .add(queuedFn)
@@ -581,14 +588,16 @@ export class SiloWorker<
         this._onError(e, { taskId: task.id });
       })
       .finally(() => {
-        // Stop heartbeat for this task
-        const interval = this._heartbeatIntervals.get(task.id);
-        if (interval) {
-          clearInterval(interval);
+        // Clear the closure-captured handle, never a map lookup: a concurrent
+        // delivery of the same task id may have replaced the map entry, and
+        // clearing the looked-up handle would orphan this delivery's interval.
+        clearInterval(heartbeatInterval);
+        if (this._heartbeatIntervals.get(task.id) === heartbeatInterval) {
           this._heartbeatIntervals.delete(task.id);
         }
-        // Remove from active executions
-        this._activeExecutions.delete(task.id);
+        if (this._activeExecutions.get(task.id) === execution) {
+          this._activeExecutions.delete(task.id);
+        }
         span.end();
       });
   }
@@ -608,11 +617,12 @@ export class SiloWorker<
       });
     }, this._heartbeatIntervalMs);
     this._heartbeatIntervals.set(task.id, heartbeatInterval);
+    const stopHeartbeat = (): void => clearInterval(heartbeatInterval);
 
     // Add to the queue for execution
     this._taskQueue
       .add(async () => {
-        await this._executeRefreshTask(task, shard);
+        await this._executeRefreshTask(task, shard, stopHeartbeat);
       })
       .catch((error) => {
         this._onError(error instanceof Error ? error : new Error(String(error)), {
@@ -620,10 +630,9 @@ export class SiloWorker<
         });
       })
       .finally(() => {
-        // Stop heartbeat
-        const interval = this._heartbeatIntervals.get(task.id);
-        if (interval) {
-          clearInterval(interval);
+        // Same closure-captured cleanup as _enqueueTask, for the same reason.
+        clearInterval(heartbeatInterval);
+        if (this._heartbeatIntervals.get(task.id) === heartbeatInterval) {
           this._heartbeatIntervals.delete(task.id);
         }
       });
@@ -634,6 +643,7 @@ export class SiloWorker<
    */
   private async _executeTaskWithExecution(
     execution: TaskExecution<Payload, Metadata>,
+    stopHeartbeat: () => void,
   ): Promise<void> {
     const context: TaskContext<Payload, Metadata> = {
       task: execution.task,
@@ -652,6 +662,9 @@ export class SiloWorker<
         data: serializeError(error),
       };
     }
+
+    // The handler has settled: no report below may race a heartbeat
+    stopHeartbeat();
 
     // If the task was cancelled (by server or client), report Cancelled outcome instead
     if (execution.shouldReportCancelled) {
@@ -676,7 +689,11 @@ export class SiloWorker<
   /**
    * Execute a refresh task and report its outcome.
    */
-  private async _executeRefreshTask(task: RefreshTask, shard: string): Promise<void> {
+  private async _executeRefreshTask(
+    task: RefreshTask,
+    shard: string,
+    stopHeartbeat: () => void,
+  ): Promise<void> {
     const context: RefreshTaskContext = {
       task,
       shard,
@@ -701,6 +718,9 @@ export class SiloWorker<
         message: errorObj.message,
       };
     }
+
+    // The handler has settled: stop heartbeats before the report goes out
+    stopHeartbeat();
 
     // Report the refresh outcome
     await this._client.reportRefreshOutcome({
