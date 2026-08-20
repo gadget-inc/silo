@@ -595,6 +595,13 @@ export class SiloWorker<
     // when setInterval was called, so we explicitly bind the heartbeat fn to
     // taskContext — without this every Heartbeat RPC would be its own root
     // trace instead of a child of the lifecycle span.
+    //
+    // stopHeartbeat is passed into the execute function so the interval stops
+    // the moment the handler settles, before the outcome report goes out — a
+    // heartbeat racing an in-flight report would NOT_FOUND against the
+    // already-deleted lease.
+    let heartbeatInterval: ReturnType<typeof setInterval> | undefined;
+    const stopHeartbeat = (): void => clearInterval(heartbeatInterval);
     const heartbeatFn = otelContext.bind(taskContext, () => {
       this._sendHeartbeatForTask(execution, stopHeartbeat).catch((error) => {
         this._onError(error instanceof Error ? error : new Error(String(error)), {
@@ -602,12 +609,8 @@ export class SiloWorker<
         });
       });
     });
-    const heartbeatInterval = setInterval(heartbeatFn, this._heartbeatIntervalMs);
+    heartbeatInterval = setInterval(heartbeatFn, this._heartbeatIntervalMs);
     this._heartbeatIntervals.set(task.id, heartbeatInterval);
-    // Passed into the execute function so the interval stops the moment the
-    // handler settles, before the outcome report goes out — a heartbeat racing
-    // an in-flight report would NOT_FOUND against the already-deleted lease.
-    const stopHeartbeat = (): void => clearInterval(heartbeatInterval);
 
     // Add task to the queue for execution. Bind the queued callback so the
     // await chain inside (handler invocation + reportOutcome) inherits
@@ -689,6 +692,13 @@ export class SiloWorker<
     execution: TaskExecution<Payload, Metadata>,
     stopHeartbeat: () => void,
   ): Promise<void> {
+    // The lease can be lost while the task is still queued (heartbeats run
+    // from delivery, not execution start) -- never start the handler for a
+    // task this worker no longer owns
+    if (execution.isLeaseLost) {
+      return;
+    }
+
     const context: TaskContext<Payload, Metadata> = {
       task: execution.task,
       cancellationSignal: execution.signal,
@@ -716,23 +726,33 @@ export class SiloWorker<
     }
 
     // If the task was cancelled (by server or client), report Cancelled outcome instead
-    if (execution.shouldReportCancelled) {
+    try {
+      if (execution.shouldReportCancelled) {
+        await this._client.reportOutcome({
+          taskId: execution.task.id,
+          shard: execution.task.shard,
+          tenant: execution.task.tenantId,
+          outcome: { type: "cancelled" },
+        });
+        return;
+      }
+
+      // Report the outcome to the correct shard
       await this._client.reportOutcome({
         taskId: execution.task.id,
         shard: execution.task.shard,
         tenant: execution.task.tenantId,
-        outcome: { type: "cancelled" },
+        outcome,
       });
-      return;
+    } catch (error) {
+      // A heartbeat in flight when the handler settled can mark the lease
+      // lost while the report is on the wire; the report's failure is then
+      // expected noise -- the lease-lost event already surfaced via onError
+      if (execution.isLeaseLost) {
+        return;
+      }
+      throw error;
     }
-
-    // Report the outcome to the correct shard
-    await this._client.reportOutcome({
-      taskId: execution.task.id,
-      shard: execution.task.shard,
-      tenant: execution.task.tenantId,
-      outcome,
-    });
   }
 
   /**

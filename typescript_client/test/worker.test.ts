@@ -890,13 +890,77 @@ describe("SiloWorker", () => {
       expect(onError).not.toHaveBeenCalled();
     });
 
-    it("exports DuplicateTaskDeliveryError from the package barrel", async () => {
+    it("drops a duplicate delivery of an actively-executing refresh task", async () => {
+      const refreshTask = {
+        id: "refresh-dup",
+        queueKey: "queue-1",
+        currentMaxConcurrency: 5,
+        lastRefreshedAtMs: 0n,
+        metadata: {},
+        leaseMs: 30000n,
+        shard: "00000000-0000-0000-0000-000000000001",
+        taskGroup: "default",
+      };
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce({ tasks: [], refreshTasks: [refreshTask] })
+        .mockResolvedValueOnce({ tasks: [], refreshTasks: [refreshTask] })
+        .mockResolvedValue(tasksResult([]));
+      const reportRefreshOutcome = vi.fn().mockResolvedValue(undefined);
+      const onError = vi.fn();
+      const client = {
+        leaseTasks,
+        reportOutcome: vi.fn().mockResolvedValue(undefined),
+        reportRefreshOutcome,
+        heartbeat: vi.fn().mockResolvedValue({ cancelled: false }),
+        cancelJob: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SiloGRPCClient;
+
+      const refreshHandler = vi.fn().mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return 7;
+      });
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler: async () => ({ type: "success", result: {} }),
+        refreshHandler,
+        pollIntervalMs: 10,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await worker.stop();
+
+      expect(refreshHandler).toHaveBeenCalledTimes(1);
+      expect(reportRefreshOutcome).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_DUPLICATE_TASK_DELIVERY" }),
+        expect.objectContaining({ taskId: "refresh-dup" }),
+      );
+    });
+
+    it("exports DuplicateTaskDeliveryError and TaskLeaseLostError from the package barrel", async () => {
       const barrel = await import("../src/index");
       expect(barrel.DuplicateTaskDeliveryError).toBeDefined();
       const err = new barrel.DuplicateTaskDeliveryError("task-1", "job-1");
       expect(err.code).toBe("SILO_DUPLICATE_TASK_DELIVERY");
       expect(err.taskId).toBe("task-1");
       expect(err.jobId).toBe("job-1");
+
+      expect(barrel.TaskLeaseLostError).toBeDefined();
+      const leaseLost = new barrel.TaskLeaseLostError(
+        "task-1",
+        "job-1",
+        new Error("lease not found"),
+      );
+      expect(leaseLost.code).toBe("SILO_TASK_LEASE_LOST");
+      expect(leaseLost.taskId).toBe("task-1");
+      expect(leaseLost.jobId).toBe("job-1");
     });
   });
 
@@ -959,6 +1023,60 @@ describe("SiloWorker", () => {
       const err = onError.mock.calls[0][0] as { message: string };
       expect(err.message).toContain("task-ll");
       expect(err.message).toContain("job-ll");
+    });
+
+    it("treats a lease-owner-mismatch heartbeat rejection as a lost lease", async () => {
+      const task = createTask("task-om", "job-om");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi
+        .fn()
+        .mockRejectedValue(new SiloFailedPreconditionError("lease owner mismatch"));
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let signalAbortedInHandler = false;
+      const handler: TaskHandler = async (ctx) => {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 500);
+          ctx.cancellationSignal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        signalAbortedInHandler = ctx.cancellationSignal.aborted;
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await worker.stop();
+
+      expect(signalAbortedInHandler).toBe(true);
+      expect(reportOutcome).not.toHaveBeenCalled();
+      expect(heartbeat).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_TASK_LEASE_LOST" }),
+        expect.objectContaining({ taskId: "task-om" }),
+      );
     });
 
     it("executes a retry re-delivered after the lease was lost", async () => {
@@ -1028,6 +1146,65 @@ describe("SiloWorker", () => {
       expect(onError).toHaveBeenCalledWith(
         expect.objectContaining({ code: "SILO_TASK_LEASE_LOST" }),
         expect.anything(),
+      );
+    });
+
+    it("never starts the handler for a task whose lease was lost while queued", async () => {
+      const task1 = createTask("task-q1", "job-q1");
+      const task2 = createTask("task-q2", "job-q2");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task1, task2]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      // task-q2 loses its lease while it waits in the queue behind task-q1
+      const heartbeat = vi.fn().mockImplementation(async (_worker: string, taskId: string) => {
+        if (taskId === "task-q2") {
+          throw new TaskNotFoundError("task-q2", "lease not found");
+        }
+        return { cancelled: false };
+      });
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let releaseFirstTask: () => void;
+      const firstTaskBlocked = new Promise<void>((resolve) => {
+        releaseFirstTask = resolve;
+      });
+      const handledTaskIds: string[] = [];
+      const handler: TaskHandler = async (ctx) => {
+        handledTaskIds.push(ctx.task.id);
+        if (ctx.task.id === "task-q1") {
+          await firstTaskBlocked;
+        }
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        maxConcurrentTasks: 1,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      // Let task-q2's queued heartbeat reject lease-gone before task-q1 frees the slot
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      releaseFirstTask!();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await worker.stop();
+
+      expect(handledTaskIds).toEqual(["task-q1"]);
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(reportOutcome).toHaveBeenCalledWith(expect.objectContaining({ taskId: "task-q1" }));
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_TASK_LEASE_LOST" }),
+        expect.objectContaining({ taskId: "task-q2" }),
       );
     });
 
