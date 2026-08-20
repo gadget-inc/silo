@@ -208,6 +208,17 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // Periodic placement sample: reports the coordinator's owned shard set so
+    // dashboards and alerts see what this node actually owns.
+    let placement_metrics_handle = metrics.as_ref().map(|m| {
+        let shutdown = shutdown_tx.subscribe();
+        tokio::spawn(silo::placement_metrics::run_sampler(
+            coordinator.clone(),
+            m.clone(),
+            shutdown,
+        ))
+    });
+
     // Periodic jemalloc stats scrape: lets us distinguish purgeable retained
     // pages from genuinely live allocations vs non-jemalloc mmaps.
     #[cfg(unix)]
@@ -290,6 +301,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = handle.await;
     }
     if let Some(handle) = tokio_metrics_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = placement_metrics_handle {
         let _ = handle.await;
     }
 
