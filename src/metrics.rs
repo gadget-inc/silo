@@ -98,6 +98,26 @@ impl GrantPath {
     }
 }
 
+/// Which detection branch observed a dispatch-time lease overwrite,
+/// recorded as the `source` label on `silo_task_lease_overwrites_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseOverwriteSource {
+    /// A still-live lease record was found by the pre-write point read.
+    Stored,
+    /// The task id was already leased earlier within the same dequeue
+    /// iteration (the lease write is still in the uncommitted batch).
+    Batch,
+}
+
+impl LeaseOverwriteSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeaseOverwriteSource::Stored => "stored",
+            LeaseOverwriteSource::Batch => "batch",
+        }
+    }
+}
+
 // (shard_id, tenant, task_group, queue, queue_kind)
 type BackgroundActionMetricKey = (String, String, String, String, String);
 type BackgroundActionGaugeState = Arc<Mutex<HashMap<BackgroundActionMetricKey, GaugeSeriesState>>>;
@@ -166,6 +186,7 @@ pub struct Metrics {
 
     // Lease metrics
     task_leases_active: GaugeVec,
+    task_lease_overwrites_total: CounterVec,
     ready_to_start_latency_ms: HistogramVec,
     leasable_to_start_latency_ms: HistogramVec,
     lease_reaper_duration: HistogramVec,
@@ -635,6 +656,19 @@ impl Metrics {
         self.lease_reaper_leases_reaped_total
             .with_label_values(&[shard])
             .inc_by(count as f64);
+    }
+
+    /// Record a RunAttempt dispatch that wrote a lease over a still-live
+    /// existing lease.
+    pub fn record_task_lease_overwrite(
+        &self,
+        shard: &str,
+        task_group: &str,
+        source: LeaseOverwriteSource,
+    ) {
+        self.task_lease_overwrites_total
+            .with_label_values(&[shard, task_group, source.as_str()])
+            .inc();
     }
 
     /// Record a lease reaper scan failure.
@@ -2179,6 +2213,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let task_lease_overwrites_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_task_lease_overwrites_total",
+                "Number of RunAttempt dispatches that wrote a lease over a still-live existing lease (double-dispatch detector); source is \"stored\" for a lease found in the DB and \"batch\" for a repeat within one dequeue iteration",
+            ),
+            &["shard", "task_group", "source"],
+        )?,
+    );
+
     let ready_to_start_latency_ms = register(
         &registry,
         HistogramVec::new(
@@ -2530,6 +2575,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         polls_total,
         poll_duration,
         task_leases_active,
+        task_lease_overwrites_total,
         ready_to_start_latency_ms,
         leasable_to_start_latency_ms,
         lease_reaper_duration,

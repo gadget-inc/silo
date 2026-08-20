@@ -214,3 +214,104 @@ async fn lease_task_grpc_already_running() -> anyhow::Result<()> {
     .expect("test timed out")?;
     Ok(())
 }
+
+/// The TypeScript worker classifies a lost lease by matching these exact
+/// Status messages (isLeaseGoneError in typescript_client/src/worker.ts);
+/// a wording change would silently downgrade lease-lost to a transient
+/// error on every deployed client, so the strings are pinned here.
+#[silo::test(flavor = "multi_thread")]
+async fn heartbeat_grpc_missing_lease_pins_lease_not_found_message() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let result = client
+            .heartbeat(HeartbeatRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                worker_id: "test-worker".to_string(),
+                task_id: "00000000-0000-0000-0000-00000000dead".to_string(),
+                tenant_id: None,
+            })
+            .await;
+
+        match result {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::NotFound);
+                assert_eq!(status.message(), "lease not found");
+            }
+            Ok(_) => panic!("expected NOT_FOUND error"),
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
+
+/// Companion pin to the missing-lease message above: the owner-mismatch
+/// wording is the other authoritative lost-lease signal for clients.
+#[silo::test(flavor = "multi_thread")]
+async fn heartbeat_grpc_wrong_worker_pins_lease_owner_mismatch_message() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let enq_resp = client
+            .enqueue(EnqueueRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "owner-mismatch-pin-job".to_string(),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(
+                        rmp_serde::to_vec(&serde_json::json!({"test": true})).unwrap(),
+                    )),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+
+        let lease_resp = client
+            .lease_task(LeaseTaskRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: enq_resp.id,
+                tenant: None,
+                worker_id: "worker-1".to_string(),
+            })
+            .await?
+            .into_inner();
+        let task = lease_resp.task.expect("should have task");
+
+        let result = client
+            .heartbeat(HeartbeatRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                worker_id: "worker-2".to_string(),
+                task_id: task.id,
+                tenant_id: None,
+            })
+            .await;
+
+        match result {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert_eq!(status.message(), "lease owner mismatch");
+            }
+            Ok(_) => panic!("expected FAILED_PRECONDITION error"),
+        }
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}

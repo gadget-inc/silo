@@ -51,6 +51,7 @@ Leases represent tasks actively being processed by workers.
 | `silo_leasable_to_start_latency_ms` | Histogram | `shard`, `task_group` | Time a task spent leasable — eligible for a worker to pick up — before it was leased, excluding waits for concurrency tickets or rate-limit clearance (in milliseconds) |
 | `silo_lease_reaper_duration_seconds` | Histogram | `shard` | Duration of expired lease reaper scan operations |
 | `silo_lease_reaper_scans_total` | Counter | `shard` | Total number of expired lease reaper scan operations |
+| `silo_task_lease_overwrites_total` | Counter | `shard`, `task_group`, `source` | RunAttempt dispatches that wrote a lease over a still-live existing lease (double-dispatch detector); `source` is `stored` for a live lease found by the pre-write read and `batch` for a repeated task id within one dequeue iteration |
 
 **Key insights:**
 - `silo_task_leases_active` shows in-flight work at any given moment
@@ -59,6 +60,7 @@ Leases represent tasks actively being processed by workers.
 - `silo_ready_to_start_latency_ms` measures overall queue time from a task's original scheduled start to its lease. Silo preserves the original scheduled start through tenant concurrency-limit chains, so a task that waited on concurrency tickets or rate limits reports that wait here — high values can mean worker saturation, but can also mean a tenant is self-throttling behind its own limits
 - `silo_leasable_to_start_latency_ms` measures only the time a task was leasable (all grants held, eligible for pickup) before a worker leased it. Waits for concurrency tickets or rate-limit clearance are excluded, so this metric only grows when workers are the bottleneck — it is the worker-capacity signal, while `silo_ready_to_start_latency_ms` is the customer-perceived queue-time signal
 - `silo_lease_reaper_duration_seconds` tracks how long the expired lease reaper takes to scan all leases per shard. High values indicate a large number of active leases or database pressure, and can contribute to increased CPU usage
+- `silo_task_lease_overwrites_total` should stay at zero. Any increment means the dispatch path created a lease over one that was still live — the signature of the same task being dispatched twice — and the `shard`/`task_group`/`source` labels localize where it happened. Dispatch still proceeds; the counter is detection, not prevention
 
 ### Broker Metrics
 

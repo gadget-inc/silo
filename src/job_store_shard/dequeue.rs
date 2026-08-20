@@ -1,5 +1,7 @@
 //! Task dequeue and processing operations.
 
+use std::collections::HashSet;
+
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 
@@ -44,6 +46,11 @@ struct DequeueIterationState {
     /// `try_reserve` failing and the batch committing is picked up
     /// immediately instead of waiting for the periodic reconcile.
     converted_requests: Vec<(String, String)>,
+    /// Task ids whose lease was written into this iteration's batch. The
+    /// batch is uncommitted, so a `db.get` cannot see those writes; the
+    /// double-dispatch detection guard consults this set to catch a repeat
+    /// of the same task id within one dequeue call.
+    leased_task_ids: HashSet<String>,
     processed_internal: bool,
 }
 
@@ -59,6 +66,7 @@ impl DequeueIterationState {
             pending_attempts: Vec::new(),
             holder_releases: Vec::new(),
             converted_requests: Vec::new(),
+            leased_task_ids: HashSet::new(),
             processed_internal: false,
         }
     }
@@ -1177,6 +1185,70 @@ impl JobStoreShard {
         // [SILO-DEQ-CONC] Implicit: If job requires concurrency, task must hold all required queues.
         // This is guaranteed by construction: RunAttempt tasks are only created when concurrency
         // is granted (at enqueue or grant_next), with held_queues populated.
+
+        // Double-dispatch detection: dispatch is about to write this task's
+        // lease record, so a still-live lease there means the same task was
+        // already dispatched. Detection only -- the overwrite proceeds
+        // unchanged and no guard failure may alter the dispatch outcome.
+        if state.leased_task_ids.contains(task_id) {
+            tracing::warn!(
+                tenant = %tenant,
+                job_id = %job_id,
+                task_id = %task_id,
+                worker_id = %worker_id,
+                "RunAttempt task leased twice within one dequeue iteration; \
+                 overwriting the lease still in this iteration's batch",
+            );
+            if let Some(m) = &self.metrics {
+                m.record_task_lease_overwrite(
+                    self.name(),
+                    decoded.task_group(),
+                    crate::metrics::LeaseOverwriteSource::Batch,
+                );
+            }
+        } else {
+            // Detection must never alter dispatch: read and decode failures
+            // are logged at debug so a persistently blind detector remains
+            // observable, then dispatch proceeds regardless.
+            match self.db.get(&leased_task_key(task_id)).await {
+                Ok(Some(existing_bytes)) => match crate::codec::decode_lease(existing_bytes) {
+                    Ok(existing) => {
+                        let remaining_lease_ms = existing.expiry_ms() - now_ms;
+                        if remaining_lease_ms > 0 {
+                            tracing::warn!(
+                                tenant = %tenant,
+                                job_id = %job_id,
+                                task_id = %task_id,
+                                existing_worker_id = %existing.worker_id(),
+                                new_worker_id = %worker_id,
+                                remaining_lease_ms,
+                                "dispatching RunAttempt over a still-live existing lease; \
+                                 possible double dispatch",
+                            );
+                            if let Some(m) = &self.metrics {
+                                m.record_task_lease_overwrite(
+                                    self.name(),
+                                    decoded.task_group(),
+                                    crate::metrics::LeaseOverwriteSource::Stored,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::debug!(
+                        task_id = %task_id,
+                        error = %e,
+                        "lease-overwrite guard could not decode existing lease record",
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => tracing::debug!(
+                    task_id = %task_id,
+                    error = %e,
+                    "lease-overwrite guard read failed",
+                ),
+            }
+        }
+        state.leased_task_ids.insert(task_id.to_string());
 
         // [SILO-DEQ-3] Delete task from task queue
         state.batch.delete(task_key);
