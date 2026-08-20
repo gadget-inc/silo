@@ -7,7 +7,7 @@ export type { ConcurrencyLimit, FloatingConcurrencyLimit, GubernatorRateLimit } 
 /**
  * Reason why a task was cancelled.
  */
-export type CancellationReason = "server" | "client";
+export type CancellationReason = "server" | "client" | "lease-lost";
 
 /**
  * A task received from Silo, with the payload decoded.
@@ -98,6 +98,8 @@ export class TaskExecution<
   private readonly _taskAbortController: AbortController;
   /** Whether the task has been cancelled (by server or client) */
   private _cancelled: boolean = false;
+  /** Whether the worker discovered mid-execution that it no longer holds the lease */
+  private _leaseLost: boolean = false;
   /** The reason for cancellation if cancelled */
   private _cancellationReason: CancellationReason | undefined;
   /** Promise resolving when cancel RPC completes (if initiated by client) */
@@ -135,6 +137,27 @@ export class TaskExecution<
   /** Whether the task was cancelled and should report Cancelled outcome */
   get shouldReportCancelled(): boolean {
     return this._cancelled;
+  }
+
+  /** Whether the lease for this task is known to be gone (no outcome may be reported) */
+  get isLeaseLost(): boolean {
+    return this._leaseLost;
+  }
+
+  /**
+   * Mark the lease as lost and cancel the execution.
+   * One-shot: returns true only for the call that performs the transition,
+   * so concurrent in-flight heartbeat failures surface the event once.
+   */
+  public markLeaseLost(): boolean {
+    if (this._leaseLost) return false;
+    this._leaseLost = true;
+    if (!this._cancelled) {
+      this._cancelled = true;
+      this._cancellationReason = "lease-lost";
+      this._taskAbortController.abort();
+    }
+    return true;
   }
 
   /**

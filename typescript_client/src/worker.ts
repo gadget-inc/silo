@@ -15,9 +15,35 @@ import type {
   RefreshOutcome,
   HeartbeatResult,
 } from "./client";
-import { DuplicateTaskDeliveryError } from "./client";
+import {
+  DuplicateTaskDeliveryError,
+  SiloFailedPreconditionError,
+  TaskLeaseLostError,
+  TaskNotFoundError,
+} from "./client";
 import { Task, TaskExecution, transformTask } from "./TaskExecution";
 import { WorkerMetrics, getWorkerMeter } from "./metrics";
+
+/**
+ * Whether a heartbeat failure authoritatively signals the lease is gone.
+ *
+ * Only two signals qualify: the lease-gone flavor of NOT_FOUND (server
+ * message "lease not found") and the lease-owner-mismatch
+ * FAILED_PRECONDITION (another worker re-leased the task). Both are matched
+ * on the underlying message: a wrong-shard NOT_FOUND ("shard not found",
+ * from exhausted routing retries) and the stale-topology FAILED_PRECONDITION
+ * ("is not within shard ... range") are routing conditions, not lease state,
+ * and must not abort a running handler.
+ */
+function isLeaseGoneError(error: unknown): boolean {
+  if (error instanceof TaskNotFoundError) {
+    return error.grpcMessage?.includes("lease not found") ?? false;
+  }
+  if (error instanceof SiloFailedPreconditionError) {
+    return error.message.includes("lease owner mismatch");
+  }
+  return false;
+}
 
 /**
  * Context passed to task handlers with utilities for the current task.
@@ -570,7 +596,7 @@ export class SiloWorker<
     // taskContext — without this every Heartbeat RPC would be its own root
     // trace instead of a child of the lifecycle span.
     const heartbeatFn = otelContext.bind(taskContext, () => {
-      this._sendHeartbeatForTask(execution).catch((error) => {
+      this._sendHeartbeatForTask(execution, stopHeartbeat).catch((error) => {
         this._onError(error instanceof Error ? error : new Error(String(error)), {
           taskId: task.id,
         });
@@ -684,6 +710,11 @@ export class SiloWorker<
     // The handler has settled: no report below may race a heartbeat
     stopHeartbeat();
 
+    // The lease is gone, so any outcome report would fail NOT_FOUND
+    if (execution.isLeaseLost) {
+      return;
+    }
+
     // If the task was cancelled (by server or client), report Cancelled outcome instead
     if (execution.shouldReportCancelled) {
       await this._client.reportOutcome({
@@ -752,23 +783,59 @@ export class SiloWorker<
   /**
    * Send a heartbeat for a task execution and handle cancellation if detected.
    */
-  private async _sendHeartbeatForTask(execution: TaskExecution): Promise<void> {
+  private async _sendHeartbeatForTask(
+    execution: TaskExecution,
+    stopHeartbeat: () => void,
+  ): Promise<void> {
     // Don't send heartbeats for already-cancelled tasks
     if (execution.isCancelled) {
       return;
     }
 
-    const result: HeartbeatResult = await this._client.heartbeat(
-      this._workerId,
-      execution.task.id,
-      execution.task.shard,
-      execution.task.tenantId,
-    );
+    let result: HeartbeatResult;
+    try {
+      result = await this._client.heartbeat(
+        this._workerId,
+        execution.task.id,
+        execution.task.shard,
+        execution.task.tenantId,
+      );
+    } catch (error) {
+      if (isLeaseGoneError(error)) {
+        this._handleLeaseLost(execution, error as Error, stopHeartbeat);
+        return;
+      }
+      // Transient failures (network, UNAVAILABLE, routing) propagate to the
+      // interval's catch, which surfaces them via onError; execution continues
+      throw error;
+    }
 
     // If the server reports cancellation, mark the execution as cancelled
     if (result.cancelled) {
       execution.markCancelledByServer();
     }
+  }
+
+  /**
+   * React to an authoritative lost-lease signal: stop heartbeating, cancel
+   * the execution, free the task id for a re-delivered retry, and surface
+   * the event once.
+   */
+  private _handleLeaseLost(
+    execution: TaskExecution,
+    cause: Error,
+    stopHeartbeat: () => void,
+  ): void {
+    stopHeartbeat();
+    if (!execution.markLeaseLost()) {
+      return;
+    }
+    if (this._activeExecutions.get(execution.task.id) === execution) {
+      this._activeExecutions.delete(execution.task.id);
+    }
+    this._onError(new TaskLeaseLostError(execution.task.id, execution.task.jobId, cause), {
+      taskId: execution.task.id,
+    });
   }
 
   /**

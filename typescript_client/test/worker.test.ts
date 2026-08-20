@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { SiloWorker, type TaskHandler } from "../src/worker";
 import type { SiloGRPCClient, LeaseTasksResult } from "../src/client";
-import { encodeBytes } from "../src/client";
+import { encodeBytes, TaskNotFoundError, SiloFailedPreconditionError } from "../src/client";
 import type { Task } from "../src/pb/silo";
 
 // Mock client for unit tests
@@ -897,6 +897,290 @@ describe("SiloWorker", () => {
       expect(err.code).toBe("SILO_DUPLICATE_TASK_DELIVERY");
       expect(err.taskId).toBe("task-1");
       expect(err.jobId).toBe("job-1");
+    });
+  });
+
+  describe("lost lease", () => {
+    it("aborts, stops heartbeating, and reports no outcome when the lease is gone", async () => {
+      const task = createTask("task-ll", "job-ll");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi
+        .fn()
+        .mockRejectedValue(new TaskNotFoundError("task-ll", "lease not found"));
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let signalAbortedInHandler = false;
+      const handler: TaskHandler = async (ctx) => {
+        // Run until the cancellation signal fires (or a generous timeout)
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 500);
+          ctx.cancellationSignal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        signalAbortedInHandler = ctx.cancellationSignal.aborted;
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      // Enough time for the heartbeat rejection, handler wind-down, and any
+      // further heartbeat intervals that should no longer fire
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await worker.stop();
+
+      expect(signalAbortedInHandler).toBe(true);
+      expect(reportOutcome).not.toHaveBeenCalled();
+      expect(heartbeat).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_TASK_LEASE_LOST" }),
+        expect.objectContaining({ taskId: "task-ll" }),
+      );
+      const err = onError.mock.calls[0][0] as { message: string };
+      expect(err.message).toContain("task-ll");
+      expect(err.message).toContain("job-ll");
+    });
+
+    it("executes a retry re-delivered after the lease was lost", async () => {
+      const task = createTask("task-ll-retry", "job-ll-retry");
+      let leaseLostReported = false;
+      let deliveredRetry = false;
+      const leaseTasks = vi.fn().mockImplementation(async () => {
+        if (leaseTasks.mock.calls.length === 1) {
+          return tasksResult([task]);
+        }
+        // Re-deliver the same task id once the lease-lost event fired
+        if (leaseLostReported && !deliveredRetry) {
+          deliveredRetry = true;
+          return tasksResult([task]);
+        }
+        return tasksResult([]);
+      });
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      // First delivery's heartbeat loses the lease; the retry's heartbeats succeed
+      const heartbeat = vi.fn().mockImplementation(async () => {
+        if (!deliveredRetry) {
+          throw new TaskNotFoundError("task-ll-retry", "lease not found");
+        }
+        return { cancelled: false };
+      });
+      const onError = vi.fn().mockImplementation(() => {
+        leaseLostReported = true;
+      });
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      const handler = vi
+        .fn()
+        .mockImplementation(async (ctx: { cancellationSignal: AbortSignal }) => {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 60);
+            ctx.cancellationSignal.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                resolve();
+              },
+              { once: true },
+            );
+          });
+          return { type: "success", result: {} };
+        });
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await worker.stop();
+
+      // Handler ran for the original delivery and again for the retry
+      expect(handler).toHaveBeenCalledTimes(2);
+      // Only the retry reported an outcome (no duplicate-delivery error either)
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_TASK_LEASE_LOST" }),
+        expect.anything(),
+      );
+    });
+
+    it("continues executing when a heartbeat fails with a wrong-shard NOT_FOUND", async () => {
+      const task = createTask("task-ws", "job-ws");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi
+        .fn()
+        .mockRejectedValue(new TaskNotFoundError("task-ws", "shard not found"));
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let signalAbortedInHandler = false;
+      const handler: TaskHandler = async (ctx) => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        signalAbortedInHandler = ctx.cancellationSignal.aborted;
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await worker.stop();
+
+      expect(signalAbortedInHandler).toBe(false);
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(reportOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "task-ws", outcome: { type: "success", result: {} } }),
+      );
+      // The failures surface as plain heartbeat errors, not lease-lost
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_TASK_NOT_FOUND" }),
+        expect.objectContaining({ taskId: "task-ws" }),
+      );
+    });
+
+    it("continues executing when a heartbeat fails with a stale-topology FAILED_PRECONDITION", async () => {
+      const task = createTask("task-st", "job-st");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi
+        .fn()
+        .mockRejectedValue(
+          new SiloFailedPreconditionError(
+            "tenant 'a' is not within shard 00000000-0000-0000-0000-000000000001 range [0, 100); refresh topology and retry",
+          ),
+        );
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let signalAbortedInHandler = false;
+      const handler: TaskHandler = async (ctx) => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        signalAbortedInHandler = ctx.cancellationSignal.aborted;
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await worker.stop();
+
+      expect(signalAbortedInHandler).toBe(false);
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "SILO_FAILED_PRECONDITION" }),
+        expect.objectContaining({ taskId: "task-st" }),
+      );
+    });
+
+    it("continues executing when a heartbeat fails with a transient error", async () => {
+      const task = createTask("task-tr", "job-tr");
+      const leaseTasks = vi
+        .fn()
+        .mockResolvedValueOnce(tasksResult([task]))
+        .mockResolvedValue(tasksResult([]));
+      const reportOutcome = vi.fn().mockResolvedValue(undefined);
+      const heartbeat = vi.fn().mockRejectedValue(new Error("connection reset"));
+      const onError = vi.fn();
+      const client = createMockClient({ leaseTasks, reportOutcome, heartbeat });
+
+      let signalAbortedInHandler = false;
+      const handler: TaskHandler = async (ctx) => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        signalAbortedInHandler = ctx.cancellationSignal.aborted;
+        return { type: "success", result: {} };
+      };
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 10,
+        heartbeatIntervalMs: 30,
+        onError,
+      });
+
+      worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await worker.stop();
+
+      expect(signalAbortedInHandler).toBe(false);
+      expect(reportOutcome).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({ message: "connection reset" }),
+        expect.objectContaining({ taskId: "task-tr" }),
+      );
+    });
+  });
+
+  describe("TaskExecution lease-lost state", () => {
+    it("marks lease-lost once, aborts with the lease-lost reason, and suppresses cancelled reporting", async () => {
+      const { TaskExecution } = await import("../src/TaskExecution");
+      const client = createMockClient();
+      const execution = new TaskExecution(
+        { id: "task-1", jobId: "job-1" } as never,
+        "test-worker",
+        client,
+      );
+
+      expect(execution.markLeaseLost()).toBe(true);
+      expect(execution.signal.aborted).toBe(true);
+      expect(execution.cancellationReason).toBe("lease-lost");
+      expect(execution.isLeaseLost).toBe(true);
+      // A concurrent in-flight heartbeat rejecting with the same signal
+      // does not win the latch a second time
+      expect(execution.markLeaseLost()).toBe(false);
     });
   });
 
