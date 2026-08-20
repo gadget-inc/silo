@@ -33,7 +33,7 @@
 //! and potentially lose the crashed node's WAL data.
 
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, watch};
@@ -125,7 +125,29 @@ impl ShardOwnerMap {
     pub fn get_node(&self, shard_id: &ShardId) -> Option<&String> {
         self.shard_to_node.get(shard_id)
     }
+
+    /// Shards in the shard map that the assignment left without an owner,
+    /// keyed by shard id with the ring each shard is on (the default ring
+    /// rendered as [`DEFAULT_RING_LABEL`]).
+    ///
+    /// This is the desired assignment from current membership, so a shard
+    /// appears here only when no member is eligible for its ring -- not while
+    /// an eligible owner is still acquiring it.
+    pub fn unassigned_shards(&self) -> BTreeMap<ShardId, String> {
+        self.shard_map
+            .shards()
+            .iter()
+            .filter(|shard| !self.shard_to_node.contains_key(&shard.id))
+            .map(|shard| {
+                let ring = shard.placement_ring().unwrap_or(DEFAULT_RING_LABEL);
+                (shard.id, ring.to_string())
+            })
+            .collect()
+    }
 }
+
+/// Label under which default-ring shards are reported (metrics, logs).
+pub const DEFAULT_RING_LABEL: &str = "default";
 
 /// Error type for coordination operations
 #[derive(Debug, thiserror::Error)]

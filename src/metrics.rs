@@ -149,6 +149,9 @@ pub struct Metrics {
 
     // Shard/broker metrics
     shards_owned: Gauge,
+    /// Shards the desired assignment leaves without an owner, per ring.
+    /// Driven by the placement metrics sampler.
+    shards_unassigned: GaugeVec,
     coordination_shards_open: Gauge,
     broker_buffer_size: GaugeVec,
     broker_inflight_size: GaugeVec,
@@ -455,6 +458,21 @@ impl Metrics {
     /// Update the number of shards owned by this node (from coordinator).
     pub fn set_shards_owned(&self, count: u64) {
         self.shards_owned.set(count as f64);
+    }
+
+    /// Update the number of shards on `ring` that the desired assignment
+    /// leaves without an owner.
+    pub fn set_shards_unassigned(&self, ring: &str, count: u64) {
+        self.shards_unassigned
+            .with_label_values(&[ring])
+            .set(count as f64);
+    }
+
+    /// Drop the `silo_shards_unassigned` series for `ring` once no shard on
+    /// it is unassigned, so a recovered ring stops being exported rather than
+    /// lingering at 0.
+    pub fn clear_shards_unassigned(&self, ring: &str) {
+        let _ = self.shards_unassigned.remove_label_values(&[ring]);
     }
 
     /// Update the number of shards currently open in this process.
@@ -2027,6 +2045,24 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let shards_unassigned = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_shards_unassigned",
+                format!(
+                    "Number of shards on each placement ring (label `ring`, the default ring \
+                     labelled `default`) that the desired assignment leaves without an owner \
+                     because no current member is eligible for that ring -- this reflects \
+                     desired assignment, not acquisition state; sampled every {}s, which \
+                     bounds staleness",
+                    crate::placement_metrics::SAMPLE_INTERVAL.as_secs()
+                ),
+            ),
+            &["ring"],
+        )?,
+    );
+
     let coordination_shards_open = register(
         &registry,
         Gauge::new(
@@ -2478,6 +2514,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         query_scanned_keys,
         query_point_lookups,
         shards_owned,
+        shards_unassigned,
         coordination_shards_open,
         broker_buffer_size,
         broker_inflight_size,
