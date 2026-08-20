@@ -84,11 +84,61 @@ export class TaskNotFoundError extends Error {
 
   /** The task ID that was not found */
   public readonly taskId: string;
+  /**
+   * The underlying gRPC status message, when mapped from an RPC failure.
+   * Distinguishes NOT_FOUND flavors: a missing lease ("lease not found")
+   * vs exhausted shard routing ("shard not found").
+   */
+  public readonly grpcMessage?: string;
 
-  constructor(taskId: string) {
-    super(`Task "${taskId}" not found`);
+  constructor(taskId: string, grpcMessage?: string) {
+    super(`Task "${taskId}" not found${grpcMessage ? `: ${grpcMessage}` : ""}`);
     this.name = "TaskNotFoundError";
     this.taskId = taskId;
+    this.grpcMessage = grpcMessage;
+  }
+}
+
+/**
+ * Error reported when a worker discovers mid-execution that it no longer
+ * holds a task's lease (the lease record is gone or another worker owns it).
+ * The worker cancels the execution and reports no outcome for the task.
+ */
+export class TaskLeaseLostError extends Error {
+  code = "SILO_TASK_LEASE_LOST";
+
+  /** The task whose lease was lost */
+  public readonly taskId: string;
+  /** The job the task belongs to */
+  public readonly jobId: string;
+
+  constructor(taskId: string, jobId: string, cause: Error) {
+    super(`Lease lost for task "${taskId}" (job "${jobId}"): ${cause.message}`);
+    this.name = "TaskLeaseLostError";
+    this.taskId = taskId;
+    this.jobId = jobId;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Error reported when a worker receives a task it is already executing.
+ * The duplicate delivery is dropped; the original execution continues.
+ */
+export class DuplicateTaskDeliveryError extends Error {
+  code = "SILO_DUPLICATE_TASK_DELIVERY";
+
+  /** The task ID that was delivered twice */
+  public readonly taskId: string;
+  /** The job ID the task belongs to, if known */
+  public readonly jobId?: string;
+
+  constructor(taskId: string, jobId?: string) {
+    const jobMsg = jobId ? ` for job "${jobId}"` : "";
+    super(`Task "${taskId}"${jobMsg} delivered while already executing on this worker`);
+    this.name = "DuplicateTaskDeliveryError";
+    this.taskId = taskId;
+    this.jobId = jobId;
   }
 }
 
@@ -1060,7 +1110,7 @@ function mapRpcError(error: unknown, context: RpcErrorContext): Error {
   switch (error.code) {
     case "NOT_FOUND":
       if (context.taskId) {
-        return new TaskNotFoundError(context.taskId);
+        return new TaskNotFoundError(context.taskId, error.message);
       }
       if (context.jobId) {
         return new JobNotFoundError(context.jobId, context.tenant);
