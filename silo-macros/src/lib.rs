@@ -30,16 +30,16 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let output = if is_async {
         quote! {
-            #[tokio::test #paren_args]
             #(#attrs)*
+            #[tokio::test #paren_args]
             #vis #sig {
                 silo::trace::with_test_tracing(stringify!(#name), || async move { #block }).await
             }
         }
     } else {
         quote! {
-            #[test]
             #(#attrs)*
+            #[test]
             #vis #sig {
                 silo::trace::with_test_tracing_sync(stringify!(#name), || { #block })
             }

@@ -589,6 +589,47 @@ impl JobStoreShard {
         Ok((attempt_val, background_action_transition))
     }
 
+    /// Whether `attempt_key`'s chain already has a live terminal
+    /// materialization, making any further grant source for it a duplicate:
+    /// the job is `Running` at that attempt (materialized AND dispatched),
+    /// this iteration's batch already continued the chain
+    /// (`materialized_attempts` — invisible to a durable read), or a live
+    /// `RunAttempt` / `CheckRateLimit` row exists at the parent's start time
+    /// or the status-pointed start (`live_terminal_row_exists`, ignoring
+    /// `exclude_key`, the row the caller is itself consuming).
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt_already_materialized(
+        &self,
+        state: &DequeueIterationState,
+        status: &JobStatus,
+        attempt_key: &(String, String, u32),
+        task_group: &str,
+        priority: u8,
+        parent_start_time_ms: i64,
+        exclude_key: Option<&[u8]>,
+    ) -> Result<bool, JobStoreShardError> {
+        if status.kind == JobStatusKind::Running
+            || state.materialized_attempts.contains(attempt_key)
+        {
+            return Ok(true);
+        }
+        let mut starts = vec![parent_start_time_ms];
+        if let Some(s) = status.next_attempt_starts_after_ms {
+            starts.push(s);
+        }
+        let (_, job_id, attempt_number) = attempt_key;
+        Ok(live_terminal_row_exists(
+            &self.db,
+            task_group,
+            priority,
+            job_id,
+            *attempt_number,
+            &starts,
+            exclude_key,
+        )
+        .await?)
+    }
+
     /// Process a RequestTicket task.
     ///
     /// The ticket carries the chain's task_id, the persisted limits list,
@@ -698,14 +739,9 @@ impl JobStoreShard {
             return Ok(());
         }
 
-        // Duplicate-materialization guard: at most one live terminal task row
-        // per (job_id, attempt). A Running status at this attempt means the
-        // chain already materialized AND dispatched; a live RunAttempt /
-        // CheckRateLimit row — durable, or written by this iteration's batch
-        // (`materialized_attempts`) — means it materialized and awaits
-        // dispatch. Either way this ticket is a second grant source for the
-        // same chain: drop it WITHOUT releasing holders, which the live chain
-        // owns under the same task id.
+        // Duplicate-materialization guard: this ticket is a second grant
+        // source for a chain that already materialized. Drop it WITHOUT
+        // releasing holders, which the live chain owns under the same task id.
         let parent = parse_task_key(task_key);
         let parent_start_time_ms = parent
             .as_ref()
@@ -713,27 +749,18 @@ impl JobStoreShard {
             .unwrap_or(now_ms);
         let parent_epoch_ms = parent.as_ref().map(|p| p.epoch_ms as i64).unwrap_or(0);
         let attempt_key = (tenant.clone(), job_id.clone(), attempt_number);
-        let already_materialized = if status.kind == JobStatusKind::Running
-            || state.materialized_attempts.contains(&attempt_key)
-        {
-            true
-        } else {
-            let mut starts = vec![parent_start_time_ms];
-            if let Some(s) = status.next_attempt_starts_after_ms {
-                starts.push(s);
-            }
-            live_terminal_row_exists(
-                &self.db,
+        if self
+            .attempt_already_materialized(
+                state,
+                &status,
+                &attempt_key,
                 &req_task_group,
                 rt.priority(),
-                &job_id,
-                attempt_number,
-                &starts,
+                parent_start_time_ms,
                 None,
             )
             .await?
-        };
-        if already_materialized {
+        {
             tracing::warn!(
                 tenant = %tenant,
                 job_id = %job_id,
@@ -1011,27 +1038,18 @@ impl JobStoreShard {
         // WITHOUT releasing holders — the live chain owns them under the same
         // task id.
         let attempt_key = (tenant.to_string(), job_id.to_string(), attempt_number);
-        let already_materialized = if status.kind == JobStatusKind::Running
-            || state.materialized_attempts.contains(&attempt_key)
-        {
-            true
-        } else {
-            let mut starts = vec![parent_start_time_ms];
-            if let Some(s) = status.next_attempt_starts_after_ms {
-                starts.push(s);
-            }
-            live_terminal_row_exists(
-                &self.db,
+        if self
+            .attempt_already_materialized(
+                state,
+                &status,
+                &attempt_key,
                 check_task_group,
                 priority,
-                job_id,
-                attempt_number,
-                &starts,
+                parent_start_time_ms,
                 Some(task_key),
             )
             .await?
-        };
-        if already_materialized {
+        {
             tracing::warn!(
                 tenant = %tenant,
                 job_id = %job_id,
@@ -1166,6 +1184,21 @@ impl JobStoreShard {
                     parent_epoch_ms,
                     check_task_group,
                 )?;
+                // Point the job status at the retry row's start time so
+                // status-driven lookups (cancel, expedite, reimport, and this
+                // handler's own duplicate guard) can find the parked row.
+                if let Some(transition) = self
+                    .retarget_scheduled_task_key(
+                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                        tenant,
+                        job_id,
+                        attempt_number,
+                        retry_backoff,
+                    )
+                    .await?
+                {
+                    state.background_action_transitions.push(transition);
+                }
             }
             Err(e) => {
                 tracing::warn!(job_id = %job_id, error = %e, "gubernator rate limit check failed, will retry");
@@ -1187,11 +1220,23 @@ impl JobStoreShard {
                     parent_epoch_ms,
                     check_task_group,
                 )?;
+                if let Some(transition) = self
+                    .retarget_scheduled_task_key(
+                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                        tenant,
+                        job_id,
+                        attempt_number,
+                        retry_backoff,
+                    )
+                    .await?
+                {
+                    state.background_action_transitions.push(transition);
+                }
             }
         }
 
-        // Every branch above wrote this attempt's next terminal-variant row
-        // (the chain continuation or a rate-limit retry) into the batch.
+        // Every branch above continued this attempt's chain into the batch --
+        // a chain continuation, a parked deferral, or a rate-limit retry.
         state.materialized_attempts.insert(attempt_key);
 
         Ok(())

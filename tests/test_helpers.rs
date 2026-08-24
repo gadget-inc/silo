@@ -532,7 +532,12 @@ pub async fn duplicate_live_terminal_task_rows(db: &InstrumentedDb) -> Vec<Strin
         let (variant, tenant) = match silo::codec::decode_task(&kv.value) {
             Ok(Task::RunAttempt { tenant, .. }) => ("RunAttempt", tenant),
             Ok(Task::CheckRateLimit { tenant, .. }) => ("CheckRateLimit", tenant),
-            _ => continue,
+            Ok(_) => continue,
+            Err(e) => panic!(
+                "undecodable task row at key {:?}: {e} -- a corrupt terminal row would \
+                 silently escape the invariant check",
+                parsed
+            ),
         };
         rows.entry((tenant, parsed.job_id.clone(), parsed.attempt))
             .or_default()
@@ -566,6 +571,43 @@ pub async fn assert_single_live_terminal_task_row_per_attempt(db: &InstrumentedD
         "single-live-terminal-row invariant violated:\n  {}",
         violations.join("\n  ")
     );
+}
+
+/// Durably write a live RunAttempt lease at `task_id`'s lease key, naming
+/// `worker_id` as the owner -- the state a prior dispatch of the same task id
+/// leaves behind. Flushes so a subsequent dequeue's point read sees it.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_run_attempt_lease(
+    shard: &JobStoreShard,
+    worker_id: &str,
+    task_id: &str,
+    tenant: &str,
+    job_id: &str,
+    task_group: &str,
+    expiry_ms: i64,
+    started_at_ms: i64,
+) {
+    let lease = silo::task::LeaseRecord {
+        worker_id: worker_id.to_string(),
+        task: silo::task::Task::RunAttempt {
+            id: task_id.to_string(),
+            tenant: tenant.to_string(),
+            job_id: job_id.to_string(),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            held_queues: vec![],
+            task_group: task_group.to_string(),
+        },
+        expiry_ms,
+        started_at_ms,
+    };
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(
+        &silo::keys::leased_task_key(task_id),
+        &silo::codec::encode_lease(&lease),
+    );
+    shard.db().write(batch).await.expect("write lease");
+    shard.db().flush().await.expect("flush lease");
 }
 
 /// Poll an async function until the predicate returns true, or timeout.

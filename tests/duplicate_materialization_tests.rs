@@ -184,6 +184,10 @@ async fn duplicate_request_rows_granted_across_invocations_keep_single_terminal_
 
     let first = shard.process_concurrency_grants(tenant, QUEUE, 1).await;
     assert_eq!(first.len(), 1, "first invocation must grant one request");
+    // Advance the millisecond clock so a regressed guard would write the
+    // duplicate at a distinct epoch instead of silently coalescing onto the
+    // first grant's key, which would let the invariant assertion pass
+    // vacuously.
     tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     let second = shard.process_concurrency_grants(tenant, QUEUE, 1).await;
     assert_eq!(
@@ -199,6 +203,90 @@ async fn duplicate_request_rows_granted_across_invocations_keep_single_terminal_
         0,
         "the dropped duplicate row must be deleted"
     );
+}
+
+/// A job routed through TWO concurrency queues whose first grant is
+/// processed twice (the incident's routing shape): the first grant resumes
+/// the chain through the second queue to the terminal RunAttempt; the
+/// duplicate is dropped, leaving exactly one live row, one delivery carrying
+/// both held queues, and one holder per queue.
+#[silo::test]
+async fn two_limit_chain_with_first_grant_processed_twice_delivers_once() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "dup-two-queues";
+    let queue_b = "dup-q-b";
+    let limits = vec![
+        Limit::Concurrency(ConcurrencyLimit {
+            key: QUEUE.to_string(),
+            max_concurrency: 2,
+        }),
+        Limit::Concurrency(ConcurrencyLimit {
+            key: queue_b.to_string(),
+            max_concurrency: 2,
+        }),
+    ];
+
+    let job_id = enqueue_parked_job(&shard, tenant, limits.clone()).await;
+    let ready_at = now_ms() - 1_000;
+    write_request_row(
+        &shard,
+        tenant,
+        &job_id,
+        "dup-two-queue-task",
+        ready_at,
+        "aaaa0001",
+        &limits,
+    )
+    .await;
+    write_request_row(
+        &shard,
+        tenant,
+        &job_id,
+        "dup-two-queue-task",
+        ready_at,
+        "bbbb0002",
+        &limits,
+    )
+    .await;
+
+    let first = shard.process_concurrency_grants(tenant, QUEUE, 1).await;
+    assert_eq!(first.len(), 1, "first invocation must grant and resume");
+    // Advance the millisecond clock so a regressed guard would write the
+    // duplicate at a distinct epoch instead of coalescing onto the first
+    // grant's key.
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    let second = shard.process_concurrency_grants(tenant, QUEUE, 1).await;
+    assert_eq!(
+        second.len(),
+        0,
+        "the duplicate must be dropped, not granted"
+    );
+
+    assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    assert_eq!(count_live_run_attempt_rows(&shard, &job_id).await, 1);
+
+    let task_ids = dequeue_task_ids_until(&shard, "worker-two-q", TASK_GROUP, 1).await;
+    let lease_bytes = shard
+        .db()
+        .get(&silo::keys::leased_task_key(&task_ids[0]))
+        .await
+        .expect("read lease")
+        .expect("lease present");
+    let lease = silo::codec::decode_lease(lease_bytes).expect("decode lease");
+    let held = lease.held_queues();
+    assert_eq!(
+        held,
+        vec![QUEUE.to_string(), queue_b.to_string()],
+        "the delivered chain must hold both queues in order"
+    );
+    let followup = shard
+        .dequeue("worker-two-q", TASK_GROUP, 1)
+        .await
+        .expect("follow-up poll");
+    assert!(followup.tasks.is_empty(), "exactly one delivery total");
+    assert_eq!(shard.concurrency_holder_count(tenant, QUEUE), 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue_b), 1);
 }
 
 /// R2 — the same duplicate request rows reaching the scanner within ONE
@@ -320,7 +408,9 @@ async fn request_ticket_replayed_after_landed_conversion_delivers_attempt_once()
 
     // A worker polls: the replayed ticket grants the chain AGAIN and writes a
     // second terminal row; both rows dispatch. A single execution total means
-    // exactly one delivery and no lease overwrite.
+    // exactly one delivery and no lease overwrite. The sleep advances the
+    // millisecond clock so a regressed guard would write the duplicate at a
+    // distinct epoch instead of silently coalescing onto the first row's key.
     tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     shard
         .force_buffer_tasks_for_test(vec![replayed_key])
@@ -499,6 +589,81 @@ async fn replayed_check_rate_limit_continuation_delivers_attempt_once() {
     assert_eq!(overwrites, 0.0, "no lease overwrite may fire");
 }
 
+/// A replayed CheckRateLimit for an attempt whose live chain is parked in a
+/// rate-limit retry backoff must be dropped, not re-entered: the retry branch
+/// retargets the job status to the retry row's start time, so the guard's
+/// status-derived candidate start finds the parked row.
+#[silo::test]
+async fn replayed_check_rate_limit_during_retry_backoff_is_dropped() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "dup-crl-backoff";
+    // limit 0: every check is over limit, so the chain parks in retry backoff.
+    let limits = vec![Limit::RateLimit(GubernatorRateLimit::new(
+        "dup-backoff",
+        "dup-backoff-key",
+        0,
+        60_000,
+    ))];
+
+    let start_a = now_ms() - 2_000;
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10,
+            start_a,
+            None,
+            msgpack_payload(&serde_json::json!({})),
+            limits,
+            None,
+            TASK_GROUP,
+        )
+        .await
+        .expect("enqueue rate-limited job");
+
+    let (_crl_key, crl_bytes) = first_task_kv(shard.db()).await.expect("check row present");
+
+    // Processing the check parks the chain: the over-limit result schedules a
+    // future-dated retry row.
+    let out = shard
+        .dequeue("worker-backoff", TASK_GROUP, 1)
+        .await
+        .expect("dequeue check");
+    assert!(out.tasks.is_empty(), "an over-limit check delivers nothing");
+    assert_eq!(
+        count_task_keys(shard.db()).await,
+        1,
+        "the chain must be parked on one retry row"
+    );
+
+    // The replay's durable state: a second copy of the original check row,
+    // ready-dated so the broker claims it while the retry row waits out its
+    // backoff.
+    let replay_key = silo::keys::task_key(TASK_GROUP, start_a + 500, 10, &job_id, 1, start_a + 500);
+    let mut batch = WriteBatch::new();
+    batch.put(&replay_key, &crl_bytes);
+    shard.db().write(batch).await.expect("write replayed row");
+    shard.db().flush().await.expect("flush replayed row");
+    shard
+        .force_buffer_tasks_for_test(vec![replay_key])
+        .await
+        .expect("buffer replayed row");
+
+    let out = shard
+        .dequeue("worker-backoff", TASK_GROUP, 1)
+        .await
+        .expect("dequeue replay");
+    assert!(out.tasks.is_empty(), "the replay delivers nothing");
+
+    assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    assert_eq!(
+        count_task_keys(shard.db()).await,
+        1,
+        "the replay must be dropped, leaving only the parked retry row"
+    );
+}
+
 /// A legitimate chain re-materialization must keep dodging the broker's ack
 /// tombstone: processing a CheckRateLimit through a real dequeue ack-deletes
 /// its row (tombstoning that exact key in the broker), and the continuation
@@ -532,15 +697,23 @@ async fn rate_limit_chain_delivers_once_after_its_check_row_is_tombstoned() {
 
     // The dequeue loop claims the CheckRateLimit through the broker (ack
     // tombstone installed at its key), writes the continuation, and delivers
-    // it — exactly once.
-    let task_ids = dequeue_task_ids_until(&shard, "worker-rl", TASK_GROUP, 1).await;
-    assert_eq!(task_ids.len(), 1, "the chain's RunAttempt must deliver");
+    // it — exactly once (dequeue_task_ids_until panics on its deadline if the
+    // continuation never delivers).
+    dequeue_task_ids_until(&shard, "worker-rl", TASK_GROUP, 1).await;
 
     assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
     assert_eq!(
         count_task_keys(shard.db()).await,
         0,
         "no task row may remain after delivery"
+    );
+    let followup = shard
+        .dequeue("worker-rl", TASK_GROUP, 1)
+        .await
+        .expect("follow-up poll");
+    assert!(
+        followup.tasks.is_empty(),
+        "no second delivery may exist for the chain"
     );
 }
 
@@ -591,28 +764,25 @@ async fn redispatch_over_other_workers_live_lease_delivers_without_duplicate_row
         .force_buffer_tasks_for_test(vec![row_key.clone()])
         .await
         .expect("buffer the row");
-    let lease = silo::task::LeaseRecord {
-        worker_id: "worker-a".to_string(),
-        task: Task::RunAttempt {
-            id: task_id.clone(),
-            tenant: tenant.to_string(),
-            job_id: job_id.clone(),
-            attempt_number: 1,
-            relative_attempt_number: 1,
-            held_queues: vec![],
-            task_group: TASK_GROUP.to_string(),
-        },
-        expiry_ms: now + silo::task::DEFAULT_LEASE_MS,
-        started_at_ms: now,
-    };
+    write_run_attempt_lease(
+        &shard,
+        "worker-a",
+        &task_id,
+        tenant,
+        &job_id,
+        TASK_GROUP,
+        now + 60_000,
+        now,
+    )
+    .await;
     let mut batch = WriteBatch::new();
-    batch.put(
-        &silo::keys::leased_task_key(&task_id),
-        &silo::codec::encode_lease(&lease),
-    );
     batch.delete(&row_key);
-    shard.db().write(batch).await.expect("write lease");
-    shard.db().flush().await.expect("flush lease");
+    shard
+        .db()
+        .write(batch)
+        .await
+        .expect("delete the durable row");
+    shard.db().flush().await.expect("flush the row delete");
 
     let result = shard
         .dequeue("worker-b", TASK_GROUP, 1)

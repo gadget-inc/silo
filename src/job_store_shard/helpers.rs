@@ -300,14 +300,17 @@ pub(crate) fn put_task<W: WriteBatcher>(
 ///
 /// Status-driven point lookups (lease, cancel, expedite, reimport) know a task's
 /// identity from `JobStatus` but not its `epoch_ms`, which is a write-only
-/// disambiguator (see [`crate::keys::task_key`]). Only one chain task is ever
-/// live per `(job_id, attempt)`: a rewrite deletes the old key and writes the
-/// new one in the same batch, and the duplicate-materialization guard —
+/// disambiguator (see [`crate::keys::task_key`]). Only one chain task survives
+/// to dispatch per `(job_id, attempt)`: a rewrite deletes the old key and
+/// writes the new one in the same batch, the duplicate-materialization guard —
 /// [`live_terminal_row_exists`] plus the per-batch seen-sets consulted at the
 /// chain re-entry points (the grant scanner's reserve loop,
 /// `handle_request_ticket`, `handle_check_rate_limit`) — drops any second
-/// grant source for an attempt instead of letting it write a coexisting row.
-/// So this prefix scan returns at most one row.
+/// grant source for an attempt instead of letting it write a coexisting row,
+/// and dispatch drops a provably duplicate row it is handed. The guard
+/// resolves uncertainty toward delivery, so a duplicate can exist transiently
+/// between two concurrent writers' commits; this prefix scan takes the first
+/// row in that window.
 pub(crate) async fn find_task_by_identity(
     txn: &InstrumentedDbTransaction,
     task_group: &str,

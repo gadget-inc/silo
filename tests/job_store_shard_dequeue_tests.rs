@@ -706,27 +706,17 @@ async fn dequeue_drops_duplicate_row_when_other_worker_holds_live_lease() {
 
         // The other worker's live lease from dispatching the attempt's other
         // materialization.
-        let lease = silo::task::LeaseRecord {
-            worker_id: "other-worker".to_string(),
-            task: Task::RunAttempt {
-                id: task_id.clone(),
-                tenant: "-".to_string(),
-                job_id: job_id.clone(),
-                attempt_number: 1,
-                relative_attempt_number: 1,
-                held_queues: vec![],
-                task_group: "default".to_string(),
-            },
-            expiry_ms: now + 60_000,
-            started_at_ms: now,
-        };
-        let mut batch = WriteBatch::new();
-        batch.put(
-            &silo::keys::leased_task_key(&task_id),
-            &silo::codec::encode_lease(&lease),
-        );
-        shard.db().write(batch).await.expect("write lease");
-        shard.db().flush().await.expect("flush lease");
+        write_run_attempt_lease(
+            &shard,
+            "other-worker",
+            &task_id,
+            "-",
+            &job_id,
+            "default",
+            now + 60_000,
+            now,
+        )
+        .await;
 
         let result = shard
             .dequeue("worker-2", "default", 1)
@@ -932,28 +922,20 @@ async fn dequeue_over_same_workers_live_lease_delivers_via_overwrite() {
             panic!("expected RunAttempt task");
         };
 
-        // Worker W's own live lease with the row still present.
-        let lease = silo::task::LeaseRecord {
-            worker_id: "worker-w".to_string(),
-            task: Task::RunAttempt {
-                id: task_id.clone(),
-                tenant: "-".to_string(),
-                job_id: job_id.clone(),
-                attempt_number: 1,
-                relative_attempt_number: 1,
-                held_queues: vec![],
-                task_group: "default".to_string(),
-            },
-            expiry_ms: now + 60_000,
-            started_at_ms: now,
-        };
-        let mut batch = WriteBatch::new();
-        batch.put(
-            &silo::keys::leased_task_key(&task_id),
-            &silo::codec::encode_lease(&lease),
-        );
-        shard.db().write(batch).await.expect("write lease");
-        shard.db().flush().await.expect("flush lease");
+        // Worker W's own live lease with the row still present. The stale
+        // started_at_ms lets the post-dequeue assertion prove the lease was
+        // actually rewritten, not merely left in place.
+        write_run_attempt_lease(
+            &shard,
+            "worker-w",
+            &task_id,
+            "-",
+            &job_id,
+            "default",
+            now + 60_000,
+            now - 100_000,
+        )
+        .await;
 
         let result = shard
             .dequeue("worker-w", "default", 1)
@@ -973,11 +955,18 @@ async fn dequeue_over_same_workers_live_lease_delivers_via_overwrite() {
         assert_eq!(overwrites, 1.0, "the detection is counted");
         let drops = metric_value_or_zero(
             &body,
-            &["silo_task_lease_duplicate_drops_total", "task_group=\"default\""],
+            &[
+                "silo_task_lease_duplicate_drops_total",
+                "task_group=\"default\"",
+            ],
         );
-        assert_eq!(drops, 0.0, "a same-worker re-lease must not count as a drop");
+        assert_eq!(
+            drops, 0.0,
+            "a same-worker re-lease must not count as a drop"
+        );
 
-        // The overwrite proceeded: fresh expiry, same worker.
+        // The overwrite actually rewrote the lease: same worker, but a fresh
+        // started_at_ms that only the new dispatch can have stamped.
         let lease_bytes = shard
             .db()
             .get(&silo::keys::leased_task_key(&task_id))
@@ -986,7 +975,12 @@ async fn dequeue_over_same_workers_live_lease_delivers_via_overwrite() {
             .expect("lease exists");
         let lease = decode_lease(lease_bytes).expect("decode lease");
         assert_eq!(lease.worker_id(), "worker-w");
-        assert!(lease.expiry_ms() >= now + silo::task::DEFAULT_LEASE_MS);
+        assert!(
+            lease.started_at_ms() >= now,
+            "started_at_ms {} must be re-stamped by the overwrite (pre-written lease had {})",
+            lease.started_at_ms(),
+            now - 100_000
+        );
     });
 }
 
@@ -1011,27 +1005,17 @@ async fn dropped_duplicate_row_is_never_delivered_and_owner_completes() {
             panic!("expected RunAttempt task");
         };
 
-        let lease = silo::task::LeaseRecord {
-            worker_id: "other-worker".to_string(),
-            task: Task::RunAttempt {
-                id: task_id.clone(),
-                tenant: "-".to_string(),
-                job_id: job_id.clone(),
-                attempt_number: 1,
-                relative_attempt_number: 1,
-                held_queues: vec![],
-                task_group: "default".to_string(),
-            },
-            expiry_ms: now + 60_000,
-            started_at_ms: now,
-        };
-        let mut batch = WriteBatch::new();
-        batch.put(
-            &silo::keys::leased_task_key(&task_id),
-            &silo::codec::encode_lease(&lease),
-        );
-        shard.db().write(batch).await.expect("write lease");
-        shard.db().flush().await.expect("flush lease");
+        write_run_attempt_lease(
+            &shard,
+            "other-worker",
+            &task_id,
+            "-",
+            &job_id,
+            "default",
+            now + 60_000,
+            now,
+        )
+        .await;
 
         // The duplicate row is dropped on the first poll and never surfaces
         // again on later polls.
@@ -1095,27 +1079,17 @@ async fn dequeue_over_expired_lease_stays_silent() {
             panic!("expected RunAttempt task");
         };
 
-        let expired_lease = silo::task::LeaseRecord {
-            worker_id: "other-worker".to_string(),
-            task: Task::RunAttempt {
-                id: task_id.clone(),
-                tenant: "-".to_string(),
-                job_id: job_id.clone(),
-                attempt_number: 1,
-                relative_attempt_number: 1,
-                held_queues: vec![],
-                task_group: "default".to_string(),
-            },
-            expiry_ms: now - 60_000,
-            started_at_ms: now - 120_000,
-        };
-        let mut batch = WriteBatch::new();
-        batch.put(
-            &silo::keys::leased_task_key(&task_id),
-            &silo::codec::encode_lease(&expired_lease),
-        );
-        shard.db().write(batch).await.expect("write expired lease");
-        shard.db().flush().await.expect("flush expired lease");
+        write_run_attempt_lease(
+            &shard,
+            "other-worker",
+            &task_id,
+            "-",
+            &job_id,
+            "default",
+            now - 60_000,
+            now - 120_000,
+        )
+        .await;
 
         let result = shard
             .dequeue("worker-2", "default", 1)
@@ -1131,7 +1105,10 @@ async fn dequeue_over_expired_lease_stays_silent() {
         assert_eq!(overwrites, 0.0, "expired leftover lease must not count");
         let drops = metric_value_or_zero(
             &body,
-            &["silo_task_lease_duplicate_drops_total", "task_group=\"default\""],
+            &[
+                "silo_task_lease_duplicate_drops_total",
+                "task_group=\"default\"",
+            ],
         );
         assert_eq!(drops, 0.0, "expired leftover lease must not be dropped");
     });

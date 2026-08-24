@@ -1736,7 +1736,9 @@ pub async fn verify_server_invariants(
     // twice. The variant filter also keeps floating-refresh rows (synthetic
     // per-queue job ids) out of the count.
     let duplicate_terminal_rows_query = r#"
-        SELECT tenant, job_id, attempt, COUNT(*) as cnt
+        SELECT tenant, job_id, attempt, COUNT(*) as cnt,
+               array_agg(variant_type) as variants,
+               array_agg(start_time_ms) as starts
         FROM tasks
         WHERE variant_type IN ('RunAttempt', 'CheckRateLimit')
         GROUP BY tenant, job_id, attempt
@@ -1761,9 +1763,14 @@ pub async fn verify_server_invariants(
                     let job_id = row.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
                     let attempt = row.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
                     let count = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let variants = row
+                        .get("variants")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    let starts = row.get("starts").map(|v| v.to_string()).unwrap_or_default();
                     result.violations.push(format!(
-                        "singleLiveTerminalRow violation: tenant '{}' job '{}' attempt {} has {} live terminal task rows",
-                        tenant, job_id, attempt, count
+                        "singleLiveTerminalRow violation: tenant '{}' job '{}' attempt {} has {} live terminal task rows (variants {} at starts {})",
+                        tenant, job_id, attempt, count, variants, starts
                     ));
                 }
             }

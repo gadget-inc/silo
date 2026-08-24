@@ -61,14 +61,16 @@ pub fn run() {
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             tracing::trace!(violations = ?state.violations, "server_state");
 
-            let reported = state
-                .violations
-                .iter()
-                .any(|v| v.contains("singleLiveTerminalRow") && v.contains("seeded-duplicate-job"));
+            let reported = state.violations.iter().any(|v| {
+                v.contains("singleLiveTerminalRow")
+                    && v.contains("seeded-duplicate-job")
+                    && v.contains("has 2 live terminal task rows")
+            });
             assert!(
                 reported,
                 "the seeded duplicate terminal rows must be reported as a \
-                 singleLiveTerminalRow violation; got violations: {:?}",
+                 singleLiveTerminalRow violation counting exactly 2 rows; got \
+                 violations: {:?}",
                 state.violations
             );
 
