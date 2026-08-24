@@ -149,13 +149,10 @@ async fn invariant_helper_reports_hand_planted_duplicate_terminal_rows() {
 }
 
 /// R1 — two request rows for one `(job_id, attempt)` (the state the random
-/// request-key suffix permits) granted by two separate scanner invocations.
-/// Each invocation stamps its own epoch on the resumed chain's terminal write,
-/// so the second grant materializes a second live RunAttempt row.
+/// request-key suffix permits) reaching the scanner in separate invocations:
+/// the first grants; the second is dropped by the duplicate-materialization
+/// guard's durable check, which finds the attempt's live terminal row.
 #[silo::test]
-#[ignore = "red reproduction: duplicate request rows granted across scanner invocations \
-            materialize two terminal rows for one attempt (random request-key suffix + \
-            blind terminal write + per-chunk epoch stamping)"]
 async fn duplicate_request_rows_granted_across_invocations_keep_single_terminal_row() {
     let (_tmp, shard) = open_temp_shard().await;
     shard.stop_grant_scanner();
@@ -187,22 +184,26 @@ async fn duplicate_request_rows_granted_across_invocations_keep_single_terminal_
 
     let first = shard.process_concurrency_grants(tenant, QUEUE, 1).await;
     assert_eq!(first.len(), 1, "first invocation must grant one request");
-    // A later invocation stamps a fresh chunk epoch.
     tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     let second = shard.process_concurrency_grants(tenant, QUEUE, 1).await;
     assert_eq!(
         second.len(),
-        1,
-        "second invocation must grant the duplicate"
+        0,
+        "the duplicate row must be dropped, not granted"
     );
 
     assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    assert_eq!(count_live_run_attempt_rows(&shard, &job_id).await, 1);
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "the dropped duplicate row must be deleted"
+    );
 }
 
-/// R2 — the same duplicate request rows granted within ONE scanner commit
-/// chunk share the chunk's epoch, so both terminal writes land at the same
-/// task key and collapse to a single live row. Pins the same-chunk collision
-/// as regression coverage.
+/// R2 — the same duplicate request rows reaching the scanner within ONE
+/// commit chunk: the durable check cannot see the chunk's uncommitted batch,
+/// so the guard's per-chunk seen-set is what drops the second row.
 #[silo::test]
 async fn duplicate_request_rows_granted_in_one_chunk_keep_single_terminal_row() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -236,15 +237,16 @@ async fn duplicate_request_rows_granted_in_one_chunk_keep_single_terminal_row() 
     let granted = shard.process_concurrency_grants(tenant, QUEUE, 2).await;
     assert_eq!(
         granted.len(),
-        2,
-        "both duplicate rows must be granted in one pass (one commit chunk)"
+        1,
+        "one row grants; its same-chunk duplicate must be dropped by the seen-set"
     );
 
     assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    assert_eq!(count_live_run_attempt_rows(&shard, &job_id).await, 1);
     assert_eq!(
-        count_live_run_attempt_rows(&shard, &job_id).await,
-        1,
-        "same-chunk grants share one epoch, so the terminal writes collide at one key"
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "the dropped duplicate row must be deleted"
     );
 }
 
@@ -255,9 +257,6 @@ async fn duplicate_request_rows_granted_in_one_chunk_keep_single_terminal_row() 
 /// rows dispatch to the worker — one attempt delivered twice, the second over
 /// the first's live lease.
 #[silo::test]
-#[ignore = "red reproduction: a replayed at-capacity RequestTicket conversion leaves both a \
-            request row and a re-processable ticket for one attempt; the scanner and the \
-            ticket each materialize a terminal row and both dispatch (source=stored)"]
 async fn request_ticket_replayed_after_landed_conversion_delivers_attempt_once() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
     shard.stop_grant_scanner();
@@ -356,14 +355,17 @@ async fn request_ticket_replayed_after_landed_conversion_delivers_attempt_once()
     assert_eq!(overwrites, 0.0, "no lease overwrite may fire");
 }
 
-/// R4 — two chain resumes for one attempt in two separate write batches (the
-/// shape a scanner grant racing a dequeue-driven resume produces): each
-/// writer's durable read cannot see the other's uncommitted batch, and each
-/// stamps its own `now_ms` epoch, so both terminal writes survive commit.
+/// R4 — the cross-writer race: two chain resumes for one attempt run against
+/// separate write batches BEFORE either batch commits (a scanner chunk and a
+/// concurrent dequeue iteration's batch). Each writer's durable read cannot
+/// see the other's uncommitted edits and their per-batch seen-sets are
+/// disjoint, so both terminal writes survive at distinct epochs.
 #[silo::test]
-#[ignore = "red reproduction: two chain resumes for one attempt against separate write \
-            batches each pass their own durable read and stamp distinct epochs — both \
-            terminal rows commit"]
+#[ignore = "residual: the cross-writer interleaving defeats any per-writer durable read \
+            plus seen-set; closing it needs a transactional write path or deterministic \
+            request-row identity. Containment: dispatch-time prevention backstops the \
+            different-worker and in-batch delivery shapes, and the hardened client's \
+            duplicate-delivery dedup contains the same-worker shape"]
 async fn concurrent_chain_resumes_in_two_batches_keep_single_terminal_row() {
     let (_tmp, shard) = open_temp_shard().await;
     shard.stop_grant_scanner();
@@ -393,7 +395,10 @@ async fn concurrent_chain_resumes_in_two_batches_keep_single_terminal_row() {
         read_cache: None,
     };
 
+    // Both writers resume with neither batch committed — the interleaving a
+    // concurrent scanner chunk and dequeue iteration produce.
     let epoch_base = now_ms();
+    let mut batches = Vec::new();
     for offset in [0, 1] {
         let mut batch = WriteBatch::new();
         let grants = resumer
@@ -404,6 +409,9 @@ async fn concurrent_chain_resumes_in_two_batches_keep_single_terminal_row() {
             grants.is_empty(),
             "terminal resume makes no further reservations"
         );
+        batches.push(batch);
+    }
+    for batch in batches {
         shard.db().write(batch).await.expect("commit resume batch");
     }
 
@@ -416,9 +424,6 @@ async fn concurrent_chain_resumes_in_two_batches_keep_single_terminal_row() {
 /// same worker — the second over the first's still-live lease — so one
 /// attempt is delivered twice.
 #[silo::test]
-#[ignore = "red reproduction: a replayed CheckRateLimit continuation re-enters the chain \
-            with the same task id and materializes a second RunAttempt; both dispatch, \
-            the second over the first's live lease (source=stored)"]
 async fn replayed_check_rate_limit_continuation_delivers_attempt_once() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
     shard.stop_grant_scanner();
@@ -492,6 +497,51 @@ async fn replayed_check_rate_limit_continuation_delivers_attempt_once() {
         &["silo_task_lease_overwrites_total", "task_group=\"default\""],
     );
     assert_eq!(overwrites, 0.0, "no lease overwrite may fire");
+}
+
+/// A legitimate chain re-materialization must keep dodging the broker's ack
+/// tombstone: processing a CheckRateLimit through a real dequeue ack-deletes
+/// its row (tombstoning that exact key in the broker), and the continuation
+/// RunAttempt reuses every key component except a strictly fresher epoch. An
+/// epoch reuse would be suppressed by the tombstone and never deliver.
+#[silo::test]
+async fn rate_limit_chain_delivers_once_after_its_check_row_is_tombstoned() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "rl-tombstone-dodge";
+    let limits = vec![Limit::RateLimit(GubernatorRateLimit::new(
+        "rl-dodge",
+        "rl-dodge-key",
+        100,
+        60_000,
+    ))];
+
+    shard
+        .enqueue(
+            tenant,
+            None,
+            10,
+            now_ms(),
+            None,
+            msgpack_payload(&serde_json::json!({})),
+            limits,
+            None,
+            TASK_GROUP,
+        )
+        .await
+        .expect("enqueue rate-limited job");
+
+    // The dequeue loop claims the CheckRateLimit through the broker (ack
+    // tombstone installed at its key), writes the continuation, and delivers
+    // it — exactly once.
+    let task_ids = dequeue_task_ids_until(&shard, "worker-rl", TASK_GROUP, 1).await;
+    assert_eq!(task_ids.len(), 1, "the chain's RunAttempt must deliver");
+
+    assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    assert_eq!(
+        count_task_keys(shard.db()).await,
+        0,
+        "no task row may remain after delivery"
+    );
 }
 
 /// R6 — redispatch over another worker's still-live lease (the

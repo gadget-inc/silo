@@ -202,6 +202,10 @@ Jobs can specify multiple limits (concurrency, floating concurrency, and rate li
 
 On retry, limit processing restarts from scratch — the job must re-acquire all concurrency tickets.
 
+### Single live terminal row per attempt
+
+A task key ends in a write-time `epoch_ms` that disambiguates a rewritten key from the broker's ack tombstone of its just-deleted predecessor; it is not part of task identity. The invariant that at most one terminal task row (`RunAttempt` or `CheckRateLimit`) is live per `(job_id, attempt)` is enforced by the duplicate-materialization guard at every chain re-entry point — the grant scanner's reserve loop, `handle_request_ticket`, and `handle_check_rate_limit`. Before continuing a chain, each consults `live_terminal_row_exists` (a durable prefix scan at the attempt's candidate start times) plus a per-batch seen-set for rows the current uncommitted batch already wrote, and drops any second grant source for the attempt (a duplicate request row, a replayed ticket, or a replayed rate-limit continuation) instead of materializing a coexisting row at a fresh epoch. Status-driven lookups (`find_task_by_identity` in cancel, expedite, reimport, and lease) rely on this when they act on the single row their prefix scan returns.
+
 ### Floating max concurrency limits
 
 Silo supports concurrency queues who's max concurrency is adjusted continuously over time. This allows queues to be adjusted by operators, as well as by automated controllers trying to achieve some setpoint in some other system, like rate limit usage of a downstream API.

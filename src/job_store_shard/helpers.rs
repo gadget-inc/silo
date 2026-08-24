@@ -301,8 +301,13 @@ pub(crate) fn put_task<W: WriteBatcher>(
 /// Status-driven point lookups (lease, cancel, expedite, reimport) know a task's
 /// identity from `JobStatus` but not its `epoch_ms`, which is a write-only
 /// disambiguator (see [`crate::keys::task_key`]). Only one chain task is ever
-/// live per `(job_id, attempt)` — a rewrite deletes the old key and writes the
-/// new one in the same batch — so this prefix scan returns at most one row.
+/// live per `(job_id, attempt)`: a rewrite deletes the old key and writes the
+/// new one in the same batch, and the duplicate-materialization guard —
+/// [`live_terminal_row_exists`] plus the per-batch seen-sets consulted at the
+/// chain re-entry points (the grant scanner's reserve loop,
+/// `handle_request_ticket`, `handle_check_rate_limit`) — drops any second
+/// grant source for an attempt instead of letting it write a coexisting row.
+/// So this prefix scan returns at most one row.
 pub(crate) async fn find_task_by_identity(
     txn: &InstrumentedDbTransaction,
     task_group: &str,
@@ -318,6 +323,56 @@ pub(crate) async fn find_task_by_identity(
         Some(kv) => Ok(Some((kv.key.to_vec(), kv.value))),
         None => Ok(None),
     }
+}
+
+/// Whether a live terminal task row (`RunAttempt` or `CheckRateLimit`) exists
+/// for `(job_id, attempt)` at any of the candidate `start_times`, ignoring
+/// `exclude_key` (the row a chain continuation is consuming in its own
+/// uncommitted batch, which a durable read still sees).
+///
+/// This is the durable half of the duplicate-materialization guard: the chain
+/// re-entry points (grant scanner, RequestTicket grant, CheckRateLimit
+/// continuation) consult it before materializing a terminal row, so a second
+/// grant source for one attempt is dropped instead of coexisting at a fresh
+/// `epoch_ms`. Same-batch repeats are invisible to durable reads and are
+/// caught by the callers' seen-sets instead.
+pub(crate) async fn live_terminal_row_exists(
+    db: &InstrumentedDb,
+    task_group: &str,
+    priority: u8,
+    job_id: &str,
+    attempt: u32,
+    start_times: &[i64],
+    exclude_key: Option<&[u8]>,
+) -> Result<bool, slatedb::Error> {
+    use crate::fb::silo::fb::TaskVariant;
+
+    let mut checked: Vec<i64> = Vec::with_capacity(start_times.len());
+    for &start in start_times {
+        if checked.contains(&start) {
+            continue;
+        }
+        checked.push(start);
+        let prefix = task_key_lookup_prefix(task_group, start, priority, job_id, attempt);
+        let end = end_bound(&prefix);
+        let mut iter = db
+            .scan_with_options::<Vec<u8>, _>(prefix..end, &crate::scan_options())
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            if exclude_key == Some(kv.key.as_ref()) {
+                continue;
+            }
+            if let Ok(decoded) = crate::codec::decode_task_validated(kv.value.clone())
+                && matches!(
+                    decoded.variant_type(),
+                    TaskVariant::RunAttempt | TaskVariant::CheckRateLimit
+                )
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Retry an operation that may fail with a SlateDB transaction conflict.
