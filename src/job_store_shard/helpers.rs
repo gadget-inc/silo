@@ -330,8 +330,11 @@ pub(crate) async fn find_task_by_identity(
 
 /// Whether a live terminal task row (`RunAttempt` or `CheckRateLimit`) exists
 /// for `(job_id, attempt)` at any of the candidate `start_times`, ignoring
-/// `exclude_key` (the row a chain continuation is consuming in its own
-/// uncommitted batch, which a durable read still sees).
+/// `exclude_keys` (rows the caller's own uncommitted batch has deleted, which
+/// a durable read still sees). Excluding every batch-deleted row — not just
+/// the caller's own — is what breaks the tie between same-start peer rows
+/// claimed into one batch: each peer defers to the still-live later ones, and
+/// the last peer scanned finds no remaining evidence and continues the chain.
 ///
 /// This is the durable half of the duplicate-materialization guard: the chain
 /// re-entry points (grant scanner, RequestTicket grant, CheckRateLimit
@@ -346,7 +349,7 @@ pub(crate) async fn live_terminal_row_exists(
     job_id: &str,
     attempt: u32,
     start_times: &[i64],
-    exclude_key: Option<&[u8]>,
+    exclude_keys: &[Vec<u8>],
 ) -> Result<bool, slatedb::Error> {
     use crate::fb::silo::fb::TaskVariant;
 
@@ -362,7 +365,7 @@ pub(crate) async fn live_terminal_row_exists(
             .scan_with_options::<Vec<u8>, _>(prefix..end, &crate::scan_options())
             .await?;
         while let Some(kv) = iter.next().await? {
-            if exclude_key == Some(kv.key.as_ref()) {
+            if exclude_keys.iter().any(|k| k.as_slice() == kv.key.as_ref()) {
                 continue;
             }
             if let Ok(decoded) = crate::codec::decode_task_validated(kv.value.clone())

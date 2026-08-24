@@ -2845,7 +2845,7 @@ impl ConcurrencyManager {
                         &req.job_id,
                         req.attempt_number,
                         &starts,
-                        None,
+                        &[],
                     )
                     .await
                     {

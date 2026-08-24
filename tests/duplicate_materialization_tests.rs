@@ -589,6 +589,87 @@ async fn replayed_check_rate_limit_continuation_delivers_attempt_once() {
     assert_eq!(overwrites, 0.0, "no lease overwrite may fire");
 }
 
+/// Two live CheckRateLimit peers for one attempt at the same start time
+/// (differing only in `epoch_ms`), claimed in one dequeue iteration. Each
+/// peer's durable guard scan sees the other, so the guard must ignore rows
+/// this iteration's batch already consumed — otherwise both peers defer to
+/// each other, both deletes commit, and the attempt stalls `Scheduled` with
+/// no live row.
+#[silo::test]
+async fn peer_check_rate_limit_rows_at_same_start_deliver_attempt_once() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "dup-crl-peer";
+    let limits = vec![Limit::RateLimit(GubernatorRateLimit::new(
+        "dup-peer-rl",
+        "dup-peer-rl-key",
+        100,
+        60_000,
+    ))];
+
+    // Enqueue with a past start so the chain writes a ready CheckRateLimit row.
+    let start_a = now_ms() - 2_000;
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10,
+            start_a,
+            None,
+            msgpack_payload(&serde_json::json!({})),
+            limits,
+            None,
+            TASK_GROUP,
+        )
+        .await
+        .expect("enqueue rate-limited job");
+
+    let (crl_key, crl_bytes) = first_task_kv(shard.db()).await.expect("check row present");
+    let Ok(Task::CheckRateLimit { .. }) = silo::codec::decode_task(&crl_bytes) else {
+        panic!("expected the job's CheckRateLimit row");
+    };
+
+    // The replay's durable state: a peer CheckRateLimit row at the SAME start,
+    // distinguished only by `epoch_ms` — the shape a replay that reuses the
+    // parent's start time produces. Both rows share a key prefix, so each
+    // peer's guard scan sees the other.
+    let peer_key = silo::keys::task_key(TASK_GROUP, start_a, 10, &job_id, 1, now_ms() + 50_000);
+    assert_ne!(peer_key, crl_key, "peer must be a distinct key");
+    let mut batch = WriteBatch::new();
+    batch.put(&peer_key, &crl_bytes);
+    shard.db().write(batch).await.expect("write peer row");
+    shard.db().flush().await.expect("flush peer row");
+
+    // Force both peers into one claimed batch so a single dequeue iteration
+    // processes them back to back.
+    shard
+        .force_buffer_tasks_for_test(vec![crl_key.clone(), peer_key.clone()])
+        .await
+        .expect("buffer both peers");
+
+    let mut deliveries = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let out = shard
+            .dequeue("worker-crl-peer", TASK_GROUP, 4)
+            .await
+            .expect("dequeue")
+            .tasks;
+        deliveries.extend(out.iter().map(|t| t.attempt().task_id().to_string()));
+        if count_task_keys(shard.db()).await == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "one peer must continue the chain and deliver exactly once, got deliveries {deliveries:?}"
+    );
+}
+
 /// A replayed CheckRateLimit for an attempt whose live chain is parked in a
 /// rate-limit retry backoff must be dropped, not re-entered: the retry branch
 /// retargets the job status to the retry row's start time, so the guard's

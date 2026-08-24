@@ -596,8 +596,12 @@ impl JobStoreShard {
     /// (`materialized_attempts` — invisible to a durable read), or a live
     /// `RunAttempt` / `CheckRateLimit` row exists at the parent's start time
     /// or the status-pointed start (`live_terminal_row_exists`, ignoring
-    /// `exclude_key`, the row the caller is itself consuming).
-    #[allow(clippy::too_many_arguments)]
+    /// every row this iteration's batch has already deleted —
+    /// `tombstone_keys` — since those deletes are uncommitted and a durable
+    /// read still sees them). Skipping all batch-deleted rows, not just the
+    /// caller's own, keeps same-start peers claimed into one batch from
+    /// mutually deferring: the last peer scanned sees only tombstoned
+    /// evidence and continues the chain.
     async fn attempt_already_materialized(
         &self,
         state: &DequeueIterationState,
@@ -606,7 +610,6 @@ impl JobStoreShard {
         task_group: &str,
         priority: u8,
         parent_start_time_ms: i64,
-        exclude_key: Option<&[u8]>,
     ) -> Result<bool, JobStoreShardError> {
         if status.kind == JobStatusKind::Running
             || state.materialized_attempts.contains(attempt_key)
@@ -625,7 +628,7 @@ impl JobStoreShard {
             job_id,
             *attempt_number,
             &starts,
-            exclude_key,
+            &state.tombstone_keys,
         )
         .await?)
     }
@@ -757,7 +760,6 @@ impl JobStoreShard {
                 &req_task_group,
                 rt.priority(),
                 parent_start_time_ms,
-                None,
             )
             .await?
         {
@@ -1032,11 +1034,14 @@ impl JobStoreShard {
         // Duplicate-materialization guard, mirroring handle_request_ticket: a
         // Running status at this attempt, an attempt already continued by this
         // iteration's batch, or a live terminal row elsewhere in the keyspace
-        // (this row's own key is excluded — its batch delete is uncommitted,
-        // so a durable read still sees it) all mean the chain already
-        // materialized through another copy of this continuation. Drop
-        // WITHOUT releasing holders — the live chain owns them under the same
-        // task id.
+        // (rows this batch already consumed are excluded — their deletes are
+        // uncommitted, so a durable read still sees them) all mean the chain
+        // already materialized through another copy of this continuation. The
+        // batch-wide exclusion is what lets exactly one of N same-start peers
+        // claimed into this batch proceed: earlier peers defer to the
+        // still-live later ones, and the last sees only tombstoned evidence.
+        // Drop WITHOUT releasing holders — the live chain owns them under the
+        // same task id.
         let attempt_key = (tenant.to_string(), job_id.to_string(), attempt_number);
         if self
             .attempt_already_materialized(
@@ -1046,7 +1051,6 @@ impl JobStoreShard {
                 check_task_group,
                 priority,
                 parent_start_time_ms,
-                Some(task_key),
             )
             .await?
         {
