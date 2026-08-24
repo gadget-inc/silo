@@ -500,6 +500,74 @@ pub fn msgpack_payload(value: &serde_json::Value) -> Vec<u8> {
     rmp_serde::to_vec(value).expect("failed to encode payload as messagepack")
 }
 
+/// Scan the whole task keyspace and report every `(tenant, job_id, attempt)`
+/// with MORE than one live terminal task row (`RunAttempt` or
+/// `CheckRateLimit`), one human-readable violation string per group.
+///
+/// A job's limit chain must keep at most one live terminal row per
+/// `(job_id, attempt)` — the trailing `epoch_ms` in the task key is a
+/// write-time disambiguator, not identity, so a second row at a different
+/// epoch is a double materialization that dispatches the same attempt twice.
+/// Non-terminal variants (`RequestTicket`, `RefreshFloatingLimit`) are not
+/// counted: tickets park a chain rather than dispatch it, and refresh tasks
+/// use synthetic per-queue job ids.
+pub async fn duplicate_live_terminal_task_rows(db: &InstrumentedDb) -> Vec<String> {
+    use silo::task::Task;
+    use std::collections::HashMap;
+
+    let start = silo::keys::tasks_prefix();
+    let end = silo::keys::end_bound(&start);
+    let mut iter = db
+        .scan::<Vec<u8>, _>(start..end)
+        .await
+        .expect("scan task keyspace");
+
+    let mut rows: HashMap<(String, String, u32), Vec<String>> = HashMap::new();
+    loop {
+        let maybe = iter.next().await.expect("iterate task keyspace");
+        let Some(kv) = maybe else { break };
+        let Some(parsed) = silo::keys::parse_task_key(&kv.key) else {
+            continue;
+        };
+        let (variant, tenant) = match silo::codec::decode_task(&kv.value) {
+            Ok(Task::RunAttempt { tenant, .. }) => ("RunAttempt", tenant),
+            Ok(Task::CheckRateLimit { tenant, .. }) => ("CheckRateLimit", tenant),
+            _ => continue,
+        };
+        rows.entry((tenant, parsed.job_id.clone(), parsed.attempt))
+            .or_default()
+            .push(format!(
+                "{variant}@start={},epoch={}",
+                parsed.start_time_ms, parsed.epoch_ms
+            ));
+    }
+
+    let mut violations: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, group)| group.len() > 1)
+        .map(|((tenant, job_id, attempt), group)| {
+            format!(
+                "tenant={tenant} job={job_id} attempt={attempt}: {} live terminal task rows [{}]",
+                group.len(),
+                group.join(", ")
+            )
+        })
+        .collect();
+    violations.sort();
+    violations
+}
+
+/// Assert the "at most one live terminal task row per `(job_id, attempt)`"
+/// invariant across the shard's whole task keyspace.
+pub async fn assert_single_live_terminal_task_row_per_attempt(db: &InstrumentedDb) {
+    let violations = duplicate_live_terminal_task_rows(db).await;
+    assert!(
+        violations.is_empty(),
+        "single-live-terminal-row invariant violated:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// Poll an async function until the predicate returns true, or timeout.
 /// Returns the last value produced by `f`.
 pub async fn poll_until<F, Fut, T, P>(mut f: F, predicate: P, timeout_ms: u64) -> T

@@ -300,6 +300,17 @@ pub fn dst_turmoilfs_database_template(
 
 /// Helper to create a standard server host for tests
 pub async fn setup_server(port: u16) -> turmoil::Result<()> {
+    setup_server_with_seeder(port, |_shard| async { Ok(()) }).await
+}
+
+/// Like [`setup_server`], but hands the opened shard to `seed` before the
+/// gRPC server starts serving, so a scenario can plant durable state (e.g.
+/// hand-written task rows) that clients then observe through the API.
+pub async fn setup_server_with_seeder<F, Fut>(port: u16, seed: F) -> turmoil::Result<()>
+where
+    F: FnOnce(Arc<silo::job_store_shard::JobStoreShard>) -> Fut,
+    Fut: Future<Output = turmoil::Result<()>>,
+{
     tracing::trace!(port = port, "setup_server: starting");
     let cfg = AppConfig {
         server: silo::settings::ServerConfig {
@@ -338,10 +349,11 @@ pub async fn setup_server(port: u16) -> turmoil::Result<()> {
     // For DST tests, use a fixed shard ID (zero UUID) for simplicity
     let test_shard_id = ShardId::parse("00000000-0000-0000-0000-000000000000").unwrap();
     tracing::trace!("setup_server: opening shard");
-    let _ = factory
+    let shard = factory
         .open(&test_shard_id, &ShardRange::full())
         .await
         .map_err(|e| e.to_string())?;
+    seed(shard).await?;
     let factory = Arc::new(factory);
     tracing::trace!("setup_server: shard opened");
 
@@ -1717,7 +1729,51 @@ pub async fn verify_server_invariants(
         }
     }
 
-    // Query 4: Check for terminal jobs with holders (noHoldersForTerminal violation)
+    // Query 4: At most one live terminal task row (RunAttempt / CheckRateLimit)
+    // per (tenant, job_id, attempt). The task key's trailing epoch_ms is a
+    // write-time disambiguator, not identity, so a second row at a different
+    // epoch is a double materialization that dispatches the same attempt
+    // twice. The variant filter also keeps floating-refresh rows (synthetic
+    // per-queue job ids) out of the count.
+    let duplicate_terminal_rows_query = r#"
+        SELECT tenant, job_id, attempt, COUNT(*) as cnt
+        FROM tasks
+        WHERE variant_type IN ('RunAttempt', 'CheckRateLimit')
+        GROUP BY tenant, job_id, attempt
+        HAVING COUNT(*) > 1
+    "#;
+    match client
+        .query(tonic::Request::new(QueryRequest {
+            shard: shard.to_string(),
+            sql: duplicate_terminal_rows_query.to_string(),
+            tenant: None,
+            parameters: vec![],
+        }))
+        .await
+    {
+        Ok(resp) => {
+            let response = resp.into_inner();
+            for row_bytes in &response.rows {
+                if let Some(serialized_bytes::Encoding::Msgpack(data)) = &row_bytes.encoding
+                    && let Ok(row) = parse_msgpack_row(data)
+                {
+                    let tenant = row.get("tenant").and_then(|v| v.as_str()).unwrap_or("");
+                    let job_id = row.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let attempt = row.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let count = row.get("cnt").and_then(|v| v.as_u64()).unwrap_or(0);
+                    result.violations.push(format!(
+                        "singleLiveTerminalRow violation: tenant '{}' job '{}' attempt {} has {} live terminal task rows",
+                        tenant, job_id, attempt, count
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::trace!(error = %e, "duplicate terminal task rows query failed");
+        }
+    }
+
+    // Query 5: Check for terminal jobs with holders (noHoldersForTerminal violation)
     // This joins jobs and queues to find any terminal jobs that still have holders
     let terminal_with_holders_query = r#"
         SELECT j.id, j.status_kind, q.queue_name, q.task_id
