@@ -546,8 +546,12 @@ async fn rate_limit_chain_delivers_once_after_its_check_row_is_tombstoned() {
 
 /// R6 — redispatch over another worker's still-live lease (the
 /// production-confirmed cancelled-dequeue shape): the row is the SAME
-/// materialization delivered again, so it must deliver (lost-response
-/// recovery), count a stored overwrite, and leave no duplicate terminal row.
+/// materialization delivered again — its durable row was already deleted by
+/// the landed commit, only a stale broker-buffer entry survives — so it must
+/// deliver (lost-response recovery), count a stored overwrite, and leave no
+/// duplicate terminal row. The durable-absence of the row is what
+/// distinguishes this legitimate redispatch from a duplicate row, which
+/// dispatch drops.
 #[silo::test]
 async fn redispatch_over_other_workers_live_lease_delivers_without_duplicate_row() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
@@ -569,7 +573,7 @@ async fn redispatch_over_other_workers_live_lease_delivers_without_duplicate_row
         .await
         .expect("enqueue");
 
-    let (_key, task_bytes) = first_task_kv(shard.db()).await.expect("task present");
+    let (row_key, task_bytes) = first_task_kv(shard.db()).await.expect("task present");
     let Ok(Task::RunAttempt {
         id: task_id,
         job_id,
@@ -579,8 +583,14 @@ async fn redispatch_over_other_workers_live_lease_delivers_without_duplicate_row
         panic!("expected RunAttempt task");
     };
 
-    // The still-live lease a dropped-mid-commit dispatch to worker A leaves
-    // behind (its response never reached A).
+    // The state a dispatch dropped mid-commit leaves behind: worker A's lease
+    // landed and the row's durable delete landed with it (its response never
+    // reached A), while the broker's buffer still holds the row from a scan
+    // snapshot that predates the delete.
+    shard
+        .force_buffer_tasks_for_test(vec![row_key.clone()])
+        .await
+        .expect("buffer the row");
     let lease = silo::task::LeaseRecord {
         worker_id: "worker-a".to_string(),
         task: Task::RunAttempt {
@@ -600,6 +610,7 @@ async fn redispatch_over_other_workers_live_lease_delivers_without_duplicate_row
         &silo::keys::leased_task_key(&task_id),
         &silo::codec::encode_lease(&lease),
     );
+    batch.delete(&row_key);
     shard.db().write(batch).await.expect("write lease");
     shard.db().flush().await.expect("flush lease");
 

@@ -1300,35 +1300,68 @@ impl JobStoreShard {
         // This is guaranteed by construction: RunAttempt tasks are only created when concurrency
         // is granted (at enqueue or grant_next), with held_queues populated.
 
-        // Double-dispatch detection: dispatch is about to write this task's
-        // lease record, so a still-live lease there means the same task was
-        // already dispatched. Detection only -- the overwrite proceeds
-        // unchanged and no guard failure may alter the dispatch outcome.
+        // Double-dispatch guard: dispatch is about to write this task's lease
+        // record, so a still-live lease there means the task id was already
+        // dispatched. Repeats that can only be a duplicate materialization are
+        // DROPPED -- deleted in the batch and acknowledged to the broker like
+        // a delivered row, never delivered:
+        //
+        // - An in-batch repeat: one LeaseTasks call carries one worker for
+        //   its whole iteration and the broker never yields a key twice in
+        //   one claim, so a repeated task id is always a second row.
+        // - A stored live lease held by a DIFFERENT worker while this row is
+        //   still durably present: the leased dispatch deleted its own row in
+        //   its commit, so a surviving row is a second materialization. When
+        //   the row is durably ABSENT (only a stale broker-buffer entry
+        //   survives, the redispatch shape a dequeue future dropped
+        //   mid-commit produces), the dispatch is the lost-response recovery
+        //   and delivers via overwrite.
+        //
+        // A stored live lease held by the SAME worker keeps overwrite
+        // semantics: that is the requeue-after-ambiguous-commit recovery,
+        // re-delivering the task to its rightful owner, and the client's
+        // duplicate-delivery dedup contains the case where the first copy did
+        // arrive. Guard read/decode failures never turn into drops -- on any
+        // uncertainty the dispatch delivers.
+        let mut drop_source: Option<crate::metrics::LeaseOverwriteSource> = None;
         if state.leased_task_ids.contains(task_id) {
             tracing::warn!(
                 tenant = %tenant,
                 job_id = %job_id,
                 task_id = %task_id,
                 worker_id = %worker_id,
+                action = "dropped",
                 "RunAttempt task leased twice within one dequeue iteration; \
-                 overwriting the lease still in this iteration's batch",
+                 dropping the duplicate row",
             );
-            if let Some(m) = &self.metrics {
-                m.record_task_lease_overwrite(
-                    self.name(),
-                    decoded.task_group(),
-                    crate::metrics::LeaseOverwriteSource::Batch,
-                );
-            }
+            drop_source = Some(crate::metrics::LeaseOverwriteSource::Batch);
         } else {
-            // Detection must never alter dispatch: read and decode failures
-            // are logged at debug so a persistently blind detector remains
-            // observable, then dispatch proceeds regardless.
             match self.db.get(&leased_task_key(task_id)).await {
                 Ok(Some(existing_bytes)) => match crate::codec::decode_lease(existing_bytes) {
                     Ok(existing) => {
                         let remaining_lease_ms = existing.expiry_ms() - now_ms;
                         if remaining_lease_ms > 0 {
+                            let row_durably_present = if existing.worker_id() == worker_id {
+                                false
+                            } else {
+                                match self.db.get(&task_key).await {
+                                    Ok(present) => present.is_some(),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "lease guard row-presence read failed; delivering via overwrite",
+                                        );
+                                        false
+                                    }
+                                }
+                            };
+                            let action = if row_durably_present {
+                                drop_source = Some(crate::metrics::LeaseOverwriteSource::Stored);
+                                "dropped"
+                            } else {
+                                "overwritten"
+                            };
                             tracing::warn!(
                                 tenant = %tenant,
                                 job_id = %job_id,
@@ -1336,6 +1369,7 @@ impl JobStoreShard {
                                 existing_worker_id = %existing.worker_id(),
                                 new_worker_id = %worker_id,
                                 remaining_lease_ms,
+                                action,
                                 "dispatching RunAttempt over a still-live existing lease; \
                                  possible double dispatch",
                             );
@@ -1361,6 +1395,17 @@ impl JobStoreShard {
                     "lease-overwrite guard read failed",
                 ),
             }
+        }
+        if let Some(source) = drop_source {
+            if let Some(m) = &self.metrics {
+                if source == crate::metrics::LeaseOverwriteSource::Batch {
+                    m.record_task_lease_overwrite(self.name(), decoded.task_group(), source);
+                }
+                m.record_task_lease_duplicate_drop(self.name(), decoded.task_group(), source);
+            }
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
+            return Ok(());
         }
         state.leased_task_ids.insert(task_id.to_string());
 

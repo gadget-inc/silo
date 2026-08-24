@@ -674,12 +674,14 @@ async fn dequeue_ignores_recently_acked_task_keys() {
     });
 }
 
-/// Dispatching a task whose lease key already holds a live lease is the
-/// double-dispatch anomaly: dequeue proceeds (overwrite semantics are
-/// unchanged) but warns and counts the overwrite so the grant-path bug that
-/// materializes duplicate RunAttempt tasks is visible from metrics.
+/// A durably present RunAttempt row whose task id is live-leased by ANOTHER
+/// worker can only be a duplicate materialization: the leased dispatch
+/// consumed its own row, so this one is a second grant source's write.
+/// Dispatch drops it -- deleted and acknowledged like a delivered row, never
+/// delivered -- counted in the drops counter beside the detection counter,
+/// and the live lease is left untouched.
 #[silo::test]
-async fn dequeue_over_live_lease_counts_stored_overwrite_and_still_delivers() {
+async fn dequeue_drops_duplicate_row_when_other_worker_holds_live_lease() {
     with_timeout!(20000, {
         let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
         let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
@@ -702,8 +704,8 @@ async fn dequeue_over_live_lease_counts_stored_overwrite_and_still_delivers() {
             panic!("expected RunAttempt task");
         };
 
-        // Pre-write a live lease at the task's lease key, as a prior dispatch
-        // of the same task would have left behind
+        // The other worker's live lease from dispatching the attempt's other
+        // materialization.
         let lease = silo::task::LeaseRecord {
             worker_id: "other-worker".to_string(),
             task: Task::RunAttempt {
@@ -730,7 +732,20 @@ async fn dequeue_over_live_lease_counts_stored_overwrite_and_still_delivers() {
             .dequeue("worker-2", "default", 1)
             .await
             .expect("dequeue");
-        assert_eq!(result.tasks.len(), 1, "task must still be delivered");
+        assert!(
+            result.tasks.is_empty(),
+            "the duplicate row must be dropped, not delivered"
+        );
+        assert_eq!(
+            count_task_keys(shard.db()).await,
+            0,
+            "the dropped row must be deleted"
+        );
+        assert_eq!(
+            shard.broker_inflight_len("default"),
+            0,
+            "the dropped row must be acknowledged out of the broker's in-flight set"
+        );
 
         let body = gather_metrics_text(&metrics);
         let overwrites = metric_value_or_zero(
@@ -741,10 +756,19 @@ async fn dequeue_over_live_lease_counts_stored_overwrite_and_still_delivers() {
                 "source=\"stored\"",
             ],
         );
-        assert_eq!(overwrites, 1.0, "stored-lease overwrite must be counted");
+        assert_eq!(overwrites, 1.0, "the detection is still counted");
+        let drops = metric_value_or_zero(
+            &body,
+            &[
+                "silo_task_lease_duplicate_drops_total",
+                "task_group=\"default\"",
+                "source=\"stored\"",
+            ],
+        );
+        assert_eq!(drops, 1.0, "the drop must be counted");
 
-        // The overwrite proceeded: the lease names the dequeuing worker with
-        // a fresh expiry
+        // The live lease is untouched: still the other worker's, original
+        // expiry.
         let lease_bytes = shard
             .db()
             .get(&silo::keys::leased_task_key(&task_id))
@@ -752,23 +776,20 @@ async fn dequeue_over_live_lease_counts_stored_overwrite_and_still_delivers() {
             .expect("get lease")
             .expect("lease exists");
         let lease = decode_lease(lease_bytes).expect("decode lease");
-        assert_eq!(lease.worker_id(), "worker-2");
-        let after = now_ms();
-        assert!(
-            lease.expiry_ms() >= now + silo::task::DEFAULT_LEASE_MS
-                && lease.expiry_ms() <= after + silo::task::DEFAULT_LEASE_MS,
-            "lease expiry {} should be ~now + DEFAULT_LEASE_MS",
-            lease.expiry_ms()
-        );
+        assert_eq!(lease.worker_id(), "other-worker");
+        assert_eq!(lease.expiry_ms(), now + 60_000);
     });
 }
 
 /// A repeat of the same task id within a single dequeue iteration cannot be
 /// seen by the pre-write point read (the first lease write is still in the
-/// uncommitted batch), so the guard tracks the iteration's leased task ids
-/// and counts the repeat under source="batch".
+/// uncommitted batch), so the guard tracks the iteration's leased task ids.
+/// One LeaseTasks call carries one worker and the broker never yields a key
+/// twice in one claim, so the repeat is always a second row: it is dropped --
+/// deleted, acknowledged, never delivered -- and counted under
+/// source="batch" in both the detection and drop counters.
 #[silo::test]
-async fn dequeue_counts_batch_overwrite_for_repeated_task_id_in_one_iteration() {
+async fn dequeue_drops_in_batch_repeat_of_a_task_id() {
     with_timeout!(20000, {
         let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
         let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
@@ -826,13 +847,27 @@ async fn dequeue_counts_batch_overwrite_for_repeated_task_id_in_one_iteration() 
             "broker never buffered both task records (buffered={buffered})"
         );
 
-        // Both task records dequeue in one call, so the second lease write
-        // repeats a task id already leased in this iteration's batch
+        // Both task records dequeue in one call, so the second row repeats a
+        // task id already leased in this iteration's batch and is dropped.
         let result = shard
             .dequeue("worker-1", "default", 2)
             .await
             .expect("dequeue");
-        assert_eq!(result.tasks.len(), 2, "both records must be delivered");
+        assert_eq!(
+            result.tasks.len(),
+            1,
+            "exactly one record delivers; the in-batch repeat is dropped"
+        );
+        assert_eq!(
+            count_task_keys(shard.db()).await,
+            0,
+            "no row may be left behind"
+        );
+        assert_eq!(
+            shard.broker_inflight_len("default"),
+            0,
+            "the dropped row must be acknowledged out of the broker's in-flight set"
+        );
 
         let body = gather_metrics_text(&metrics);
         let batch_overwrites = metric_value_or_zero(
@@ -843,7 +878,16 @@ async fn dequeue_counts_batch_overwrite_for_repeated_task_id_in_one_iteration() 
                 "source=\"batch\"",
             ],
         );
-        assert_eq!(batch_overwrites, 1.0, "batch overwrite must be counted");
+        assert_eq!(batch_overwrites, 1.0, "the detection must be counted");
+        let batch_drops = metric_value_or_zero(
+            &body,
+            &[
+                "silo_task_lease_duplicate_drops_total",
+                "task_group=\"default\"",
+                "source=\"batch\"",
+            ],
+        );
+        assert_eq!(batch_drops, 1.0, "the drop must be counted");
         let stored_overwrites = metric_value_or_zero(
             &body,
             &[
@@ -856,6 +900,173 @@ async fn dequeue_counts_batch_overwrite_for_repeated_task_id_in_one_iteration() 
             stored_overwrites, 0.0,
             "the repeat is invisible to the point read; only the batch branch fires"
         );
+    });
+}
+
+/// A still-live stored lease held by the SAME worker keeps overwrite
+/// semantics: this is the shape of the requeue-after-ambiguous-commit
+/// recovery, where the commit landed but the worker never received the
+/// response -- the overwrite re-delivers the task to its rightful owner, and
+/// the client's duplicate-delivery dedup contains the case where the first
+/// copy did arrive.
+#[silo::test]
+async fn dequeue_over_same_workers_live_lease_delivers_via_overwrite() {
+    with_timeout!(20000, {
+        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
+        let now = now_ms();
+
+        shard
+            .enqueue("-", None, 10, now, None, payload, vec![], None, "default")
+            .await
+            .expect("enqueue");
+
+        let (_key, task_bytes) = first_task_kv(shard.db()).await.expect("task present");
+        let decoded = silo::codec::decode_task(&task_bytes).expect("decode task");
+        let Task::RunAttempt {
+            id: task_id,
+            job_id,
+            ..
+        } = decoded
+        else {
+            panic!("expected RunAttempt task");
+        };
+
+        // Worker W's own live lease with the row still present.
+        let lease = silo::task::LeaseRecord {
+            worker_id: "worker-w".to_string(),
+            task: Task::RunAttempt {
+                id: task_id.clone(),
+                tenant: "-".to_string(),
+                job_id: job_id.clone(),
+                attempt_number: 1,
+                relative_attempt_number: 1,
+                held_queues: vec![],
+                task_group: "default".to_string(),
+            },
+            expiry_ms: now + 60_000,
+            started_at_ms: now,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            &silo::keys::leased_task_key(&task_id),
+            &silo::codec::encode_lease(&lease),
+        );
+        shard.db().write(batch).await.expect("write lease");
+        shard.db().flush().await.expect("flush lease");
+
+        let result = shard
+            .dequeue("worker-w", "default", 1)
+            .await
+            .expect("dequeue");
+        assert_eq!(result.tasks.len(), 1, "the task must be re-delivered");
+
+        let body = gather_metrics_text(&metrics);
+        let overwrites = metric_value_or_zero(
+            &body,
+            &[
+                "silo_task_lease_overwrites_total",
+                "task_group=\"default\"",
+                "source=\"stored\"",
+            ],
+        );
+        assert_eq!(overwrites, 1.0, "the detection is counted");
+        let drops = metric_value_or_zero(
+            &body,
+            &["silo_task_lease_duplicate_drops_total", "task_group=\"default\""],
+        );
+        assert_eq!(drops, 0.0, "a same-worker re-lease must not count as a drop");
+
+        // The overwrite proceeded: fresh expiry, same worker.
+        let lease_bytes = shard
+            .db()
+            .get(&silo::keys::leased_task_key(&task_id))
+            .await
+            .expect("get lease")
+            .expect("lease exists");
+        let lease = decode_lease(lease_bytes).expect("decode lease");
+        assert_eq!(lease.worker_id(), "worker-w");
+        assert!(lease.expiry_ms() >= now + silo::task::DEFAULT_LEASE_MS);
+    });
+}
+
+/// A dropped duplicate row stays dropped: it is never delivered on later
+/// polls (deleted and tombstoned like a delivered row), and the attempt's
+/// rightful execution -- owned by the live lease -- completes normally.
+#[silo::test]
+async fn dropped_duplicate_row_is_never_delivered_and_owner_completes() {
+    with_timeout!(20000, {
+        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
+        let now = now_ms();
+
+        let job_id = shard
+            .enqueue("-", None, 10, now, None, payload, vec![], None, "default")
+            .await
+            .expect("enqueue");
+
+        let (_key, task_bytes) = first_task_kv(shard.db()).await.expect("task present");
+        let decoded = silo::codec::decode_task(&task_bytes).expect("decode task");
+        let Task::RunAttempt { id: task_id, .. } = decoded else {
+            panic!("expected RunAttempt task");
+        };
+
+        let lease = silo::task::LeaseRecord {
+            worker_id: "other-worker".to_string(),
+            task: Task::RunAttempt {
+                id: task_id.clone(),
+                tenant: "-".to_string(),
+                job_id: job_id.clone(),
+                attempt_number: 1,
+                relative_attempt_number: 1,
+                held_queues: vec![],
+                task_group: "default".to_string(),
+            },
+            expiry_ms: now + 60_000,
+            started_at_ms: now,
+        };
+        let mut batch = WriteBatch::new();
+        batch.put(
+            &silo::keys::leased_task_key(&task_id),
+            &silo::codec::encode_lease(&lease),
+        );
+        shard.db().write(batch).await.expect("write lease");
+        shard.db().flush().await.expect("flush lease");
+
+        // The duplicate row is dropped on the first poll and never surfaces
+        // again on later polls.
+        for poll in 0..5 {
+            let result = shard
+                .dequeue("worker-2", "default", 1)
+                .await
+                .expect("dequeue");
+            assert!(
+                result.tasks.is_empty(),
+                "poll {poll} must not deliver the dropped duplicate"
+            );
+        }
+        let body = gather_metrics_text(&metrics);
+        let drops = metric_value_or_zero(
+            &body,
+            &[
+                "silo_task_lease_duplicate_drops_total",
+                "task_group=\"default\"",
+                "source=\"stored\"",
+            ],
+        );
+        assert_eq!(drops, 1.0, "exactly one drop across all polls");
+
+        // The live lease's owner completes the attempt normally.
+        shard
+            .report_attempt_outcome(&task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("owner reports outcome");
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("get status")
+            .expect("status present");
+        assert_eq!(status.kind, silo::job::JobStatusKind::Succeeded);
     });
 }
 
@@ -918,5 +1129,10 @@ async fn dequeue_over_expired_lease_stays_silent() {
             &["silo_task_lease_overwrites_total", "task_group=\"default\""],
         );
         assert_eq!(overwrites, 0.0, "expired leftover lease must not count");
+        let drops = metric_value_or_zero(
+            &body,
+            &["silo_task_lease_duplicate_drops_total", "task_group=\"default\""],
+        );
+        assert_eq!(drops, 0.0, "expired leftover lease must not be dropped");
     });
 }
