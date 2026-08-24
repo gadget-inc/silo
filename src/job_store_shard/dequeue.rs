@@ -54,10 +54,12 @@ struct DequeueIterationState {
     /// of the same task id within one dequeue call.
     leased_task_ids: HashSet<String>,
     /// `(tenant, job_id, attempt)` tuples whose chain this iteration has
-    /// already continued into the uncommitted batch. The same-batch half of
-    /// the duplicate-materialization guard: a durable read cannot see this
-    /// batch's terminal-row writes, so a second RequestTicket / CheckRateLimit
-    /// for the same attempt within one iteration is caught here.
+    /// already continued into the uncommitted batch — including delivering
+    /// its RunAttempt. The same-batch half of the duplicate-materialization
+    /// guard: a durable read cannot see this batch's terminal-row, lease, or
+    /// status writes (and the guard's scan skips rows the batch has deleted),
+    /// so a second RequestTicket / CheckRateLimit for the same attempt within
+    /// one iteration is caught here.
     materialized_attempts: HashSet<(String, String, u32)>,
     processed_internal: bool,
 }
@@ -1457,6 +1459,17 @@ impl JobStoreShard {
             return Ok(());
         }
         state.leased_task_ids.insert(task_id.to_string());
+        // Delivery is this batch materializing (and dispatching) the attempt.
+        // Recording it in the seen-set is what keeps a co-claimed duplicate
+        // grant source from re-continuing the chain: this row is about to be
+        // tombstoned (excluded from the guard's durable scan) and the
+        // status/lease writes below are uncommitted, so a durable read alone
+        // would conclude the attempt was never materialized.
+        state.materialized_attempts.insert((
+            tenant.to_string(),
+            job_id.to_string(),
+            attempt_number,
+        ));
 
         // [SILO-DEQ-3] Delete task from task queue
         state.batch.delete(task_key);

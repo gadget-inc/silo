@@ -670,6 +670,107 @@ async fn peer_check_rate_limit_rows_at_same_start_deliver_attempt_once() {
     );
 }
 
+/// A RunAttempt delivered earlier in the same dequeue iteration must still
+/// count as materialization evidence for a co-claimed duplicate grant source.
+/// Delivery tombstones the RunAttempt's row (excluded from the guard's
+/// durable scan) and its status/lease writes are uncommitted (invisible to
+/// durable reads), so the guard's batch seen-set is the only thing standing
+/// between a same-batch replayed CheckRateLimit and a second chain
+/// continuation.
+#[silo::test]
+async fn replayed_check_rate_limit_after_same_batch_delivery_is_dropped() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    shard.stop_grant_scanner();
+    let tenant = "dup-crl-post-delivery";
+
+    // A plain job whose chain materializes a ready RunAttempt row directly.
+    let start_a = now_ms() - 2_000;
+    let job_id = shard
+        .enqueue(
+            tenant,
+            None,
+            10,
+            start_a,
+            None,
+            msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            TASK_GROUP,
+        )
+        .await
+        .expect("enqueue plain job");
+
+    let (ra_key, ra_bytes) = first_task_kv(shard.db())
+        .await
+        .expect("run attempt present");
+    let Ok(Task::RunAttempt { id: task_id, .. }) = silo::codec::decode_task(&ra_bytes) else {
+        panic!("expected the job's RunAttempt row");
+    };
+
+    // The replay's durable state: a duplicate CheckRateLimit for the same
+    // attempt at the same start, with a larger epoch so the RunAttempt is
+    // scanned (and delivered) first within the shared batch.
+    let rate_limit =
+        GubernatorRateLimit::new("dup-post-delivery", "dup-post-delivery-key", 100, 60_000);
+    let crl = Task::CheckRateLimit {
+        task_id: task_id.clone(),
+        tenant: tenant.to_string(),
+        job_id: job_id.clone(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        limit_index: 0,
+        rate_limit: (&rate_limit).into(),
+        retry_count: 0,
+        started_at_ms: start_a,
+        priority: 10,
+        held_queues: vec![],
+        task_group: TASK_GROUP.to_string(),
+    };
+    let crl_key = silo::keys::task_key(TASK_GROUP, start_a, 10, &job_id, 1, now_ms() + 60_000);
+    let mut batch = WriteBatch::new();
+    batch.put(&crl_key, &encode_task(&crl));
+    shard
+        .db()
+        .write(batch)
+        .await
+        .expect("write replayed check row");
+    shard.db().flush().await.expect("flush replayed check row");
+
+    // Force both rows into one claimed batch, RunAttempt first.
+    shard
+        .force_buffer_tasks_for_test(vec![ra_key.clone(), crl_key.clone()])
+        .await
+        .expect("buffer both rows");
+
+    let mut deliveries = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let out = shard
+            .dequeue("worker-post-delivery", TASK_GROUP, 4)
+            .await
+            .expect("dequeue")
+            .tasks;
+        deliveries.extend(out.iter().map(|t| t.attempt().task_id().to_string()));
+        if count_task_keys(shard.db()).await == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "the replayed check must be dropped, not re-continue the chain; got deliveries {deliveries:?}"
+    );
+    let body = gather_metrics_text(&metrics);
+    let overwrites = metric_value_or_zero(
+        &body,
+        &["silo_task_lease_overwrites_total", "task_group=\"default\""],
+    );
+    assert_eq!(overwrites, 0.0, "no lease overwrite may fire");
+}
+
 /// A replayed CheckRateLimit for an attempt whose live chain is parked in a
 /// rate-limit retry backoff must be dropped, not re-entered: the retry branch
 /// retargets the job status to the retry row's start time, so the guard's
