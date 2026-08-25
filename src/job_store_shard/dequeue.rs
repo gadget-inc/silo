@@ -12,7 +12,9 @@ use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
 use crate::job_store_shard::counters::BackgroundActionMetricTransition;
-use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned, now_epoch_ms};
+use crate::job_store_shard::helpers::{
+    DbWriteBatcher, decode_job_status_owned, live_terminal_row_exists, now_epoch_ms,
+};
 use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
 use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
@@ -51,6 +53,14 @@ struct DequeueIterationState {
     /// double-dispatch detection guard consults this set to catch a repeat
     /// of the same task id within one dequeue call.
     leased_task_ids: HashSet<String>,
+    /// `(tenant, job_id, attempt)` tuples whose chain this iteration has
+    /// already continued into the uncommitted batch — including delivering
+    /// its RunAttempt. The same-batch half of the duplicate-materialization
+    /// guard: a durable read cannot see this batch's terminal-row, lease, or
+    /// status writes (and the guard's scan skips rows the batch has deleted),
+    /// so a second RequestTicket / CheckRateLimit for the same attempt within
+    /// one iteration is caught here.
+    materialized_attempts: HashSet<(String, String, u32)>,
     processed_internal: bool,
 }
 
@@ -67,6 +77,7 @@ impl DequeueIterationState {
             holder_releases: Vec::new(),
             converted_requests: Vec::new(),
             leased_task_ids: HashSet::new(),
+            materialized_attempts: HashSet::new(),
             processed_internal: false,
         }
     }
@@ -580,6 +591,50 @@ impl JobStoreShard {
         Ok((attempt_val, background_action_transition))
     }
 
+    /// Whether `attempt_key`'s chain already has a live terminal
+    /// materialization, making any further grant source for it a duplicate:
+    /// the job is `Running` at that attempt (materialized AND dispatched),
+    /// this iteration's batch already continued the chain
+    /// (`materialized_attempts` — invisible to a durable read), or a live
+    /// `RunAttempt` / `CheckRateLimit` row exists at the parent's start time
+    /// or the status-pointed start (`live_terminal_row_exists`, ignoring
+    /// every row this iteration's batch has already deleted —
+    /// `tombstone_keys` — since those deletes are uncommitted and a durable
+    /// read still sees them). Skipping all batch-deleted rows, not just the
+    /// caller's own, keeps same-start peers claimed into one batch from
+    /// mutually deferring: the last peer scanned sees only tombstoned
+    /// evidence and continues the chain.
+    async fn attempt_already_materialized(
+        &self,
+        state: &DequeueIterationState,
+        status: &JobStatus,
+        attempt_key: &(String, String, u32),
+        task_group: &str,
+        priority: u8,
+        parent_start_time_ms: i64,
+    ) -> Result<bool, JobStoreShardError> {
+        if status.kind == JobStatusKind::Running
+            || state.materialized_attempts.contains(attempt_key)
+        {
+            return Ok(true);
+        }
+        let mut starts = vec![parent_start_time_ms];
+        if let Some(s) = status.next_attempt_starts_after_ms {
+            starts.push(s);
+        }
+        let (_, job_id, attempt_number) = attempt_key;
+        Ok(live_terminal_row_exists(
+            &self.db,
+            task_group,
+            priority,
+            job_id,
+            *attempt_number,
+            &starts,
+            &state.tombstone_keys,
+        )
+        .await?)
+    }
+
     /// Process a RequestTicket task.
     ///
     /// The ticket carries the chain's task_id, the persisted limits list,
@@ -655,7 +710,7 @@ impl JobStoreShard {
                     .push((tenant.clone(), q.clone(), task_id.clone()));
             }
         };
-        match self.db.get(&job_status_key(&tenant, &job_id)).await? {
+        let status = match self.db.get(&job_status_key(&tenant, &job_id)).await? {
             Some(raw) => match decode_job_status_owned(&raw) {
                 Ok(status)
                     if matches!(
@@ -667,7 +722,7 @@ impl JobStoreShard {
                     drop_ticket_and_release(state);
                     return Ok(());
                 }
-                Ok(_) => {}
+                Ok(status) => status,
                 Err(_) => {
                     // Unreadable status — treat as missing.
                     drop_ticket_and_release(state);
@@ -678,6 +733,48 @@ impl JobStoreShard {
                 drop_ticket_and_release(state);
                 return Ok(());
             }
+        };
+
+        // A ticket is only current for the attempt the job status schedules.
+        // A ticket for another attempt is a remnant of an earlier chain (its
+        // attempt could only advance after that chain materialized and
+        // dispatched), so drop it and release its holders.
+        if status.current_attempt != Some(attempt_number) {
+            drop_ticket_and_release(state);
+            return Ok(());
+        }
+
+        // Duplicate-materialization guard: this ticket is a second grant
+        // source for a chain that already materialized. Drop it WITHOUT
+        // releasing holders, which the live chain owns under the same task id.
+        let parent = parse_task_key(task_key);
+        let parent_start_time_ms = parent
+            .as_ref()
+            .map(|p| p.start_time_ms as i64)
+            .unwrap_or(now_ms);
+        let parent_epoch_ms = parent.as_ref().map(|p| p.epoch_ms as i64).unwrap_or(0);
+        let attempt_key = (tenant.clone(), job_id.clone(), attempt_number);
+        if self
+            .attempt_already_materialized(
+                state,
+                &status,
+                &attempt_key,
+                &req_task_group,
+                rt.priority(),
+                parent_start_time_ms,
+            )
+            .await?
+        {
+            tracing::warn!(
+                tenant = %tenant,
+                job_id = %job_id,
+                task_id = %task_id,
+                attempt = attempt_number,
+                "dropping duplicate RequestTicket; the attempt's chain already has a live terminal row or is running"
+            );
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
+            return Ok(());
         }
 
         // Capacity comes from the persisted limits (no JobInfo round-trip).
@@ -781,12 +878,6 @@ impl JobStoreShard {
         // (task_group, priority, job_id, attempt_number) are constant within a
         // chain, so a fresh `epoch_ms` strictly past the parent's makes the
         // follow-up key unique even when it reuses the parent's start_time.
-        let parent = parse_task_key(task_key);
-        let parent_start_time_ms = parent
-            .as_ref()
-            .map(|p| p.start_time_ms as i64)
-            .unwrap_or(now_ms);
-        let parent_epoch_ms = parent.as_ref().map(|p| p.epoch_ms as i64).unwrap_or(0);
         let task_key_epoch_ms = now_ms.max(parent_epoch_ms + 1);
 
         let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
@@ -813,6 +904,8 @@ impl JobStoreShard {
                 },
             )
             .await?;
+
+        state.materialized_attempts.insert(attempt_key);
 
         // Each (queue, task_id) the chain reserved also needs rollback if the
         // batch write fails.
@@ -909,7 +1002,7 @@ impl JobStoreShard {
                     .push((tenant.to_string(), queue, check_task_id.to_string()));
             }
         };
-        match self.db.get(&job_status_key(tenant, job_id)).await? {
+        let status = match self.db.get(&job_status_key(tenant, job_id)).await? {
             Some(raw) => match decode_job_status_owned(&raw) {
                 Ok(status)
                     if matches!(
@@ -920,7 +1013,7 @@ impl JobStoreShard {
                     drop_and_release(state);
                     return Ok(());
                 }
-                Ok(_) => {}
+                Ok(status) => status,
                 Err(_) => {
                     drop_and_release(state);
                     return Ok(());
@@ -930,6 +1023,47 @@ impl JobStoreShard {
                 drop_and_release(state);
                 return Ok(());
             }
+        };
+
+        // A CheckRateLimit is only current for the attempt the job status
+        // schedules; one for another attempt is a remnant of an earlier chain.
+        // Drop it and release its holders.
+        if status.current_attempt != Some(attempt_number) {
+            drop_and_release(state);
+            return Ok(());
+        }
+
+        // Duplicate-materialization guard, mirroring handle_request_ticket: a
+        // Running status at this attempt, an attempt already continued by this
+        // iteration's batch, or a live terminal row elsewhere in the keyspace
+        // (rows this batch already consumed are excluded — their deletes are
+        // uncommitted, so a durable read still sees them) all mean the chain
+        // already materialized through another copy of this continuation. The
+        // batch-wide exclusion is what lets exactly one of N same-start peers
+        // claimed into this batch proceed: earlier peers defer to the
+        // still-live later ones, and the last sees only tombstoned evidence.
+        // Drop WITHOUT releasing holders — the live chain owns them under the
+        // same task id.
+        let attempt_key = (tenant.to_string(), job_id.to_string(), attempt_number);
+        if self
+            .attempt_already_materialized(
+                state,
+                &status,
+                &attempt_key,
+                check_task_group,
+                priority,
+                parent_start_time_ms,
+            )
+            .await?
+        {
+            tracing::warn!(
+                tenant = %tenant,
+                job_id = %job_id,
+                task_id = %check_task_id,
+                attempt = attempt_number,
+                "dropping duplicate CheckRateLimit; the attempt's chain already has a live terminal row or is running"
+            );
+            return Ok(());
         }
 
         // Load job info to get the full limits list
@@ -1056,6 +1190,21 @@ impl JobStoreShard {
                     parent_epoch_ms,
                     check_task_group,
                 )?;
+                // Point the job status at the retry row's start time so
+                // status-driven lookups (cancel, expedite, reimport, and this
+                // handler's own duplicate guard) can find the parked row.
+                if let Some(transition) = self
+                    .retarget_scheduled_task_key(
+                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                        tenant,
+                        job_id,
+                        attempt_number,
+                        retry_backoff,
+                    )
+                    .await?
+                {
+                    state.background_action_transitions.push(transition);
+                }
             }
             Err(e) => {
                 tracing::warn!(job_id = %job_id, error = %e, "gubernator rate limit check failed, will retry");
@@ -1077,8 +1226,24 @@ impl JobStoreShard {
                     parent_epoch_ms,
                     check_task_group,
                 )?;
+                if let Some(transition) = self
+                    .retarget_scheduled_task_key(
+                        &mut DbWriteBatcher::new(&self.db, &mut state.batch),
+                        tenant,
+                        job_id,
+                        attempt_number,
+                        retry_backoff,
+                    )
+                    .await?
+                {
+                    state.background_action_transitions.push(transition);
+                }
             }
         }
+
+        // Every branch above continued this attempt's chain into the batch --
+        // a chain continuation, a parked deferral, or a rate-limit retry.
+        state.materialized_attempts.insert(attempt_key);
 
         Ok(())
     }
@@ -1186,35 +1351,68 @@ impl JobStoreShard {
         // This is guaranteed by construction: RunAttempt tasks are only created when concurrency
         // is granted (at enqueue or grant_next), with held_queues populated.
 
-        // Double-dispatch detection: dispatch is about to write this task's
-        // lease record, so a still-live lease there means the same task was
-        // already dispatched. Detection only -- the overwrite proceeds
-        // unchanged and no guard failure may alter the dispatch outcome.
+        // Double-dispatch guard: dispatch is about to write this task's lease
+        // record, so a still-live lease there means the task id was already
+        // dispatched. Repeats that can only be a duplicate materialization are
+        // DROPPED -- deleted in the batch and acknowledged to the broker like
+        // a delivered row, never delivered:
+        //
+        // - An in-batch repeat: one LeaseTasks call carries one worker for
+        //   its whole iteration and the broker never yields a key twice in
+        //   one claim, so a repeated task id is always a second row.
+        // - A stored live lease held by a DIFFERENT worker while this row is
+        //   still durably present: the leased dispatch deleted its own row in
+        //   its commit, so a surviving row is a second materialization. When
+        //   the row is durably ABSENT (only a stale broker-buffer entry
+        //   survives, the redispatch shape a dequeue future dropped
+        //   mid-commit produces), the dispatch is the lost-response recovery
+        //   and delivers via overwrite.
+        //
+        // A stored live lease held by the SAME worker keeps overwrite
+        // semantics: that is the requeue-after-ambiguous-commit recovery,
+        // re-delivering the task to its rightful owner, and the client's
+        // duplicate-delivery dedup contains the case where the first copy did
+        // arrive. Guard read/decode failures never turn into drops -- on any
+        // uncertainty the dispatch delivers.
+        let mut drop_source: Option<crate::metrics::LeaseOverwriteSource> = None;
         if state.leased_task_ids.contains(task_id) {
             tracing::warn!(
                 tenant = %tenant,
                 job_id = %job_id,
                 task_id = %task_id,
                 worker_id = %worker_id,
+                action = "dropped",
                 "RunAttempt task leased twice within one dequeue iteration; \
-                 overwriting the lease still in this iteration's batch",
+                 dropping the duplicate row",
             );
-            if let Some(m) = &self.metrics {
-                m.record_task_lease_overwrite(
-                    self.name(),
-                    decoded.task_group(),
-                    crate::metrics::LeaseOverwriteSource::Batch,
-                );
-            }
+            drop_source = Some(crate::metrics::LeaseOverwriteSource::Batch);
         } else {
-            // Detection must never alter dispatch: read and decode failures
-            // are logged at debug so a persistently blind detector remains
-            // observable, then dispatch proceeds regardless.
             match self.db.get(&leased_task_key(task_id)).await {
                 Ok(Some(existing_bytes)) => match crate::codec::decode_lease(existing_bytes) {
                     Ok(existing) => {
                         let remaining_lease_ms = existing.expiry_ms() - now_ms;
                         if remaining_lease_ms > 0 {
+                            let row_durably_present = if existing.worker_id() == worker_id {
+                                false
+                            } else {
+                                match self.db.get(&task_key).await {
+                                    Ok(present) => present.is_some(),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "lease guard row-presence read failed; delivering via overwrite",
+                                        );
+                                        false
+                                    }
+                                }
+                            };
+                            let action = if row_durably_present {
+                                drop_source = Some(crate::metrics::LeaseOverwriteSource::Stored);
+                                "dropped"
+                            } else {
+                                "overwritten"
+                            };
                             tracing::warn!(
                                 tenant = %tenant,
                                 job_id = %job_id,
@@ -1222,6 +1420,7 @@ impl JobStoreShard {
                                 existing_worker_id = %existing.worker_id(),
                                 new_worker_id = %worker_id,
                                 remaining_lease_ms,
+                                action,
                                 "dispatching RunAttempt over a still-live existing lease; \
                                  possible double dispatch",
                             );
@@ -1248,7 +1447,29 @@ impl JobStoreShard {
                 ),
             }
         }
+        if let Some(source) = drop_source {
+            if let Some(m) = &self.metrics {
+                if source == crate::metrics::LeaseOverwriteSource::Batch {
+                    m.record_task_lease_overwrite(self.name(), decoded.task_group(), source);
+                }
+                m.record_task_lease_duplicate_drop(self.name(), decoded.task_group(), source);
+            }
+            state.batch.delete(task_key);
+            state.ack_deleted(task_key);
+            return Ok(());
+        }
         state.leased_task_ids.insert(task_id.to_string());
+        // Delivery is this batch materializing (and dispatching) the attempt.
+        // Recording it in the seen-set is what keeps a co-claimed duplicate
+        // grant source from re-continuing the chain: this row is about to be
+        // tombstoned (excluded from the guard's durable scan) and the
+        // status/lease writes below are uncommitted, so a durable read alone
+        // would conclude the attempt was never materialized.
+        state.materialized_attempts.insert((
+            tenant.to_string(),
+            job_id.to_string(),
+            attempt_number,
+        ));
 
         // [SILO-DEQ-3] Delete task from task queue
         state.batch.delete(task_key);

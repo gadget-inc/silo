@@ -14,6 +14,7 @@ use syn::{ItemFn, parse_macro_input};
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args_ts = proc_macro2::TokenStream::from(attr);
     let input = parse_macro_input!(item as ItemFn);
+    let attrs = &input.attrs;
     let vis = &input.vis;
     let sig = &input.sig;
     let block = &input.block;
@@ -29,6 +30,7 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let output = if is_async {
         quote! {
+            #(#attrs)*
             #[tokio::test #paren_args]
             #vis #sig {
                 silo::trace::with_test_tracing(stringify!(#name), || async move { #block }).await
@@ -36,6 +38,7 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
+            #(#attrs)*
             #[test]
             #vis #sig {
                 silo::trace::with_test_tracing_sync(stringify!(#name), || { #block })

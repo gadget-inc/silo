@@ -6,6 +6,7 @@ pub mod cancel_releases_ticket;
 pub mod chaos;
 pub mod concurrency_limits;
 pub mod concurrent_grant_race;
+pub mod duplicate_terminal_rows;
 pub mod expedite_concurrency;
 pub mod fault_injection_partition;
 pub mod floating_concurrency;

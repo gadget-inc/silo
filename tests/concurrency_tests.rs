@@ -196,13 +196,31 @@ async fn periodic_reconcile_grants_pending_request_without_signal() {
     let manual_task_id = parsed.task_id;
     drop(iter);
 
+    // Clear the enqueue's grant entirely -- holder AND the terminal RunAttempt
+    // row it wrote -- so the injected request models a genuinely parked chain.
+    // A request row coexisting with a live terminal row for the same attempt
+    // is the duplicate-materialization state the grant scanner's guard drops
+    // rather than grants.
     let mut clear_batch = WriteBatch::new();
     clear_batch.delete(&holder_key);
+    let tasks_prefix = silo::keys::task_group_prefix("default");
+    let mut task_iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(
+            tasks_prefix.clone()..silo::keys::end_bound(&tasks_prefix),
+            &silo::scan_options(),
+        )
+        .await
+        .expect("scan tasks");
+    while let Some(kv) = task_iter.next().await.expect("iterate tasks") {
+        clear_batch.delete(&kv.key);
+    }
+    drop(task_iter);
     shard
         .db()
         .write(clear_batch)
         .await
-        .expect("clear pre-existing holder");
+        .expect("clear pre-existing grant state");
     shard.rollback_concurrency_grant_for_test(tenant, &queue, &manual_task_id);
 
     assert_eq!(

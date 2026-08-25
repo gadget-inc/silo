@@ -3421,6 +3421,10 @@ async fn two_concurrency_limits_chain_resumes_correctly() {
     );
     let job2_task_id = job2_tasks[0].attempt().task_id().to_string();
 
+    // The multi-hop resume must not have materialized a second terminal task
+    // row for either job's attempt.
+    assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+
     // Inspect the lease: held_queues must include BOTH A and B. Pre-fix this
     // would have been only [A] (the queue just granted by the scanner), and B
     // would be silently bypassed.

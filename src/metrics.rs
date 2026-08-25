@@ -187,6 +187,7 @@ pub struct Metrics {
     // Lease metrics
     task_leases_active: GaugeVec,
     task_lease_overwrites_total: CounterVec,
+    task_lease_duplicate_drops_total: CounterVec,
     ready_to_start_latency_ms: HistogramVec,
     leasable_to_start_latency_ms: HistogramVec,
     lease_reaper_duration: HistogramVec,
@@ -667,6 +668,20 @@ impl Metrics {
         source: LeaseOverwriteSource,
     ) {
         self.task_lease_overwrites_total
+            .with_label_values(&[shard, task_group, source.as_str()])
+            .inc();
+    }
+
+    /// Record a duplicate RunAttempt row dropped at dispatch instead of
+    /// delivered. Every drop is also a detection, so the overwrite counter is
+    /// incremented alongside this one.
+    pub fn record_task_lease_duplicate_drop(
+        &self,
+        shard: &str,
+        task_group: &str,
+        source: LeaseOverwriteSource,
+    ) {
+        self.task_lease_duplicate_drops_total
             .with_label_values(&[shard, task_group, source.as_str()])
             .inc();
     }
@@ -2218,7 +2233,18 @@ pub fn init() -> anyhow::Result<Metrics> {
         CounterVec::new(
             Opts::new(
                 "silo_task_lease_overwrites_total",
-                "Number of RunAttempt dispatches that wrote a lease over a still-live existing lease (double-dispatch detector); source is \"stored\" for a lease found in the DB and \"batch\" for a repeat within one dequeue iteration",
+                "Number of RunAttempt dispatches that found a still-live existing lease for the task id (double-dispatch detector, counted whether the dispatch overwrote or dropped); source is \"stored\" for a lease found in the DB and \"batch\" for a repeat within one dequeue iteration",
+            ),
+            &["shard", "task_group", "source"],
+        )?,
+    );
+
+    let task_lease_duplicate_drops_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_task_lease_duplicate_drops_total",
+                "Number of duplicate RunAttempt rows dropped at dispatch instead of delivered (a durably present row whose task id is live-leased by another worker, or a repeat within one dequeue iteration); every drop also increments silo_task_lease_overwrites_total",
             ),
             &["shard", "task_group", "source"],
         )?,
@@ -2576,6 +2602,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         poll_duration,
         task_leases_active,
         task_lease_overwrites_total,
+        task_lease_duplicate_drops_total,
         ready_to_start_latency_ms,
         leasable_to_start_latency_ms,
         lease_reaper_duration,

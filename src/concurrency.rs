@@ -51,7 +51,7 @@ use slatedb::config::WriteOptions;
 use crate::instrumented_db::InstrumentedDb;
 
 use crate::job_store_shard::counters::{decode_counter, encode_counter};
-use crate::job_store_shard::helpers::WriteBatcher;
+use crate::job_store_shard::helpers::{WriteBatcher, live_terminal_row_exists};
 
 use crate::codec::{
     decode_concurrency_action, decode_floating_limit_state, encode_concurrency_action,
@@ -2314,6 +2314,12 @@ impl ConcurrencyManager {
             /// JobInfo fetch when computing max_concurrency and resuming the
             /// chain.
             limits: Vec<Limit>,
+            /// The job status's `next_attempt_starts_after_ms`, captured at
+            /// validation. When a resumed chain wrote its terminal row at a
+            /// retargeted start time, this is where that row lives — the
+            /// duplicate-materialization guard checks it alongside the
+            /// request's own start.
+            status_start_ms: Option<i64>,
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
@@ -2341,6 +2347,12 @@ impl ConcurrencyManager {
         let mut total_stale_deleted: usize = 0;
         let mut budget_exhausted = false;
         let chain_resumer = self.chain_resumer();
+        // Duplicate-materialization guard, same-batch half: (job_id, attempt)
+        // pairs whose chain this invocation has already resumed into a chunk
+        // batch that is not yet committed — invisible to the durable check.
+        // Cleared at every `commit_grant_chunk`, after which the durable check
+        // sees the committed rows.
+        let mut chunk_materialized: HashSet<(String, u32)> = HashSet::new();
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
         // granted `count` requests, or hit the end / capacity limit. Each pass
@@ -2546,6 +2558,7 @@ impl ConcurrencyManager {
                     limit_index,
                     held_queues,
                     limits,
+                    status_start_ms: None,
                 });
             }
 
@@ -2651,7 +2664,7 @@ impl ConcurrencyManager {
             .await;
 
             let mut valid_requests: Vec<ScannedRequest> = Vec::new();
-            for (req, status_result) in scanned.into_iter().zip(status_results.into_iter()) {
+            for (mut req, status_result) in scanned.into_iter().zip(status_results.into_iter()) {
                 let is_valid = match status_result {
                     Ok(Some(status_raw)) => match decode_job_status_owned(&status_raw) {
                         // [SILO-GRANT-5] Request records are only valid for the currently
@@ -2671,7 +2684,10 @@ impl ConcurrencyManager {
                             );
                             false
                         }
-                        Ok(_) => true,
+                        Ok(status) => {
+                            req.status_start_ms = status.next_attempt_starts_after_ms;
+                            true
+                        }
                         Err(_) => {
                             tracing::warn!(
                                 job_id = %req.job_id,
@@ -2806,6 +2822,58 @@ impl ConcurrencyManager {
                     break;
                 }
 
+                // Duplicate-materialization guard: at most one live terminal
+                // task row per (job_id, attempt). A request row whose attempt
+                // already has a live RunAttempt / CheckRateLimit — either
+                // durably (an earlier grant, a replayed conversion) or in this
+                // chunk's uncommitted batch — is a second grant source for the
+                // same chain; granting it would materialize a duplicate row at
+                // a fresh epoch and dispatch the attempt twice. Delete it like
+                // any other stale request.
+                let attempt_key = (req.job_id.clone(), req.attempt_number);
+                let already_materialized = if chunk_materialized.contains(&attempt_key) {
+                    true
+                } else {
+                    let mut starts = vec![req.start_time_ms];
+                    if let Some(s) = req.status_start_ms {
+                        starts.push(s);
+                    }
+                    match live_terminal_row_exists(
+                        db,
+                        &req.task_group,
+                        req.priority,
+                        &req.job_id,
+                        req.attempt_number,
+                        &starts,
+                        &[],
+                    )
+                    .await
+                    {
+                        Ok(exists) => exists,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                job_id = %req.job_id,
+                                queue = %queue,
+                                "grant scanner: duplicate-materialization check failed; skipping request this pass"
+                            );
+                            continue;
+                        }
+                    }
+                };
+                if already_materialized {
+                    tracing::warn!(
+                        job_id = %req.job_id,
+                        queue = %queue,
+                        attempt = req.attempt_number,
+                        task_id = %req.task_id,
+                        "grant scanner: dropping duplicate request; a live terminal task row already exists for this attempt"
+                    );
+                    batch.delete(&req.request_key);
+                    chunk_stale += 1;
+                    continue;
+                }
+
                 // [SILO-GRANT-1] Pre: Queue has capacity — try to atomically reserve a slot
                 if !self.counts.try_reserve_internal(
                     tenant,
@@ -2893,6 +2961,7 @@ impl ConcurrencyManager {
                     }
                 }
 
+                chunk_materialized.insert(attempt_key);
                 chunk_grants.push((req.task_id.clone(), req.task_group.clone()));
 
                 if chunk_grants.len() >= self.grant_scanner_commit_chunk_size {
@@ -2920,6 +2989,7 @@ impl ConcurrencyManager {
                     total_stale_deleted += stale_deletes;
                     all_granted_groups.extend(chunk_grants.drain(..).map(|(_, tg)| tg));
                     chunk_reservations.clear();
+                    chunk_materialized.clear();
                     chunk_now = crate::job_store_shard::now_epoch_ms();
                 }
             }
@@ -2954,6 +3024,7 @@ impl ConcurrencyManager {
             total_granted += chunk_grants.len();
             total_stale_deleted += stale_deletes;
             all_granted_groups.extend(chunk_grants.into_iter().map(|(_, tg)| tg));
+            chunk_materialized.clear();
         }
 
         // No silent cap: surface invocations that yielded on the scan budget so

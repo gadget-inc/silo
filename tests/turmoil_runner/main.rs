@@ -40,6 +40,15 @@ fn grpc_end_to_end() {
 }
 
 #[test]
+fn duplicate_terminal_rows() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::duplicate_terminal_rows::run();
+    } else {
+        verify_determinism("duplicate_terminal_rows", get_seed());
+    }
+}
+
+#[test]
 fn fault_injection_partition() {
     if is_subprocess() || is_fuzz_mode() {
         scenarios::fault_injection_partition::run();
