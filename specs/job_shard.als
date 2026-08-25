@@ -565,6 +565,42 @@ pred enqueueWithConcurrencyQueued[tid: TaskId, j: Job, q: Queue, t: Time, tnext:
     holdersUnchanged[t, tnext]
 }
 
+-- Transition: ENQUEUE_WITH_CONCURRENCY_MIXED - Walker grants holder on one
+-- queue, pauses on another. Models the post-refactor multi-limit chain where
+-- the walker carries a single task_id through every artifact (holders +
+-- durable EnqueueTask intent). Both the new holder at `qGranted` and the
+-- TicketRequest at `qPaused` bind the same `tid`; the chain has no DbQueuedTask
+-- and no CheckRateLimit row at this point. The chain becomes resolvable when
+-- `qPaused` opens (see grantNextRequest, which then creates the RunAttempt).
+-- See implementation plan: enqueue/concurrency unification.
+pred enqueueWithConcurrencyMixed[tid: TaskId, j: Job, qGranted: Queue, qPaused: Queue, t: Time, tnext: Time] {
+    enqueuePreConditions[tid, j, t]
+    enqueueJobCreated[j, t, tnext]
+    enqueueFrameConditions[tid, t, tnext]
+
+    -- Pre: distinct queues, both required by the job
+    qGranted != qPaused
+    qGranted in jobQueues[j]
+    qPaused in jobQueues[j]
+
+    -- Pre: walker grants on the first, pauses on the second
+    queueHasCapacity[qGranted, t]
+    not queueHasCapacity[qPaused, t]
+
+    -- Post: holder created at qGranted, others unchanged
+    holdersAt[qGranted, tnext] = tid
+    all q2: Queue | q2 != qGranted implies holdersAt[q2, tnext] = holdersAt[q2, t]
+
+    -- Post: NO RunAttempt task in DB (chain unresolved)
+    no qt: DbQueuedTask | qt.db_qtask = tid and qt.db_qtime = tnext
+    all tid2: TaskId | dbQueuedAt[tid2, tnext] = dbQueuedAt[tid2, t]
+
+    -- Post: durable request at qPaused, same chain task_id
+    one r: TicketRequest | r.tr_job = j and r.tr_queue = qPaused and r.tr_task = tid and r.tr_time = tnext
+    requestTasksAt[qPaused, tnext] = requestTasksAt[qPaused, t] + tid
+    all q2: Queue | q2 != qPaused implies requestTasksAt[q2, tnext] = requestTasksAt[q2, t]
+}
+
 -- Transition: BROKER_SCAN - Read from DB to Buffer
 -- See: task_broker.rs::scan_tasks
 pred brokerScan[t: Time, tnext: Time] {
@@ -1062,9 +1098,16 @@ pred cancelJob[j: Job, t: Time, tnext: Time] {
     attemptExistsAt[tnext] = attemptExistsAt[t]
     all a: attemptExistsAt[t] | attemptStatusAt[a, tnext] = attemptStatusAt[a, t]
 
-    -- Concurrency cleanup: release holders for cancelled job's tasks (removed from DB queue)
-    -- and delete requests for cancelled job
-    all q: Queue | holdersAt[q, tnext] = { tid: holdersAt[q, t] | dbQueuedAt[tid, t] != j }
+    -- Concurrency cleanup: release holders for cancelled job's tasks regardless
+    -- of which durable artifact carries the chain (DbQueuedTask, DbCheckRateLimitTask,
+    -- or a TicketRequest binding the chain's task_id). The latter two cases close
+    -- pre-existing gaps the enqueue/concurrency unification surfaces: a paused
+    -- chain may carry holders with no DbQueuedTask, marked only by CheckRateLimit
+    -- or by a TicketRequest (the EnqueueTask durable intent).
+    all q: Queue | holdersAt[q, tnext] = { tid: holdersAt[q, t] |
+        dbQueuedAt[tid, t] != j and
+        dbCheckRateLimitAt[tid, t] != j and
+        (no r: TicketRequest | r.tr_task = tid and r.tr_job = j and r.tr_time = t) }
     all q: Queue | requestTasksAt[q, tnext] = { tid: requestTasksAt[q, t] |
         no r: TicketRequest | r.tr_job = j and r.tr_queue = q and r.tr_task = tid and r.tr_time = t }
 }
@@ -1920,6 +1963,7 @@ pred step[t: Time, tnext: Time] {
     -- Concurrency ticket management
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyGranted[tid, j, q, t, tnext])
     or (some tid: TaskId, j: Job, q: Queue | enqueueWithConcurrencyQueued[tid, j, q, t, tnext])
+    or (some tid: TaskId, j: Job, qGranted: Queue, qPaused: Queue | enqueueWithConcurrencyMixed[tid, j, qGranted, qPaused, t, tnext])
     or (some q: Queue, tid: TaskId | grantNextRequest[q, tid, t, tnext])
     or (some q: Queue, tid: TaskId | dropStaleRequest[q, tid, t, tnext])
     or (some tid: TaskId, w: Worker, q: Queue | completeSuccessReleaseTicket[tid, w, q, t, tnext])
@@ -2093,17 +2137,27 @@ assert queueLimitEnforced {
 
 /**
  * Holders only exist for tasks that are active in some form (in DB queue, in
- * buffer, leased, or carried by a CheckRateLimit task).
+ * buffer, leased, carried by a CheckRateLimit task, or referenced by a
+ * durable concurrency request that binds the chain's task_id).
  *
- * A ticket holder is created at enqueue (granted), at grant_next, or by an
+ * A ticket holder is created at enqueue (granted), at grant_next, by an
  * enqueue-with-concurrency-and-rate-limit (where the task is a CheckRateLimit
- * carrying the holder), and released when:
+ * carrying the holder), or by enqueueWithConcurrencyMixed (where the walker
+ * grants on one queue and pauses on another, leaving the chain referenced
+ * only by a TicketRequest in the durable EnqueueTask intent). It is released
+ * when:
  * - Task completes successfully or fails: [SILO-REL-1]
  * - Lease expires: [SILO-REAP-*] releases via completion path
  * - Job cancelled with task in queue: [SILO-CXL-3] eagerly removes holders
  * - Dequeue handler drops the task on an early-return path (max retries,
  *   missing job_info, malformed job_info): dequeueDropRunAttempt /
  *   dequeueDropCheckRateLimit
+ *
+ * The TicketRequest clause covers the post-refactor mid-walk pause shape
+ * introduced by the enqueue/concurrency unification: a chain that holds
+ * earlier queues' holders while its remaining limit is still pending in a
+ * durable EnqueueTask intent. Without that clause this assertion would flag
+ * the legitimate paused-mid-walk state as a leak.
  *
  * If a future drop-path forgets to release the held queues, this assertion
  * produces a counterexample — that's exactly the bug shape fixed in PR #255
@@ -2118,7 +2172,9 @@ assert holdersRequireActiveTask {
         some bufferedAt[h.th_task, h.th_time] or
         some leaseAt[h.th_task, h.th_time] or
         some dbCheckRateLimitAt[h.th_task, h.th_time] or
-        some bufferedCheckRateLimitAt[h.th_task, h.th_time]
+        some bufferedCheckRateLimitAt[h.th_task, h.th_time] or
+        (some r: TicketRequest |
+            r.tr_task = h.th_task and r.tr_time = h.th_time)
 }
 
 /**
@@ -2381,6 +2437,50 @@ pred exampleCancelledRequestCleanup {
         -- t2: j2 is cancelled, request eagerly removed
         isCancelledAt[j2, t2]
         no r: TicketRequest | r.tr_job = j2 and r.tr_queue = q and r.tr_time = t2  -- Request eagerly removed
+    }
+}
+
+/**
+ * Scenario: Multi-limit chain is partially granted: walker holds qGranted and
+ * pauses on qPaused with a durable EnqueueTask intent binding the same task_id.
+ * Witness for the post-refactor state shape that the enqueue/concurrency
+ * unification makes legal — `holdersRequireActiveTask` must accept this via
+ * its TicketRequest clause.
+ */
+pred exampleEnqueueMixedHolderAndRequest {
+    some tid: TaskId, j: Job, qGranted: Queue, qPaused: Queue, t: Time | {
+        qGranted != qPaused
+        -- holder for the chain on qGranted
+        some h: TicketHolder | h.th_task = tid and h.th_queue = qGranted and h.th_time = t
+        -- durable request at qPaused with the chain's task_id
+        some r: TicketRequest | r.tr_task = tid and r.tr_job = j and r.tr_queue = qPaused and r.tr_time = t
+        -- chain unresolved: no RunAttempt/buffer/lease/CRL task
+        no dbQueuedAt[tid, t]
+        no bufferedAt[tid, t]
+        no leaseAt[tid, t]
+        no dbCheckRateLimitAt[tid, t]
+        no bufferedCheckRateLimitAt[tid, t]
+    }
+}
+
+/**
+ * Scenario: Cancel during a partially-granted mixed state must release the
+ * holder, not just the request. Witnesses that cancelJob's holder filter
+ * recognizes a chain marked only by TicketRequest.
+ */
+pred exampleCancelReleasesMixedHolders {
+    some tid: TaskId, j: Job, qGranted: Queue, qPaused: Queue, t1, t2: Time | {
+        lt[t1, t2]
+        qGranted != qPaused
+        -- t1: mixed state (holder + request, no DB task)
+        some h: TicketHolder | h.th_task = tid and h.th_queue = qGranted and h.th_time = t1
+        some r: TicketRequest | r.tr_task = tid and r.tr_job = j and r.tr_queue = qPaused and r.tr_time = t1
+        no dbQueuedAt[tid, t1]
+        not isCancelledAt[j, t1]
+        -- t2: job cancelled; both holder and request gone for this chain
+        isCancelledAt[j, t2]
+        no h: TicketHolder | h.th_task = tid and h.th_time = t2
+        no r: TicketRequest | r.tr_task = tid and r.tr_time = t2
     }
 }
 
@@ -3214,6 +3314,21 @@ run exampleConcurrencyWaitsInQueue for 4 but exactly 2 Job, 1 Worker, 3 TaskId, 
 
 run exampleCancelledRequestCleanup for 4 but exactly 2 Job, 1 Worker, 3 TaskId, 3 Attempt, 8 Time, 1 Queue,
     16 JobState, 8 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 3 JobAttemptRelation, 16 JobCancelled,
+    2 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
+
+-- Witness that the new mixed-grant pause state is reachable. Scope keeps
+-- 2 queues + at least 2 task ids so the holder for the predecessor (occupying
+-- qPaused) and the chain's own task_id can coexist.
+run exampleEnqueueMixedHolderAndRequest for 4 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 6 Time, 2 Queue,
+    6 JobState, 6 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease,
+    6 AttemptExists, 6 JobExists, 2 JobAttemptRelation, 6 JobCancelled,
+    2 JobQueueRequirement, 6 TicketRequest, 6 TicketHolder
+
+-- Witness that cancellation releases holders for a chain marked only by a
+-- TicketRequest (the post-refactor mixed pause shape).
+run exampleCancelReleasesMixedHolders for 5 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time, 2 Queue,
+    8 JobState, 8 AttemptState, 4 DbQueuedTask, 4 BufferedTask, 2 Lease,
+    8 AttemptExists, 8 JobExists, 2 JobAttemptRelation, 8 JobCancelled,
     2 JobQueueRequirement, 8 TicketRequest, 8 TicketHolder
 
 run exampleCancelledJobReleasesTicketOnComplete for 3 but exactly 1 Job, 1 Worker, 2 TaskId, 2 Attempt, 8 Time, 1 Queue,
