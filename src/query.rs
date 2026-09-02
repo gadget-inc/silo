@@ -266,8 +266,14 @@ pub trait Scan: std::fmt::Debug + Send + Sync + 'static {
     ) -> SendableRecordBatchStream;
 
     /// Describe the scan strategy for EXPLAIN output. Returns a human-readable
-    /// description of what index/scan path will be used for the given filters.
-    fn describe(&self, _filters: &[Expr], _limit: Option<usize>) -> String {
+    /// description of what index/scan path will be used for the given
+    /// projection and filters.
+    fn describe(
+        &self,
+        _projection: &SchemaRef,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> String {
         "CustomScan".to_string()
     }
 
@@ -429,7 +435,9 @@ impl DisplayAs for SiloExecutionPlan {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                let desc = self.scanner.describe(&self.filters, self.limit);
+                let desc = self
+                    .scanner
+                    .describe(&self.projected_schema, &self.filters, self.limit);
                 write!(f, "SiloExecutionPlan: {}", desc)
             }
         }
@@ -891,7 +899,8 @@ impl JobsScanner {
 /// Captures what columns the DataFusion projection requires, so we can pick
 /// the most efficient scan path and skip fetches we don't need.
 struct ProjectionNeeds {
-    /// Needs fields only in job_info: priority, enqueue_time_ms, payload, task_group, metadata
+    /// Needs a job_info read per row: priority, payload, task_group, metadata,
+    /// limits, or enqueue_time_ms when the status index cannot serve it.
     need_job_info: bool,
     /// Needs fields available from the status/time index key: status_kind, status_changed_at_ms
     need_status_index_fields: bool,
@@ -899,6 +908,9 @@ struct ProjectionNeeds {
     need_status_point_lookup: bool,
     /// Fast path: scan status/time index directly, no point-lookups required
     use_status_index_path: bool,
+    /// On the fast path, enqueue_time_ms is projected and read from each index
+    /// entry's value, with a job_info read for just the entries lacking it.
+    enqueue_time_from_index: bool,
     /// ExactId with a tenant: must verify existence even without job_info columns
     needs_existence_check: bool,
 }
@@ -909,11 +921,17 @@ impl ProjectionNeeds {
     }
 }
 
-fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> ProjectionNeeds {
-    let need_job_info = projection.fields().iter().any(|f| {
+fn analyze_projection(
+    projection: &SchemaRef,
+    strategy: &JobsScanStrategy,
+    backfill_complete: bool,
+) -> ProjectionNeeds {
+    let projects = |name: &str| projection.fields().iter().any(|f| f.name() == name);
+    let need_enqueue_time = projects("enqueue_time_ms");
+    let need_other_job_info = projection.fields().iter().any(|f| {
         matches!(
             f.name().as_str(),
-            "priority" | "enqueue_time_ms" | "payload" | "task_group" | "metadata" | "limits"
+            "priority" | "payload" | "task_group" | "metadata" | "limits"
         )
     });
     // status_kind and status_changed_at_ms are encoded in the status/time index key, so
@@ -928,17 +946,41 @@ fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> Pr
             "current_attempt" | "next_attempt_starts_after_ms"
         )
     });
+    // For Scheduled rows the index key carries the scheduled start time while
+    // the status record carries the transition time; the Status strategy's
+    // pairs path returns the record's value, so it keeps that column.
+    let need_status_changed_at = projects("status_changed_at_ms");
+    let index_path_strategy = match strategy {
+        JobsScanStrategy::FullScan { .. } | JobsScanStrategy::StatusUnion { .. } => true,
+        JobsScanStrategy::Status {
+            tenant: Some(_), ..
+        } => !need_status_changed_at,
+        _ => false,
+    };
     // When no job_info fields or status point-lookup fields are needed (including the
     // empty-projection case for COUNT(*)), scan the status/time index directly and skip
     // all get_jobs_batch / get_jobs_status_batch point-lookups.
-    // Valid for FullScan (whole index prefix) and StatusUnion (per-status ranges of the
-    // same index) — other strategies already have a bounded pair list.
-    let use_status_index_path = !need_job_info
-        && !need_status_point_lookup
-        && matches!(
-            strategy,
-            JobsScanStrategy::FullScan { .. } | JobsScanStrategy::StatusUnion { .. }
-        );
+    // Valid for FullScan (whole index prefix), StatusUnion and tenant-scoped Status
+    // (per-status ranges of the same index) — other strategies already have a
+    // bounded pair list.
+    let base_fast_path = !need_other_job_info && !need_status_point_lookup && index_path_strategy;
+    // enqueue_time_ms is index-served only where the scanned ranges are
+    // expected to carry it in every entry: tenant-scoped Status and StatusUnion
+    // always, FullScan once the shard's backfill has completed. Entries that
+    // lack it are hydrated from job_info individually. Whenever the fast path
+    // is not taken, the column stays a job_info column.
+    let enqueue_time_from_index = need_enqueue_time
+        && base_fast_path
+        && match strategy {
+            JobsScanStrategy::Status {
+                tenant: Some(_), ..
+            }
+            | JobsScanStrategy::StatusUnion { .. } => true,
+            JobsScanStrategy::FullScan { tenant: Some(_) } => backfill_complete,
+            _ => false,
+        };
+    let use_status_index_path = base_fast_path && (!need_enqueue_time || enqueue_time_from_index);
+    let need_job_info = need_other_job_info || (need_enqueue_time && !use_status_index_path);
     // ExactId with a tenant synthesises the pair without scanning the DB, so we must
     // verify existence via get_jobs_batch even when job_info columns aren't projected.
     let needs_existence_check = matches!(
@@ -953,14 +995,74 @@ fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> Pr
         need_status_index_fields,
         need_status_point_lookup,
         use_status_index_path,
+        enqueue_time_from_index,
         needs_existence_check,
     }
 }
 
+/// The scan path the jobs scanner takes for a projection, strategy and limit.
+/// Named in EXPLAIN output so an index-served query is recognisable without
+/// profiling it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobsScanPath {
+    /// Row tally from the per-status counters; no scan at all.
+    StatusCounters,
+    /// Status/time index entries only, with a per-row job_info read for
+    /// entries lacking a projected enqueue_time_ms.
+    StatusIndex,
+    /// Streaming job_info / job_status merge join over a FullScan.
+    FullscanJoin,
+    /// Index-resolved (tenant, job_id) pairs hydrated by batched point-lookups.
+    Pairs,
+}
+
+impl std::fmt::Display for JobsScanPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            JobsScanPath::StatusCounters => "status-counters",
+            JobsScanPath::StatusIndex => "status-index",
+            JobsScanPath::FullscanJoin => "fullscan-join",
+            JobsScanPath::Pairs => "pairs",
+        })
+    }
+}
+
+/// The one dispatch decision shared by `scan` and `describe`, so EXPLAIN
+/// reports exactly the path the scan takes. The counters guard comes first.
+fn choose_jobs_scan_path(
+    shard: &JobStoreShard,
+    projection: &SchemaRef,
+    strategy: &JobsScanStrategy,
+    limit: Option<usize>,
+) -> (JobsScanPath, ProjectionNeeds) {
+    let needs = analyze_projection(projection, strategy, shard.enqueue_time_backfill_complete());
+    let path = if projection.fields().is_empty()
+        && limit.is_none()
+        && shard.count_from_status_counters
+        && matches!(strategy, JobsScanStrategy::FullScan { tenant: Some(_) })
+    {
+        // Empty-projection full-tenant scan with no LIMIT — the shape of
+        // `SELECT COUNT(*) FROM jobs WHERE tenant = ...`. Answer the row
+        // tally from the per-status counters (O(#statuses)) rather than
+        // walking the index. The `limit.is_none()` guard excludes shapes
+        // like `EXISTS`/`SELECT 1 ... LIMIT n` that push a scan limit and
+        // want actual rows, not a (reconciler-lagged) counter tally.
+        JobsScanPath::StatusCounters
+    } else if needs.use_status_index_path {
+        JobsScanPath::StatusIndex
+    } else if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
+        JobsScanPath::FullscanJoin
+    } else {
+        JobsScanPath::Pairs
+    };
+    (path, needs)
+}
+
 impl Scan for JobsScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, projection: &SchemaRef, filters: &[Expr], limit: Option<usize>) -> String {
         let strategy = parse_jobs_scan_strategy(filters);
-        format!("jobs[{}], limit={:?}", strategy, limit)
+        let (path, _) = choose_jobs_scan_path(&self.shard, projection, &strategy, limit);
+        format!("jobs[{strategy}], path={path}, limit={limit:?}")
     }
 
     fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
@@ -976,56 +1078,43 @@ impl Scan for JobsScanner {
     ) -> SendableRecordBatchStream {
         let strategy = parse_jobs_scan_strategy(filters);
         let shard = Arc::clone(&self.shard);
-        let needs = analyze_projection(&projection, &strategy);
+        let (path, needs) = choose_jobs_scan_path(&shard, &projection, &strategy, limit);
 
         // Each branch produces its own lazy `async_stream` generator that owns
         // the underlying scan cursor(s). Because nothing is spawned, dropping the
         // returned stream (statement timeout, client disconnect, LIMIT satisfied)
         // drops the cursor and stops the scan at its next `.await` — no zombies.
-        let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> =
-            if projection.fields().is_empty()
-                && limit.is_none()
-                && shard.count_from_status_counters
-                && matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) })
-            {
-                // Empty-projection full-tenant scan with no LIMIT — the shape of
-                // `SELECT COUNT(*) FROM jobs WHERE tenant = ...`. Answer the row
-                // tally from the per-status counters (O(#statuses)) rather than
-                // walking the index. The `limit.is_none()` guard excludes shapes
-                // like `EXISTS`/`SELECT 1 ... LIMIT n` that push a scan limit and
-                // want actual rows, not a (reconciler-lagged) counter tally.
-                Box::pin(count_from_counters_stream(
-                    shard,
-                    projection.clone(),
-                    strategy,
-                ))
-            } else if needs.use_status_index_path {
-                Box::pin(status_index_stream(
-                    shard,
-                    projection.clone(),
-                    strategy,
-                    batch_size,
-                    limit,
-                ))
-            } else if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
-                Box::pin(fullscan_join_stream(
-                    shard,
-                    projection.clone(),
-                    needs,
-                    strategy,
-                    batch_size,
-                    limit,
-                ))
-            } else {
-                Box::pin(job_pairs_stream(
-                    shard,
-                    projection.clone(),
-                    needs,
-                    strategy,
-                    batch_size,
-                    limit,
-                ))
-            };
+        let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> = match path {
+            JobsScanPath::StatusCounters => Box::pin(count_from_counters_stream(
+                shard,
+                projection.clone(),
+                strategy,
+            )),
+            JobsScanPath::StatusIndex => Box::pin(status_index_stream(
+                shard,
+                projection.clone(),
+                strategy,
+                needs.enqueue_time_from_index,
+                batch_size,
+                limit,
+            )),
+            JobsScanPath::FullscanJoin => Box::pin(fullscan_join_stream(
+                shard,
+                projection.clone(),
+                needs,
+                strategy,
+                batch_size,
+                limit,
+            )),
+            JobsScanPath::Pairs => Box::pin(job_pairs_stream(
+                shard,
+                projection.clone(),
+                needs,
+                strategy,
+                batch_size,
+                limit,
+            )),
+        };
 
         Box::pin(RecordBatchStreamAdapter::new(projection, inner))
     }
@@ -1051,22 +1140,36 @@ fn count_from_counters_stream(
     }
 }
 
+/// One status/time index entry as the fast path reads it: the key's fields
+/// plus the value's `enqueue_time_ms`, `None` when the entry lacks it.
+struct IndexRow {
+    tenant: String,
+    job_id: String,
+    status: String,
+    changed_at_ms: i64,
+    enqueue_time_ms: Option<i64>,
+}
+
 /// Streams the status/time index in bounded chunks, emitting RecordBatches with
 /// no point-lookups. Used when the projection only needs tenant, id,
-/// status_kind, or status_changed_at_ms (including the COUNT(*) fallback when
-/// counter-based counting is disabled). Serves FullScan (one whole-prefix range)
-/// and StatusUnion (one range per status arm, all planned from a single clock
-/// snapshot that also fixes the emitted virtual-status labels).
+/// status_kind, status_changed_at_ms or an index-served enqueue_time_ms
+/// (including the COUNT(*) fallback when counter-based counting is disabled).
+/// Serves FullScan (one whole-prefix range), tenant-scoped Status (one range)
+/// and StatusUnion (one range per status arm); the status arms are planned
+/// from a single clock snapshot that also fixes the emitted virtual-status
+/// labels. With `enqueue_time_from_index`, entries whose value lacks the
+/// column are hydrated from job_info individually.
 fn status_index_stream(
     shard: Arc<JobStoreShard>,
     projection: SchemaRef,
     strategy: JobsScanStrategy,
+    enqueue_time_from_index: bool,
     batch_size: usize,
     limit: Option<usize>,
 ) -> impl Stream<Item = DfResult<RecordBatch>> {
     async_stream::try_stream! {
-        // FullScan keeps its per-batch label clock (`None`); a union plans every
-        // arm's range from one snapshot and labels rows with that same snapshot,
+        // FullScan keeps its per-batch label clock (`None`); a status arm plans
+        // its range from one snapshot and labels rows with that same snapshot,
         // so a job crossing its scheduled-start time mid-scan cannot appear in
         // two arms or carry a label inconsistent with the arm that produced it.
         let (ranges, label_now): (Vec<KeyRange>, Option<i64>) = match &strategy {
@@ -1077,6 +1180,16 @@ fn status_index_stream(
                         .iter()
                         .map(|status| status_index_range(tenant, *status, scan_now))
                         .collect(),
+                    Some(scan_now),
+                )
+            }
+            JobsScanStrategy::Status {
+                tenant: Some(tenant),
+                status,
+            } => {
+                let scan_now = crate::job_store_shard::helpers::now_epoch_ms();
+                (
+                    vec![status_index_range(tenant, *status, scan_now)],
                     Some(scan_now),
                 )
             }
@@ -1109,15 +1222,20 @@ fn status_index_stream(
                 if chunk.is_empty() {
                     break;
                 }
-                let mut rows: Vec<(String, String, String, i64)> = Vec::with_capacity(chunk.len());
+                let mut rows: Vec<IndexRow> = Vec::with_capacity(chunk.len());
                 for kv in &chunk {
                     let Some(p) = crate::keys::parse_status_time_index_key(&kv.key)
                         .filter(|p| !p.job_id.is_empty())
                     else {
                         continue;
                     };
-                    let changed = p.changed_at_ms();
-                    rows.push((p.tenant, p.job_id, p.status, changed));
+                    rows.push(IndexRow {
+                        changed_at_ms: p.changed_at_ms(),
+                        tenant: p.tenant,
+                        job_id: p.job_id,
+                        status: p.status,
+                        enqueue_time_ms: crate::keys::decode_status_index_value(&kv.value),
+                    });
                 }
                 if rows.is_empty() {
                     continue;
@@ -1128,6 +1246,12 @@ fn status_index_stream(
                         rows.truncate(remaining);
                     }
                 }
+                if enqueue_time_from_index {
+                    hydrate_missing_enqueue_times(&shard, &mut rows).await?;
+                    if rows.is_empty() {
+                        continue;
+                    }
+                }
                 let batch_now =
                     label_now.unwrap_or_else(crate::job_store_shard::helpers::now_epoch_ms);
                 let batch = build_status_index_batch(&projection, &shard_id, &rows, batch_now)?;
@@ -1136,6 +1260,52 @@ fn status_index_stream(
             }
         }
     }
+}
+
+/// Fill `enqueue_time_ms` for the rows whose index entry lacks it by reading
+/// job_info for just those rows. A row whose job_info is gone is dropped,
+/// matching the pairs path. Every row looked up counts on both the
+/// point-lookup and the fallback-hydration metrics.
+async fn hydrate_missing_enqueue_times(
+    shard: &JobStoreShard,
+    rows: &mut Vec<IndexRow>,
+) -> DfResult<()> {
+    let mut by_tenant: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows.iter().filter(|row| row.enqueue_time_ms.is_none()) {
+        by_tenant
+            .entry(row.tenant.clone())
+            .or_default()
+            .push(row.job_id.clone());
+    }
+    if by_tenant.is_empty() {
+        return Ok(());
+    }
+    let mut found: HashMap<(String, String), i64> = HashMap::new();
+    for (tenant, ids) in &by_tenant {
+        if let Some(metrics) = &shard.metrics {
+            metrics.record_query_point_lookups(shard.name(), ids.len() as u64);
+            metrics.record_enqueue_time_fallback_hydrations(shard.name(), ids.len() as u64);
+        }
+        let views = shard.get_jobs_batch(tenant, ids).await.map_err(exec_err)?;
+        found.extend(
+            views
+                .into_iter()
+                .map(|(id, view)| ((tenant.clone(), id), view.enqueue_time_ms())),
+        );
+    }
+    rows.retain_mut(|row| {
+        if row.enqueue_time_ms.is_some() {
+            return true;
+        }
+        match found.get(&(row.tenant.clone(), row.job_id.clone())) {
+            Some(enqueue_time_ms) => {
+                row.enqueue_time_ms = Some(*enqueue_time_ms);
+                true
+            }
+            None => false,
+        }
+    });
+    Ok(())
 }
 
 /// Tenant-scoped status/time index range for one status filter arm. `now_ms`
@@ -1169,7 +1339,7 @@ fn status_index_range(tenant: &str, status: QueryStatusFilter, now_ms: i64) -> K
 fn build_status_index_batch(
     projection: &SchemaRef,
     shard_id: &str,
-    chunk: &[(String, String, String, i64)],
+    chunk: &[IndexRow],
     now_ms: i64,
 ) -> DfResult<RecordBatch> {
     let n = chunk.len();
@@ -1183,13 +1353,13 @@ fn build_status_index_batch(
             "tenant" => Arc::new(StringArray::from(
                 chunk
                     .iter()
-                    .map(|(t, _, _, _)| t.as_str())
+                    .map(|row| row.tenant.as_str())
                     .collect::<Vec<_>>(),
             )),
             "id" => Arc::new(StringArray::from(
                 chunk
                     .iter()
-                    .map(|(_, id, _, _)| id.as_str())
+                    .map(|row| row.job_id.as_str())
                     .collect::<Vec<_>>(),
             )),
             "status_kind" => {
@@ -1199,11 +1369,11 @@ fn build_status_index_batch(
                 Arc::new(StringArray::from(
                     chunk
                         .iter()
-                        .map(|(_, _, sk, ts)| {
-                            if sk == "Scheduled" && *ts <= now_ms {
+                        .map(|row| {
+                            if row.status == "Scheduled" && row.changed_at_ms <= now_ms {
                                 Some("Waiting")
                             } else {
-                                Some(sk.as_str())
+                                Some(row.status.as_str())
                             }
                         })
                         .collect::<Vec<_>>(),
@@ -1212,8 +1382,16 @@ fn build_status_index_batch(
             "status_changed_at_ms" => Arc::new(Int64Array::from(
                 chunk
                     .iter()
-                    .map(|(_, _, _, ts)| Some(*ts))
+                    .map(|row| Some(row.changed_at_ms))
                     .collect::<Vec<_>>(),
+            )),
+            // Present only when the scan chose to serve it from the index; by
+            // then every row has been decoded or hydrated.
+            "enqueue_time_ms" => Arc::new(Int64Array::from(
+                chunk
+                    .iter()
+                    .map(|row| row.enqueue_time_ms.unwrap_or(0))
+                    .collect::<Vec<i64>>(),
             )),
             _ => new_null_array(f.data_type(), n),
         };
@@ -2077,7 +2255,7 @@ impl QueuesScanner {
 }
 
 impl Scan for QueuesScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _projection: &SchemaRef, filters: &[Expr], limit: Option<usize>) -> String {
         let mut tenant = None;
         let mut queue = None;
         let mut entry_type = None;
@@ -2411,7 +2589,7 @@ impl std::fmt::Debug for TenantCountsScanner {
 }
 
 impl Scan for TenantCountsScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _projection: &SchemaRef, filters: &[Expr], limit: Option<usize>) -> String {
         let tenant_range = parse_tenant_counts_scan_range(filters)
             .map(|range| describe_tenant_status_counter_scan_range(&range))
             .unwrap_or_else(|| "all".to_string());
@@ -2498,7 +2676,7 @@ impl std::fmt::Debug for QueueCountsScanner {
 }
 
 impl Scan for QueueCountsScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _projection: &SchemaRef, filters: &[Expr], limit: Option<usize>) -> String {
         let mut tenant = None;
         for f in filters {
             if let Some((col, val)) = parse_eq_filter(f)
@@ -2810,7 +2988,7 @@ fn variant_type_name(vt: crate::fb::silo::fb::TaskVariant) -> &'static str {
 }
 
 impl Scan for TasksScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _projection: &SchemaRef, filters: &[Expr], limit: Option<usize>) -> String {
         let strategy = parse_tasks_scan_strategy(filters);
         format!("tasks[{}], limit={:?}", strategy, limit)
     }

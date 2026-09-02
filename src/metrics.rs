@@ -171,6 +171,10 @@ pub struct Metrics {
     /// record, at its next transition) and in the backfill sweep. Converges
     /// to zero once every status record carries the value.
     enqueue_time_repair_reads: CounterVec,
+    /// Rows the status-index query path had to hydrate from `JOB_INFO`
+    /// because their index entry carried no `enqueue_time_ms`, per shard.
+    /// Converges to zero once every index entry carries the value.
+    enqueue_time_fallback_hydrations: CounterVec,
 
     // Shard/broker metrics
     shards_owned: Gauge,
@@ -495,6 +499,24 @@ impl Metrics {
     /// touch `JOB_INFO`.
     pub fn enqueue_time_repair_reads_value(&self, shard: &str) -> f64 {
         self.enqueue_time_repair_reads
+            .with_label_values(&[shard])
+            .get()
+    }
+
+    /// Add `n` to the per-shard fallback-hydration counter: rows on the
+    /// status-index query path whose index entry lacked `enqueue_time_ms` and
+    /// were read from `JOB_INFO` instead.
+    pub fn record_enqueue_time_fallback_hydrations(&self, shard: &str, n: u64) {
+        self.enqueue_time_fallback_hydrations
+            .with_label_values(&[shard])
+            .inc_by(n as f64);
+    }
+
+    /// Read the current fallback-hydration counter for a shard. Exposed for
+    /// tests and operational assertions that an index-served query stayed
+    /// index-only.
+    pub fn enqueue_time_fallback_hydrations_value(&self, shard: &str) -> f64 {
+        self.enqueue_time_fallback_hydrations
             .with_label_values(&[shard])
             .get()
     }
@@ -2117,6 +2139,16 @@ pub fn init() -> anyhow::Result<Metrics> {
             &["shard"],
         )?,
     );
+    let enqueue_time_fallback_hydrations = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_enqueue_time_fallback_hydrations_total",
+                "Rows hydrated from JOB_INFO on the status-index query path because their index entry lacked enqueue_time_ms, per shard",
+            ),
+            &["shard"],
+        )?,
+    );
 
     // Shard/broker metrics
     let shards_owned = register(
@@ -2622,6 +2654,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         query_scanned_keys,
         query_point_lookups,
         enqueue_time_repair_reads,
+        enqueue_time_fallback_hydrations,
         shards_owned,
         shards_unassigned,
         coordination_shards_open,
