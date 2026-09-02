@@ -65,9 +65,18 @@ async fn main() {
     println!("\n========================================");
     println!("Query Performance Benchmark");
     println!("========================================\n");
+    // The generator writes the Zipf jobs plus the expedite and deep-queue jobs.
+    let generated_jobs = total_jobs
+        + metadata.expedite_job_ids.len()
+        + metadata.deep_queue_waiter_ids.len()
+        + metadata.deep_queue_holder_task_ids.len();
     println!(
-        "Dataset: {} jobs across {} tenants (expected ~{}, actual {})",
-        total_jobs, NUM_TENANTS, total_jobs, actual_count
+        "Dataset: {} Zipf jobs across {} tenants (generated {}, actual {})",
+        total_jobs, NUM_TENANTS, generated_jobs, actual_count
+    );
+    assert_eq!(
+        actual_count as usize, generated_jobs,
+        "golden shard job count must equal the generator's total"
     );
 
     let large_tenant = &tenant_sizes[0].0; // tenant_001, ~796k
@@ -261,7 +270,91 @@ async fn main() {
     println!();
 
     shard.close().await.expect("close shard");
+
+    run_listing_benchmarks(&metadata, large_tenant).await;
+    println!();
+
     println!("Done.");
+}
+
+/// The editor's listing shape: a bounded sample of one tenant, optionally
+/// pinned to a status, ordered newest-first by enqueue time.
+fn listing_query(tenant: &str, status_filter: Option<&str>) -> String {
+    let status = status_filter
+        .map(|s| format!(" AND status_kind = '{s}'"))
+        .unwrap_or_default();
+    format!(
+        "SELECT id FROM (SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '{tenant}'{status} LIMIT 50000) ORDER BY enqueue_time_ms DESC, id DESC LIMIT 101"
+    )
+}
+
+/// Measure the listing shape on a clone of the golden shard in three states:
+/// the completion marker set with every index entry carrying its value (the
+/// index path), the marker cleared (the job-record path for the unfiltered
+/// shape), and the marker set with the tenant's index values stripped (every
+/// row hydrated through the fallback).
+async fn run_listing_benchmarks(metadata: &GoldenShardMetadata, tenant: &str) {
+    let (_guard, shard) = clone_golden_shard("listing", metadata).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("query engine");
+    let shapes = [("unfiltered", None), ("succeeded", Some("Succeeded"))];
+
+    println!("--- Editor Listing Query ({}) ---", tenant);
+    shard
+        .set_enqueue_time_backfill_complete(true)
+        .await
+        .expect("set marker");
+    for (name, filter) in shapes {
+        let r = bench_query(
+            &engine,
+            &format!("listing_{name}_index"),
+            &listing_query(tenant, filter),
+        )
+        .await;
+        r.print();
+    }
+
+    // The marker gates only the unfiltered shape; the filtered shape is a
+    // control here and should match its `_index` row within noise.
+    shard
+        .set_enqueue_time_backfill_complete(false)
+        .await
+        .expect("clear marker");
+    for (name, filter) in shapes {
+        let r = bench_query(
+            &engine,
+            &format!("listing_{name}_marker_cleared"),
+            &listing_query(tenant, filter),
+        )
+        .await;
+        r.print();
+    }
+
+    let stripped = strip_tenant_index_values(&shard, tenant).await;
+    println!("  (stripped {} index values)", stripped);
+    // Flush so the stripped entries are read from SSTs like the other states
+    // rather than from whatever mix of memtable and L0 the writes landed in.
+    shard
+        .db()
+        .flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .expect("flush stripped entries");
+    shard
+        .set_enqueue_time_backfill_complete(true)
+        .await
+        .expect("set marker");
+    for (name, filter) in shapes {
+        let r = bench_query(
+            &engine,
+            &format!("listing_{name}_fallback"),
+            &listing_query(tenant, filter),
+        )
+        .await;
+        r.print();
+    }
+
+    shard.close().await.expect("close listing clone");
 }
 
 async fn run_tenant_queries(engine: &ShardQueryEngine, tenant: &str) {

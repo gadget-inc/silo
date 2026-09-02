@@ -209,6 +209,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_backfill: silo::settings::EnqueueTimeBackfillConfig::default(),
         },
         ShardRange::full(),
     )
@@ -255,6 +256,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_backfill: silo::settings::EnqueueTimeBackfillConfig::default(),
         },
         ShardRange::full(),
     )
@@ -695,4 +697,173 @@ pub fn metric_value_or_zero(body: &str, substrings: &[&str]) -> f64 {
         .and_then(|line| line.rsplit_once(' '))
         .and_then(|(_, v)| v.parse::<f64>().ok())
         .unwrap_or(0.0)
+}
+
+fn put_preserving_expiry(
+    batch: &mut slatedb::WriteBatch,
+    key: &[u8],
+    value: &[u8],
+    expire_ts: Option<i64>,
+) {
+    use slatedb::config::{PutOptions, Ttl};
+    match expire_ts {
+        Some(ts) => batch.put_with_options(
+            key,
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAt(ts),
+            },
+        ),
+        None => batch.put(key, value),
+    }
+}
+
+/// Rewrite a job's status record and status/time index entry into the shape
+/// of rows that lack `enqueue_time_ms`: the status record without the field
+/// and the index entry with an empty value. Each row keeps its existing
+/// `expire_ts`. Shared by the query, transition-repair and backfill tests.
+pub async fn strip_enqueue_time_from_job_rows(shard: &JobStoreShard, tenant: &str, job_id: &str) {
+    use silo::codec::{decode_job_status_owned, encode_job_status};
+    use silo::keys::{idx_status_time_key, job_status_key, status_index_timestamp};
+
+    let status_key = job_status_key(tenant, job_id);
+    let status_kv = shard
+        .db()
+        .get_key_value(&status_key)
+        .await
+        .expect("get status row")
+        .expect("status row exists");
+    let mut status = decode_job_status_owned(&status_kv.value).expect("decode status");
+    status.enqueue_time_ms = None;
+    let index_key = idx_status_time_key(
+        tenant,
+        status.kind.as_str(),
+        status_index_timestamp(&status),
+        job_id,
+    );
+    let index_kv = shard
+        .db()
+        .get_key_value(&index_key)
+        .await
+        .expect("get index row")
+        .expect("index row exists");
+
+    let mut batch = slatedb::WriteBatch::new();
+    put_preserving_expiry(
+        &mut batch,
+        &status_key,
+        &encode_job_status(&status),
+        status_kv.expire_ts,
+    );
+    put_preserving_expiry(&mut batch, &index_key, &[], index_kv.expire_ts);
+    shard.db().write(batch).await.expect("write stripped rows");
+}
+
+/// Read the status/time index entry value for the job's current status
+/// through the db handle and decode it with the public codec.
+pub async fn index_entry_enqueue_time(
+    shard: &JobStoreShard,
+    tenant: &str,
+    job_id: &str,
+) -> Option<i64> {
+    use silo::keys::{decode_status_index_value, idx_status_time_key, status_index_timestamp};
+
+    let status = shard
+        .get_job_status(tenant, job_id)
+        .await
+        .expect("get status")
+        .expect("status exists");
+    let key = idx_status_time_key(
+        tenant,
+        status.kind.as_str(),
+        status_index_timestamp(&status),
+        job_id,
+    );
+    let value = shard
+        .db()
+        .get(&key)
+        .await
+        .expect("get index entry")
+        .expect("index entry exists");
+    decode_status_index_value(&value)
+}
+
+/// Assert the status record and the index entry both carry exactly the
+/// `enqueue_time_ms` stored in `JOB_INFO`.
+pub async fn assert_rows_carry_job_info_enqueue_time(
+    shard: &JobStoreShard,
+    tenant: &str,
+    job_id: &str,
+    context: &str,
+) {
+    let expected = shard
+        .get_job(tenant, job_id)
+        .await
+        .expect("get job")
+        .expect("job exists")
+        .enqueue_time_ms();
+    let status = shard
+        .get_job_status(tenant, job_id)
+        .await
+        .expect("get status")
+        .expect("status exists");
+    assert_eq!(
+        status.enqueue_time_ms,
+        Some(expected),
+        "{context}: status record enqueue_time_ms"
+    );
+    assert_eq!(
+        index_entry_enqueue_time(shard, tenant, job_id).await,
+        Some(expected),
+        "{context}: index entry enqueue_time_ms"
+    );
+}
+
+/// Assert both rows lack the value, as `strip_enqueue_time_from_job_rows`
+/// leaves them.
+pub async fn assert_rows_lack_enqueue_time(shard: &JobStoreShard, tenant: &str, job_id: &str) {
+    let status = shard
+        .get_job_status(tenant, job_id)
+        .await
+        .expect("get status")
+        .expect("status exists");
+    assert_eq!(status.enqueue_time_ms, None, "stripped status record");
+    assert_eq!(
+        index_entry_enqueue_time(shard, tenant, job_id).await,
+        None,
+        "stripped index entry"
+    );
+}
+
+/// Sweep settings for tests: enabled, with the given batch size and a 1 ms
+/// pause between batches.
+pub fn fast_enqueue_time_backfill(batch_size: usize) -> silo::settings::EnqueueTimeBackfillConfig {
+    silo::settings::EnqueueTimeBackfillConfig {
+        enabled: true,
+        batch_size,
+        pause_ms: 1,
+    }
+}
+
+/// Open (or reopen) a shard on the local filesystem at `path`, letting the
+/// caller adjust the database config before the open. Every setting not
+/// touched by `configure` keeps its default, so the enqueue-time backfill
+/// sweep stays off unless the caller enables it.
+pub async fn open_shard_at_path(
+    path: &str,
+    range: ShardRange,
+    metrics: silo::metrics::Metrics,
+    configure: impl FnOnce(&mut DatabaseConfig),
+) -> Arc<JobStoreShard> {
+    let mut cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: path.to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        ..Default::default()
+    };
+    configure(&mut cfg);
+    JobStoreShard::open(&cfg, MockGubernatorClient::new_arc(), Some(metrics), range)
+        .await
+        .expect("open shard")
 }

@@ -457,3 +457,56 @@ fn test_task_key_lookup_prefix_matches_any_epoch() {
     let other = task_key("group1", 1000, 10, "job124", 1, 0);
     assert!(!other.starts_with(&prefix));
 }
+
+#[test]
+fn status_index_value_roundtrips_enqueue_time() {
+    use silo::keys::{
+        STATUS_INDEX_VALUE_LEN, decode_status_index_value, encode_status_index_value,
+    };
+
+    let cases: [i64; 4] = [0, 1, -1, 1_700_000_000_000];
+    for enqueue_time_ms in cases {
+        let value = encode_status_index_value(Some(enqueue_time_ms));
+        assert_eq!(
+            value.len(),
+            STATUS_INDEX_VALUE_LEN,
+            "value for {enqueue_time_ms} must be 8 bytes"
+        );
+        assert_eq!(
+            decode_status_index_value(&value),
+            Some(enqueue_time_ms),
+            "roundtrip of {enqueue_time_ms}"
+        );
+    }
+}
+
+#[test]
+fn status_index_value_unknown_encodes_empty() {
+    use silo::keys::{decode_status_index_value, encode_status_index_value};
+
+    let value = encode_status_index_value(None);
+    assert!(
+        value.is_empty(),
+        "unknown enqueue time must encode as empty"
+    );
+    assert_eq!(decode_status_index_value(&value), None);
+}
+
+#[test]
+fn status_index_value_decode_tolerates_malformed_values() {
+    use silo::keys::decode_status_index_value;
+
+    let cases: [(&str, &[u8]); 4] = [
+        ("empty", &[]),
+        ("short", &[1, 2, 3]),
+        ("seven bytes", &[0; 7]),
+        ("nine bytes", &[0; 9]),
+    ];
+    for (name, value) in cases {
+        assert_eq!(
+            decode_status_index_value(value),
+            None,
+            "{name} value must decode as unknown"
+        );
+    }
+}

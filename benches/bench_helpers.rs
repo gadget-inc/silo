@@ -48,6 +48,11 @@ pub const DEEP_QUEUE_WAITERS: usize = 20_000;
 
 const METADATA_FILE: &str = "golden-metadata.json";
 
+/// On-disk format of the golden shard. Bump whenever the rows a generated
+/// shard contains change shape (a schema field, an index value encoding);
+/// a cached shard with a different version is removed and regenerated.
+pub const GOLDEN_FORMAT_VERSION: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
@@ -55,6 +60,8 @@ const METADATA_FILE: &str = "golden-metadata.json";
 /// Persisted metadata about the golden shard, written as JSON.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GoldenShardMetadata {
+    /// Must equal [`GOLDEN_FORMAT_VERSION`] for the cached shard to be reused.
+    pub format_version: u32,
     pub total_jobs: usize,
     pub checkpoint_id: Uuid,
 
@@ -231,18 +238,30 @@ pub async fn ensure_golden_shard() -> GoldenShardMetadata {
         return meta;
     }
 
+    // A cache with missing or mismatched metadata is replaced wholesale so a
+    // stale shard is never appended to.
+    if Path::new(GOLDEN_DATA_DIR).exists() {
+        println!(
+            "Removing golden shard at {} (metadata absent, unreadable, or written for a different format version)",
+            GOLDEN_DATA_DIR
+        );
+        std::fs::remove_dir_all(GOLDEN_DATA_DIR).expect("remove stale golden data dir");
+    }
     std::fs::create_dir_all(GOLDEN_DATA_DIR).expect("create golden data dir");
     let tenant_sizes = compute_tenant_sizes();
     generate_golden_dataset(&tenant_sizes).await
 }
 
+/// The cached metadata, or `None` when it is absent, unreadable, or written
+/// for a different [`GOLDEN_FORMAT_VERSION`].
 fn load_cached_metadata() -> Option<GoldenShardMetadata> {
     let path = metadata_path();
     if !path.exists() {
         return None;
     }
     let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let meta: GoldenShardMetadata = serde_json::from_str(&data).ok()?;
+    (meta.format_version == GOLDEN_FORMAT_VERSION).then_some(meta)
 }
 
 async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShardMetadata {
@@ -311,6 +330,7 @@ async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShar
     let known = collect_known_job_ids(tenant_sizes);
 
     let metadata = GoldenShardMetadata {
+        format_version: GOLDEN_FORMAT_VERSION,
         total_jobs,
         checkpoint_id: checkpoint.id,
         waiting_jobs: known.waiting,
@@ -617,6 +637,7 @@ pub async fn clone_golden_shard(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_backfill: silo::settings::EnqueueTimeBackfillConfig::default(),
             grant_scanner: silo::concurrency::GrantScannerConfig::default(),
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
@@ -630,6 +651,37 @@ pub async fn clone_golden_shard(
     let guard = CloneGuard { path: clone_path };
 
     (guard, shard)
+}
+
+/// Rewrite every status/time index entry of `tenant` with an empty value, the
+/// shape of entries written without `enqueue_time_ms`, so the index path has to
+/// hydrate each row from `JOB_INFO`. Returns the number of entries rewritten.
+pub async fn strip_tenant_index_values(shard: &JobStoreShard, tenant: &str) -> usize {
+    use silo::keys::{end_bound, idx_status_time_tenant_prefix};
+
+    let start = idx_status_time_tenant_prefix(tenant);
+    let end = end_bound(&start);
+    let mut iter = shard
+        .db()
+        .scan_with_options::<Vec<u8>, _>(start..end, &silo::scan_options_uncached())
+        .await
+        .expect("scan index entries");
+    let mut keys = Vec::new();
+    while let Some(kv) = iter.next().await.expect("next index entry") {
+        keys.push(kv.key.to_vec());
+    }
+    for chunk in keys.chunks(BATCH_SIZE) {
+        let mut batch = slatedb::WriteBatch::new();
+        for key in chunk {
+            batch.put(key, []);
+        }
+        shard
+            .db()
+            .write(batch)
+            .await
+            .expect("write stripped entries");
+    }
+    keys.len()
 }
 
 /// Open the golden shard read-only (large flush interval, no cloning).

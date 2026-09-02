@@ -232,6 +232,9 @@ table JobStatus {
   changed_at_ms: int64;
   next_attempt_starts_after_ms: int64 = null;
   current_attempt: uint32 = null;
+  /// The job's enqueue_time_ms as stored in JobInfo, copied forward on every
+  /// status transition. Absent on records written without it.
+  enqueue_time_ms: int64 = null;
 }
 
 // ============================================================

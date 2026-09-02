@@ -17,11 +17,11 @@ use crate::job_store_shard::counters::{
 };
 use crate::job_store_shard::helpers::{
     DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, now_epoch_ms, put_task,
-    retry_on_txn_conflict,
+    retry_on_txn_conflict, try_load_job_view,
 };
 use crate::keys::{
-    idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
-    tenant_status_counter_key,
+    encode_status_index_value, idx_metadata_key, idx_status_time_key, job_info_key, job_status_key,
+    status_index_timestamp, tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -431,8 +431,11 @@ impl JobStoreShard {
             start_at_ms
         };
 
-        // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time
-        let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
+        // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time.
+        // The status carries the raw start_at_ms stored in JobInfo, not the
+        // clamped effective start used for the first task.
+        let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1)
+            .with_enqueue_time_ms(start_at_ms);
         let job_status_kind = job_status.kind;
 
         writer.put(job_info_key(tenant, job_id), &job_value)?;
@@ -851,7 +854,7 @@ impl JobStoreShard {
         writer: &mut W,
         tenant: &str,
         job_id: &str,
-        new_status: JobStatus,
+        mut new_status: JobStatus,
         expire_ts: Option<i64>,
         job_metric_info: Option<&JobView>,
     ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
@@ -875,23 +878,44 @@ impl JobStoreShard {
         let new_kind = new_status.kind;
         let needs_background_action_counters =
             background_action_queue_counter_transition_is_relevant(old_kind, new_kind);
+
+        // Resolve the enqueue time to copy forward, cheapest source first. A
+        // JOB_INFO read is issued only when the old status record lacks the
+        // value, and at most once per transition: when the gauge path below
+        // reads JOB_INFO anyway, that read is reused, and a miss there ends
+        // resolution without a second read.
+        let mut enqueue_time_ms = new_status
+            .enqueue_time_ms
+            .or_else(|| old_status.as_ref().and_then(|old| old.enqueue_time_ms))
+            .or_else(|| job_metric_info.map(JobView::enqueue_time_ms));
+        let mut repair_read_issued = false;
+
         let derived_metric_info: Option<(String, Vec<(String, String)>)> =
             if needs_background_action_counters {
                 match job_metric_info {
                     Some(view) => Some((view.task_group().to_string(), view.metadata())),
-                    None => writer
-                        .get(&job_info_key(tenant, job_id))
-                        .await?
-                        .map(|raw| {
-                            JobView::new(raw)
-                                .map(|view| (view.task_group().to_string(), view.metadata()))
-                                .map_err(|e| JobStoreShardError::Codec(e.to_string()))
-                        })
-                        .transpose()?,
+                    None => {
+                        let view = try_load_job_view(writer, tenant, job_id).await?;
+                        if enqueue_time_ms.is_none() {
+                            repair_read_issued = true;
+                            enqueue_time_ms = view.as_ref().map(JobView::enqueue_time_ms);
+                        }
+                        view.map(|view| (view.task_group().to_string(), view.metadata()))
+                    }
                 }
             } else {
                 None
             };
+        if enqueue_time_ms.is_none() && !repair_read_issued {
+            repair_read_issued = true;
+            enqueue_time_ms = try_load_job_view(writer, tenant, job_id)
+                .await?
+                .map(|view| view.enqueue_time_ms());
+        }
+        if repair_read_issued && let Some(m) = &self.metrics {
+            m.record_enqueue_time_repair_reads(&self.name, 1);
+        }
+        new_status.enqueue_time_ms = enqueue_time_ms;
         let background_action_transition =
             derived_metric_info.as_ref().map(|(task_group, metadata)| {
                 BackgroundActionMetricTransition {
@@ -933,6 +957,7 @@ impl JobStoreShard {
         )
     }
 
+    /// Write the status row and merge the +1 tenant status counter for its kind.
     pub(crate) fn write_job_status_with_index_opts_and_metadata<W: WriteBatcher>(
         writer: &mut W,
         tenant: &str,
@@ -940,31 +965,46 @@ impl JobStoreShard {
         new_status: JobStatus,
         expire_ts: Option<i64>,
     ) -> Result<(), JobStoreShardError> {
-        // Write new status value
-        let job_status_value = encode_job_status(&new_status);
-        let status_key = job_status_key(tenant, job_id);
-        match expire_ts {
-            Some(ts) => writer.put_with_expire(&status_key, &job_status_value, ts)?,
-            None => writer.put(&status_key, &job_status_value)?,
-        }
-
-        // Insert new index entries
-        // For Scheduled statuses, use next_attempt_starts_after_ms as the timestamp
-        // to enable efficient waiting/future-scheduled range scans.
-        let new_kind = new_status.kind;
-        let ts = status_index_timestamp(&new_status);
-        let timek = idx_status_time_key(tenant, new_kind.as_str(), ts, job_id);
-        match expire_ts {
-            Some(ets) => writer.put_with_expire(&timek, [], ets)?,
-            None => writer.put(&timek, [])?,
-        }
-
-        // Increment tenant status counter for the new status
+        Self::write_job_status_row(writer, tenant, job_id, &new_status, expire_ts)?;
         writer.merge(
-            tenant_status_counter_key(tenant, new_kind.as_str()),
+            tenant_status_counter_key(tenant, new_status.kind.as_str()),
             encode_counter(1),
         )?;
+        Ok(())
+    }
 
+    /// Write a job's status record and its status/time index entry, both with
+    /// the optional row TTL. Moves no counters. This is the only producer of
+    /// index entry values: the entry carries the status record's
+    /// `enqueue_time_ms`, so the two can never disagree.
+    pub(crate) fn write_job_status_row<W: WriteBatcher>(
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        status: &JobStatus,
+        expire_ts: Option<i64>,
+    ) -> Result<(), JobStoreShardError> {
+        let status_value = encode_job_status(status);
+        let status_key = job_status_key(tenant, job_id);
+        // For Scheduled statuses the index is keyed by next_attempt_starts_after_ms
+        // so waiting/future-scheduled range scans stay cheap.
+        let index_key = idx_status_time_key(
+            tenant,
+            status.kind.as_str(),
+            status_index_timestamp(status),
+            job_id,
+        );
+        let index_value = encode_status_index_value(status.enqueue_time_ms);
+        match expire_ts {
+            Some(ts) => {
+                writer.put_with_expire(&status_key, &status_value, ts)?;
+                writer.put_with_expire(&index_key, &index_value, ts)?;
+            }
+            None => {
+                writer.put(&status_key, &status_value)?;
+                writer.put(&index_key, &index_value)?;
+            }
+        }
         Ok(())
     }
 

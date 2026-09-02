@@ -192,6 +192,11 @@ pub struct JobStatus {
     /// Present when a task exists in the task queue (Scheduled status), absent when the job is running (task became a lease) or terminal.
     /// Used for O(1) task key reconstruction in expedite operations.
     pub current_attempt: Option<u32>,
+    /// The job's `enqueue_time_ms` as stored in `JobInfo`. Immutable for the
+    /// job's whole life and copied forward on every status transition so the
+    /// status/time index can serve it without reading `JobInfo`. `None` on
+    /// records written without it; the next transition fills it in.
+    pub enqueue_time_ms: Option<i64>,
 }
 
 impl JobStatus {
@@ -206,7 +211,14 @@ impl JobStatus {
             changed_at_ms,
             next_attempt_starts_after_ms,
             current_attempt,
+            enqueue_time_ms: None,
         }
+    }
+
+    /// Attach the job's `enqueue_time_ms` (the value stored in `JobInfo`).
+    pub fn with_enqueue_time_ms(mut self, enqueue_time_ms: i64) -> Self {
+        self.enqueue_time_ms = Some(enqueue_time_ms);
+        self
     }
 
     /// Create a Scheduled status with the next attempt start time and attempt number.

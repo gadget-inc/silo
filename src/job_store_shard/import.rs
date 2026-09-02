@@ -192,6 +192,7 @@ impl JobStoreShard {
         let num_attempts = params.attempts.len() as u32;
         let (job_status, status_kind, is_terminal) =
             determine_import_status(params, num_attempts, now_ms, effective_start_at_ms);
+        let job_status = job_status.with_enqueue_time_ms(effective_enqueue_time_ms);
         let terminal_expire_ts: Option<i64> = if is_terminal {
             self.terminal_expire_ts(status_kind, now_ms)
         } else {
@@ -512,6 +513,8 @@ impl JobStoreShard {
         let total_attempts = params.attempts.len() as u32;
         let (new_job_status, status_kind, is_terminal) =
             determine_import_status(params, total_attempts, now_ms, effective_start_at_ms);
+        // JOB_INFO keeps the job's original enqueue time across a reimport.
+        let new_job_status = new_job_status.with_enqueue_time_ms(existing_job.enqueue_time_ms());
         let terminal_expire_ts: Option<i64> = if is_terminal {
             self.terminal_expire_ts(status_kind, now_ms)
         } else {
