@@ -8,66 +8,7 @@ mod test_helpers;
 
 use silo::job::JobStatusKind;
 use silo::job_store_shard::JobStoreShard;
-use silo::keys::{decode_status_index_value, idx_status_time_key, status_index_timestamp};
 use test_helpers::*;
-
-/// Read the index entry value for the job's current status through the db
-/// handle and decode it with the public codec.
-async fn index_entry_enqueue_time(
-    shard: &JobStoreShard,
-    tenant: &str,
-    job_id: &str,
-) -> Option<i64> {
-    let status = shard
-        .get_job_status(tenant, job_id)
-        .await
-        .expect("get status")
-        .expect("status exists");
-    let key = idx_status_time_key(
-        tenant,
-        status.kind.as_str(),
-        status_index_timestamp(&status),
-        job_id,
-    );
-    let value = shard
-        .db()
-        .get(&key)
-        .await
-        .expect("get index entry")
-        .expect("index entry exists");
-    decode_status_index_value(&value)
-}
-
-/// Assert the status record and the index entry both carry exactly the
-/// `enqueue_time_ms` stored in `JOB_INFO`.
-async fn assert_rows_carry_job_info_enqueue_time(
-    shard: &JobStoreShard,
-    tenant: &str,
-    job_id: &str,
-    context: &str,
-) {
-    let expected = shard
-        .get_job(tenant, job_id)
-        .await
-        .expect("get job")
-        .expect("job exists")
-        .enqueue_time_ms();
-    let status = shard
-        .get_job_status(tenant, job_id)
-        .await
-        .expect("get status")
-        .expect("status exists");
-    assert_eq!(
-        status.enqueue_time_ms,
-        Some(expected),
-        "{context}: status record enqueue_time_ms"
-    );
-    assert_eq!(
-        index_entry_enqueue_time(shard, tenant, job_id).await,
-        Some(expected),
-        "{context}: index entry enqueue_time_ms"
-    );
-}
 
 async fn enqueue_at(shard: &JobStoreShard, tenant: &str, start_at_ms: i64) -> String {
     shard
@@ -305,17 +246,6 @@ async fn reimport_preserves_original_enqueue_time() {
     let status = shard.get_job_status("-", "reimp").await.unwrap().unwrap();
     assert_eq!(status.kind, JobStatusKind::Succeeded);
     assert_rows_carry_job_info_enqueue_time(&shard, "-", "reimp", "reimport").await;
-}
-
-/// Assert both rows lack the value, as the stripping helper leaves them.
-async fn assert_rows_lack_enqueue_time(shard: &JobStoreShard, tenant: &str, job_id: &str) {
-    let status = shard.get_job_status(tenant, job_id).await.unwrap().unwrap();
-    assert_eq!(status.enqueue_time_ms, None, "stripped status record");
-    assert_eq!(
-        index_entry_enqueue_time(shard, tenant, job_id).await,
-        None,
-        "stripped index entry"
-    );
 }
 
 fn repair_reads(metrics: &silo::metrics::Metrics, shard: &JobStoreShard) -> f64 {

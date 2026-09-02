@@ -5,6 +5,7 @@ pub(crate) mod counters;
 mod dequeue;
 mod drop_tenant_holders;
 mod enqueue;
+pub mod enqueue_time_backfill;
 mod expedite;
 mod floating;
 pub(crate) mod helpers;
@@ -109,6 +110,9 @@ pub struct OpenShardOptions {
     /// next-hop skip threshold, live headroom). Populated from the
     /// `grant_scanner_*` knobs in the database config.
     pub grant_scanner: GrantScannerConfig,
+    /// One-shot sweep that fills `enqueue_time_ms` into status rows lacking
+    /// it. Off by default; see `EnqueueTimeBackfillConfig`.
+    pub enqueue_time_backfill: crate::settings::EnqueueTimeBackfillConfig,
     /// Max requester-counter keys the periodic concurrency reconcile sweep
     /// walks per tick. Populated from `concurrency_reconcile_scan_slice` in
     /// the database config.
@@ -239,6 +243,9 @@ pub struct JobStoreShard {
     /// it at open, written together with it by
     /// [`set_enqueue_time_backfill_complete`](Self::set_enqueue_time_backfill_complete).
     enqueue_time_backfill_complete: AtomicBool,
+    /// Settings for the sweep that fills `enqueue_time_ms` into status rows
+    /// lacking it.
+    pub(crate) enqueue_time_backfill: crate::settings::EnqueueTimeBackfillConfig,
 }
 
 #[derive(Debug, Error)]
@@ -432,6 +439,7 @@ impl JobStoreShard {
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 count_from_status_counters: cfg.count_from_status_counters,
+                enqueue_time_backfill: cfg.enqueue_time_backfill.clone(),
             },
             range,
         )
@@ -476,6 +484,7 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
+            enqueue_time_backfill,
         } = options;
 
         // Wall-clock timer for the whole open, used to emit per-phase debug
@@ -599,6 +608,7 @@ impl JobStoreShard {
             terminal_job_expire_s,
             count_from_status_counters,
             enqueue_time_backfill_complete: AtomicBool::new(enqueue_time_backfill_complete),
+            enqueue_time_backfill,
         });
 
         // Install the chain resumer before starting the grant scanner so the
@@ -646,6 +656,10 @@ impl JobStoreShard {
         // change (durable_seq advances, manifest revisions). No-op when
         // metrics are disabled.
         shard.spawn_db_status_watcher();
+
+        // Fill enqueue_time_ms into status rows written without it, once per
+        // shard. No-op unless enabled and the completion marker is absent.
+        shard.spawn_enqueue_time_backfill(range.clone());
 
         // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth.
         // Only enabled when the deployment runs the standalone compactor, which

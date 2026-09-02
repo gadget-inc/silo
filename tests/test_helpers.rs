@@ -209,6 +209,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_backfill: silo::settings::EnqueueTimeBackfillConfig::default(),
         },
         ShardRange::full(),
     )
@@ -255,6 +256,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_backfill: silo::settings::EnqueueTimeBackfillConfig::default(),
         },
         ShardRange::full(),
     )
@@ -755,4 +757,132 @@ pub async fn strip_enqueue_time_from_job_rows(shard: &JobStoreShard, tenant: &st
     );
     put_preserving_expiry(&mut batch, &index_key, &[], index_kv.expire_ts);
     shard.db().write(batch).await.expect("write stripped rows");
+}
+
+/// Read the status/time index entry value for the job's current status
+/// through the db handle and decode it with the public codec.
+pub async fn index_entry_enqueue_time(
+    shard: &JobStoreShard,
+    tenant: &str,
+    job_id: &str,
+) -> Option<i64> {
+    use silo::keys::{decode_status_index_value, idx_status_time_key, status_index_timestamp};
+
+    let status = shard
+        .get_job_status(tenant, job_id)
+        .await
+        .expect("get status")
+        .expect("status exists");
+    let key = idx_status_time_key(
+        tenant,
+        status.kind.as_str(),
+        status_index_timestamp(&status),
+        job_id,
+    );
+    let value = shard
+        .db()
+        .get(&key)
+        .await
+        .expect("get index entry")
+        .expect("index entry exists");
+    decode_status_index_value(&value)
+}
+
+/// Assert the status record and the index entry both carry exactly the
+/// `enqueue_time_ms` stored in `JOB_INFO`.
+pub async fn assert_rows_carry_job_info_enqueue_time(
+    shard: &JobStoreShard,
+    tenant: &str,
+    job_id: &str,
+    context: &str,
+) {
+    let expected = shard
+        .get_job(tenant, job_id)
+        .await
+        .expect("get job")
+        .expect("job exists")
+        .enqueue_time_ms();
+    let status = shard
+        .get_job_status(tenant, job_id)
+        .await
+        .expect("get status")
+        .expect("status exists");
+    assert_eq!(
+        status.enqueue_time_ms,
+        Some(expected),
+        "{context}: status record enqueue_time_ms"
+    );
+    assert_eq!(
+        index_entry_enqueue_time(shard, tenant, job_id).await,
+        Some(expected),
+        "{context}: index entry enqueue_time_ms"
+    );
+}
+
+/// Assert both rows lack the value, as `strip_enqueue_time_from_job_rows`
+/// leaves them.
+pub async fn assert_rows_lack_enqueue_time(shard: &JobStoreShard, tenant: &str, job_id: &str) {
+    let status = shard
+        .get_job_status(tenant, job_id)
+        .await
+        .expect("get status")
+        .expect("status exists");
+    assert_eq!(status.enqueue_time_ms, None, "stripped status record");
+    assert_eq!(
+        index_entry_enqueue_time(shard, tenant, job_id).await,
+        None,
+        "stripped index entry"
+    );
+}
+
+/// Sweep settings for tests: enabled, with the given batch size and a 1 ms
+/// pause between batches.
+pub fn fast_enqueue_time_backfill(batch_size: usize) -> silo::settings::EnqueueTimeBackfillConfig {
+    silo::settings::EnqueueTimeBackfillConfig {
+        enabled: true,
+        batch_size,
+        pause_ms: 1,
+    }
+}
+
+/// Open (or reopen) a shard on the local filesystem at `path`, letting the
+/// caller adjust the database config before the open. Every setting not
+/// touched by `configure` keeps its default, so the enqueue-time backfill
+/// sweep stays off unless the caller enables it.
+pub async fn open_shard_at_path(
+    path: &str,
+    range: ShardRange,
+    metrics: silo::metrics::Metrics,
+    configure: impl FnOnce(&mut DatabaseConfig),
+) -> Arc<JobStoreShard> {
+    let mut cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: path.to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        ..Default::default()
+    };
+    configure(&mut cfg);
+    JobStoreShard::open(&cfg, MockGubernatorClient::new_arc(), Some(metrics), range)
+        .await
+        .expect("open shard")
+}
+
+/// Open a temp shard with the enqueue-time backfill sweep enabled and fast
+/// pauses, for tests that seed rows through a different handle first.
+pub async fn open_temp_shard_with_enqueue_time_backfill(
+    batch_size: usize,
+) -> (
+    tempfile::TempDir,
+    Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let metrics = silo::metrics::init().expect("init metrics");
+    let path = tmp.path().to_string_lossy().to_string();
+    let shard = open_shard_at_path(&path, ShardRange::full(), metrics.clone(), |cfg| {
+        cfg.enqueue_time_backfill = fast_enqueue_time_backfill(batch_size);
+    })
+    .await;
+    (tmp, shard, metrics)
 }

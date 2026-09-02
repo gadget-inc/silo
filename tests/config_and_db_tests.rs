@@ -1029,3 +1029,93 @@ async fn factory_passes_slatedb_settings_to_shards() {
     let result = shard.db().get(b"key").await.expect("get");
     assert_eq!(result.unwrap().as_ref(), b"value");
 }
+
+#[silo::test]
+fn parse_toml_enqueue_time_backfill_defaults_off() {
+    use silo::settings::{DatabaseConfig, EnqueueTimeBackfillConfig};
+
+    let cfg: AppConfig = toml::from_str(
+        r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#,
+    )
+    .expect("parse TOML");
+    let defaults = EnqueueTimeBackfillConfig::default();
+    assert!(!defaults.enabled, "sweep is off by default");
+    assert_eq!(defaults.batch_size, 1000);
+    assert_eq!(defaults.pause_ms, 50);
+    assert_eq!(cfg.database.enqueue_time_backfill, defaults, "template");
+
+    let db: DatabaseConfig = toml::from_str(
+        r#"
+name = "shard-0"
+backend = "fs"
+path = "/tmp/silo-0"
+"#,
+    )
+    .expect("parse DatabaseConfig");
+    assert_eq!(db.enqueue_time_backfill, defaults, "database config");
+    assert_eq!(
+        DatabaseConfig::default().enqueue_time_backfill,
+        defaults,
+        "database config Default"
+    );
+}
+
+#[silo::test]
+fn parse_toml_enqueue_time_backfill_round_trip() {
+    use silo::settings::{DatabaseConfig, DatabaseTemplate, EnqueueTimeBackfillConfig};
+
+    let expected = EnqueueTimeBackfillConfig {
+        enabled: true,
+        batch_size: 250,
+        pause_ms: 10,
+    };
+
+    let cfg: AppConfig = toml::from_str(
+        r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+
+[database.enqueue_time_backfill]
+enabled = true
+batch_size = 250
+pause_ms = 10
+"#,
+    )
+    .expect("parse TOML");
+    assert_eq!(
+        cfg.database.enqueue_time_backfill, expected,
+        "template parse"
+    );
+    let serialized = toml::to_string(&cfg.database).expect("serialize template");
+    let template: DatabaseTemplate = toml::from_str(&serialized).expect("reparse template");
+    assert_eq!(
+        template.enqueue_time_backfill, expected,
+        "template round trip"
+    );
+
+    let db: DatabaseConfig = toml::from_str(
+        r#"
+name = "shard-0"
+backend = "fs"
+path = "/tmp/silo-0"
+
+[enqueue_time_backfill]
+enabled = true
+batch_size = 250
+pause_ms = 10
+"#,
+    )
+    .expect("parse DatabaseConfig");
+    assert_eq!(db.enqueue_time_backfill, expected, "database config parse");
+    let serialized = toml::to_string(&db).expect("serialize database config");
+    let db: DatabaseConfig = toml::from_str(&serialized).expect("reparse database config");
+    assert_eq!(
+        db.enqueue_time_backfill, expected,
+        "database config round trip"
+    );
+}

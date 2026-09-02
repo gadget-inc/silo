@@ -415,6 +415,53 @@ pub struct DatabaseTemplate {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// One-shot background sweep that fills `enqueue_time_ms` into status
+    /// records and status/time index entries that lack it. See
+    /// [`EnqueueTimeBackfillConfig`]. Off by default.
+    #[serde(default)]
+    pub enqueue_time_backfill: EnqueueTimeBackfillConfig,
+}
+
+/// Default for `enqueue_time_backfill.batch_size`.
+fn default_enqueue_time_backfill_batch_size() -> usize {
+    1000
+}
+
+/// Default for `enqueue_time_backfill.pause_ms`.
+fn default_enqueue_time_backfill_pause_ms() -> u64 {
+    50
+}
+
+/// Settings for the one-shot background sweep that fills `enqueue_time_ms`
+/// into status records and status/time index entries that lack it. The sweep
+/// runs once per shard after open, persists its progress so a restart
+/// resumes, and records a completion marker so it never runs again. Enabling
+/// it is the rollout step for serving `enqueue_time_ms` from the status index
+/// on unfiltered scans.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct EnqueueTimeBackfillConfig {
+    /// Run the sweep on shards that do not hold the completion marker.
+    /// Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Status records examined per batch before pausing. Defaults to 1000.
+    /// Values below 1 are treated as 1.
+    #[serde(default = "default_enqueue_time_backfill_batch_size")]
+    pub batch_size: usize,
+    /// Pause between batches in milliseconds. Also bounds the per-shard
+    /// jitter before the first batch. Defaults to 50.
+    #[serde(default = "default_enqueue_time_backfill_pause_ms")]
+    pub pause_ms: u64,
+}
+
+impl Default for EnqueueTimeBackfillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: default_enqueue_time_backfill_batch_size(),
+            pause_ms: default_enqueue_time_backfill_pause_ms(),
+        }
+    }
 }
 
 impl Default for DatabaseTemplate {
@@ -443,6 +490,7 @@ impl Default for DatabaseTemplate {
             count_from_status_counters: default_count_from_status_counters(),
             slatedb: None,
             memory_cache: None,
+            enqueue_time_backfill: EnqueueTimeBackfillConfig::default(),
         }
     }
 }
@@ -826,6 +874,11 @@ pub struct DatabaseConfig {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+    /// One-shot background sweep that fills `enqueue_time_ms` into status
+    /// records and status/time index entries that lack it. See
+    /// [`EnqueueTimeBackfillConfig`]. Off by default.
+    #[serde(default)]
+    pub enqueue_time_backfill: EnqueueTimeBackfillConfig,
 }
 
 impl Default for DatabaseConfig {
@@ -853,6 +906,7 @@ impl Default for DatabaseConfig {
             count_from_status_counters: default_count_from_status_counters(),
             slatedb: None,
             memory_cache: None,
+            enqueue_time_backfill: EnqueueTimeBackfillConfig::default(),
         }
     }
 }

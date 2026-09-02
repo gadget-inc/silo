@@ -96,6 +96,13 @@ apply_wal_on_close = true
 [database.wal]
 backend = "fs"
 path = "/var/lib/silo/wal/%shard%"
+
+# Optional: one-shot sweep that fills enqueue_time_ms into status rows
+# written without it (off by default)
+[database.enqueue_time_backfill]
+enabled = false
+batch_size = 1000
+pause_ms = 50
 ```
 
 ### Database Options
@@ -106,6 +113,9 @@ path = "/var/lib/silo/wal/%shard%"
 | `path` | string | `"/tmp/silo/%shard%"` | Path or URL for data storage. Use `%shard%` as a placeholder for the shard number. |
 | `apply_wal_on_close` | bool | `true` | Flush WAL to object storage before closing shards (recommended for durability) |
 | `concurrency_reconcile_interval_ms` | number | `5000` | Optional interval for periodic pending-request reconciliation in the concurrency manager |
+| `enqueue_time_backfill.enabled` | bool | `false` | Run the one-shot sweep that fills `enqueue_time_ms` into status rows written without it (see below) |
+| `enqueue_time_backfill.batch_size` | number | `1000` | Status records the sweep examines per batch before pausing |
+| `enqueue_time_backfill.pause_ms` | number | `50` | Pause between sweep batches, in milliseconds; also bounds the per-shard jitter before the first batch |
 
 <Aside type="caution">
 The `%shard%` placeholder must be an independent directory segment—it cannot have a prefix or suffix within the same path component.
@@ -167,6 +177,14 @@ Note that `apply_wal_on_close` only applies during **graceful** shutdowns. If a 
 Silo runs a background reconciliation loop while each shard is open. This loop periodically scans pending concurrency request records and re-signals grant processing. It is a self-healing mechanism for cases where durable requests exist but in-memory notifications were missed (for example, due to a crash between separate write/notify phases).
 
 This option is **optional**. If omitted, Silo uses the default value of `5000` milliseconds.
+
+#### `enqueue_time_backfill`
+
+Each job's status record and status/time index entry carry the job's `enqueue_time_ms`, which lets the query engine serve that column from the index instead of decoding every job record. Rows written by a Silo build that stored the value only in the job record lack it; queries still return the right answer for those rows by reading the job record, only slower.
+
+The `[database.enqueue_time_backfill]` sweep fills the value into every such row once per shard. It starts shortly after the shard opens, walks the shard's status records in batches of `batch_size` with a `pause_ms` pause between batches, rewrites only rows that lack the value (keeping each row's expiry exactly as it is), and records a completion marker so it never runs again on that shard. Progress is checkpointed after every batch, so a restart mid-sweep resumes where it left off. A row that a live status transition rewrites while the sweep is running is skipped, because the transition wrote the value itself.
+
+The sweep is **off by default**. Enable it in a deploy once every node runs a build that writes the value; the `silo_enqueue_time_repair_reads_total` metric counts the job-record reads it issues and stops growing once the sweep has converged.
 
 ### SlateDB Configuration
 

@@ -34,6 +34,7 @@ pub mod prefix {
     pub const COUNTER_CONCURRENCY_REQUESTERS: u8 = 0xF7;
     pub const COUNTER_TENANT_STATUS: u8 = 0xF8;
     pub const ENQUEUE_TIME_BACKFILL_COMPLETE: u8 = 0xF9;
+    pub const ENQUEUE_TIME_BACKFILL_PROGRESS: u8 = 0xFA;
 }
 
 /// Encode a key with its namespace prefix.
@@ -624,6 +625,12 @@ pub fn cleanup_status_key() -> Vec<u8> {
 /// index entry on this shard carries `enqueue_time_ms`.
 pub fn enqueue_time_backfill_complete_key() -> Vec<u8> {
     vec![prefix::ENQUEUE_TIME_BACKFILL_COMPLETE]
+}
+
+/// Key for the enqueue-time backfill sweep's persisted progress (resume
+/// point and counts).
+pub fn enqueue_time_backfill_progress_key() -> Vec<u8> {
+    vec![prefix::ENQUEUE_TIME_BACKFILL_PROGRESS]
 }
 
 /// Key for storing the timestamp (ms) when the shard was first created/initialized.
