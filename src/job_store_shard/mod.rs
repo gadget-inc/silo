@@ -38,6 +38,7 @@ use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::Arc;
 #[cfg(feature = "server")]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -233,6 +234,11 @@ pub struct JobStoreShard {
     /// When true, the query engine answers unfiltered per-tenant `COUNT(*)`
     /// from per-status counters instead of a full status-index scan.
     pub(crate) count_from_status_counters: bool,
+    /// Whether every status record and status/time index entry on this shard
+    /// carries `enqueue_time_ms`. Mirrors the completion marker key: read from
+    /// it at open, written together with it by
+    /// [`set_enqueue_time_backfill_complete`](Self::set_enqueue_time_backfill_complete).
+    enqueue_time_backfill_complete: AtomicBool,
 }
 
 #[derive(Debug, Error)]
@@ -565,6 +571,11 @@ impl JobStoreShard {
             range.clone(),
         );
 
+        let enqueue_time_backfill_complete = db
+            .get(&crate::keys::enqueue_time_backfill_complete_key())
+            .await?
+            .is_some();
+
         let shard = Arc::new(Self {
             name,
             db,
@@ -587,6 +598,7 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
+            enqueue_time_backfill_complete: AtomicBool::new(enqueue_time_backfill_complete),
         });
 
         // Install the chain resumer before starting the grant scanner so the
@@ -659,6 +671,34 @@ impl JobStoreShard {
         );
 
         Ok(shard)
+    }
+
+    /// Whether every status record and status/time index entry on this shard
+    /// carries `enqueue_time_ms`. While false, index entries written without
+    /// the value may still exist, so unfiltered scans that project
+    /// `enqueue_time_ms` must read it from `JOB_INFO`.
+    pub fn enqueue_time_backfill_complete(&self) -> bool {
+        self.enqueue_time_backfill_complete.load(Ordering::Acquire)
+    }
+
+    /// Record or clear backfill completion: writes (or deletes) the marker key
+    /// and updates the in-memory flag together, so the flag never disagrees
+    /// with what a reopen would read.
+    pub async fn set_enqueue_time_backfill_complete(
+        &self,
+        complete: bool,
+    ) -> Result<(), JobStoreShardError> {
+        let key = crate::keys::enqueue_time_backfill_complete_key();
+        if complete {
+            self.db
+                .put(&key, helpers::now_epoch_ms().to_be_bytes())
+                .await?;
+        } else {
+            self.db.delete(&key).await?;
+        }
+        self.enqueue_time_backfill_complete
+            .store(complete, Ordering::Release);
+        Ok(())
     }
 
     /// Get the query engine for this shard, lazily initializing it on first access.

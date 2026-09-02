@@ -166,6 +166,11 @@ pub struct Metrics {
     /// shard. Stays flat for index-only scans — the signal that an aggregate
     /// shape rode the index-only path instead of per-row hydration.
     query_point_lookups: CounterVec,
+    /// `JOB_INFO` reads issued to resolve `enqueue_time_ms` for a status
+    /// record that lacks it, per shard — on the write path (once per such
+    /// record, at its next transition) and in the backfill sweep. Converges
+    /// to zero once every status record carries the value.
+    enqueue_time_repair_reads: CounterVec,
 
     // Shard/broker metrics
     shards_owned: Gauge,
@@ -475,6 +480,23 @@ impl Metrics {
     /// tests and operational assertions that a scan stayed on the index-only path.
     pub fn query_point_lookups_value(&self, shard: &str) -> f64 {
         self.query_point_lookups.with_label_values(&[shard]).get()
+    }
+
+    /// Add `n` to the per-shard enqueue-time repair-read counter: `JOB_INFO`
+    /// reads issued to fill in `enqueue_time_ms` on a status record lacking it.
+    pub fn record_enqueue_time_repair_reads(&self, shard: &str, n: u64) {
+        self.enqueue_time_repair_reads
+            .with_label_values(&[shard])
+            .inc_by(n as f64);
+    }
+
+    /// Read the current enqueue-time repair-read counter for a shard. Exposed
+    /// for tests and operational assertions that a transition or sweep did not
+    /// touch `JOB_INFO`.
+    pub fn enqueue_time_repair_reads_value(&self, shard: &str) -> f64 {
+        self.enqueue_time_repair_reads
+            .with_label_values(&[shard])
+            .get()
     }
 
     /// Update the number of shards owned by this node (from coordinator).
@@ -2085,6 +2107,16 @@ pub fn init() -> anyhow::Result<Metrics> {
             &["shard"],
         )?,
     );
+    let enqueue_time_repair_reads = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_enqueue_time_repair_reads_total",
+                "JOB_INFO reads issued to resolve enqueue_time_ms for status records lacking it, per shard",
+            ),
+            &["shard"],
+        )?,
+    );
 
     // Shard/broker metrics
     let shards_owned = register(
@@ -2589,6 +2621,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         query_cancelled,
         query_scanned_keys,
         query_point_lookups,
+        enqueue_time_repair_reads,
         shards_owned,
         shards_unassigned,
         coordination_shards_open,

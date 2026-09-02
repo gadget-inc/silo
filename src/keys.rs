@@ -33,6 +33,7 @@ pub mod prefix {
     pub const CLEANUP_COMPLETED_AT: u8 = 0xF6;
     pub const COUNTER_CONCURRENCY_REQUESTERS: u8 = 0xF7;
     pub const COUNTER_TENANT_STATUS: u8 = 0xF8;
+    pub const ENQUEUE_TIME_BACKFILL_COMPLETE: u8 = 0xF9;
 }
 
 /// Encode a key with its namespace prefix.
@@ -187,6 +188,26 @@ pub fn status_index_timestamp(status: &JobStatus) -> i64 {
     } else {
         status.changed_at_ms
     }
+}
+
+/// Byte length of a status/time index entry value that carries an enqueue time.
+pub const STATUS_INDEX_VALUE_LEN: usize = 8;
+
+/// Encode the value stored under a status/time index key: the job's
+/// `enqueue_time_ms` as a big-endian i64, or empty when it is unknown.
+pub fn encode_status_index_value(enqueue_time_ms: Option<i64>) -> Vec<u8> {
+    match enqueue_time_ms {
+        Some(ms) => ms.to_be_bytes().to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Decode a status/time index entry value into the job's `enqueue_time_ms`.
+/// An empty value means the entry was written without one; any other length
+/// is treated the same way (unknown), never as an error.
+pub fn decode_status_index_value(value: &[u8]) -> Option<i64> {
+    let bytes: [u8; STATUS_INDEX_VALUE_LEN] = value.try_into().ok()?;
+    Some(i64::from_be_bytes(bytes))
 }
 
 /// Index: jobs by metadata key/value (unsorted within key/value).
@@ -597,6 +618,12 @@ pub fn cleanup_complete_key() -> Vec<u8> {
 /// This is the source of truth for whether the shard needs cleanup work.
 pub fn cleanup_status_key() -> Vec<u8> {
     vec![prefix::CLEANUP_STATUS]
+}
+
+/// Key for the marker recording that every status record and status/time
+/// index entry on this shard carries `enqueue_time_ms`.
+pub fn enqueue_time_backfill_complete_key() -> Vec<u8> {
+    vec![prefix::ENQUEUE_TIME_BACKFILL_COMPLETE]
 }
 
 /// Key for storing the timestamp (ms) when the shard was first created/initialized.

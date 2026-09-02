@@ -607,3 +607,14 @@ fn test_decoded_task_invalid_data() {
     let result = decode_task_validated(vec![0xFF, 0xFF]);
     assert!(result.is_err());
 }
+
+#[silo::test]
+fn test_job_status_enqueue_time_roundtrip() {
+    let without = JobStatus::running(5000);
+    let decoded = decode_job_status_owned(&encode_job_status(&without)).unwrap();
+    assert_eq!(decoded.enqueue_time_ms, None);
+
+    let with = JobStatus::running(5000).with_enqueue_time_ms(1_700_000_000_000);
+    let decoded = decode_job_status_owned(&encode_job_status(&with)).unwrap();
+    assert_eq!(decoded.enqueue_time_ms, Some(1_700_000_000_000));
+}

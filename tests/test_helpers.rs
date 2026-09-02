@@ -696,3 +696,63 @@ pub fn metric_value_or_zero(body: &str, substrings: &[&str]) -> f64 {
         .and_then(|(_, v)| v.parse::<f64>().ok())
         .unwrap_or(0.0)
 }
+
+fn put_preserving_expiry(
+    batch: &mut slatedb::WriteBatch,
+    key: &[u8],
+    value: &[u8],
+    expire_ts: Option<i64>,
+) {
+    use slatedb::config::{PutOptions, Ttl};
+    match expire_ts {
+        Some(ts) => batch.put_with_options(
+            key,
+            value,
+            &PutOptions {
+                ttl: Ttl::ExpireAt(ts),
+            },
+        ),
+        None => batch.put(key, value),
+    }
+}
+
+/// Rewrite a job's status record and status/time index entry into the shape
+/// of rows that lack `enqueue_time_ms`: the status record without the field
+/// and the index entry with an empty value. Each row keeps its existing
+/// `expire_ts`. Shared by the query, transition-repair and backfill tests.
+pub async fn strip_enqueue_time_from_job_rows(shard: &JobStoreShard, tenant: &str, job_id: &str) {
+    use silo::codec::{decode_job_status_owned, encode_job_status};
+    use silo::keys::{idx_status_time_key, job_status_key, status_index_timestamp};
+
+    let status_key = job_status_key(tenant, job_id);
+    let status_kv = shard
+        .db()
+        .get_key_value(&status_key)
+        .await
+        .expect("get status row")
+        .expect("status row exists");
+    let mut status = decode_job_status_owned(&status_kv.value).expect("decode status");
+    status.enqueue_time_ms = None;
+    let index_key = idx_status_time_key(
+        tenant,
+        status.kind.as_str(),
+        status_index_timestamp(&status),
+        job_id,
+    );
+    let index_kv = shard
+        .db()
+        .get_key_value(&index_key)
+        .await
+        .expect("get index row")
+        .expect("index row exists");
+
+    let mut batch = slatedb::WriteBatch::new();
+    put_preserving_expiry(
+        &mut batch,
+        &status_key,
+        &encode_job_status(&status),
+        status_kv.expire_ts,
+    );
+    put_preserving_expiry(&mut batch, &index_key, &[], index_kv.expire_ts);
+    shard.db().write(batch).await.expect("write stripped rows");
+}

@@ -451,6 +451,21 @@ pub(crate) async fn load_job_view(
     crate::job::JobView::new(job_raw)
 }
 
+/// Load a `JobView` for the given tenant/job, or `None` when the job info
+/// key does not exist.
+pub(crate) async fn try_load_job_view(
+    reader: &impl WriteBatcher,
+    tenant: &str,
+    id: &str,
+) -> Result<Option<crate::job::JobView>, JobStoreShardError> {
+    let job_info_key = crate::keys::job_info_key(tenant, id);
+    reader
+        .get(&job_info_key)
+        .await?
+        .map(crate::job::JobView::new)
+        .transpose()
+}
+
 /// Decode a `JobStatus` from raw bytes into an owned value.
 pub(crate) fn decode_job_status_owned(raw: &[u8]) -> Result<JobStatus, JobStoreShardError> {
     Ok(crate::codec::decode_job_status_owned(raw)?)
