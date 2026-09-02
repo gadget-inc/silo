@@ -242,7 +242,7 @@ pub async fn ensure_golden_shard() -> GoldenShardMetadata {
     // stale shard is never appended to.
     if Path::new(GOLDEN_DATA_DIR).exists() {
         println!(
-            "Removing golden shard at {} (missing or mismatched format version)",
+            "Removing golden shard at {} (metadata absent, unreadable, or written for a different format version)",
             GOLDEN_DATA_DIR
         );
         std::fs::remove_dir_all(GOLDEN_DATA_DIR).expect("remove stale golden data dir");

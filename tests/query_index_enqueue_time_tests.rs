@@ -324,6 +324,9 @@ async fn other_job_info_columns_keep_the_job_record_path() {
     }
 }
 
+/// Every index-served shape hydrates exactly the rows in its range whose
+/// entry lacks the value. The status shapes run without the marker, since
+/// they are index-served regardless of it.
 #[silo::test]
 async fn rows_lacking_the_value_are_hydrated_individually() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
@@ -331,29 +334,46 @@ async fn rows_lacking_the_value_are_hydrated_individually() {
     for i in 0..10 {
         strip_enqueue_time_from_job_rows(&shard, "-", &format!("future{i:03}")).await;
     }
-    shard
-        .set_enqueue_time_backfill_complete(true)
-        .await
-        .unwrap();
+    strip_enqueue_time_from_job_rows(&shard, "-", "done").await;
+    strip_enqueue_time_from_job_rows(&shard, "-", "waiting").await;
     let sql = engine(&shard);
-    let query = "SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-'";
 
-    let before = snapshot(&metrics, &shard);
-    let rows = id_enqueue_rows(&run(&sql, query).await);
-    let after = snapshot(&metrics, &shard);
+    // (shape name, marker set, stripped rows inside the shape's ranges)
+    let cases = [
+        ("FullScan", true, 12.0),
+        ("Status stored", false, 1.0),
+        ("Status virtual", false, 1.0),
+        ("StatusUnion", false, 2.0),
+    ];
+    for (name, marker, stripped_in_range) in cases {
+        let query = INDEX_SERVED_SHAPES
+            .iter()
+            .find(|(shape, _)| *shape == name)
+            .map(|(_, query)| *query)
+            .expect("known shape");
+        shard
+            .set_enqueue_time_backfill_complete(marker)
+            .await
+            .unwrap();
+        assert_eq!(explain_path(&sql, query).await, "status-index", "{name}");
 
-    assert_eq!(rows.len(), expected.len());
-    assert_rows_match(&rows, &expected, "mixed chunk");
-    assert_eq!(
-        after.fallback - before.fallback,
-        10.0,
-        "one hydration per stripped row"
-    );
-    assert_eq!(
-        after.point_lookups - before.point_lookups,
-        10.0,
-        "rows carrying the value are not looked up"
-    );
+        let before = snapshot(&metrics, &shard);
+        let rows = id_enqueue_rows(&run(&sql, query).await);
+        let after = snapshot(&metrics, &shard);
+
+        assert!(!rows.is_empty(), "{name}: rows");
+        assert_rows_match(&rows, &expected, name);
+        assert_eq!(
+            after.fallback - before.fallback,
+            stripped_in_range,
+            "{name}: one hydration per stripped row in range"
+        );
+        assert_eq!(
+            after.point_lookups - before.point_lookups,
+            stripped_in_range,
+            "{name}: rows carrying the value are not looked up"
+        );
+    }
 }
 
 #[silo::test]
@@ -388,6 +408,19 @@ async fn row_whose_job_info_is_gone_is_dropped_without_error() {
     );
     assert_eq!(rows.len(), expected.len());
     assert_rows_match(&rows, &expected, "after drop");
+
+    // A dropped row does not count toward the LIMIT: the scan pulls the next
+    // entry in its place.
+    let limit = expected.len();
+    let limited = id_enqueue_rows(
+        &run(
+            &sql,
+            &format!("SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-' LIMIT {limit}"),
+        )
+        .await,
+    );
+    assert_eq!(limited.len(), limit, "LIMIT filled past the dropped row");
+    assert_rows_match(&limited, &expected, "limited after drop");
 }
 
 #[silo::test]
@@ -497,4 +530,82 @@ async fn waiting_status_query_returns_the_transition_time() {
             .value(0);
         assert_eq!(changed, status.changed_at_ms, "complete={complete}");
     }
+}
+
+/// The editor's listing shape on a tenant larger than production's problem
+/// threshold. Imports 120k jobs, so it runs only on request:
+/// `cargo test --test query_index_enqueue_time_tests -- --ignored`.
+#[silo::test]
+#[ignore]
+async fn listing_query_on_a_100k_job_tenant_is_index_only() {
+    use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
+
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let total = 120_000usize;
+    let now = now_ms();
+    for chunk_start in (0..total).step_by(500) {
+        let params: Vec<ImportJobParams> = (chunk_start..(chunk_start + 500).min(total))
+            .map(|i| {
+                let enqueue_time_ms = now - total as i64 + i as i64;
+                let attempts = if i % 2 == 0 {
+                    vec![ImportedAttempt {
+                        status: ImportedAttemptStatus::Succeeded { result: vec![] },
+                        started_at_ms: enqueue_time_ms + 10,
+                        finished_at_ms: enqueue_time_ms + 20,
+                    }]
+                } else {
+                    vec![]
+                };
+                ImportJobParams {
+                    id: format!("job-{i:07}"),
+                    priority: 50,
+                    enqueue_time_ms,
+                    start_at_ms: now + 3_600_000,
+                    retry_policy: None,
+                    payload: msgpack_payload(&serde_json::json!({"i": i})),
+                    limits: vec![],
+                    metadata: None,
+                    task_group: "default".to_string(),
+                    attempts,
+                }
+            })
+            .collect();
+        let results = shard.import_jobs("-", params).await.expect("import");
+        assert!(
+            results.iter().all(|r| r.success),
+            "import batch at {chunk_start}"
+        );
+    }
+    let sql = engine(&shard);
+
+    // Both paths see every row when the sample bound exceeds the tenant, so
+    // their results must agree exactly.
+    let whole_tenant = "SELECT id FROM (SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-' LIMIT 200000) ORDER BY enqueue_time_ms DESC, id DESC LIMIT 101";
+    assert_eq!(explain_path(&sql, whole_tenant).await, "fullscan-join");
+    let job_record_order = string_column(&run(&sql, whole_tenant).await, "id");
+    shard
+        .set_enqueue_time_backfill_complete(true)
+        .await
+        .unwrap();
+    assert_eq!(explain_path(&sql, whole_tenant).await, "status-index");
+    let before = snapshot(&metrics, &shard);
+    let index_order = string_column(&run(&sql, whole_tenant).await, "id");
+    let after = snapshot(&metrics, &shard);
+    assert_eq!(index_order.len(), 101);
+    assert_eq!(index_order, job_record_order, "same rows in the same order");
+    assert_eq!(
+        after.point_lookups, before.point_lookups,
+        "zero JOB_INFO point lookups"
+    );
+    assert_eq!(after.fallback, before.fallback, "zero fallback hydrations");
+
+    // The production shape (50k sample) is index-only as well.
+    let production = "SELECT id FROM (SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-' LIMIT 50000) ORDER BY enqueue_time_ms DESC, id DESC LIMIT 101";
+    assert_eq!(explain_path(&sql, production).await, "status-index");
+    let before = snapshot(&metrics, &shard);
+    let rows = string_column(&run(&sql, production).await, "id");
+    let after = snapshot(&metrics, &shard);
+    assert_eq!(rows.len(), 101);
+    assert_eq!(after.point_lookups, before.point_lookups);
+    assert_eq!(after.fallback, before.fallback);
 }

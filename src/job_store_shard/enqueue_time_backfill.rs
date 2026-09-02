@@ -11,6 +11,7 @@
 //! completion marker and flag, after which the sweep never runs again.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -19,10 +20,11 @@ use slatedb::bytes::Bytes;
 use tracing::{debug, info, warn};
 
 use crate::job::JobView;
-use crate::job_store_shard::helpers::{TxnWriter, decode_job_status_owned};
+use crate::job_store_shard::helpers::{TxnWriter, decode_job_status_owned, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    end_bound, enqueue_time_backfill_progress_key, job_info_key, parse_job_status_key, prefix,
+    end_bound, enqueue_time_backfill_complete_key, enqueue_time_backfill_progress_key,
+    job_info_key, parse_job_status_key, prefix,
 };
 use crate::shard_range::ShardRange;
 
@@ -39,8 +41,21 @@ pub struct EnqueueTimeBackfillProgress {
     pub repaired: u64,
     /// Rows skipped because a concurrent transition rewrote them first.
     pub skipped_conflict: u64,
-    /// Rows skipped because their `JOB_INFO` no longer exists.
+    /// Rows skipped because `JOB_INFO` is absent.
     pub skipped_missing_job_info: u64,
+    /// Rows skipped because the status record or `JOB_INFO` failed to decode.
+    #[serde(default)]
+    pub skipped_undecodable: u64,
+}
+
+/// How a batch ended.
+enum BatchEnd {
+    /// The iterator ran out before the batch filled: the keyspace is done.
+    Exhausted,
+    /// The batch filled; resume after this key.
+    Checkpoint(Vec<u8>),
+    /// The shard is closing; resume after this key, if any row was examined.
+    Cancelled(Option<Vec<u8>>),
 }
 
 /// Outcome of one [`JobStoreShard::run_enqueue_time_backfill`] call.
@@ -88,6 +103,7 @@ impl JobStoreShard {
                     repaired = outcome.progress.repaired,
                     skipped_conflict = outcome.progress.skipped_conflict,
                     skipped_missing_job_info = outcome.progress.skipped_missing_job_info,
+                    skipped_undecodable = outcome.progress.skipped_undecodable,
                     "enqueue-time backfill complete"
                 ),
                 Ok(outcome) => debug!(
@@ -95,6 +111,11 @@ impl JobStoreShard {
                     scanned = outcome.progress.scanned,
                     repaired = outcome.progress.repaired,
                     "enqueue-time backfill paused (shard closing); resumes on next open"
+                ),
+                Err(e) if cancellation.is_cancelled() => debug!(
+                    shard = %shard.name,
+                    error = %e,
+                    "enqueue-time backfill interrupted by shard close; resumes on next open"
                 ),
                 Err(e) => warn!(
                     shard = %shard.name,
@@ -107,8 +128,10 @@ impl JobStoreShard {
 
     /// Run the sweep until the keyspace is exhausted or the shard's
     /// cancellation token fires, resuming from any persisted progress.
-    /// Completion writes the marker and sets the in-memory flag.
-    pub async fn run_enqueue_time_backfill(
+    /// Completion writes the final progress and the marker together and sets
+    /// the in-memory flag. The sweep is idempotent, so unreadable progress
+    /// restarts it from the beginning rather than stopping it.
+    pub(crate) async fn run_enqueue_time_backfill(
         &self,
         range: &ShardRange,
     ) -> Result<EnqueueTimeBackfillOutcome, JobStoreShardError> {
@@ -121,13 +144,18 @@ impl JobStoreShard {
             .unwrap_or_default();
 
         loop {
-            let start = match &progress.last_key {
-                Some(last_key) => {
-                    let mut key = hex::decode(last_key).map_err(|e| {
-                        JobStoreShardError::Codec(format!("backfill progress key: {e}"))
-                    })?;
+            let start = match progress.last_key.as_deref().map(hex::decode) {
+                Some(Ok(mut key)) if key.first() == Some(&prefix::JOB_STATUS) => {
                     key.push(0);
                     key
+                }
+                Some(_) => {
+                    warn!(
+                        shard = %self.name,
+                        "enqueue-time backfill: persisted resume key is not a JOB_STATUS key; restarting from the beginning"
+                    );
+                    progress.last_key = None;
+                    vec![prefix::JOB_STATUS]
                 }
                 None => vec![prefix::JOB_STATUS],
             };
@@ -140,16 +168,30 @@ impl JobStoreShard {
                     &mut progress,
                 )
                 .await?;
-            let Some(last_key) = batch_end else {
-                self.save_enqueue_time_backfill_progress(&progress).await?;
-                self.set_enqueue_time_backfill_complete(true).await?;
-                return Ok(EnqueueTimeBackfillOutcome {
-                    progress,
-                    complete: true,
-                });
-            };
-            progress.last_key = Some(hex::encode(&last_key));
-            self.save_enqueue_time_backfill_progress(&progress).await?;
+            match batch_end {
+                BatchEnd::Exhausted => {
+                    self.record_enqueue_time_backfill_complete(&progress)
+                        .await?;
+                    return Ok(EnqueueTimeBackfillOutcome {
+                        progress,
+                        complete: true,
+                    });
+                }
+                BatchEnd::Cancelled(last_key) => {
+                    if let Some(last_key) = last_key {
+                        progress.last_key = Some(hex::encode(&last_key));
+                        self.save_enqueue_time_backfill_progress(&progress).await?;
+                    }
+                    return Ok(EnqueueTimeBackfillOutcome {
+                        progress,
+                        complete: false,
+                    });
+                }
+                BatchEnd::Checkpoint(last_key) => {
+                    progress.last_key = Some(hex::encode(&last_key));
+                    self.save_enqueue_time_backfill_progress(&progress).await?;
+                }
+            }
             debug!(
                 shard = %self.name,
                 scanned = progress.scanned,
@@ -167,14 +209,46 @@ impl JobStoreShard {
     }
 
     /// The persisted sweep progress, or `None` if the sweep has not run on
-    /// this shard.
+    /// this shard or its record is unreadable.
     pub async fn enqueue_time_backfill_progress(
         &self,
     ) -> Result<Option<EnqueueTimeBackfillProgress>, JobStoreShardError> {
-        match self.db.get(&enqueue_time_backfill_progress_key()).await? {
-            Some(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
-            None => Ok(None),
+        let Some(raw) = self.db.get(&enqueue_time_backfill_progress_key()).await? else {
+            return Ok(None);
+        };
+        match serde_json::from_slice(&raw) {
+            Ok(progress) => Ok(Some(progress)),
+            Err(e) => {
+                warn!(
+                    shard = %self.name,
+                    error = %e,
+                    "enqueue-time backfill: persisted progress is unreadable; treating as absent"
+                );
+                Ok(None)
+            }
         }
+    }
+
+    /// Write the final progress and the completion marker in one batch, then
+    /// set the flag, so a crash cannot leave the counts and the marker
+    /// disagreeing.
+    async fn record_enqueue_time_backfill_complete(
+        &self,
+        progress: &EnqueueTimeBackfillProgress,
+    ) -> Result<(), JobStoreShardError> {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            enqueue_time_backfill_progress_key(),
+            serde_json::to_vec(progress)?,
+        );
+        batch.put(
+            enqueue_time_backfill_complete_key(),
+            now_epoch_ms().to_be_bytes(),
+        );
+        self.db.write(batch).await?;
+        self.enqueue_time_backfill_complete
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn save_enqueue_time_backfill_progress(
@@ -188,10 +262,10 @@ impl JobStoreShard {
         Ok(())
     }
 
-    /// Examine up to `batch_size` status records from `start`. Returns the
-    /// last key examined, or `None` when the keyspace ended before the batch
-    /// filled. Iterates the database directly with uncached scan options so
-    /// the sweep's reads never register as query scanned keys.
+    /// Examine up to `batch_size` status records from `start`, stopping early
+    /// when the shard starts closing. Iterates the database directly with
+    /// uncached scan options so the sweep's reads never register as query
+    /// scanned keys.
     async fn enqueue_time_backfill_batch(
         &self,
         range: &ShardRange,
@@ -199,15 +273,18 @@ impl JobStoreShard {
         end: Vec<u8>,
         batch_size: usize,
         progress: &mut EnqueueTimeBackfillProgress,
-    ) -> Result<Option<Vec<u8>>, JobStoreShardError> {
+    ) -> Result<BatchEnd, JobStoreShardError> {
         let mut iter = self
             .db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options_uncached())
             .await?;
         let mut last_key = None;
         for _ in 0..batch_size {
+            if self.cancellation.is_cancelled() {
+                return Ok(BatchEnd::Cancelled(last_key));
+            }
             let Some(kv) = iter.next().await? else {
-                return Ok(None);
+                return Ok(BatchEnd::Exhausted);
             };
             last_key = Some(kv.key.to_vec());
             let Some(parsed) = parse_job_status_key(&kv.key) else {
@@ -227,7 +304,9 @@ impl JobStoreShard {
             )
             .await?;
         }
-        Ok(last_key)
+        Ok(BatchEnd::Checkpoint(
+            last_key.expect("a full batch examined at least one key"),
+        ))
     }
 
     /// Rewrite one status record and its index entry with `enqueue_time_ms`
@@ -246,6 +325,7 @@ impl JobStoreShard {
         let status = match decode_job_status_owned(status_raw) {
             Ok(status) => status,
             Err(e) => {
+                progress.skipped_undecodable += 1;
                 warn!(
                     shard = %self.name,
                     tenant = %tenant,
@@ -267,7 +347,20 @@ impl JobStoreShard {
             progress.skipped_missing_job_info += 1;
             return Ok(());
         };
-        let enqueue_time_ms = JobView::new(job_raw)?.enqueue_time_ms();
+        let enqueue_time_ms = match JobView::new(job_raw) {
+            Ok(view) => view.enqueue_time_ms(),
+            Err(e) => {
+                progress.skipped_undecodable += 1;
+                warn!(
+                    shard = %self.name,
+                    tenant = %tenant,
+                    job_id = %job_id,
+                    error = %e,
+                    "enqueue-time backfill: failed to decode job info, skipping row"
+                );
+                return Ok(());
+            }
+        };
 
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         if txn.get(status_key).await?.as_ref() != Some(status_raw) {

@@ -906,7 +906,8 @@ struct ProjectionNeeds {
     need_status_index_fields: bool,
     /// Needs fields only in the status record: current_attempt, next_attempt_starts_after_ms
     need_status_point_lookup: bool,
-    /// Fast path: scan status/time index directly, no point-lookups required
+    /// Fast path: scan status/time index directly, with point-lookups only for
+    /// entries lacking an index-served enqueue_time_ms
     use_status_index_path: bool,
     /// On the fast path, enqueue_time_ms is projected and read from each index
     /// entry's value, with a job_info read for just the entries lacking it.
@@ -964,11 +965,12 @@ fn analyze_projection(
     // (per-status ranges of the same index) — other strategies already have a
     // bounded pair list.
     let base_fast_path = !need_other_job_info && !need_status_point_lookup && index_path_strategy;
-    // enqueue_time_ms is index-served only where the scanned ranges are
-    // expected to carry it in every entry: tenant-scoped Status and StatusUnion
-    // always, FullScan once the shard's backfill has completed. Entries that
-    // lack it are hydrated from job_info individually. Whenever the fast path
-    // is not taken, the column stays a job_info column.
+    // enqueue_time_ms is index-served where per-row hydration of entries that
+    // lack it can never cost more than the alternative: tenant-scoped Status
+    // and StatusUnion always (their pairs path already reads job_info per
+    // row), FullScan only once the shard's backfill has completed (its merge
+    // join is cheaper than per-row hydration). Whenever the fast path is not
+    // taken, the column stays a job_info column.
     let enqueue_time_from_index = need_enqueue_time
         && base_fast_path
         && match strategy {
@@ -1151,7 +1153,8 @@ struct IndexRow {
 }
 
 /// Streams the status/time index in bounded chunks, emitting RecordBatches with
-/// no point-lookups. Used when the projection only needs tenant, id,
+/// no point-lookups beyond the per-row `enqueue_time_ms` hydration described
+/// below. Used when the projection only needs tenant, id,
 /// status_kind, status_changed_at_ms or an index-served enqueue_time_ms
 /// (including the COUNT(*) fallback when counter-based counting is disabled).
 /// Serves FullScan (one whole-prefix range), tenant-scoped Status (one range)
@@ -1280,24 +1283,29 @@ async fn hydrate_missing_enqueue_times(
     if by_tenant.is_empty() {
         return Ok(());
     }
-    let mut found: HashMap<(String, String), i64> = HashMap::new();
+    let mut found: HashMap<&str, HashMap<String, i64>> = HashMap::new();
     for (tenant, ids) in &by_tenant {
         if let Some(metrics) = &shard.metrics {
             metrics.record_query_point_lookups(shard.name(), ids.len() as u64);
             metrics.record_enqueue_time_fallback_hydrations(shard.name(), ids.len() as u64);
         }
         let views = shard.get_jobs_batch(tenant, ids).await.map_err(exec_err)?;
-        found.extend(
+        found.insert(
+            tenant.as_str(),
             views
                 .into_iter()
-                .map(|(id, view)| ((tenant.clone(), id), view.enqueue_time_ms())),
+                .map(|(id, view)| (id, view.enqueue_time_ms()))
+                .collect(),
         );
     }
     rows.retain_mut(|row| {
         if row.enqueue_time_ms.is_some() {
             return true;
         }
-        match found.get(&(row.tenant.clone(), row.job_id.clone())) {
+        match found
+            .get(row.tenant.as_str())
+            .and_then(|by_id| by_id.get(&row.job_id))
+        {
             Some(enqueue_time_ms) => {
                 row.enqueue_time_ms = Some(*enqueue_time_ms);
                 true
@@ -1390,7 +1398,13 @@ fn build_status_index_batch(
             "enqueue_time_ms" => Arc::new(Int64Array::from(
                 chunk
                     .iter()
-                    .map(|row| row.enqueue_time_ms.unwrap_or(0))
+                    .map(|row| {
+                        debug_assert!(
+                            row.enqueue_time_ms.is_some(),
+                            "enqueue_time_ms projected on the index path without hydration"
+                        );
+                        row.enqueue_time_ms.unwrap_or(0)
+                    })
                     .collect::<Vec<i64>>(),
             )),
             _ => new_null_array(f.data_type(), n),

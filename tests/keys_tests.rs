@@ -460,14 +460,16 @@ fn test_task_key_lookup_prefix_matches_any_epoch() {
 
 #[test]
 fn status_index_value_roundtrips_enqueue_time() {
-    use silo::keys::{decode_status_index_value, encode_status_index_value};
+    use silo::keys::{
+        STATUS_INDEX_VALUE_LEN, decode_status_index_value, encode_status_index_value,
+    };
 
     let cases: [i64; 4] = [0, 1, -1, 1_700_000_000_000];
     for enqueue_time_ms in cases {
         let value = encode_status_index_value(Some(enqueue_time_ms));
         assert_eq!(
             value.len(),
-            8,
+            STATUS_INDEX_VALUE_LEN,
             "value for {enqueue_time_ms} must be 8 bytes"
         );
         assert_eq!(

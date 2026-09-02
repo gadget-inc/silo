@@ -166,10 +166,11 @@ pub struct Metrics {
     /// shard. Stays flat for index-only scans — the signal that an aggregate
     /// shape rode the index-only path instead of per-row hydration.
     query_point_lookups: CounterVec,
-    /// `JOB_INFO` reads issued to resolve `enqueue_time_ms` for a status
-    /// record that lacks it, per shard — on the write path (once per such
-    /// record, at its next transition) and in the backfill sweep. Converges
-    /// to zero once every status record carries the value.
+    /// Status records that lacked `enqueue_time_ms` and had it resolved from a
+    /// `JOB_INFO` read, per shard — on the write path (once per such record,
+    /// at its next transition, counting a read the gauge path issued anyway)
+    /// and in the backfill sweep. Converges to zero once every status record
+    /// carries the value.
     enqueue_time_repair_reads: CounterVec,
     /// Rows the status-index query path had to hydrate from `JOB_INFO`
     /// because their index entry carried no `enqueue_time_ms`, per shard.

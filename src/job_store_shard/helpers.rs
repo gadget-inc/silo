@@ -443,12 +443,9 @@ pub(crate) async fn load_job_view(
     tenant: &str,
     id: &str,
 ) -> Result<crate::job::JobView, JobStoreShardError> {
-    let job_info_key = crate::keys::job_info_key(tenant, id);
-    let maybe_job_raw = reader.get(&job_info_key).await?;
-    let Some(job_raw) = maybe_job_raw else {
-        return Err(JobStoreShardError::JobNotFound(id.to_string()));
-    };
-    crate::job::JobView::new(job_raw)
+    try_load_job_view(reader, tenant, id)
+        .await?
+        .ok_or_else(|| JobStoreShardError::JobNotFound(id.to_string()))
 }
 
 /// Load a `JobView` for the given tenant/job, or `None` when the job info

@@ -408,16 +408,16 @@ SELECT * FROM jobs WHERE tenant = 'customer-123' AND status_kind = 'Failed'
 
 ### Index-served columns
 
-On large tenants, which columns you project matters as much as which filters you use. The status/time index carries `tenant`, `id`, `status_kind`, `status_changed_at_ms` and `enqueue_time_ms` for every job, so a query that projects only those columns is answered from the index alone, without reading a job record per row:
+On large tenants, which columns you project matters as much as which filters you use. The status/time index carries `tenant`, `id`, `status_kind` and `status_changed_at_ms` for every job, and `enqueue_time_ms` for every job written since the value was added to the index (the `enqueue_time_backfill` sweep fills it in for the rest), so a query that projects only those columns is answered from the index alone, without reading a job record per row:
 
 - `enqueue_time_ms` is index-served on tenant-filtered `status_kind = ...` and `status_kind IN (...)` queries, and on tenant-filtered queries with no status filter once the shard has finished backfilling its index entries (see the `enqueue_time_backfill` setting in the server configuration reference).
 - `status_changed_at_ms` on a single `status_kind = ...` filter reads the status record instead, so that shape stays on the per-row path.
 - Every other column (`priority`, `payload`, `task_group`, `metadata`, `limits`, `current_attempt`, `next_attempt_starts_after_ms`) needs a per-row record read.
 
-`EXPLAIN` names the path taken as `path=status-counters`, `path=status-index`, `path=fullscan-join` or `path=pairs`; the first two never read job records. The editor's listing shape is index-served on a backfilled shard:
+`EXPLAIN` names the path taken as `path=status-counters`, `path=status-index`, `path=fullscan-join` or `path=pairs`. `status-counters` never reads job records; `status-index` reads one only for index entries that lack `enqueue_time_ms`, which the `silo_enqueue_time_fallback_hydrations_total` metric counts. The editor's listing shape is index-served on a backfilled shard:
 
 ```sql
--- path=status-index: no job record reads, even with hundreds of thousands of jobs
+-- path=status-index: no job record reads on a backfilled shard, whatever the tenant's size
 SELECT id FROM (
   SELECT id, enqueue_time_ms FROM jobs WHERE tenant = 'customer-123' LIMIT 50000
 ) ORDER BY enqueue_time_ms DESC, id DESC LIMIT 101

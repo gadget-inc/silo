@@ -867,22 +867,3 @@ pub async fn open_shard_at_path(
         .await
         .expect("open shard")
 }
-
-/// Open a temp shard with the enqueue-time backfill sweep enabled and fast
-/// pauses, for tests that seed rows through a different handle first.
-pub async fn open_temp_shard_with_enqueue_time_backfill(
-    batch_size: usize,
-) -> (
-    tempfile::TempDir,
-    Arc<JobStoreShard>,
-    silo::metrics::Metrics,
-) {
-    let tmp = tempfile::tempdir().unwrap();
-    let metrics = silo::metrics::init().expect("init metrics");
-    let path = tmp.path().to_string_lossy().to_string();
-    let shard = open_shard_at_path(&path, ShardRange::full(), metrics.clone(), |cfg| {
-        cfg.enqueue_time_backfill = fast_enqueue_time_backfill(batch_size);
-    })
-    .await;
-    (tmp, shard, metrics)
-}

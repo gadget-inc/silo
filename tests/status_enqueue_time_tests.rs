@@ -265,7 +265,7 @@ async fn rows_without_enqueue_time_are_repaired_by_next_transition() {
 
     assert_rows_carry_job_info_enqueue_time(&shard, "-", &job_id, "cancel repairs").await;
     let reads = repair_reads(&metrics, &shard) - before;
-    assert!(reads <= 1.0, "at most one repair read, recorded {reads}");
+    assert_eq!(reads, 1.0, "exactly one repair read, recorded {reads}");
 }
 
 /// Transitions that already hold a `JobView` repair the rows without any
@@ -288,7 +288,7 @@ async fn transitions_with_job_view_repair_without_a_read() {
         "dequeue reads"
     );
 
-    // error branch of report-outcome (retry scheduled)
+    // error branch of report-outcome (no retry policy, lands Failed)
     strip_enqueue_time_from_job_rows(&shard, "-", &job).await;
     let before = repair_reads(&metrics, &shard);
     shard
@@ -624,35 +624,21 @@ async fn backfill_completion_marker_and_flag_move_together() {
 /// A reopened shard reads the flag from the persisted marker.
 #[silo::test]
 async fn reopened_shard_reads_backfill_flag_from_marker() {
-    use silo::gubernator::MockGubernatorClient;
-    use silo::settings::{Backend, DatabaseConfig};
     use silo::shard_range::ShardRange;
 
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = DatabaseConfig {
-        name: "test".to_string(),
-        backend: Backend::Fs,
-        path: tmp.path().to_string_lossy().to_string(),
-        slatedb: Some(fast_flush_slatedb_settings()),
-        ..Default::default()
-    };
-    let open = || {
-        JobStoreShard::open(
-            &cfg,
-            MockGubernatorClient::new_arc(),
-            None,
-            ShardRange::full(),
-        )
-    };
+    let path = tmp.path().to_string_lossy().to_string();
+    let metrics = silo::metrics::init().expect("init metrics");
+    let open = || open_shard_at_path(&path, ShardRange::full(), metrics.clone(), |_| {});
 
-    let shard = open().await.expect("open");
+    let shard = open().await;
     shard
         .set_enqueue_time_backfill_complete(true)
         .await
         .expect("set");
     shard.close().await.expect("close");
 
-    let shard = open().await.expect("reopen");
+    let shard = open().await;
     assert!(
         shard.enqueue_time_backfill_complete(),
         "flag read from marker at open"
@@ -663,9 +649,51 @@ async fn reopened_shard_reads_backfill_flag_from_marker() {
         .expect("clear");
     shard.close().await.expect("close");
 
-    let shard = open().await.expect("reopen after clear");
+    let shard = open().await;
     assert!(
         !shard.enqueue_time_backfill_complete(),
         "cleared marker read at open"
+    );
+}
+
+/// A terminal transition on a shard with row expiry writes both rows with the
+/// value and with the expiry.
+#[silo::test]
+async fn terminal_transition_writes_value_and_expiry_on_both_rows() {
+    use silo::job_attempt::AttemptOutcome;
+    use silo::keys::{idx_status_time_key, job_status_key, status_index_timestamp};
+
+    let (_tmp, shard) = open_temp_shard_with_terminal_expire_s(60).await;
+    let job_id = enqueue_at(&shard, "-", 0).await;
+    let task = dequeue_one(&shard).await;
+    shard
+        .report_attempt_outcome(&task, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("report success");
+
+    assert_rows_carry_job_info_enqueue_time(&shard, "-", &job_id, "terminal").await;
+    let status = shard.get_job_status("-", &job_id).await.unwrap().unwrap();
+    assert_eq!(status.kind, JobStatusKind::Succeeded);
+    let status_row = shard
+        .db()
+        .get_key_value(&job_status_key("-", &job_id))
+        .await
+        .unwrap()
+        .expect("status row");
+    let index_row = shard
+        .db()
+        .get_key_value(&idx_status_time_key(
+            "-",
+            status.kind.as_str(),
+            status_index_timestamp(&status),
+            &job_id,
+        ))
+        .await
+        .unwrap()
+        .expect("index row");
+    assert!(status_row.expire_ts.is_some(), "status row carries expiry");
+    assert_eq!(
+        index_row.expire_ts, status_row.expire_ts,
+        "index row carries the same expiry"
     );
 }
