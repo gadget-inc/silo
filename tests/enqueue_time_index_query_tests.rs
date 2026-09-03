@@ -9,6 +9,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::SessionConfig;
 use silo::job_store_shard::JobStoreShard;
 use silo::query::ShardQueryEngine;
 use test_helpers::*;
@@ -102,6 +103,7 @@ async fn key_served_tenant_projections_take_the_index_path_when_complete() {
         "SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-'",
         "SELECT id FROM jobs WHERE tenant = '-' LIMIT 5",
         "SELECT shard_id, tenant, id, enqueue_time_ms FROM jobs WHERE tenant = '-'",
+        "SELECT shard_id FROM jobs WHERE tenant = '-'",
     ];
 
     mark_complete(&shard, true).await;
@@ -282,4 +284,89 @@ async fn a_resolved_plan_keeps_its_path_after_the_flag_clears() {
 
     assert_eq!(rows_of(&batches), expected);
     assert_eq!(lookups, 0.0, "the plan must still execute the index path");
+}
+
+#[silo::test]
+async fn index_path_streams_correctly_across_small_batches() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    seed(&shard, 50).await;
+    mark_complete(&shard, true).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = "SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-' LIMIT 23";
+    let expected = id_time_rows(&engine, query).await;
+    assert_eq!(expected.len(), 23);
+
+    // A batch size that does not divide the limit exercises the chunk clamp
+    // and the accumulation across chunks.
+    let plan = engine.get_physical_plan(query).await.expect("plan");
+    let small_batches = SessionContext::new_with_config(SessionConfig::new().with_batch_size(7));
+    let scanned_before = metrics.query_scanned_keys_value(shard.name());
+    let batches = datafusion::physical_plan::collect(plan, small_batches.task_ctx())
+        .await
+        .expect("collect");
+    let scanned = metrics.query_scanned_keys_value(shard.name()) - scanned_before;
+
+    assert!(
+        batches.len() >= 4,
+        "expected several small batches, got {}",
+        batches.len()
+    );
+    assert_eq!(rows_of(&batches), expected);
+    assert!(scanned <= 23.0, "scanned {scanned} keys for LIMIT 23");
+}
+
+#[silo::test]
+async fn deleted_job_never_appears_in_an_index_listing() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 6).await;
+    mark_complete(&shard, true).await;
+    let tasks = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    let doomed = tasks[0].attempt().job_id().to_string();
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            silo::job_attempt::AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report");
+    shard.delete_job("-", &doomed).await.expect("delete_job");
+
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = "SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-' ORDER BY enqueue_time_ms DESC, id ASC";
+    assert!(
+        explain_line(&engine, query)
+            .await
+            .contains(ENQUEUE_INDEX_LABEL)
+    );
+    let ids: Vec<String> = id_time_rows(&engine, query)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids.len(), 5);
+    assert!(
+        !ids.contains(&doomed),
+        "{doomed} was deleted but is still listed"
+    );
+}
+
+#[silo::test]
+async fn status_filtered_listings_return_the_same_rows_regardless_of_the_flag() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 12).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = "SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting' ORDER BY enqueue_time_ms DESC, id ASC";
+
+    mark_complete(&shard, false).await;
+    let cleared = id_time_rows(&engine, query).await;
+    mark_complete(&shard, true).await;
+    let set = id_time_rows(&engine, query).await;
+
+    assert!(!cleared.is_empty(), "seed includes waiting jobs");
+    assert_eq!(set, cleared);
+    assert!(explain_line(&engine, query).await.contains("path=JobPairs"));
 }

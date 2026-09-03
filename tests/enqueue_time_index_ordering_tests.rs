@@ -27,7 +27,7 @@ async fn seed(shard: &JobStoreShard, count: usize) {
         let writes = chunk.iter().map(|&i| {
             shard.enqueue(
                 "-",
-                Some(format!("job-{i:05}")),
+                Some(format!("job-{i}")),
                 (i % 7) as u8,
                 base - ((i / 2) as i64) * 1_000,
                 None,
@@ -279,7 +279,7 @@ async fn non_matching_order_by_keeps_its_sort_and_stays_correct() {
     seed(&shard, 60).await;
     let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
     let queries = [
-        "SELECT id FROM jobs WHERE tenant = '-' ORDER BY enqueue_time_ms ASC LIMIT 20",
+        "SELECT id FROM jobs WHERE tenant = '-' ORDER BY enqueue_time_ms ASC, id ASC LIMIT 20",
         "SELECT id FROM jobs WHERE tenant = '-' ORDER BY enqueue_time_ms DESC, id DESC LIMIT 20",
         "SELECT id FROM jobs WHERE tenant = '-' ORDER BY priority, id LIMIT 20",
     ];
