@@ -275,6 +275,7 @@ async fn open_shard(
             floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+            enqueue_time_index_backfill: Default::default(),
             grant_scanner: silo::concurrency::GrantScannerConfig::default(),
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,

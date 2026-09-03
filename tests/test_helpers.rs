@@ -216,6 +216,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+            enqueue_time_index_backfill: Default::default(),
         },
         ShardRange::full(),
     )
@@ -270,6 +271,7 @@ pub async fn open_temp_shard_with_orphan_sweep(
             floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+            enqueue_time_index_backfill: Default::default(),
         },
         range,
     )
@@ -323,6 +325,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+            enqueue_time_index_backfill: Default::default(),
         },
         ShardRange::full(),
     )

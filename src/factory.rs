@@ -522,6 +522,7 @@ impl ShardFactory {
                         floating_refresh_stale_max_ms: template.floating_refresh_stale_max_ms,
                         broker_tombstone_revive_after_generations: template
                             .broker_tombstone_revive_after_generations,
+                        enqueue_time_index_backfill: Default::default(),
                     },
                     range.clone(),
                 )
@@ -1550,6 +1551,7 @@ impl ShardFactory {
                 broker_tombstone_revive_after_generations: self
                     .template
                     .broker_tombstone_revive_after_generations,
+                enqueue_time_index_backfill: Default::default(),
             },
             ShardRange::full(),
         )
