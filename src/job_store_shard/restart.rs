@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::helpers::{
-    TxnWriter, decode_job_status_owned, load_job_view, now_epoch_ms, retry_on_txn_conflict,
+    TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{attempt_prefix, job_cancelled_key, job_status_key};
@@ -117,8 +117,12 @@ impl JobStoreShard {
             txn.delete(&cancelled_key)?;
         }
 
-        // Get the job info first to know the priority and compute start_at_ms
-        let job_view = load_job_view(&TxnWriter(&txn), tenant, id).await?;
+        // Re-put the job's rows without the terminal-retention TTL they may
+        // carry, and read the job info to know the priority and compute
+        // start_at_ms.
+        let job_view = self
+            .revive_terminal_job_records(&mut TxnWriter(&txn), tenant, id)
+            .await?;
         let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
 
