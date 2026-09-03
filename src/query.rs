@@ -7,6 +7,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, Int64Array, StringArray, UInt8Array, UInt32Array, new_null_array,
 };
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session as CatalogSession;
@@ -16,7 +17,8 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr};
 use datafusion::physical_plan::display::{DisplayAs, DisplayFormatType};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -271,17 +273,34 @@ impl ScanPath for NoScanPath {
     }
 }
 
+/// One column of the ordering a scan path guarantees on its output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderingColumn {
+    pub name: String,
+    pub descending: bool,
+}
+
 /// The resolved decision carried on a plan from planning to execution.
 /// Cheap to clone: plans are cloned by DataFusion's optimizer passes.
 #[derive(Debug, Clone)]
 pub struct ScanDecision {
     path: Arc<dyn ScanPath>,
+    /// The output ordering the path guarantees, by projected column name;
+    /// empty when the path promises none. Nulls sort last, which is
+    /// immaterial while every ordering column is non-nullable.
+    output_ordering: Vec<OrderingColumn>,
+    /// Whether the path enforces a pushed-down fetch itself. A path that
+    /// ignores its limit must leave this false, since the planner removes the
+    /// limit node above a plan that accepts a fetch.
+    accepts_fetch: bool,
 }
 
 impl ScanDecision {
     pub fn new(path: impl ScanPath) -> Self {
         Self {
             path: Arc::new(path),
+            output_ordering: Vec::new(),
+            accepts_fetch: false,
         }
     }
 
@@ -290,9 +309,25 @@ impl ScanDecision {
         Self::new(NoScanPath)
     }
 
+    /// Declare the ordering the path guarantees and that it enforces a
+    /// pushed-down fetch.
+    pub fn ordered_with_fetch(mut self, output_ordering: Vec<OrderingColumn>) -> Self {
+        self.output_ordering = output_ordering;
+        self.accepts_fetch = true;
+        self
+    }
+
     /// The scanner-specific decision, if it is of type `T`.
     pub fn path<T: ScanPath>(&self) -> Option<&T> {
         self.path.as_any().downcast_ref::<T>()
+    }
+
+    pub fn output_ordering(&self) -> &[OrderingColumn] {
+        &self.output_ordering
+    }
+
+    pub fn accepts_fetch(&self) -> bool {
+        self.accepts_fetch
     }
 }
 
@@ -424,7 +459,28 @@ impl SiloExecutionPlan {
         scanner: ScannerRef,
     ) -> Self {
         let decision = scanner.resolve(&projected_schema, filters, limit);
-        let eq = EquivalenceProperties::new(projected_schema.clone());
+        // Declare the path's ordering only when every ordering column is in
+        // the projected schema; a prefix of the ordering would be a false
+        // promise, and a query that needs the order projects the columns.
+        let ordering: Vec<PhysicalSortExpr> = decision
+            .output_ordering()
+            .iter()
+            .filter_map(|c| {
+                let expr = col(&c.name, &projected_schema).ok()?;
+                Some(PhysicalSortExpr::new(
+                    expr,
+                    SortOptions {
+                        descending: c.descending,
+                        nulls_first: false,
+                    },
+                ))
+            })
+            .collect();
+        let eq = if !ordering.is_empty() && ordering.len() == decision.output_ordering().len() {
+            EquivalenceProperties::new_with_orderings(projected_schema.clone(), [ordering])
+        } else {
+            EquivalenceProperties::new(projected_schema.clone())
+        };
         let props = PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(1),
@@ -486,6 +542,31 @@ impl ExecutionPlan for SiloExecutionPlan {
     }
     fn statistics(&self) -> DfResult<Statistics> {
         Ok(Statistics::default())
+    }
+    fn fetch(&self) -> Option<usize> {
+        if self.decision.accepts_fetch() {
+            self.limit
+        } else {
+            None
+        }
+    }
+    /// Accept a pushed-down fetch (skip plus limit) on paths that enforce
+    /// their limit. The planner removes the limit node above the returned
+    /// plan, so every other path returns `None` and keeps its limit operator.
+    /// The path, ordering, filters, and plan properties are unchanged; the
+    /// limit becomes the tighter of the two.
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        if !self.decision.accepts_fetch() {
+            return None;
+        }
+        let limit = match (self.limit, fetch) {
+            (Some(current), Some(new)) => Some(current.min(new)),
+            (current, new) => current.or(new),
+        };
+        Some(Arc::new(Self {
+            limit,
+            ..self.clone()
+        }))
     }
 }
 
@@ -1115,7 +1196,24 @@ impl Scan for JobsScanner {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> ScanDecision {
-        ScanDecision::new(self.resolve_jobs(projection, filters, limit))
+        let jobs = self.resolve_jobs(projection, filters, limit);
+        let path = jobs.path;
+        let decision = ScanDecision::new(jobs);
+        match path {
+            // The index range is walked in key order, which is exactly
+            // `enqueue_time_ms DESC, id ASC`, and the stream stops at its limit.
+            JobsScanPath::EnqueueTimeIndex => decision.ordered_with_fetch(vec![
+                OrderingColumn {
+                    name: "enqueue_time_ms".to_string(),
+                    descending: true,
+                },
+                OrderingColumn {
+                    name: "id".to_string(),
+                    descending: false,
+                },
+            ]),
+            _ => decision,
+        }
     }
 
     fn describe(&self, decision: &ScanDecision, filters: &[Expr], limit: Option<usize>) -> String {
