@@ -65,9 +65,18 @@ fn enqueue_time_index_tenant_prefix_scopes_scan() {
     let end = end_bound(&prefix);
     let inside = idx_enqueue_time_key("tenant1", 1_000, "job1");
     let other_tenant = idx_enqueue_time_key("tenant10", 1_000, "job1");
-    assert!(inside >= prefix && inside < end);
-    assert!(!(other_tenant >= prefix && other_tenant < end));
-    assert!(parse_enqueue_time_index_key(&job_info_key("tenant1", "job1")).is_none());
+    assert!(
+        inside >= prefix && inside < end,
+        "a tenant1 key must fall inside tenant1's prefix range"
+    );
+    assert!(
+        !(other_tenant >= prefix && other_tenant < end),
+        "a tenant10 key must fall outside tenant1's prefix range"
+    );
+    assert!(
+        parse_enqueue_time_index_key(&job_info_key("tenant1", "job1")).is_none(),
+        "a JOB_INFO key must not parse as an enqueue-time index key"
+    );
 }
 
 #[test]

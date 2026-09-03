@@ -171,7 +171,7 @@ async fn first_import_writes_entry_keyed_by_enqueue_time() {
 async fn delete_job_removes_entry() {
     let (_tmp, shard) = open_temp_shard().await;
     enqueue_at(&shard, "-", "doomed", now_ms()).await;
-    enqueue_at(&shard, "-", "survivor", now_ms() - 1).await;
+    enqueue_at(&shard, "-", "survivor", now_ms() + 60_000).await;
     run_next_attempt(&shard, AttemptOutcome::Success { result: vec![] }).await;
     assert_eq!(
         shard

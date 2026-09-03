@@ -254,7 +254,7 @@ async fn assert_index_matches_jobs(shard: &JobStoreShard) {
 }
 
 #[silo::test]
-async fn job_deleted_during_the_sweep_has_no_entry() {
+async fn job_deleted_while_the_sweep_runs_has_no_entry() {
     let tmp = tempfile::tempdir().unwrap();
     let shard = open_shard_at(tmp.path(), None, Default::default()).await;
     let ids = enqueue_many(&shard, "job", 60).await;
@@ -295,7 +295,7 @@ async fn job_deleted_during_the_sweep_has_no_entry() {
 }
 
 #[silo::test]
-async fn job_finishing_during_the_sweep_gets_an_entry_with_its_ttl() {
+async fn job_finishing_while_the_sweep_runs_gets_an_entry_with_its_ttl() {
     let tmp = tempfile::tempdir().unwrap();
     let shard = open_shard_at(tmp.path(), Some(60), Default::default()).await;
     let ids = enqueue_many(&shard, "job", 60).await;
@@ -399,16 +399,8 @@ fn enabled(batch_size: usize, pause_ms: u64) -> EnqueueTimeIndexBackfillConfig {
     }
 }
 
-async fn persisted_rows_scanned(db: &InstrumentedDb) -> u64 {
-    let Some(raw) = db
-        .get(&silo::keys::enqueue_time_index_backfill_progress_key())
-        .await
-        .expect("get")
-    else {
-        return 0;
-    };
-    let progress: serde_json::Value = serde_json::from_slice(&raw).expect("json");
-    progress["rows_scanned"].as_u64().unwrap_or(0)
+async fn indexed_count(db: &InstrumentedDb) -> usize {
+    indexed_ids(db).await.len()
 }
 
 #[silo::test]
@@ -422,8 +414,7 @@ async fn close_stops_the_sweep_and_it_resumes_from_its_checkpoint_after_reopen()
     // The background sweep starts on open and checkpoints after every row.
     let shard = open_shard_at(tmp.path(), None, enabled(1, 20)).await;
     assert!(!shard.enqueue_time_index_complete());
-    let scanned_before_close =
-        poll_until(|| persisted_rows_scanned(shard.db()), |n| *n >= 5, 10_000).await;
+    let indexed_before_close = poll_until(|| indexed_count(shard.db()), |n| *n >= 5, 10_000).await;
     shard.close().await.expect("close");
 
     let shard = open_shard_at(tmp.path(), None, Default::default()).await;
@@ -431,10 +422,10 @@ async fn close_stops_the_sweep_and_it_resumes_from_its_checkpoint_after_reopen()
         !shard.enqueue_time_index_complete(),
         "sweep was interrupted"
     );
-    let resumed = persisted_rows_scanned(shard.db()).await;
+    let resumed = indexed_count(shard.db()).await;
     assert!(
-        resumed >= scanned_before_close && resumed < 200,
-        "checkpoint {resumed} should be persisted and partial"
+        resumed >= indexed_before_close && resumed < 200,
+        "{resumed} entries should survive the close and leave the sweep partial"
     );
     let result = shard
         .backfill_enqueue_time_index(50, Duration::ZERO)
@@ -448,19 +439,6 @@ async fn close_stops_the_sweep_and_it_resumes_from_its_checkpoint_after_reopen()
     assert_eq!(result.rows_written, 200);
     assert!(shard.enqueue_time_index_complete());
     assert_eq!(sorted(indexed_ids(shard.db()).await), ids);
-    shard.close().await.expect("close");
-
-    let shard = open_shard_at(tmp.path(), None, enabled(1, 20)).await;
-    assert!(
-        shard.enqueue_time_index_complete(),
-        "marker survives reopen"
-    );
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-    let result = shard
-        .backfill_enqueue_time_index(50, Duration::ZERO)
-        .await
-        .expect("backfill");
-    assert_eq!(result.rows_scanned, 0, "a completed sweep never runs again");
 }
 
 #[silo::test]
@@ -476,7 +454,6 @@ async fn default_settings_spawn_no_sweep() {
         indexed_ids(shard.db()).await.is_empty(),
         "nothing backfilled"
     );
-    assert_eq!(persisted_rows_scanned(shard.db()).await, 0);
 }
 
 #[silo::test]

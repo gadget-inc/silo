@@ -218,11 +218,6 @@ pub fn idx_enqueue_time_tenant_prefix(tenant: &str) -> Vec<u8> {
     encode_with_prefix(prefix::IDX_ENQUEUE_TIME, &(tenant,))
 }
 
-/// Prefix for scanning all enqueue-time index entries (cross-tenant).
-pub fn idx_enqueue_time_all_prefix() -> Vec<u8> {
-    vec![prefix::IDX_ENQUEUE_TIME]
-}
-
 /// Parsed enqueue-time index key components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedEnqueueTimeIndexKey {

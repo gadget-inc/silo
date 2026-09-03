@@ -263,7 +263,7 @@ pub struct JobStoreShard {
     /// The background backfill sweep spawned at open, if any; `close` waits
     /// for it to stop at a batch boundary before closing the database.
     pub(crate) enqueue_time_index_backfill_task:
-        std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Error)]
@@ -622,7 +622,7 @@ impl JobStoreShard {
             count_from_status_counters,
             enqueue_time_index_backfill,
             enqueue_time_index_complete: AtomicBool::new(false),
-            enqueue_time_index_backfill_task: std::sync::Mutex::new(None),
+            enqueue_time_index_backfill_task: tokio::sync::Mutex::new(None),
         });
 
         // The completion flag gates the query engine's index-served listing
@@ -737,13 +737,11 @@ impl JobStoreShard {
 
         // The backfill sweep observes the cancellation at its next batch
         // boundary; wait for it so no batch is writing while the database
-        // closes.
-        let backfill_task = self
-            .enqueue_time_index_backfill_task
-            .lock()
-            .expect("backfill task lock")
-            .take();
-        if let Some(task) = backfill_task
+        // closes. The handle stays in its slot until the wait finishes, so a
+        // close that times out and is retried waits again instead of closing
+        // the database under a running batch.
+        let mut backfill_task = self.enqueue_time_index_backfill_task.lock().await;
+        if let Some(task) = backfill_task.as_mut()
             && let Err(e) = task.await
         {
             tracing::warn!(
@@ -752,6 +750,8 @@ impl JobStoreShard {
                 "enqueue-time index backfill task did not stop cleanly"
             );
         }
+        *backfill_task = None;
+        drop(backfill_task);
 
         // If we have a local WAL with flush_on_close enabled, flush memtable to SSTs first
         if let Some(ref wal_config) = self.wal_close_config

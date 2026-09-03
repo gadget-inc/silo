@@ -318,7 +318,7 @@ impl ScanDecision {
     }
 
     /// The scanner-specific decision, if it is of type `T`.
-    pub fn path<T: ScanPath>(&self) -> Option<&T> {
+    pub fn downcast<T: ScanPath>(&self) -> Option<&T> {
         self.path.as_any().downcast_ref::<T>()
     }
 
@@ -460,8 +460,9 @@ impl SiloExecutionPlan {
     ) -> Self {
         let decision = scanner.resolve(&projected_schema, filters, limit);
         // Declare the path's ordering only when every ordering column is in
-        // the projected schema; a prefix of the ordering would be a false
-        // promise, and a query that needs the order projects the columns.
+        // the projected schema: a subset that omits the leading column is not
+        // an ordering of the stream, and a query that needs the order
+        // projects the columns.
         let ordering: Vec<PhysicalSortExpr> = decision
             .output_ordering()
             .iter()
@@ -1216,8 +1217,8 @@ impl Scan for JobsScanner {
         }
     }
 
-    fn describe(&self, decision: &ScanDecision, filters: &[Expr], limit: Option<usize>) -> String {
-        let decision = self.jobs_decision(decision, filters, limit, &JobsScanner::base_schema());
+    fn describe(&self, decision: &ScanDecision, _filters: &[Expr], limit: Option<usize>) -> String {
+        let decision = Self::jobs_decision(decision);
         format!(
             "jobs[{}], limit={:?}, path={:?}",
             decision.strategy, limit, decision.path
@@ -1232,12 +1233,11 @@ impl Scan for JobsScanner {
         &self,
         decision: &ScanDecision,
         projection: SchemaRef,
-        filters: &[Expr],
+        _filters: &[Expr],
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
-        let JobsScanDecision { strategy, path } =
-            self.jobs_decision(decision, filters, limit, &projection);
+        let JobsScanDecision { strategy, path } = Self::jobs_decision(decision);
         let shard = Arc::clone(&self.shard);
         let needs = analyze_projection(&projection, &strategy);
 
@@ -1288,19 +1288,14 @@ impl Scan for JobsScanner {
 }
 
 impl JobsScanner {
-    /// The plan's resolved decision, or a fresh resolution when the plan
-    /// carries a decision of another scanner's type.
-    fn jobs_decision(
-        &self,
-        decision: &ScanDecision,
-        filters: &[Expr],
-        limit: Option<usize>,
-        projection: &SchemaRef,
-    ) -> JobsScanDecision {
+    /// The plan's resolved decision. A plan is only ever executed by the
+    /// scanner that resolved it, so any other decision type is a programming
+    /// error.
+    fn jobs_decision(decision: &ScanDecision) -> JobsScanDecision {
         decision
-            .path::<JobsScanDecision>()
+            .downcast::<JobsScanDecision>()
             .cloned()
-            .unwrap_or_else(|| self.resolve_jobs(projection, filters, limit))
+            .expect("JobsScanner given another scanner's decision")
     }
 }
 

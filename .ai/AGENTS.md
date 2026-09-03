@@ -18,7 +18,7 @@ Tenants are assigned to shards via range-based partitioning (`src/shard_range.rs
 
 ## Storage
 
-Each shard is backed by a SlateDB instance (an LSM on object storage). Keys are binary-encoded using `storekey` for lexicographic ordering (`src/keys.rs`). Key prefixes: `0x01` job info, `0x02` job status, `0x03` status/time index, `0x04` metadata index, `0x05` tasks (execution queue), `0x06` leases, `0x07` attempts, `0x08`/`0x09` concurrency requests/holders, `0x0A` cancelled, `0x0B` floating limits, `0xF0+` counters/cleanup.
+Each shard is backed by a SlateDB instance (an LSM on object storage). Keys are binary-encoded using `storekey` for lexicographic ordering (`src/keys.rs`). Key prefixes: `0x01` job info, `0x02` job status, `0x03` status/time index, `0x04` metadata index, `0x05` tasks (execution queue), `0x06` leases, `0x07` attempts, `0x08`/`0x09` concurrency requests/holders, `0x0A` cancelled, `0x0B` floating limits, `0x0C` enqueue-time index, `0xF0+` counters/cleanup/backfill markers.
 
 ## Shard Lifecycle
 
