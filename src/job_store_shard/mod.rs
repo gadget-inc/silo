@@ -1612,7 +1612,7 @@ impl JobStoreShard {
     ///
     /// Returns an error if the job is currently running (has active leases/holders) or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
     pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        use crate::keys::idx_metadata_key;
+        use crate::keys::{idx_enqueue_time_key, idx_metadata_key};
         use slatedb::WriteBatch;
 
         // Check if job is running or has pending state
@@ -1642,13 +1642,15 @@ impl JobStoreShard {
             );
             batch.delete(&timek);
         }
-        // Clean up metadata index entries (load job info to enumerate metadata)
+        // Clean up metadata and enqueue-time index entries (load job info to
+        // enumerate metadata and recover the enqueue time)
         let job_metric_info = if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
             let view = JobView::new(raw)?;
             for (mk, mv) in view.metadata().into_iter() {
                 let mkey = idx_metadata_key(tenant, &mk, &mv, id);
                 batch.delete(&mkey);
             }
+            batch.delete(idx_enqueue_time_key(tenant, view.enqueue_time_ms(), id));
             Some((view.task_group().to_string(), view.metadata()))
         } else {
             None

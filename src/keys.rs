@@ -24,6 +24,7 @@ pub mod prefix {
     pub const CONCURRENCY_HOLDER: u8 = 0x09;
     pub const JOB_CANCELLED: u8 = 0x0A;
     pub const FLOATING_LIMIT: u8 = 0x0B;
+    pub const IDX_ENQUEUE_TIME: u8 = 0x0C;
     pub const COUNTER_TOTAL_JOBS: u8 = 0xF0;
     pub const COUNTER_COMPLETED_JOBS: u8 = 0xF1;
     pub const CLEANUP_PROGRESS: u8 = 0xF2;
@@ -187,6 +188,65 @@ pub fn status_index_timestamp(status: &JobStatus) -> i64 {
     } else {
         status.changed_at_ms
     }
+}
+
+/// Map an `i64` onto `u64` preserving order over the whole range, then
+/// reverse it, so that ascending byte order of the result equals descending
+/// `enqueue_time_ms`. Unlike the status/time index this does not clamp at
+/// zero: enqueue stores the caller's raw `start_at_ms`, which can be negative.
+fn invert_enqueue_time(enqueue_time_ms: i64) -> u64 {
+    u64::MAX - ((enqueue_time_ms as u64) ^ (1u64 << 63))
+}
+
+fn uninvert_enqueue_time(inverted: u64) -> i64 {
+    ((u64::MAX - inverted) ^ (1u64 << 63)) as i64
+}
+
+/// Index: a tenant's jobs ordered by `enqueue_time_ms` descending, then job id
+/// ascending. Written once at job creation; the value is empty.
+pub fn idx_enqueue_time_key(tenant: &str, enqueue_time_ms: i64, job_id: &str) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::IDX_ENQUEUE_TIME,
+        &(tenant, invert_enqueue_time(enqueue_time_ms), job_id),
+    )
+}
+
+/// Prefix for scanning a tenant's enqueue-time index newest-first.
+pub fn idx_enqueue_time_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::IDX_ENQUEUE_TIME, &(tenant,))
+}
+
+/// Prefix for scanning all enqueue-time index entries (cross-tenant).
+pub fn idx_enqueue_time_all_prefix() -> Vec<u8> {
+    vec![prefix::IDX_ENQUEUE_TIME]
+}
+
+/// Parsed enqueue-time index key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedEnqueueTimeIndexKey {
+    pub tenant: String,
+    pub inverted_enqueue_time: u64,
+    pub job_id: String,
+}
+
+impl ParsedEnqueueTimeIndexKey {
+    /// Get the original enqueue time from the inverted value.
+    pub fn enqueue_time_ms(&self) -> i64 {
+        uninvert_enqueue_time(self.inverted_enqueue_time)
+    }
+}
+
+/// Parse an enqueue-time index key back to its components.
+pub fn parse_enqueue_time_index_key(key: &[u8]) -> Option<ParsedEnqueueTimeIndexKey> {
+    if key.first() != Some(&prefix::IDX_ENQUEUE_TIME) {
+        return None;
+    }
+    let (tenant, inverted_enqueue_time, job_id): (String, u64, String) = decode(&key[1..]).ok()?;
+    Some(ParsedEnqueueTimeIndexKey {
+        tenant,
+        inverted_enqueue_time,
+        job_id,
+    })
 }
 
 /// Index: jobs by metadata key/value (unsorted within key/value).
