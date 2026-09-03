@@ -559,6 +559,16 @@ pub async fn clone_golden_shard(
     clone_name: &str,
     metadata: &GoldenShardMetadata,
 ) -> (CloneGuard, Arc<JobStoreShard>) {
+    clone_golden_shard_with_metrics(clone_name, metadata, None).await
+}
+
+/// Clone the golden shard and open it with an optional metrics registry, for
+/// benchmarks that read the query counters (scanned keys, point lookups).
+pub async fn clone_golden_shard_with_metrics(
+    clone_name: &str,
+    metadata: &GoldenShardMetadata,
+    metrics: Option<silo::metrics::Metrics>,
+) -> (CloneGuard, Arc<JobStoreShard>) {
     let root = Path::new(GOLDEN_DATA_DIR)
         .parent()
         .expect("golden data dir must have a parent");
@@ -608,7 +618,7 @@ pub async fn clone_golden_shard(
             }),
             memory_cache: None,
             rate_limiter: NullGubernatorClient::new(),
-            metrics: None,
+            metrics,
             concurrency_reconcile_interval: Duration::from_millis(
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_INTERVAL_MS,
             ),
