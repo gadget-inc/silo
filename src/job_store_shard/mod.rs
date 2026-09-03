@@ -5,6 +5,7 @@ pub(crate) mod counters;
 mod dequeue;
 mod drop_tenant_holders;
 mod enqueue;
+mod enqueue_time_index_backfill;
 mod expedite;
 mod floating;
 pub(crate) mod helpers;
@@ -19,6 +20,7 @@ pub(crate) mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
 pub use drop_tenant_holders::DropTenantStats;
+pub use enqueue_time_index_backfill::EnqueueTimeIndexBackfillResult;
 
 pub use counters::{
     JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
@@ -38,6 +40,7 @@ use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::Arc;
 #[cfg(feature = "server")]
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -54,7 +57,7 @@ use crate::keys::{attempt_key, job_info_key, job_status_key};
 use crate::metrics::Metrics;
 #[cfg(feature = "server")]
 use crate::query::ShardQueryEngine;
-use crate::settings::DatabaseConfig;
+use crate::settings::{DatabaseConfig, EnqueueTimeIndexBackfillConfig};
 use crate::shard_range::ShardRange;
 use crate::storage::resolve_object_store;
 use crate::task::{LeasedRefreshTask, LeasedTask};
@@ -128,6 +131,25 @@ pub struct OpenShardOptions {
     /// statements from per-status counters instead of scanning the status index.
     /// Populated from `DatabaseConfig::count_from_status_counters`.
     pub count_from_status_counters: bool,
+    /// One-shot backfill of the enqueue-time index for pre-existing jobs.
+    /// Populated from `DatabaseConfig::enqueue_time_index_backfill`; the
+    /// default leaves the sweep disabled.
+    pub enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig,
+}
+
+/// A start delay in `[0, max_ms)` derived from the shard name (FNV-1a), so
+/// background tasks on shards that open together are staggered the same way
+/// on every run rather than stampeding object storage.
+pub(crate) fn shard_name_jitter_ms(shard_name: &str, max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    let mut h: u64 = 1469598103934665603;
+    for b in shard_name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h % max_ms
 }
 
 /// Compute the row TTL (`expire_ts`, epoch ms) for a job that reached the
@@ -233,6 +255,15 @@ pub struct JobStoreShard {
     /// When true, the query engine answers unfiltered per-tenant `COUNT(*)`
     /// from per-status counters instead of a full status-index scan.
     pub(crate) count_from_status_counters: bool,
+    /// Settings for the enqueue-time index backfill sweep.
+    pub(crate) enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig,
+    /// Whether the enqueue-time index covers every job on this shard. Mirrors
+    /// the persisted completion marker; loaded at open.
+    pub(crate) enqueue_time_index_complete: AtomicBool,
+    /// The background backfill sweep spawned at open, if any; `close` waits
+    /// for it to stop at a batch boundary before closing the database.
+    pub(crate) enqueue_time_index_backfill_task:
+        std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Error)]
@@ -426,6 +457,7 @@ impl JobStoreShard {
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 count_from_status_counters: cfg.count_from_status_counters,
+                enqueue_time_index_backfill: cfg.enqueue_time_index_backfill.clone(),
             },
             range,
         )
@@ -470,6 +502,7 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
+            enqueue_time_index_backfill,
         } = options;
 
         // Wall-clock timer for the whole open, used to emit per-phase debug
@@ -587,7 +620,15 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
+            enqueue_time_index_backfill,
+            enqueue_time_index_complete: AtomicBool::new(false),
+            enqueue_time_index_backfill_task: std::sync::Mutex::new(None),
         });
+
+        // The completion flag gates the query engine's index-served listing
+        // path, so it must reflect the persisted marker before the shard
+        // serves anything.
+        shard.load_enqueue_time_index_complete().await?;
 
         // Install the chain resumer before starting the grant scanner so the
         // scanner's first wake-up has a working callback for resuming limit
@@ -643,6 +684,10 @@ impl JobStoreShard {
             shard.spawn_counter_reconcile_task(range, interval_seconds);
         }
 
+        // Backfill the enqueue-time index for jobs that predate it. A no-op
+        // unless enabled in the database config and not yet complete.
+        shard.spawn_enqueue_time_index_backfill();
+
         // Set the shard creation timestamp if this is the first time opening
         let created_at_started = std::time::Instant::now();
         shard.set_created_at_ms_if_unset().await?;
@@ -689,6 +734,24 @@ impl JobStoreShard {
         self.cancellation.cancel();
         self.brokers.stop();
         self.concurrency.stop_grant_scanner();
+
+        // The backfill sweep observes the cancellation at its next batch
+        // boundary; wait for it so no batch is writing while the database
+        // closes.
+        let backfill_task = self
+            .enqueue_time_index_backfill_task
+            .lock()
+            .expect("backfill task lock")
+            .take();
+        if let Some(task) = backfill_task
+            && let Err(e) = task.await
+        {
+            tracing::warn!(
+                shard = %self.name,
+                error = %e,
+                "enqueue-time index backfill task did not stop cleanly"
+            );
+        }
 
         // If we have a local WAL with flush_on_close enabled, flush memtable to SSTs first
         if let Some(ref wal_config) = self.wal_close_config
@@ -1046,17 +1109,8 @@ impl JobStoreShard {
         tokio::spawn(async move {
             // Deterministic jitter based on shard name so we don't stampede
             // object storage when many shards open simultaneously.
-            let interval_ms = reconcile_interval.as_millis() as u64;
-            let jitter_ms = if interval_ms > 0 {
-                let mut h: u64 = 1469598103934665603;
-                for b in shard_name.as_bytes() {
-                    h ^= *b as u64;
-                    h = h.wrapping_mul(1099511628211);
-                }
-                h % interval_ms
-            } else {
-                0
-            };
+            let jitter_ms =
+                shard_name_jitter_ms(&shard_name, reconcile_interval.as_millis() as u64);
 
             tokio::select! {
                 biased;

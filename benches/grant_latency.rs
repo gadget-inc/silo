@@ -271,6 +271,7 @@ async fn open_shard(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_index_backfill: Default::default(),
             grant_scanner: silo::concurrency::GrantScannerConfig::default(),
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,

@@ -209,6 +209,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_index_backfill: Default::default(),
         },
         ShardRange::full(),
     )
@@ -255,6 +256,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            enqueue_time_index_backfill: Default::default(),
         },
         ShardRange::full(),
     )

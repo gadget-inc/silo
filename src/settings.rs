@@ -403,6 +403,10 @@ pub struct DatabaseTemplate {
     /// `DatabaseConfig::count_from_status_counters`. Defaults to true.
     #[serde(default = "default_count_from_status_counters")]
     pub count_from_status_counters: bool,
+    /// One-shot backfill of the enqueue-time index for pre-existing jobs.
+    /// See `EnqueueTimeIndexBackfillConfig`; disabled by default.
+    #[serde(default)]
+    pub enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -441,6 +445,7 @@ impl Default for DatabaseTemplate {
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
             count_from_status_counters: default_count_from_status_counters(),
+            enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig::default(),
             slatedb: None,
             memory_cache: None,
         }
@@ -728,6 +733,45 @@ fn default_count_from_status_counters() -> bool {
     true
 }
 
+fn default_enqueue_time_index_backfill_batch_size() -> usize {
+    256
+}
+
+fn default_enqueue_time_index_backfill_pause_ms() -> u64 {
+    10
+}
+
+/// Settings for the one-shot per-shard sweep that writes the enqueue-time
+/// index entry (`IDX_ENQUEUE_TIME`) for jobs created before the index
+/// existed. The sweep runs once per shard, checkpoints its progress, and
+/// records a completion marker; the query engine serves listings from the
+/// index only on shards whose marker is set.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct EnqueueTimeIndexBackfillConfig {
+    /// When true, a shard whose sweep has not completed runs it in the
+    /// background after opening. Defaults to false; enabling it is the
+    /// rollout step for index-served listings.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Rows the sweep examines per transaction. Defaults to 256.
+    #[serde(default = "default_enqueue_time_index_backfill_batch_size")]
+    pub batch_size: usize,
+    /// Pause between batches, in milliseconds, to keep the sweep from
+    /// crowding out foreground writes. Defaults to 10.
+    #[serde(default = "default_enqueue_time_index_backfill_pause_ms")]
+    pub pause_ms: u64,
+}
+
+impl Default for EnqueueTimeIndexBackfillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: default_enqueue_time_index_backfill_batch_size(),
+            pause_ms: default_enqueue_time_index_backfill_pause_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DatabaseConfig {
     pub name: String,
@@ -814,6 +858,10 @@ pub struct DatabaseConfig {
     /// counting.
     #[serde(default = "default_count_from_status_counters")]
     pub count_from_status_counters: bool,
+    /// One-shot backfill of the enqueue-time index for pre-existing jobs.
+    /// See `EnqueueTimeIndexBackfillConfig`; disabled by default.
+    #[serde(default)]
+    pub enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig,
     /// Optional SlateDB-specific settings for tuning database performance.
     /// If not specified, SlateDB defaults are used. When partially specified,
     /// unspecified fields use SlateDB defaults.
@@ -851,6 +899,7 @@ impl Default for DatabaseConfig {
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: default_count_from_status_counters(),
+            enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig::default(),
             slatedb: None,
             memory_cache: None,
         }

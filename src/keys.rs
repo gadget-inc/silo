@@ -34,6 +34,8 @@ pub mod prefix {
     pub const CLEANUP_COMPLETED_AT: u8 = 0xF6;
     pub const COUNTER_CONCURRENCY_REQUESTERS: u8 = 0xF7;
     pub const COUNTER_TENANT_STATUS: u8 = 0xF8;
+    pub const ENQUEUE_TIME_INDEX_BACKFILL_PROGRESS: u8 = 0xFB;
+    pub const ENQUEUE_TIME_INDEX_BACKFILL_COMPLETE: u8 = 0xFC;
 }
 
 /// Encode a key with its namespace prefix.
@@ -668,6 +670,17 @@ pub fn shard_created_at_key() -> Vec<u8> {
 /// Only set after a split cleanup finishes.
 pub fn cleanup_completed_at_key() -> Vec<u8> {
     vec![prefix::CLEANUP_COMPLETED_AT]
+}
+
+/// Key for the enqueue-time index backfill sweep's progress checkpoint.
+pub fn enqueue_time_index_backfill_progress_key() -> Vec<u8> {
+    vec![prefix::ENQUEUE_TIME_INDEX_BACKFILL_PROGRESS]
+}
+
+/// Key for the marker recording that the enqueue-time index backfill sweep
+/// has completed on this shard.
+pub fn enqueue_time_index_backfill_complete_key() -> Vec<u8> {
+    vec![prefix::ENQUEUE_TIME_INDEX_BACKFILL_COMPLETE]
 }
 
 /// Key for the per-queue concurrency requester counter.
