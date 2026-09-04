@@ -101,6 +101,8 @@ The primary table containing all job data.
 | `next_attempt_starts_after_ms` | Int64 (nullable) | Unix timestamp in milliseconds when the next attempt is scheduled to start. Present for `Waiting`/`Scheduled` jobs, null otherwise |
 | `metadata` | Map&lt;String, String&gt; (nullable) | Key-value metadata attached to the job |
 
+Each tenant's jobs are also indexed by `enqueue_time_ms`, newest first. A tenant-scoped query that projects only `shard_id`, `tenant`, `id`, and `enqueue_time_ms` is served from that index once the shard's index backfill has completed (`enqueue_time_index_backfill.enabled = true` in the database config starts the backfill), and its rows arrive in `enqueue_time_ms DESC, id ASC` order. Silo declares that ordering to the query planner, so an `ORDER BY enqueue_time_ms DESC, id ASC` on such a query runs without a sort, and a `LIMIT` reads only `OFFSET + LIMIT` index keys rather than the whole tenant. See [Listing Jobs](#listing-jobs) and [Scan strategy priority](#scan-strategy-priority).
+
 ### `tasks` Table
 
 Exposes the internal task execution queue for **debugging purposes**. Tasks are the ephemeral work items that drive job execution — they are created when jobs are enqueued and deleted when workers lease them.
@@ -185,8 +187,28 @@ Use `current_attempt` to distinguish between freshly enqueued jobs (`current_att
 
 ### Listing Jobs
 
+The newest-first listing is cheapest when it projects only columns the enqueue-time index carries. This shape reads exactly `LIMIT` index keys on a shard whose index backfill has completed, with no sort and no job-record reads; fetch the other columns for the page afterwards by id:
+
 ```sql
--- All jobs for a tenant
+-- Newest 50 jobs for a tenant, served from the enqueue-time index
+SELECT id, enqueue_time_ms
+FROM jobs
+WHERE tenant = 'customer-123'
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 50
+
+-- The next page: reads 100 index keys, returns the last 50
+SELECT id, enqueue_time_ms
+FROM jobs
+WHERE tenant = 'customer-123'
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 50 OFFSET 50
+```
+
+The tiebreak must be `id ASC` and the projection must stay within `shard_id`, `tenant`, `id`, and `enqueue_time_ms`. Projecting or filtering on any column outside those four, or adding an indexed filter (`id`, `status_kind`, metadata), moves the query to a path that reads status or job records, and the `ORDER BY` becomes a sort over every row scanned:
+
+```sql
+-- Reads each job's record to project status and task group, then sorts
 SELECT id, status_kind, priority, task_group
 FROM jobs
 WHERE tenant = 'customer-123'
@@ -394,6 +416,8 @@ Silo picks the best scan strategy from your filters in this priority order:
 5. **Full scan** — no indexed filter — scans all jobs for the tenant
 
 Only one index-backed filter is used per query. If you combine filters (e.g., status + metadata), the highest-priority one drives the scan and the rest are applied as post-filters.
+
+A full scan is not always a walk over job records. When the query has a `tenant` filter, no other indexed filter, and a projection limited to `shard_id`, `tenant`, `id`, and `enqueue_time_ms`, Silo walks the tenant's enqueue-time index instead, newest first, on any shard whose index backfill has completed. `EXPLAIN` names the path on the `SiloExecutionPlan` line (`path=EnqueueTimeIndex`); the same shape on a shard still being backfilled shows `path=StatusIndex` or `path=FullScanJoin` and returns the same rows.
 
 ```sql
 -- Uses ExactId scan (priority 1), even though status filter is also present

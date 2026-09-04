@@ -11,9 +11,9 @@ use crate::job_store_shard::helpers::{DbWriteBatcher, decode_job_status_owned};
 use crate::keys::{
     self, end_bound, parse_attempt_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, parse_concurrency_requester_counter_key,
-    parse_floating_limit_key, parse_job_cancelled_key, parse_job_info_key, parse_job_status_key,
-    parse_metadata_index_key, parse_status_time_index_key, parse_tenant_status_counter_key,
-    tasks_prefix,
+    parse_enqueue_time_index_key, parse_floating_limit_key, parse_job_cancelled_key,
+    parse_job_info_key, parse_job_status_key, parse_metadata_index_key,
+    parse_status_time_index_key, parse_tenant_status_counter_key, tasks_prefix,
 };
 use crate::shard_range::ShardRange;
 use slatedb::WriteBatch;
@@ -167,6 +167,11 @@ impl JobStoreShard {
             (
                 vec![prefix::FLOATING_LIMIT],
                 Box::new(|key, _| parse_floating_limit_key(key).map(|p| p.tenant)),
+            ),
+            // Enqueue-time index keys (0x0C)
+            (
+                vec![prefix::IDX_ENQUEUE_TIME],
+                Box::new(|key, _| parse_enqueue_time_index_key(key).map(|p| p.tenant)),
             ),
             // Concurrency requester counter keys (0xF7)
             (

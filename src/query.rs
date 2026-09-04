@@ -7,6 +7,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, Int64Array, StringArray, UInt8Array, UInt32Array, new_null_array,
 };
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session as CatalogSession;
@@ -16,7 +17,8 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr};
 use datafusion::physical_plan::display::{DisplayAs, DisplayFormatType};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -254,11 +256,100 @@ impl ShardQueryEngine {
     }
 }
 
+/// A scanner's planning-time decision for one scan. Scanners that dispatch
+/// between several paths store their choice here so that execution and
+/// EXPLAIN follow the same decision the planner made.
+pub trait ScanPath: std::fmt::Debug + Send + Sync + 'static {
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Placeholder for scanners with a single path.
+#[derive(Debug)]
+struct NoScanPath;
+
+impl ScanPath for NoScanPath {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// One column of the ordering a scan path guarantees on its output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderingColumn {
+    pub name: String,
+    pub descending: bool,
+}
+
+/// The resolved decision carried on a plan from planning to execution.
+/// Cheap to clone: plans are cloned by DataFusion's optimizer passes.
+#[derive(Debug, Clone)]
+pub struct ScanDecision {
+    path: Arc<dyn ScanPath>,
+    /// The output ordering the path guarantees, by projected column name;
+    /// empty when the path promises none. Nulls sort last, which is
+    /// immaterial while every ordering column is non-nullable.
+    output_ordering: Vec<OrderingColumn>,
+    /// Whether the path enforces a pushed-down fetch itself. A path that
+    /// ignores its limit must leave this false, since the planner removes the
+    /// limit node above a plan that accepts a fetch.
+    accepts_fetch: bool,
+}
+
+impl ScanDecision {
+    pub fn new(path: impl ScanPath) -> Self {
+        Self {
+            path: Arc::new(path),
+            output_ordering: Vec::new(),
+            accepts_fetch: false,
+        }
+    }
+
+    /// The decision for a scanner with a single path.
+    pub fn single_path() -> Self {
+        Self::new(NoScanPath)
+    }
+
+    /// Declare the ordering the path guarantees and that it enforces a
+    /// pushed-down fetch.
+    pub fn ordered_with_fetch(mut self, output_ordering: Vec<OrderingColumn>) -> Self {
+        self.output_ordering = output_ordering;
+        self.accepts_fetch = true;
+        self
+    }
+
+    /// The scanner-specific decision, if it is of type `T`.
+    pub fn downcast<T: ScanPath>(&self) -> Option<&T> {
+        self.path.as_any().downcast_ref::<T>()
+    }
+
+    pub fn output_ordering(&self) -> &[OrderingColumn] {
+        &self.output_ordering
+    }
+
+    pub fn accepts_fetch(&self) -> bool {
+        self.accepts_fetch
+    }
+}
+
 /// Scan trait for table scanners.
 /// Implementors provide streaming access to table data with filter pushdown.
 pub trait Scan: std::fmt::Debug + Send + Sync + 'static {
+    /// Resolve the path this scan will take for the given projection, filters,
+    /// and limit. Called once at planning time; the plan hands the result to
+    /// `scan` and `describe`, so a decision never changes between planning and
+    /// execution.
+    fn resolve(
+        &self,
+        _projection: &SchemaRef,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> ScanDecision {
+        ScanDecision::single_path()
+    }
+
     fn scan(
         &self,
+        decision: &ScanDecision,
         projection: SchemaRef,
         filters: &[Expr],
         batch_size: usize,
@@ -267,7 +358,12 @@ pub trait Scan: std::fmt::Debug + Send + Sync + 'static {
 
     /// Describe the scan strategy for EXPLAIN output. Returns a human-readable
     /// description of what index/scan path will be used for the given filters.
-    fn describe(&self, _filters: &[Expr], _limit: Option<usize>) -> String {
+    fn describe(
+        &self,
+        _decision: &ScanDecision,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> String {
         "CustomScan".to_string()
     }
 
@@ -350,6 +446,8 @@ struct SiloExecutionPlan {
     scanner: ScannerRef,
     limit: Option<usize>,
     filters: Vec<Expr>,
+    /// The scanner's path decision, resolved once when the plan is built.
+    decision: ScanDecision,
     plan_properties: PlanProperties,
 }
 
@@ -360,7 +458,30 @@ impl SiloExecutionPlan {
         limit: Option<usize>,
         scanner: ScannerRef,
     ) -> Self {
-        let eq = EquivalenceProperties::new(projected_schema.clone());
+        let decision = scanner.resolve(&projected_schema, filters, limit);
+        // Declare the path's ordering only when every ordering column is in
+        // the projected schema: a subset that omits the leading column is not
+        // an ordering of the stream, and a query that needs the order
+        // projects the columns.
+        let ordering: Vec<PhysicalSortExpr> = decision
+            .output_ordering()
+            .iter()
+            .filter_map(|c| {
+                let expr = col(&c.name, &projected_schema).ok()?;
+                Some(PhysicalSortExpr::new(
+                    expr,
+                    SortOptions {
+                        descending: c.descending,
+                        nulls_first: false,
+                    },
+                ))
+            })
+            .collect();
+        let eq = if !ordering.is_empty() && ordering.len() == decision.output_ordering().len() {
+            EquivalenceProperties::new_with_orderings(projected_schema.clone(), [ordering])
+        } else {
+            EquivalenceProperties::new(projected_schema.clone())
+        };
         let props = PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(1),
@@ -373,6 +494,7 @@ impl SiloExecutionPlan {
             scanner,
             limit,
             filters: filters.to_vec(),
+            decision,
             plan_properties: props,
         }
     }
@@ -412,6 +534,7 @@ impl ExecutionPlan for SiloExecutionPlan {
     ) -> DfResult<SendableRecordBatchStream> {
         let batch_size = context.session_config().batch_size();
         Ok(self.scanner.scan(
+            &self.decision,
             self.projected_schema.clone(),
             &self.filters,
             batch_size,
@@ -421,6 +544,31 @@ impl ExecutionPlan for SiloExecutionPlan {
     fn statistics(&self) -> DfResult<Statistics> {
         Ok(Statistics::default())
     }
+    fn fetch(&self) -> Option<usize> {
+        if self.decision.accepts_fetch() {
+            self.limit
+        } else {
+            None
+        }
+    }
+    /// Accept a pushed-down fetch (skip plus limit) on paths that enforce
+    /// their limit. The planner removes the limit node above the returned
+    /// plan, so every other path returns `None` and keeps its limit operator.
+    /// The path, ordering, filters, and plan properties are unchanged; the
+    /// limit becomes the tighter of the two.
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        if !self.decision.accepts_fetch() {
+            return None;
+        }
+        let limit = match (self.limit, fetch) {
+            (Some(current), Some(new)) => Some(current.min(new)),
+            (current, new) => current.or(new),
+        };
+        Some(Arc::new(Self {
+            limit,
+            ..self.clone()
+        }))
+    }
 }
 
 impl DisplayAs for SiloExecutionPlan {
@@ -429,7 +577,9 @@ impl DisplayAs for SiloExecutionPlan {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                let desc = self.scanner.describe(&self.filters, self.limit);
+                let desc = self
+                    .scanner
+                    .describe(&self.decision, &self.filters, self.limit);
                 write!(f, "SiloExecutionPlan: {}", desc)
             }
         }
@@ -957,10 +1107,122 @@ fn analyze_projection(projection: &SchemaRef, strategy: &JobsScanStrategy) -> Pr
     }
 }
 
-impl Scan for JobsScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+/// The physical path a jobs scan executes, chosen at planning time from the
+/// strategy, the projection, the limit, and the shard's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobsScanPath {
+    /// Empty-projection full-tenant scan with no LIMIT — the shape of
+    /// `SELECT COUNT(*) FROM jobs WHERE tenant = ...`. Answers the row tally
+    /// from the per-status counters (O(#statuses)) rather than walking an
+    /// index. Shapes like `EXISTS`/`SELECT 1 ... LIMIT n` push a scan limit and
+    /// want actual rows, not a (reconciler-lagged) counter tally, so they are
+    /// excluded.
+    CountFromCounters,
+    /// Tenant-scoped scan whose projection needs only columns carried by the
+    /// enqueue-time index key, on a shard whose index backfill has completed.
+    /// Walks the tenant's index range newest-first with no point lookups.
+    EnqueueTimeIndex,
+    /// Scan the status/time index directly, no point lookups: the projection
+    /// needs only tenant, id, status_kind, or status_changed_at_ms.
+    StatusIndex,
+    /// Full scan streaming `job_info` in windows, merge-joined against
+    /// `job_status` when a status column is projected.
+    FullScanJoin,
+    /// Index-backed `(tenant, id)` pairs hydrated by point lookups.
+    JobPairs,
+}
+
+/// The jobs scanner's resolved decision for one plan.
+#[derive(Debug, Clone)]
+pub struct JobsScanDecision {
+    pub strategy: JobsScanStrategy,
+    pub path: JobsScanPath,
+}
+
+impl ScanPath for JobsScanDecision {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Whether every projected column is carried by the enqueue-time index key.
+/// An empty projection is not key-served: it is the COUNT(*) shape, which
+/// keeps its own path.
+fn projection_served_by_enqueue_time_index(projection: &SchemaRef) -> bool {
+    !projection.fields().is_empty()
+        && projection.fields().iter().all(|f| {
+            matches!(
+                f.name().as_str(),
+                "shard_id" | "tenant" | "id" | "enqueue_time_ms"
+            )
+        })
+}
+
+impl JobsScanner {
+    fn resolve_jobs(
+        &self,
+        projection: &SchemaRef,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> JobsScanDecision {
         let strategy = parse_jobs_scan_strategy(filters);
-        format!("jobs[{}], limit={:?}", strategy, limit)
+        let needs = analyze_projection(projection, &strategy);
+        let tenant_full_scan = matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) });
+        let path = if projection.fields().is_empty()
+            && limit.is_none()
+            && self.shard.count_from_status_counters
+            && tenant_full_scan
+        {
+            JobsScanPath::CountFromCounters
+        } else if tenant_full_scan
+            && projection_served_by_enqueue_time_index(projection)
+            && self.shard.enqueue_time_index_complete()
+        {
+            JobsScanPath::EnqueueTimeIndex
+        } else if needs.use_status_index_path {
+            JobsScanPath::StatusIndex
+        } else if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
+            JobsScanPath::FullScanJoin
+        } else {
+            JobsScanPath::JobPairs
+        };
+        JobsScanDecision { strategy, path }
+    }
+}
+
+impl Scan for JobsScanner {
+    fn resolve(
+        &self,
+        projection: &SchemaRef,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> ScanDecision {
+        let jobs = self.resolve_jobs(projection, filters, limit);
+        let path = jobs.path;
+        let decision = ScanDecision::new(jobs);
+        match path {
+            // The index range is walked in key order, which is exactly
+            // `enqueue_time_ms DESC, id ASC`, and the stream stops at its limit.
+            JobsScanPath::EnqueueTimeIndex => decision.ordered_with_fetch(vec![
+                OrderingColumn {
+                    name: "enqueue_time_ms".to_string(),
+                    descending: true,
+                },
+                OrderingColumn {
+                    name: "id".to_string(),
+                    descending: false,
+                },
+            ]),
+            _ => decision,
+        }
+    }
+
+    fn describe(&self, decision: &ScanDecision, _filters: &[Expr], limit: Option<usize>) -> String {
+        let decision = Self::jobs_decision(decision);
+        format!(
+            "jobs[{}], limit={:?}, path={:?}",
+            decision.strategy, limit, decision.path
+        )
     }
 
     fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
@@ -969,12 +1231,13 @@ impl Scan for JobsScanner {
 
     fn scan(
         &self,
+        decision: &ScanDecision,
         projection: SchemaRef,
-        filters: &[Expr],
+        _filters: &[Expr],
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
-        let strategy = parse_jobs_scan_strategy(filters);
+        let JobsScanDecision { strategy, path } = Self::jobs_decision(decision);
         let shard = Arc::clone(&self.shard);
         let needs = analyze_projection(&projection, &strategy);
 
@@ -982,53 +1245,144 @@ impl Scan for JobsScanner {
         // the underlying scan cursor(s). Because nothing is spawned, dropping the
         // returned stream (statement timeout, client disconnect, LIMIT satisfied)
         // drops the cursor and stops the scan at its next `.await` — no zombies.
-        let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> =
-            if projection.fields().is_empty()
-                && limit.is_none()
-                && shard.count_from_status_counters
-                && matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) })
-            {
-                // Empty-projection full-tenant scan with no LIMIT — the shape of
-                // `SELECT COUNT(*) FROM jobs WHERE tenant = ...`. Answer the row
-                // tally from the per-status counters (O(#statuses)) rather than
-                // walking the index. The `limit.is_none()` guard excludes shapes
-                // like `EXISTS`/`SELECT 1 ... LIMIT n` that push a scan limit and
-                // want actual rows, not a (reconciler-lagged) counter tally.
-                Box::pin(count_from_counters_stream(
-                    shard,
-                    projection.clone(),
-                    strategy,
-                ))
-            } else if needs.use_status_index_path {
-                Box::pin(status_index_stream(
-                    shard,
-                    projection.clone(),
-                    strategy,
-                    batch_size,
-                    limit,
-                ))
-            } else if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
-                Box::pin(fullscan_join_stream(
-                    shard,
-                    projection.clone(),
-                    needs,
-                    strategy,
-                    batch_size,
-                    limit,
-                ))
-            } else {
-                Box::pin(job_pairs_stream(
-                    shard,
-                    projection.clone(),
-                    needs,
-                    strategy,
-                    batch_size,
-                    limit,
-                ))
-            };
+        let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> = match path {
+            JobsScanPath::CountFromCounters => Box::pin(count_from_counters_stream(
+                shard,
+                projection.clone(),
+                strategy,
+            )),
+            JobsScanPath::EnqueueTimeIndex => Box::pin(enqueue_time_index_stream(
+                shard,
+                projection.clone(),
+                strategy,
+                batch_size,
+                limit,
+            )),
+            JobsScanPath::StatusIndex => Box::pin(status_index_stream(
+                shard,
+                projection.clone(),
+                strategy,
+                batch_size,
+                limit,
+            )),
+            JobsScanPath::FullScanJoin => Box::pin(fullscan_join_stream(
+                shard,
+                projection.clone(),
+                needs,
+                strategy,
+                batch_size,
+                limit,
+            )),
+            JobsScanPath::JobPairs => Box::pin(job_pairs_stream(
+                shard,
+                projection.clone(),
+                needs,
+                strategy,
+                batch_size,
+                limit,
+            )),
+        };
 
         Box::pin(RecordBatchStreamAdapter::new(projection, inner))
     }
+}
+
+impl JobsScanner {
+    /// The plan's resolved decision. A plan is only ever executed by the
+    /// scanner that resolved it, so any other decision type is a programming
+    /// error.
+    fn jobs_decision(decision: &ScanDecision) -> JobsScanDecision {
+        decision
+            .downcast::<JobsScanDecision>()
+            .cloned()
+            .expect("JobsScanner given another scanner's decision")
+    }
+}
+
+/// Streams a tenant's enqueue-time index newest-first in bounded chunks,
+/// emitting RecordBatches whose every column comes from the index key. No
+/// point lookups: the index never holds an entry for a job whose `JOB_INFO`
+/// is gone, so nothing needs hydrating or verifying.
+fn enqueue_time_index_stream(
+    shard: Arc<JobStoreShard>,
+    projection: SchemaRef,
+    strategy: JobsScanStrategy,
+    batch_size: usize,
+    limit: Option<usize>,
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    async_stream::try_stream! {
+        let JobsScanStrategy::FullScan { tenant: Some(tenant) } = strategy else {
+            return; // guarded by the resolver; nothing to emit otherwise
+        };
+        let shard_id = shard.name().to_string();
+        let start = crate::keys::idx_enqueue_time_tenant_prefix(&tenant);
+        let end = crate::keys::end_bound(&start);
+        let mut cursor = shard
+            .open_range_cursor(start, end, &crate::scan_options())
+            .await
+            .map_err(exec_err)?;
+        let mut sent = 0usize;
+        loop {
+            if limit.is_some_and(|l| sent >= l) {
+                break;
+            }
+            // The cursor counts every key it pulls, so never pull more than
+            // the LIMIT still needs.
+            let want = limit.map_or(batch_size, |l| batch_size.min(l - sent));
+            let chunk = cursor.next_kv_chunk(want).await.map_err(exec_err)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let mut rows: Vec<(String, String, i64)> = Vec::with_capacity(chunk.len());
+            for kv in &chunk {
+                let Some(p) = crate::keys::parse_enqueue_time_index_key(&kv.key)
+                    .filter(|p| !p.job_id.is_empty())
+                else {
+                    continue;
+                };
+                let enqueue_time_ms = p.enqueue_time_ms();
+                rows.push((p.tenant, p.job_id, enqueue_time_ms));
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            if let Some(l) = limit {
+                rows.truncate(l - sent);
+            }
+            let batch = build_enqueue_time_index_batch(&projection, &shard_id, &rows)?;
+            sent += batch.num_rows();
+            yield batch;
+        }
+    }
+}
+
+fn build_enqueue_time_index_batch(
+    projection: &SchemaRef,
+    shard_id: &str,
+    rows: &[(String, String, i64)],
+) -> DfResult<RecordBatch> {
+    let n = rows.len();
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(projection.fields().len());
+    for f in projection.fields() {
+        let col: ArrayRef = match f.name().as_str() {
+            "shard_id" => Arc::new(StringArray::from(vec![shard_id; n])),
+            "tenant" => Arc::new(StringArray::from(
+                rows.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>(),
+            )),
+            "id" => Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            "enqueue_time_ms" => Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, t)| *t).collect::<Vec<_>>(),
+            )),
+            _ => new_null_array(f.data_type(), n),
+        };
+        cols.push(col);
+    }
+    RecordBatch::try_new(Arc::clone(projection), cols)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
 /// COUNT(*)-over-a-tenant fast path: sum the transactionally-maintained
@@ -2077,7 +2431,7 @@ impl QueuesScanner {
 }
 
 impl Scan for QueuesScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _decision: &ScanDecision, filters: &[Expr], limit: Option<usize>) -> String {
         let mut tenant = None;
         let mut queue = None;
         let mut entry_type = None;
@@ -2099,6 +2453,7 @@ impl Scan for QueuesScanner {
 
     fn scan(
         &self,
+        _decision: &ScanDecision,
         projection: SchemaRef,
         filters: &[Expr],
         batch_size: usize,
@@ -2411,7 +2766,7 @@ impl std::fmt::Debug for TenantCountsScanner {
 }
 
 impl Scan for TenantCountsScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _decision: &ScanDecision, filters: &[Expr], limit: Option<usize>) -> String {
         let tenant_range = parse_tenant_counts_scan_range(filters)
             .map(|range| describe_tenant_status_counter_scan_range(&range))
             .unwrap_or_else(|| "all".to_string());
@@ -2420,6 +2775,7 @@ impl Scan for TenantCountsScanner {
 
     fn scan(
         &self,
+        _decision: &ScanDecision,
         projection: SchemaRef,
         filters: &[Expr],
         _batch_size: usize,
@@ -2498,7 +2854,7 @@ impl std::fmt::Debug for QueueCountsScanner {
 }
 
 impl Scan for QueueCountsScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _decision: &ScanDecision, filters: &[Expr], limit: Option<usize>) -> String {
         let mut tenant = None;
         for f in filters {
             if let Some((col, val)) = parse_eq_filter(f)
@@ -2512,6 +2868,7 @@ impl Scan for QueueCountsScanner {
 
     fn scan(
         &self,
+        _decision: &ScanDecision,
         projection: SchemaRef,
         filters: &[Expr],
         _batch_size: usize,
@@ -2810,7 +3167,7 @@ fn variant_type_name(vt: crate::fb::silo::fb::TaskVariant) -> &'static str {
 }
 
 impl Scan for TasksScanner {
-    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+    fn describe(&self, _decision: &ScanDecision, filters: &[Expr], limit: Option<usize>) -> String {
         let strategy = parse_tasks_scan_strategy(filters);
         format!("tasks[{}], limit={:?}", strategy, limit)
     }
@@ -2821,6 +3178,7 @@ impl Scan for TasksScanner {
 
     fn scan(
         &self,
+        _decision: &ScanDecision,
         projection: SchemaRef,
         filters: &[Expr],
         batch_size: usize,

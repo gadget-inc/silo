@@ -497,8 +497,10 @@ impl ExecutionPlan for ClusterExecutionPlan {
                         TableKind::Tasks => Arc::new(TasksScanner::new(Arc::clone(&shard))),
                     };
 
-                    // Execute the scan - scanner handles projection via schema
-                    let mut stream = scanner.scan(schema, &filters, batch_size, limit);
+                    // Resolve the path once, then execute it - scanner handles
+                    // projection via schema
+                    let decision = scanner.resolve(&schema, &filters, limit);
+                    let mut stream = scanner.scan(&decision, schema, &filters, batch_size, limit);
 
                     while let Some(result) = stream.next().await {
                         match result {

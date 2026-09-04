@@ -20,8 +20,8 @@ use crate::job_store_shard::helpers::{
     retry_on_txn_conflict,
 };
 use crate::keys::{
-    idx_metadata_key, idx_status_time_key, job_info_key, job_status_key, status_index_timestamp,
-    tenant_status_counter_key,
+    idx_enqueue_time_key, idx_metadata_key, idx_status_time_key, job_info_key, job_status_key,
+    status_index_timestamp, tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
@@ -436,6 +436,7 @@ impl JobStoreShard {
         let job_status_kind = job_status.kind;
 
         writer.put(job_info_key(tenant, job_id), &job_value)?;
+        writer.put(idx_enqueue_time_key(tenant, start_at_ms, job_id), [])?;
 
         // Maintain metadata secondary index
         for (mk, mv) in &job.metadata {

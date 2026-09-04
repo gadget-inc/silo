@@ -1,12 +1,83 @@
 use silo::keys::{
     attempt_key, attempt_prefix, concurrency_holder_key, concurrency_request_job_prefix,
-    concurrency_request_key, end_bound, floating_limit_state_key, idx_metadata_key,
-    idx_status_time_key, idx_status_time_prefix, job_cancelled_key, job_info_key, job_info_prefix,
-    job_status_key, leased_task_key, parse_attempt_key, parse_concurrency_holder_key,
-    parse_concurrency_request_key, parse_floating_limit_key, parse_job_cancelled_key,
+    concurrency_request_key, end_bound, floating_limit_state_key, idx_enqueue_time_key,
+    idx_enqueue_time_tenant_prefix, idx_metadata_key, idx_status_time_key, idx_status_time_prefix,
+    job_cancelled_key, job_info_key, job_info_prefix, job_status_key, leased_task_key,
+    parse_attempt_key, parse_concurrency_holder_key, parse_concurrency_request_key,
+    parse_enqueue_time_index_key, parse_floating_limit_key, parse_job_cancelled_key,
     parse_job_info_key, parse_job_status_key, parse_lease_key, parse_metadata_index_key,
     parse_status_time_index_key, parse_task_key, task_group_prefix, task_key,
 };
+
+#[test]
+fn enqueue_time_index_key_roundtrip_across_sign() {
+    for enqueue_time_ms in [i64::MIN, -2_000, -1, 0, 1, 1_700_000_000_000, i64::MAX] {
+        let key = idx_enqueue_time_key("tenant1", enqueue_time_ms, "job123");
+        let parsed = parse_enqueue_time_index_key(&key)
+            .unwrap_or_else(|| panic!("key for {enqueue_time_ms} should parse"));
+        assert_eq!(parsed.tenant, "tenant1");
+        assert_eq!(parsed.job_id, "job123");
+        assert_eq!(
+            parsed.enqueue_time_ms(),
+            enqueue_time_ms,
+            "round-trip of enqueue_time_ms {enqueue_time_ms}"
+        );
+    }
+}
+
+#[test]
+fn enqueue_time_index_orders_by_time_desc_then_id_asc() {
+    // Newest enqueue time first; ties broken by ascending id. Two distinct
+    // negative times are included because a zero-clamped inversion would
+    // collapse them onto one key.
+    let expected: Vec<(i64, &str)> = vec![
+        (i64::MAX, "a"),
+        (5_000, "a"),
+        (5_000, "b"),
+        (1, "z"),
+        (0, "a"),
+        (0, "b"),
+        (-1, "a"),
+        (-2_000, "a"),
+        (i64::MIN, "a"),
+    ];
+    let mut keys: Vec<(Vec<u8>, (i64, &str))> = expected
+        .iter()
+        .map(|&(t, id)| (idx_enqueue_time_key("t", t, id), (t, id)))
+        .collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    let sorted: Vec<(i64, &str)> = keys.into_iter().map(|(_, e)| e).collect();
+    assert_eq!(
+        sorted, expected,
+        "key order must equal enqueue_time_ms DESC, id ASC"
+    );
+
+    let distinct: std::collections::HashSet<Vec<u8>> = expected
+        .iter()
+        .map(|&(t, id)| idx_enqueue_time_key("t", t, id))
+        .collect();
+    assert_eq!(distinct.len(), expected.len(), "every key must be distinct");
+}
+
+#[test]
+fn enqueue_time_index_tenant_prefix_scopes_scan() {
+    let prefix = idx_enqueue_time_tenant_prefix("tenant1");
+    let end = end_bound(&prefix);
+    let inside = idx_enqueue_time_key("tenant1", 1_000, "job1");
+    let other_tenant = idx_enqueue_time_key("tenant10", 1_000, "job1");
+    assert!(
+        inside >= prefix && inside < end,
+        "a tenant1 key must fall inside tenant1's prefix range"
+    );
+    assert!(
+        !(other_tenant >= prefix && other_tenant < end),
+        "a tenant10 key must fall outside tenant1's prefix range"
+    );
+    assert!(
+        parse_enqueue_time_index_key(&job_info_key("tenant1", "job1")).is_none(),
+        "a JOB_INFO key must not parse as an enqueue-time index key"
+    );
+}
 
 #[test]
 fn test_job_info_key_roundtrip() {

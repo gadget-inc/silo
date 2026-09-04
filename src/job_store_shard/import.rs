@@ -19,8 +19,8 @@ use crate::job_store_shard::helpers::{
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
 use crate::keys::{
-    attempt_key, attempt_prefix, concurrency_holder_key, end_bound, idx_metadata_key,
-    job_cancelled_key, job_info_key, job_status_key,
+    attempt_key, attempt_prefix, concurrency_holder_key, end_bound, idx_enqueue_time_key,
+    idx_metadata_key, job_cancelled_key, job_info_key, job_status_key,
 };
 use crate::retry::{RetryPolicy, retries_exhausted};
 use crate::task::Task;
@@ -211,6 +211,12 @@ impl JobStoreShard {
         };
         let job_value = encode_job_info(&job);
         put_with_optional_expire(&txn, &info_key, &job_value, terminal_expire_ts)?;
+        put_with_optional_expire(
+            &txn,
+            idx_enqueue_time_key(tenant, effective_enqueue_time_ms, job_id),
+            [],
+            terminal_expire_ts,
+        )?;
 
         // Write metadata secondary index
         for (mk, mv) in &job.metadata {
@@ -584,6 +590,14 @@ impl JobStoreShard {
         let updated_job_value = encode_job_info(&updated_job);
         let info_key = job_info_key(tenant, job_id);
         put_with_optional_expire(&txn, &info_key, &updated_job_value, terminal_expire_ts)?;
+        // The entry's TTL must always match JOB_INFO's: a reimport landing in
+        // a non-terminal status clears it, a terminal one sets it.
+        put_with_optional_expire(
+            &txn,
+            idx_enqueue_time_key(tenant, updated_job.enqueue_time_ms, job_id),
+            [],
+            terminal_expire_ts,
+        )?;
 
         // === Clean up old scheduling state ===
 
