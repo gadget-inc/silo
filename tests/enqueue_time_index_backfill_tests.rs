@@ -21,9 +21,19 @@ use test_helpers::*;
 
 const TENANT: &str = "-";
 
-/// Open (or reopen) a shard at `path` with the given backfill settings.
+/// Open (or reopen) a full-range shard at `path` with the given backfill settings.
 async fn open_shard_at(
     path: &std::path::Path,
+    terminal_expire_s: Option<u64>,
+    backfill: EnqueueTimeIndexBackfillConfig,
+) -> Arc<JobStoreShard> {
+    open_shard_with_range(path, ShardRange::full(), terminal_expire_s, backfill).await
+}
+
+/// Open (or reopen) a shard at `path` owning `range`.
+async fn open_shard_with_range(
+    path: &std::path::Path,
+    range: ShardRange,
     terminal_expire_s: Option<u64>,
     backfill: EnqueueTimeIndexBackfillConfig,
 ) -> Arc<JobStoreShard> {
@@ -37,23 +47,27 @@ async fn open_shard_at(
         enqueue_time_index_backfill: backfill,
         ..Default::default()
     };
-    JobStoreShard::open(
-        &cfg,
-        MockGubernatorClient::new_arc(),
-        None,
-        ShardRange::full(),
-    )
-    .await
-    .expect("open shard")
+    JobStoreShard::open(&cfg, MockGubernatorClient::new_arc(), None, range)
+        .await
+        .expect("open shard")
 }
 
 async fn enqueue_many(shard: &JobStoreShard, prefix: &str, count: usize) -> Vec<String> {
+    enqueue_many_for(shard, TENANT, prefix, count).await
+}
+
+async fn enqueue_many_for(
+    shard: &JobStoreShard,
+    tenant: &str,
+    prefix: &str,
+    count: usize,
+) -> Vec<String> {
     let mut ids = Vec::with_capacity(count);
     for i in 0..count {
         let id = format!("{prefix}-{i:04}");
         shard
             .enqueue(
-                TENANT,
+                tenant,
                 Some(id.clone()),
                 10u8,
                 now_ms() + i as i64,
@@ -73,15 +87,19 @@ async fn enqueue_many(shard: &JobStoreShard, prefix: &str, count: usize) -> Vec<
 /// Remove the index entries for `ids`, simulating jobs created before the
 /// index existed.
 async fn strip_entries(shard: &JobStoreShard, ids: &[String]) {
+    strip_entries_for(shard, TENANT, ids).await
+}
+
+async fn strip_entries_for(shard: &JobStoreShard, tenant: &str, ids: &[String]) {
     for id in ids {
         let job = shard
-            .get_job(TENANT, id)
+            .get_job(tenant, id)
             .await
             .expect("get_job")
             .expect("job exists");
         shard
             .db()
-            .delete(idx_enqueue_time_key(TENANT, job.enqueue_time_ms(), id))
+            .delete(idx_enqueue_time_key(tenant, job.enqueue_time_ms(), id))
             .await
             .expect("delete entry");
     }
@@ -90,7 +108,11 @@ async fn strip_entries(shard: &JobStoreShard, ids: &[String]) {
 
 /// The tenant's index entries as job ids, in index order.
 async fn indexed_ids(db: &InstrumentedDb) -> Vec<String> {
-    let start = idx_enqueue_time_tenant_prefix(TENANT);
+    indexed_ids_for(db, TENANT).await
+}
+
+async fn indexed_ids_for(db: &InstrumentedDb, tenant: &str) -> Vec<String> {
+    let start = idx_enqueue_time_tenant_prefix(tenant);
     let end = end_bound(&start);
     let mut iter = db.scan::<Vec<u8>, _>(start..end).await.expect("scan");
     let mut ids = Vec::new();
@@ -475,4 +497,74 @@ async fn enabled_sweep_on_an_empty_shard_sets_the_marker() {
             .is_some(),
         "marker persisted"
     );
+}
+
+/// A split child is a clone of its parent, so it inherits the parent's
+/// checkpoint and any entries the parent already wrote. The parent's range
+/// contains the child's, so every in-range job before the checkpoint is
+/// already indexed and the child only has to finish the walk.
+#[silo::test]
+async fn split_child_resumes_the_parents_checkpoint_and_indexes_every_in_range_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Tenant hashes: zzz (6d85...) is inside [, 8000...), aaa (ae01...) is outside.
+    let left_child = ShardRange::new("", "8000000000000000");
+    let parent = open_shard_at(tmp.path(), None, Default::default()).await;
+    let outside = enqueue_many_for(&parent, "aaa", "a", 120).await;
+    let inside = enqueue_many_for(&parent, "zzz", "z", 120).await;
+    strip_entries_for(&parent, "aaa", &outside).await;
+    strip_entries_for(&parent, "zzz", &inside).await;
+    parent.close().await.expect("close");
+
+    // The parent's sweep walks aaa's rows first (key order), then zzz's;
+    // stop it partway through zzz so the checkpoint sits inside the child's
+    // own tenant.
+    let parent = open_shard_at(tmp.path(), None, enabled(1, 10)).await;
+    poll_until(
+        || async { indexed_ids_for(parent.db(), "zzz").await.len() },
+        |n| *n >= 10,
+        15_000,
+    )
+    .await;
+    parent.close().await.expect("close");
+
+    let child = open_shard_with_range(tmp.path(), left_child, None, Default::default()).await;
+    assert!(!child.enqueue_time_index_complete());
+    let indexed_by_parent = indexed_ids_for(child.db(), "zzz").await.len();
+    assert!(
+        (10..120).contains(&indexed_by_parent),
+        "the parent must stop partway through zzz, got {indexed_by_parent}"
+    );
+    let result = child
+        .backfill_enqueue_time_index(7, Duration::ZERO)
+        .await
+        .expect("backfill");
+    assert!(result.complete, "{result:?}");
+    assert_eq!(sorted(indexed_ids_for(child.db(), "zzz").await), inside);
+}
+
+/// A child cloned from a parent whose sweep completed inherits the marker,
+/// and every job in the child's range is already indexed.
+#[silo::test]
+async fn split_child_inherits_a_completed_parent_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = open_shard_at(tmp.path(), None, Default::default()).await;
+    let inside = enqueue_many_for(&parent, "zzz", "z", 30).await;
+    enqueue_many_for(&parent, "aaa", "a", 30).await;
+    strip_entries_for(&parent, "zzz", &inside).await;
+    let result = parent
+        .backfill_enqueue_time_index(8, Duration::ZERO)
+        .await
+        .expect("backfill");
+    assert!(result.complete);
+    parent.close().await.expect("close");
+
+    let child = open_shard_with_range(
+        tmp.path(),
+        ShardRange::new("", "8000000000000000"),
+        None,
+        enabled(8, 0),
+    )
+    .await;
+    assert!(child.enqueue_time_index_complete(), "marker inherited");
+    assert_eq!(sorted(indexed_ids_for(child.db(), "zzz").await), inside);
 }

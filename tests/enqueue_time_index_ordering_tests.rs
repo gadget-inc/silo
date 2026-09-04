@@ -388,3 +388,60 @@ async fn limit_on_other_tables_is_unchanged() {
         );
     }
 }
+
+/// A residual filter above the index path keeps the limit above the filter,
+/// so a page is never cut short by rows the filter rejects.
+#[silo::test]
+async fn residual_filters_keep_the_limit_above_the_scan() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    seed(&shard, 200).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    // The newest rows carry the largest enqueue times; a cutoff at the median
+    // rejects roughly the first hundred index keys.
+    let cutoff = {
+        let times = engine
+            .sql(
+                "SELECT enqueue_time_ms FROM jobs WHERE tenant = '-' ORDER BY enqueue_time_ms DESC",
+            )
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let col = times[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .expect("int64");
+        col.value(100)
+    };
+    let queries = [
+        format!(
+            "SELECT id FROM jobs WHERE tenant = '-' AND enqueue_time_ms <= {cutoff} ORDER BY enqueue_time_ms DESC, id ASC LIMIT 5"
+        ),
+        "SELECT id FROM jobs WHERE tenant = '-' AND id LIKE 'job-1%' ORDER BY enqueue_time_ms DESC, id ASC LIMIT 5".to_string(),
+        "SELECT id FROM jobs WHERE tenant = '-' AND id LIKE 'job-19%' LIMIT 3".to_string(),
+    ];
+
+    for query in &queries {
+        mark_complete(&shard, false).await;
+        let expected = ids(&engine, query).await;
+        mark_complete(&shard, true).await;
+        let plan_text = explain(&engine, query).await;
+        let line = plan_line(&plan_text);
+        assert!(line.contains(ENQUEUE_INDEX_LABEL), "{query}:\n{plan_text}");
+        assert!(
+            plan_text.contains("FilterExec") && line.contains("limit=None"),
+            "{query}: the limit must stay above the residual filter:\n{plan_text}"
+        );
+        let before = metrics.query_scanned_keys_value(shard.name());
+        let got = ids(&engine, query).await;
+        let scanned = metrics.query_scanned_keys_value(shard.name()) - before;
+        assert_eq!(got, expected, "{query}");
+        assert!(
+            !got.is_empty() && scanned > got.len() as f64,
+            "{query}: the scan must walk past the rejected keys (scanned {scanned} for {} rows)",
+            got.len()
+        );
+    }
+}
