@@ -57,49 +57,16 @@ async fn enqueue_floating(shard: &JobStoreShard, queue: &str, tag: u32) {
         .expect("enqueue floating job");
 }
 
-/// Each dequeue against an empty buffer wakes the broker scanner, so repeated
-/// dequeues advance scan generations without waiting out the scanner's backoff.
-async fn dequeue_until_refresh_task_leased(
-    shard: &JobStoreShard,
-    attempts: usize,
-) -> Option<String> {
-    for _ in 0..attempts {
-        let result = shard
-            .dequeue("worker-2", "default", 10)
-            .await
-            .expect("dequeue");
-        if let Some(task) = result.refresh_tasks.first() {
-            return Some(task.task_id.clone());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    None
+fn read_revived_total(metrics: &silo::metrics::Metrics) -> f64 {
+    metric_value_or_zero(
+        &gather_metrics_text(metrics),
+        &["silo_broker_scan_tasks_read_total", "outcome=\"revived\""],
+    )
 }
 
-fn read_scan_outcome_total(metrics: &silo::metrics::Metrics, outcome: &str) -> f64 {
-    metrics
-        .registry()
-        .gather()
-        .into_iter()
-        .find(|f| f.get_name() == "silo_broker_scan_tasks_read_total")
-        .map(|f| {
-            f.get_metric()
-                .iter()
-                .filter(|m| {
-                    m.get_label()
-                        .iter()
-                        .any(|l| l.get_name() == "outcome" && l.get_value() == outcome)
-                })
-                .map(|m| m.get_counter().get_value())
-                .sum()
-        })
-        .unwrap_or(0.0)
-}
-
-/// The env-621258 shape: a refresh task row the broker acked and tombstoned
-/// is still durable under the same bytes. With a revive bound of one scan
-/// generation, driving scans through dequeue wakeups must lease it again
-/// without a process restart.
+/// A refresh task row the broker acked and tombstoned is still durable under
+/// the same bytes. With a revive bound of one scan generation, driving scans
+/// through dequeue wakeups must lease it again without a process restart.
 #[silo::test]
 async fn tombstoned_task_row_still_durable_is_revived_and_leased() {
     let (_tmp, shard, metrics) = open_temp_shard_with_tombstone_revive_after_generations(1).await;
@@ -113,9 +80,12 @@ async fn tombstoned_task_row_still_durable_is_revived_and_leased() {
         .expect("refresh task row is durable before dequeue");
 
     // Dequeue acks the row: the key is deleted and tombstoned in the broker.
-    let first = dequeue_until_refresh_task_leased(&shard, 50)
-        .await
-        .expect("refresh task leased once");
+    let first =
+        dequeue_refresh_tasks_until(&shard, "worker-1", "default", 1, Duration::from_secs(30))
+            .await
+            .refresh_tasks[0]
+            .task_id
+            .clone();
     shard
         .report_refresh_success(&first, 1)
         .await
@@ -133,23 +103,24 @@ async fn tombstoned_task_row_still_durable_is_revived_and_leased() {
         .expect("put row back");
     shard.db().flush().await.expect("flush");
 
-    let second = dequeue_until_refresh_task_leased(&shard, 200).await;
-    assert!(
-        second.is_some(),
-        "a durable row re-observed past the revive bound must be leased again"
-    );
-    assert_eq!(second.as_deref(), Some(first.as_str()));
-    assert_eq!(read_scan_outcome_total(&metrics, "revived"), 1.0);
+    let second =
+        dequeue_refresh_tasks_until(&shard, "worker-2", "default", 1, Duration::from_secs(30))
+            .await
+            .refresh_tasks[0]
+            .task_id
+            .clone();
+    assert_eq!(second, first, "the revived row is the same task");
+    assert_eq!(read_revived_total(&metrics), 1.0);
     assert!(
         find_refresh_task_row(&shard).await.is_none(),
         "the revived row is deleted by its second dequeue"
     );
 }
 
-/// A key that was acked and whose row is truly gone stays suppressed: no
-/// phantom lease, no phantom buffer entry, and no revival.
+/// A durably deleted task row is never re-leased and leaves no buffer entry
+/// while its tombstone ages past the revive bound.
 #[silo::test]
-async fn tombstoned_task_row_that_is_gone_is_never_revived() {
+async fn durably_deleted_row_is_not_re_leased_and_leaves_no_buffer_entry() {
     let (_tmp, shard, metrics) = open_temp_shard_with_tombstone_revive_after_generations(1).await;
 
     shard
@@ -167,20 +138,8 @@ async fn tombstoned_task_row_that_is_gone_is_never_revived() {
         .await
         .expect("enqueue");
 
-    let leased = poll_until(
-        || async {
-            shard
-                .dequeue("worker-1", "default", 10)
-                .await
-                .expect("dequeue")
-                .tasks
-                .len()
-        },
-        |&n| n == 1,
-        5000,
-    )
-    .await;
-    assert_eq!(leased, 1);
+    let leased = dequeue_task_ids_until(&shard, "worker-1", "default", 1).await;
+    assert_eq!(leased.len(), 1);
     assert_eq!(count_task_keys(shard.db()).await, 0);
 
     // Drive scan generations well past the bound.
@@ -196,7 +155,7 @@ async fn tombstoned_task_row_that_is_gone_is_never_revived() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(shard.broker_buffer_len(), 0);
-    assert_eq!(read_scan_outcome_total(&metrics, "revived"), 0.0);
+    assert_eq!(read_revived_total(&metrics), 0.0);
     assert_eq!(
         count_lease_keys(shard.db()).await,
         1,

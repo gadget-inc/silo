@@ -847,23 +847,28 @@ impl JobStoreShard {
                 Limit::FloatingConcurrency(fl) if fl.key == queue => Some(fl),
                 _ => None,
             });
+            // An earlier ticket on this queue in the same iteration already ran
+            // this decision against the same durable row and `now_ms`.
+            let already_converted = state
+                .converted_requests
+                .iter()
+                .any(|(t, q)| t == &tenant && q == &queue);
             if let Some(fl) = floating
                 && !req_task_group.is_empty()
+                && !already_converted
             {
                 let fl_state = self
                     .get_or_create_floating_limit_state(&mut writer, &tenant, fl)
                     .await?;
-                if self.floating_limit_refresh_ready(&fl_state, now_ms) {
-                    self.maybe_schedule_floating_limit_refresh(
-                        &mut writer,
-                        &tenant,
-                        fl,
-                        &fl_state,
-                        now_ms,
-                        &req_task_group,
-                        true,
-                    )?;
-                }
+                self.maybe_schedule_floating_limit_refresh(
+                    &mut writer,
+                    &tenant,
+                    &fl.key,
+                    &fl_state,
+                    now_ms,
+                    &req_task_group,
+                    true,
+                )?;
             }
             state
                 .converted_requests

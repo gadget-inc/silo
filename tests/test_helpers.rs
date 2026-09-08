@@ -703,11 +703,10 @@ pub fn metric_value_or_zero(body: &str, substrings: &[&str]) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Open a temp shard with a custom `floating_refresh_stale_ms` threshold and
-/// a fresh Metrics registry, for tests that age out an outstanding floating
-/// limit refresh flag.
-pub async fn open_temp_shard_with_floating_refresh_stale_ms(
-    stale_ms: u64,
+/// Open a temp shard wired to a fresh Metrics registry, applying `overrides`
+/// to the `DatabaseConfig` before opening.
+pub async fn open_temp_shard_with_metrics_and_config(
+    overrides: impl FnOnce(&mut DatabaseConfig),
 ) -> (
     tempfile::TempDir,
     std::sync::Arc<JobStoreShard>,
@@ -715,14 +714,14 @@ pub async fn open_temp_shard_with_floating_refresh_stale_ms(
 ) {
     let rate_limiter = MockGubernatorClient::new_arc();
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = DatabaseConfig {
+    let mut cfg = DatabaseConfig {
         name: "test".to_string(),
         backend: Backend::Fs,
         path: tmp.path().to_string_lossy().to_string(),
         slatedb: Some(fast_flush_slatedb_settings()),
-        floating_refresh_stale_ms: stale_ms,
         ..Default::default()
     };
+    overrides(&mut cfg);
     let metrics = silo::metrics::init().expect("init metrics");
     let shard = JobStoreShard::open(
         &cfg,
@@ -735,9 +734,21 @@ pub async fn open_temp_shard_with_floating_refresh_stale_ms(
     (tmp, shard, metrics)
 }
 
+/// Open a temp shard with a custom `floating_refresh_stale_ms` threshold, for
+/// tests that age out an outstanding floating limit refresh flag.
+pub async fn open_temp_shard_with_floating_refresh_stale_ms(
+    stale_ms: u64,
+) -> (
+    tempfile::TempDir,
+    std::sync::Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
+    open_temp_shard_with_metrics_and_config(|cfg| cfg.floating_refresh_stale_ms = stale_ms).await
+}
+
 /// Open a temp shard with a custom `broker_tombstone_revive_after_generations`
-/// bound and a fresh Metrics registry, for tests that revive a task row the
-/// broker is still suppressing behind an ack tombstone.
+/// bound, for tests that revive a task row the broker is still suppressing
+/// behind an ack tombstone.
 pub async fn open_temp_shard_with_tombstone_revive_after_generations(
     revive_after: u64,
 ) -> (
@@ -745,24 +756,43 @@ pub async fn open_temp_shard_with_tombstone_revive_after_generations(
     std::sync::Arc<JobStoreShard>,
     silo::metrics::Metrics,
 ) {
-    let rate_limiter = MockGubernatorClient::new_arc();
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = DatabaseConfig {
-        name: "test".to_string(),
-        backend: Backend::Fs,
-        path: tmp.path().to_string_lossy().to_string(),
-        slatedb: Some(fast_flush_slatedb_settings()),
-        broker_tombstone_revive_after_generations: revive_after,
-        ..Default::default()
-    };
-    let metrics = silo::metrics::init().expect("init metrics");
-    let shard = JobStoreShard::open(
-        &cfg,
-        rate_limiter,
-        Some(metrics.clone()),
-        ShardRange::full(),
-    )
+    open_temp_shard_with_metrics_and_config(|cfg| {
+        cfg.broker_tombstone_revive_after_generations = revive_after
+    })
     .await
-    .expect("open shard");
-    (tmp, shard, metrics)
+}
+
+/// Dequeue from `task_group` until `n` RefreshFloatingLimit tasks have been
+/// leased, or `timeout` elapses. Each dequeue against an empty buffer wakes
+/// the broker scanner, so this also advances scan generations. Run tasks
+/// leased along the way are returned too so callers can settle them.
+pub async fn dequeue_refresh_tasks_until(
+    shard: &JobStoreShard,
+    worker: &str,
+    task_group: &str,
+    n: usize,
+    timeout: Duration,
+) -> silo::job_store_shard::DequeueResult {
+    let mut merged = silo::job_store_shard::DequeueResult {
+        tasks: Vec::new(),
+        refresh_tasks: Vec::new(),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while merged.refresh_tasks.len() < n {
+        let batch = shard
+            .dequeue(worker, task_group, 10)
+            .await
+            .expect("dequeue");
+        merged.tasks.extend(batch.tasks);
+        merged.refresh_tasks.extend(batch.refresh_tasks);
+        if merged.refresh_tasks.len() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} refresh tasks in {task_group}; got {}",
+                merged.refresh_tasks.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    merged
 }

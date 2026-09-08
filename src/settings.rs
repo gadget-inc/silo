@@ -257,9 +257,8 @@ fn default_grant_scanner_live_headroom_fraction() -> f64 {
 
 /// Default for `floating_refresh_stale_ms`: how long a floating limit's
 /// outstanding-refresh flag is trusted before silo treats the refresh as
-/// lost and allows a replacement to be scheduled. A worker lease is 10 s and
-/// the production refresh interval is 500 ms, so a legitimately in-flight
-/// refresh is never this old.
+/// lost and allows a replacement to be scheduled. Well past any worker
+/// lease duration, so a legitimately in-flight refresh is never this old.
 pub const DEFAULT_FLOATING_REFRESH_STALE_MS: u64 = 60_000;
 
 fn default_floating_refresh_stale_ms() -> u64 {
@@ -832,15 +831,14 @@ pub struct DatabaseConfig {
     /// Defaults to 16.
     #[serde(default = "default_grant_scanner_commit_chunk_size")]
     pub grant_scanner_commit_chunk_size: usize,
-    /// How long (ms) a floating limit's outstanding-refresh flag is trusted
-    /// before the refresh is treated as lost and a replacement may be
-    /// scheduled. Rows carrying no scheduled-at stamp are treated as stale
-    /// immediately. Defaults to 60000.
+    /// How long (ms) an outstanding floating limit refresh is trusted. See
+    /// `DatabaseTemplate::floating_refresh_stale_ms` for details. Defaults
+    /// to 60000.
     #[serde(default = "default_floating_refresh_stale_ms")]
     pub floating_refresh_stale_ms: u64,
-    /// Scan generations an ack tombstone may keep suppressing a task key the
-    /// scanner keeps re-observing before the broker point-reads the row and
-    /// revives it if it is still durable. Defaults to 64.
+    /// Scan generations an ack tombstone may suppress a re-observed task key.
+    /// See `DatabaseTemplate::broker_tombstone_revive_after_generations` for
+    /// details. Defaults to 64.
     #[serde(default = "default_broker_tombstone_revive_after_generations")]
     pub broker_tombstone_revive_after_generations: u64,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
@@ -1087,5 +1085,29 @@ mod tests {
         )
         .expect("config with periodic_full_compaction_s should parse");
         assert_eq!(db.periodic_full_compaction_s, Some(5));
+    }
+
+    #[test]
+    fn floating_refresh_settings_default_on_both_carriers() {
+        let template: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            "#,
+        )
+        .expect("template without refresh settings should parse");
+        assert_eq!(template.floating_refresh_stale_ms, 60_000);
+        assert_eq!(template.broker_tombstone_revive_after_generations, 64);
+
+        let config: DatabaseConfig = toml::from_str(
+            r#"
+            name = "shard"
+            backend = "memory"
+            path = "/tmp/silo-shard"
+            "#,
+        )
+        .expect("config without refresh settings should parse");
+        assert_eq!(config.floating_refresh_stale_ms, 60_000);
+        assert_eq!(config.broker_tombstone_revive_after_generations, 64);
     }
 }

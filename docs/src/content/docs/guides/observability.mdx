@@ -74,7 +74,7 @@ The task broker maintains an in-memory buffer of ready tasks for efficient deque
 | `silo_broker_inflight_size` | Gauge | `shard`, `task_group` | Tasks claimed but not yet durably leased per task group |
 | `silo_broker_scan_duration_seconds` | Histogram | `shard` | Duration of broker task scanning operations |
 | `silo_broker_scans_total` | Counter | `shard` | Total number of broker task scan operations |
-| `silo_broker_scan_tasks_read_total` | Counter | `shard`, `task_group`, `outcome` | Tasks read during scans, broken down by outcome: `inserted`, `skipped_future`, `skipped_inflight`, `skipped_tombstone`, `skipped_already_buffered`, `skipped_defunct`, `revived` |
+| `silo_broker_scan_tasks_read_total` | Counter | `shard`, `task_group`, `outcome` | Tasks read during scans, broken down by outcome: `inserted`, `skipped_future`, `skipped_inflight`, `skipped_tombstone`, `skipped_already_buffered`, `skipped_defunct`; plus `revived`, recorded in addition to the row's final outcome (normally `inserted`) |
 | `silo_broker_tombstone_count` | Gauge | `shard`, `task_group` | Number of ack tombstones currently held by the broker |
 
 **Key insights:**
@@ -82,7 +82,7 @@ The task broker maintains an in-memory buffer of ready tasks for efficient deque
 - Break down `silo_broker_buffer_size` by `task_group` to identify which queues are starved vs saturated
 - High `silo_broker_scan_duration_seconds` suggests database pressure
 - `silo_broker_inflight_size` should be transiently low; persistent high values indicate dequeue bottlenecks
-- A high rate of `silo_broker_scan_tasks_read_total` with `outcome="skipped_tombstone"` indicates the scanner is repeatedly encountering recently-acked keys that haven't been compacted away yet. A key that stays re-observed for more than `broker_tombstone_revive_after_generations` scan generations (default 64) is point-read; if its row is still durable the tombstone is dropped, the task is buffered, and the read counts as `outcome="revived"`, so a durable row can never stay hidden until the next restart
+- A high rate of `silo_broker_scan_tasks_read_total` with `outcome="skipped_tombstone"` indicates the scanner is repeatedly encountering recently-acked keys that haven't been compacted away yet. A key that stays re-observed for more than `broker_tombstone_revive_after_generations` scan generations (default 64) is point-read; if its row is still durable the tombstone is dropped, the task is buffered, and the read counts as `outcome="revived"` alongside its final outcome, so a durable row can never stay hidden until the next restart
 - `outcome="revived"` should be rare. Each increment is a task row that the broker believed it had deleted but that was still in the DB; a steady rate points at a write path whose delete is not landing
 - Growing `silo_broker_tombstone_count` may signal that dequeued task keys are persisting in the DB longer than expected
 

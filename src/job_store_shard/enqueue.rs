@@ -753,7 +753,7 @@ impl JobStoreShard {
                         self.maybe_schedule_floating_limit_refresh(
                             writer,
                             tenant,
-                            fl,
+                            &fl.key,
                             &state,
                             now_ms,
                             task_group,

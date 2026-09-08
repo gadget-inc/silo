@@ -84,7 +84,7 @@ pub struct TaskBroker {
 
 impl TaskBroker {
     // Keep ack tombstones for a bounded number of completed scan generations and
-    // refresh the tombstone generation whenever a stale key is observed again.
+    // refresh `last_seen` whenever a stale key is observed again.
     const ACK_TOMBSTONE_RETAIN_GENERATIONS: u64 = 64;
 
     fn new(
@@ -209,16 +209,30 @@ impl TaskBroker {
                     skipped_tombstone += 1;
                     continue;
                 }
-                // A key re-observed past the bound may be a row whose delete
-                // never landed. A point get sees a fresher view than the range
-                // scan that yielded the key; the guard is not held across it.
+                // A key re-observed past the bound is either a stale scan or a
+                // row rewritten under the same key after the delete. A point get
+                // sees a fresher view than the range scan that yielded the key;
+                // the guard is not held across it.
                 match self.db.get(&key_bytes).await {
                     Ok(Some(durable)) => {
                         self.ack_tombstones.lock().unwrap().remove(&key_bytes);
                         revived += 1;
                         value = durable;
                     }
-                    _ => {
+                    Ok(None) => {
+                        // The delete is confirmed. Re-arm the bound so a stale
+                        // scan costs one point read per bound window, not one
+                        // per generation.
+                        if let Some(tombstone) =
+                            self.ack_tombstones.lock().unwrap().get_mut(&key_bytes)
+                        {
+                            tombstone.inserted_at = generation;
+                        }
+                        skipped_tombstone += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "tombstone revive point read failed; keeping suppression");
                         skipped_tombstone += 1;
                         continue;
                     }
@@ -743,6 +757,10 @@ mod inflight_release_tests {
     use crate::task::Task;
 
     async fn empty_broker() -> Arc<TaskBroker> {
+        broker_with_revive_bound(TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS).await
+    }
+
+    async fn broker_with_revive_bound(bound: u64) -> Arc<TaskBroker> {
         let store = Arc::new(slatedb::object_store::memory::InMemory::new());
         let db = slatedb::DbBuilder::new("test", store)
             .build()
@@ -755,8 +773,52 @@ mod inflight_release_tests {
             "shard".to_string(),
             None,
             ShardRange::full(),
-            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+            bound,
         )
+    }
+
+    /// A tombstoned key that a scan keeps yielding is suppressed while its
+    /// age (generations since insertion) is within the bound and point-read
+    /// once past it; a row still present is revived and buffered.
+    #[tokio::test]
+    async fn tombstoned_key_is_revived_only_past_the_bound() {
+        let broker = broker_with_revive_bound(1).await;
+        let entry = sample_broker_task("revive-boundary");
+        let row = encode_task(&entry.decoded.to_task().expect("task"));
+        broker.db.put(&entry.key, &row).await.expect("put row");
+        let now_ms = crate::job_store_shard::now_epoch_ms();
+
+        let generation = broker.begin_scan_generation();
+        assert_eq!(broker.scan_tasks(now_ms, generation).await, 1);
+        assert_eq!(broker.claim_ready(1).len(), 1);
+        broker.ack_durable(
+            std::slice::from_ref(&entry.key),
+            std::slice::from_ref(&entry.key),
+        );
+
+        // Age 1: within the bound, suppressed without a point read.
+        let generation = broker.begin_scan_generation();
+        assert_eq!(broker.scan_tasks(now_ms, generation).await, 0);
+        assert_eq!(broker.buffer_len(), 0);
+        assert!(
+            broker
+                .ack_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&entry.key)
+        );
+
+        // Age 2: past the bound, point-read, present, revived.
+        let generation = broker.begin_scan_generation();
+        assert_eq!(broker.scan_tasks(now_ms, generation).await, 1);
+        assert_eq!(broker.buffer_len(), 1);
+        assert!(
+            !broker
+                .ack_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&entry.key)
+        );
     }
 
     fn sample_broker_task(job_id: &str) -> BrokerTask {

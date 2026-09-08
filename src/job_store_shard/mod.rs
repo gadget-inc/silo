@@ -604,6 +604,8 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
+            // Epoch-ms arithmetic needs an i64; a value past i64::MAX saturates
+            // and means only stamp-less rows ever read as stale.
             floating_refresh_stale_ms: i64::try_from(floating_refresh_stale_ms).unwrap_or(i64::MAX),
         });
 

@@ -20,11 +20,7 @@ impl JobStoreShard {
     /// was scheduled longer ago than the shard's stale threshold, or carries
     /// no stamp at all. Such a refresh is treated as lost: no task row,
     /// lease, or in-memory suppression may pin a tenant's cap forever.
-    pub(crate) fn floating_limit_refresh_stale(
-        &self,
-        state: &DecodedFloatingLimitState,
-        now_ms: i64,
-    ) -> bool {
+    fn floating_limit_refresh_stale(&self, state: &DecodedFloatingLimitState, now_ms: i64) -> bool {
         state.refresh_task_scheduled()
             && state
                 .refresh_scheduled_at_ms()
@@ -90,8 +86,17 @@ impl JobStoreShard {
         let Some(kv) = iter.next().await? else {
             return Ok(None);
         };
-        let Ok(decoded) = decode_concurrency_action(kv.value) else {
-            return Ok(None);
+        let decoded = match decode_concurrency_action(kv.value) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue_key = %queue_key,
+                    error = %e,
+                    "head waiting request is unreadable; not scheduling a floating limit refresh"
+                );
+                return Ok(None);
+            }
         };
         let Some(request) = decoded.fb().variant_as_enqueue_task() else {
             return Ok(None);
@@ -104,18 +109,29 @@ impl JobStoreShard {
         let Some(raw) = self.db.get(&job_info_key(tenant, job_id)).await? else {
             return Ok(None);
         };
-        let Ok(job) = JobView::new(raw) else {
-            return Ok(None);
+        let job = match JobView::new(raw) {
+            Ok(job) => job,
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue_key = %queue_key,
+                    job_id = %job_id,
+                    error = %e,
+                    "head waiter's job info is unreadable; not scheduling a floating limit refresh"
+                );
+                return Ok(None);
+            }
         };
         Ok(Some(job.task_group().to_string()).filter(|g| !g.is_empty()))
     }
 
     /// Schedule a refresh for a floating queue the grant scanner found at
-    /// capacity with a backlog. Readiness is judged here with the shard's
-    /// stale threshold; the task group comes from the head waiter. The task
-    /// and state are committed in their own batch and the group's broker is
-    /// woken so the task is claimable without waiting out scan backoff.
-    /// Returns whether a task was written.
+    /// capacity with pending grant demand. Readiness is judged here with the
+    /// shard's stale threshold; the task group comes from the head waiter,
+    /// whose presence is what establishes the backlog. The task and state are
+    /// committed in their own batch and the group's broker is woken so the
+    /// task is claimable without waiting out scan backoff. Returns whether a
+    /// task was written.
     pub(crate) async fn schedule_floating_refresh_from_scanner(
         &self,
         tenant: &str,
@@ -126,29 +142,37 @@ impl JobStoreShard {
         if !self.floating_limit_refresh_ready(state, now_ms) {
             return Ok(false);
         }
+        // The scanner's row is a snapshot from its precheck. A refresh outcome
+        // committed since then must not be overwritten from that snapshot, so
+        // readiness and the write use a fresh read of the row.
+        let state_key = floating_limit_state_key(tenant, queue_key);
+        let Some(raw) = self.db.get(&state_key).await? else {
+            return Ok(false);
+        };
+        let state = &decode_floating_limit_state(raw)?;
+        if !self.floating_limit_refresh_ready(state, now_ms) {
+            return Ok(false);
+        }
         let Some(task_group) = self
             .peek_head_waiting_request_task_group(tenant, queue_key)
             .await?
         else {
             return Ok(false);
         };
-        let fl = FloatingConcurrencyLimit {
-            key: queue_key.to_string(),
-            default_max_concurrency: state.default_max_concurrency(),
-            refresh_interval_ms: state.refresh_interval_ms(),
-            metadata: state.metadata(),
-        };
         let mut batch = WriteBatch::new();
         let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
-        self.maybe_schedule_floating_limit_refresh(
+        let written = self.maybe_schedule_floating_limit_refresh(
             &mut writer,
             tenant,
-            &fl,
+            queue_key,
             state,
             now_ms,
             &task_group,
             true,
         )?;
+        if !written {
+            return Ok(false);
+        }
         self.db.write(batch).await?;
         self.brokers.wakeup(&task_group);
         Ok(true)
@@ -191,6 +215,7 @@ impl JobStoreShard {
     }
 
     /// Check if a floating limit refresh is needed and schedule it if so.
+    /// Returns whether a refresh task was written.
     ///
     /// Three call sites lazily trigger refreshes, each supplying its own
     /// waiter signal and task group: the enqueue path (a job that just
@@ -203,14 +228,14 @@ impl JobStoreShard {
         &self,
         writer: &mut W,
         tenant: &str,
-        fl: &FloatingConcurrencyLimit,
+        queue_key: &str,
         state: &DecodedFloatingLimitState,
         now_ms: i64,
         task_group: &str,
         has_waiters: bool,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<bool, JobStoreShardError> {
         if self.floating_limit_refresh_outstanding(state, now_ms) {
-            return Ok(());
+            return Ok(false);
         }
 
         // Check if we need to refresh based on interval
@@ -224,7 +249,7 @@ impl JobStoreShard {
             .unwrap_or(false);
 
         if !should_refresh || in_backoff || !has_waiters {
-            return Ok(());
+            return Ok(false);
         }
 
         // Reaching here with the flag still set means the outstanding refresh
@@ -233,7 +258,7 @@ impl JobStoreShard {
             let age_ms = state.refresh_scheduled_at_ms().map(|at| now_ms - at);
             tracing::warn!(
                 tenant = %tenant,
-                queue_key = %fl.key,
+                queue_key = %queue_key,
                 age_ms = ?age_ms,
                 "floating limit refresh flag is stale; scheduling a replacement refresh"
             );
@@ -247,7 +272,7 @@ impl JobStoreShard {
         let refresh_task = Task::RefreshFloatingLimit {
             task_id: task_id.clone(),
             tenant: tenant.to_string(),
-            queue_key: fl.key.clone(),
+            queue_key: queue_key.to_string(),
             current_max_concurrency: state.current_max_concurrency(),
             last_refreshed_at_ms: state.last_refreshed_at_ms(),
             metadata: state.metadata(),
@@ -256,7 +281,7 @@ impl JobStoreShard {
 
         // Use a synthetic task key with a special job_id format for floating refresh tasks
         let task_value = encode_task(&refresh_task);
-        let synthetic_job_id = format!("floating_refresh:{}", fl.key);
+        let synthetic_job_id = format!("floating_refresh:{queue_key}");
         let task_key_bytes = crate::keys::task_key(
             task_group,
             now_ms,
@@ -273,18 +298,18 @@ impl JobStoreShard {
             refresh_scheduled_at_ms: Some(now_ms),
             ..state.to_owned()
         };
-        let state_key = floating_limit_state_key(tenant, &fl.key);
+        let state_key = floating_limit_state_key(tenant, queue_key);
         let state_value = encode_floating_limit_state(&new_state);
         writer.put(&state_key, &state_value)?;
 
         tracing::debug!(
-            queue_key = %fl.key,
+            queue_key = %queue_key,
             current_max = state.current_max_concurrency(),
             last_refreshed = state.last_refreshed_at_ms(),
             "scheduled floating limit refresh task"
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Report a successful floating limit refresh from a worker.

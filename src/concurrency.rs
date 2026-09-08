@@ -154,9 +154,10 @@ pub trait LimitChainResumer: Send + Sync {
     fn wakeup_task_groups(&self, _groups: &[String]) {}
 
     /// The grant scanner found the floating queue `(tenant, queue)` at
-    /// capacity with a backlog and skipped its request scan. The shard-side
-    /// implementation decides whether a refresh of the queue's cap is due
-    /// and, if so, writes and commits the refresh task. Default is a no-op
+    /// capacity with pending grant demand and skipped its request scan. The
+    /// shard-side implementation verifies a waiter exists, decides whether a
+    /// refresh of the queue's cap is due and, if so, writes and commits the
+    /// refresh task. Default is a no-op
     /// for resumers with no shard access.
     async fn maybe_schedule_floating_refresh(
         &self,
@@ -2287,15 +2288,6 @@ impl ConcurrencyManager {
                 if let Some(ref m) = self.metrics {
                     m.record_concurrency_grant_precheck_skip(&self.shard);
                 }
-                // A saturated floating queue with a backlog is exactly the
-                // shape whose cap should track the API-side controller. The
-                // shard judges readiness and picks the task group; the
-                // scanner only reports that the queue is at capacity.
-                if let (Some(state), Some(resumer)) = (floating_state, self.chain_resumer()) {
-                    resumer
-                        .maybe_schedule_floating_refresh(tenant, queue, &state)
-                        .await;
-                }
                 tracing::debug!(
                     tenant = %tenant,
                     queue = %queue,
@@ -2306,6 +2298,17 @@ impl ConcurrencyManager {
                     "grant scanner: queue at capacity, skipping request scan"
                 );
                 record_invocation(0, 0);
+                // A saturated floating queue with pending grant demand is exactly
+                // the shape whose cap should track the API-side controller. The
+                // shard verifies a waiter exists, judges readiness, and picks
+                // the task group; the scanner only reports the saturation. The
+                // invocation is recorded above so its duration stays the cost
+                // of the precheck itself.
+                if let (Some(state), Some(resumer)) = (floating_state, self.chain_resumer()) {
+                    resumer
+                        .maybe_schedule_floating_refresh(tenant, queue, &state)
+                        .await;
+                }
                 return Vec::new();
             }
         }

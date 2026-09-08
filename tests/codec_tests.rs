@@ -610,8 +610,8 @@ fn test_decoded_task_invalid_data() {
     assert!(result.is_err());
 }
 
-/// A floating limit state row encoded by a build whose table ends at
-/// `metadata`, with no `refresh_scheduled_at_ms` slot. It carries
+/// A floating limit state row whose table has eight vtable slots ending at
+/// `metadata` and no `refresh_scheduled_at_ms` slot. It carries
 /// `current_max_concurrency: 19`, `last_refreshed_at_ms: 1_756_400_000_000`,
 /// `refresh_task_scheduled: true`, `refresh_interval_ms: 500`,
 /// `default_max_concurrency: 5`, `retry_count: 3`,
