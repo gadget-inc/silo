@@ -304,6 +304,7 @@ impl ShardFactory {
                         completed_job_expire_s: template.completed_job_expire_s,
                         terminal_job_expire_s: template.terminal_job_expire_s,
                         count_from_status_counters: template.count_from_status_counters,
+                        floating_refresh_stale_ms: template.floating_refresh_stale_ms,
                     },
                     range.clone(),
                 )
@@ -1127,6 +1128,7 @@ impl ShardFactory {
                 completed_job_expire_s: self.template.completed_job_expire_s,
                 terminal_job_expire_s: self.template.terminal_job_expire_s,
                 count_from_status_counters: self.template.count_from_status_counters,
+                floating_refresh_stale_ms: self.template.floating_refresh_stale_ms,
             },
             ShardRange::full(),
         )

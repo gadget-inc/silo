@@ -50,6 +50,11 @@ pub struct FloatingLimitState {
     pub next_retry_at_ms: Option<i64>,
     /// Opaque metadata passed to workers during refresh
     pub metadata: Vec<(String, String)>,
+    /// When the outstanding refresh task was scheduled (epoch ms); `None`
+    /// when no refresh is outstanding. A set `refresh_task_scheduled` older
+    /// than the shard's stale threshold, or with this field absent, is
+    /// treated as no outstanding refresh so a lost task cannot pin the cap.
+    pub refresh_scheduled_at_ms: Option<i64>,
 }
 
 /// Rate limiting algorithm used by Gubernator

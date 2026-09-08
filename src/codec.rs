@@ -632,6 +632,7 @@ pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Vec<u8> {
             retry_count: state.retry_count,
             next_retry_at_ms: state.next_retry_at_ms,
             metadata: Some(metadata),
+            refresh_scheduled_at_ms: state.refresh_scheduled_at_ms,
         },
     );
     builder.finish(root, None);
@@ -1145,6 +1146,11 @@ impl DecodedFloatingLimitState {
         fb_kv_pairs_to_owned(self.fb().metadata())
     }
 
+    /// `None` when no refresh is outstanding or the row carries no stamp.
+    pub fn refresh_scheduled_at_ms(&self) -> Option<i64> {
+        self.fb().refresh_scheduled_at_ms()
+    }
+
     /// Materialize an owned FloatingLimitState from the FlatBuffer data.
     pub fn to_owned(&self) -> FloatingLimitState {
         let f = self.fb();
@@ -1157,6 +1163,7 @@ impl DecodedFloatingLimitState {
             retry_count: f.retry_count(),
             next_retry_at_ms: f.next_retry_at_ms(),
             metadata: self.metadata(),
+            refresh_scheduled_at_ms: f.refresh_scheduled_at_ms(),
         }
     }
 }

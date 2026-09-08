@@ -346,6 +346,7 @@ fn test_floating_limit_state_roundtrip() {
         retry_count: 2,
         next_retry_at_ms: Some(8000),
         metadata: vec![("source".to_string(), "api".to_string())],
+        refresh_scheduled_at_ms: None,
     };
     let encoded = encode_floating_limit_state(&state);
     let decoded = decode_floating_limit_state(encoded).unwrap();
@@ -370,6 +371,7 @@ fn test_floating_limit_state_roundtrip_none_retry() {
         retry_count: 0,
         next_retry_at_ms: None,
         metadata: vec![],
+        refresh_scheduled_at_ms: None,
     };
     let encoded = encode_floating_limit_state(&state);
     let decoded = decode_floating_limit_state(encoded).unwrap();
@@ -606,4 +608,63 @@ fn test_decoded_task_as_bytes_passthrough() {
 fn test_decoded_task_invalid_data() {
     let result = decode_task_validated(vec![0xFF, 0xFF]);
     assert!(result.is_err());
+}
+
+/// A floating limit state row encoded by a build whose table ends at
+/// `metadata`, with no `refresh_scheduled_at_ms` slot. It carries
+/// `current_max_concurrency: 19`, `last_refreshed_at_ms: 1_756_400_000_000`,
+/// `refresh_task_scheduled: true`, `refresh_interval_ms: 500`,
+/// `default_max_concurrency: 5`, `retry_count: 3`,
+/// `next_retry_at_ms: Some(1_756_400_060_000)`, and two metadata pairs.
+const FLOATING_LIMIT_STATE_WITHOUT_SCHEDULED_AT: &[u8] = &[
+    24, 0, 0, 0, 20, 0, 48, 0, 8, 0, 24, 0, 7, 0, 32, 0, 12, 0, 16, 0, 40, 0, 20, 0, 20, 0, 0, 0,
+    0, 0, 0, 1, 19, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0, 28, 0, 0, 0, 0, 28, 153, 241, 152, 1, 0, 0,
+    244, 1, 0, 0, 0, 0, 0, 0, 96, 6, 154, 241, 152, 1, 0, 0, 2, 0, 0, 0, 48, 0, 0, 0, 4, 0, 0, 0,
+    224, 255, 255, 255, 16, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, 97, 112, 105, 0, 6, 0, 0, 0, 115, 111,
+    117, 114, 99, 101, 0, 0, 8, 0, 12, 0, 4, 0, 8, 0, 8, 0, 0, 0, 40, 0, 0, 0, 4, 0, 0, 0, 26, 0,
+    0, 0, 112, 108, 97, 116, 102, 111, 114, 109, 45, 116, 101, 110, 97, 110, 116, 45, 101, 110,
+    118, 45, 54, 49, 52, 54, 57, 54, 0, 0, 3, 0, 0, 0, 101, 110, 118, 0,
+];
+
+#[silo::test]
+fn test_floating_limit_state_without_scheduled_at_decodes_with_trailing_fields_intact() {
+    let decoded =
+        decode_floating_limit_state(FLOATING_LIMIT_STATE_WITHOUT_SCHEDULED_AT.to_vec()).unwrap();
+    assert_eq!(decoded.current_max_concurrency(), 19);
+    assert_eq!(decoded.last_refreshed_at_ms(), 1_756_400_000_000);
+    assert!(decoded.refresh_task_scheduled());
+    assert_eq!(decoded.refresh_interval_ms(), 500);
+    assert_eq!(decoded.default_max_concurrency(), 5);
+    assert_eq!(decoded.retry_count(), 3);
+    assert_eq!(decoded.next_retry_at_ms(), Some(1_756_400_060_000));
+    assert_eq!(
+        decoded.metadata(),
+        vec![
+            ("env".to_string(), "platform-tenant-env-614696".to_string()),
+            ("source".to_string(), "api".to_string()),
+        ]
+    );
+    assert_eq!(decoded.refresh_scheduled_at_ms(), None);
+    assert_eq!(decoded.to_owned().refresh_scheduled_at_ms, None);
+}
+
+#[silo::test]
+fn test_floating_limit_state_roundtrip_refresh_scheduled_at() {
+    let state = FloatingLimitState {
+        current_max_concurrency: 10,
+        last_refreshed_at_ms: 5000,
+        refresh_task_scheduled: true,
+        refresh_interval_ms: 30000,
+        default_max_concurrency: 5,
+        retry_count: 0,
+        next_retry_at_ms: None,
+        metadata: vec![("source".to_string(), "api".to_string())],
+        refresh_scheduled_at_ms: Some(5500),
+    };
+    let encoded = encode_floating_limit_state(&state);
+    let decoded = decode_floating_limit_state(encoded).unwrap();
+    assert_eq!(decoded.refresh_scheduled_at_ms(), Some(5500));
+    assert_eq!(decoded.next_retry_at_ms(), None);
+    assert_eq!(decoded.metadata().len(), 1);
+    assert_eq!(decoded.to_owned().refresh_scheduled_at_ms, Some(5500));
 }

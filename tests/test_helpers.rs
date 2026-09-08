@@ -209,6 +209,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
         },
         ShardRange::full(),
     )
@@ -255,6 +256,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
+            floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
         },
         ShardRange::full(),
     )
@@ -695,4 +697,36 @@ pub fn metric_value_or_zero(body: &str, substrings: &[&str]) -> f64 {
         .and_then(|line| line.rsplit_once(' '))
         .and_then(|(_, v)| v.parse::<f64>().ok())
         .unwrap_or(0.0)
+}
+
+/// Open a temp shard with a custom `floating_refresh_stale_ms` threshold and
+/// a fresh Metrics registry, for tests that age out an outstanding floating
+/// limit refresh flag.
+pub async fn open_temp_shard_with_floating_refresh_stale_ms(
+    stale_ms: u64,
+) -> (
+    tempfile::TempDir,
+    std::sync::Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        floating_refresh_stale_ms: stale_ms,
+        ..Default::default()
+    };
+    let metrics = silo::metrics::init().expect("init metrics");
+    let shard = JobStoreShard::open(
+        &cfg,
+        rate_limiter,
+        Some(metrics.clone()),
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+    (tmp, shard, metrics)
 }

@@ -16,11 +16,36 @@ use crate::keys::{
 use crate::task::Task;
 
 impl JobStoreShard {
-    pub(crate) fn floating_limit_refresh_ready(
+    /// True when the state's outstanding-refresh flag is set but the refresh
+    /// was scheduled longer ago than the shard's stale threshold, or carries
+    /// no stamp at all. Such a refresh is treated as lost: no task row,
+    /// lease, or in-memory suppression may pin a tenant's cap forever.
+    pub(crate) fn floating_limit_refresh_stale(
+        &self,
         state: &DecodedFloatingLimitState,
         now_ms: i64,
     ) -> bool {
-        if state.refresh_task_scheduled() {
+        state.refresh_task_scheduled()
+            && state
+                .refresh_scheduled_at_ms()
+                .is_none_or(|at| now_ms - at > self.floating_refresh_stale_ms)
+    }
+
+    /// True when a refresh task is scheduled and still trusted to complete.
+    fn floating_limit_refresh_outstanding(
+        &self,
+        state: &DecodedFloatingLimitState,
+        now_ms: i64,
+    ) -> bool {
+        state.refresh_task_scheduled() && !self.floating_limit_refresh_stale(state, now_ms)
+    }
+
+    pub(crate) fn floating_limit_refresh_ready(
+        &self,
+        state: &DecodedFloatingLimitState,
+        now_ms: i64,
+    ) -> bool {
+        if self.floating_limit_refresh_outstanding(state, now_ms) {
             return false;
         }
 
@@ -74,6 +99,7 @@ impl JobStoreShard {
             retry_count: 0,
             next_retry_at_ms: None,
             metadata: fl.metadata.clone(),
+            refresh_scheduled_at_ms: None,
         };
 
         let state_bytes = encode_floating_limit_state(&state);
@@ -96,8 +122,7 @@ impl JobStoreShard {
         task_group: &str,
         has_waiters: bool,
     ) -> Result<(), JobStoreShardError> {
-        // Check if refresh is already scheduled
-        if state.refresh_task_scheduled() {
+        if self.floating_limit_refresh_outstanding(state, now_ms) {
             return Ok(());
         }
 
@@ -113,6 +138,21 @@ impl JobStoreShard {
 
         if !should_refresh || in_backoff || !has_waiters {
             return Ok(());
+        }
+
+        // Reaching here with the flag still set means the outstanding refresh
+        // aged out; this write replaces it.
+        if state.refresh_task_scheduled() {
+            let age_ms = state.refresh_scheduled_at_ms().map(|at| now_ms - at);
+            tracing::warn!(
+                tenant = %tenant,
+                queue_key = %fl.key,
+                age_ms = ?age_ms,
+                "floating limit refresh flag is stale; scheduling a replacement refresh"
+            );
+            if let Some(m) = &self.metrics {
+                m.record_floating_limit_refresh_reset(&self.name, "stale_scheduled");
+            }
         }
 
         // Schedule a refresh task
@@ -143,6 +183,7 @@ impl JobStoreShard {
         // Update state to mark refresh as scheduled
         let new_state = FloatingLimitState {
             refresh_task_scheduled: true,
+            refresh_scheduled_at_ms: Some(now_ms),
             ..state.to_owned()
         };
         let state_key = floating_limit_state_key(tenant, &fl.key);
@@ -197,6 +238,7 @@ impl JobStoreShard {
             current_max_concurrency: new_max_concurrency,
             last_refreshed_at_ms: now_ms,
             refresh_task_scheduled: false,
+            refresh_scheduled_at_ms: None,
             retry_count: 0,
             next_retry_at_ms: None,
             ..decoded_state.to_owned()
@@ -293,10 +335,14 @@ impl JobStoreShard {
             .has_waiting_concurrency_requests(&tenant, &queue_key)
             .await?;
 
+        // The retry task's key starts at `next_retry_at`, which can sit up to
+        // the backoff cap in the future; stamping that (not now) keeps the
+        // retry from reading as stale before it is even claimable.
         let new_state = FloatingLimitState {
             retry_count: new_retry_count,
             next_retry_at_ms: Some(next_retry_at),
             refresh_task_scheduled: has_waiters,
+            refresh_scheduled_at_ms: has_waiters.then_some(next_retry_at),
             ..decoded_state.to_owned()
         };
 

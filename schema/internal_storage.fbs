@@ -301,4 +301,7 @@ table FloatingLimitState {
   retry_count: uint32;
   next_retry_at_ms: int64 = null;
   metadata: [KeyValuePair];
+  // Must stay the last field: the table uses implicit field ids and the
+  // decoder is unchecked, so any field placed before `metadata` shifts it.
+  refresh_scheduled_at_ms: int64 = null;
 }

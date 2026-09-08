@@ -2237,3 +2237,413 @@ async fn fc_before_concurrency_wedges_floating_only_jobs_via_orphaned_holder() {
         completed,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Aging out an outstanding refresh flag
+// ---------------------------------------------------------------------------
+
+fn floating_limit(queue: &str, refresh_interval_ms: i64) -> silo::job::Limit {
+    silo::job::Limit::FloatingConcurrency(silo::job::FloatingConcurrencyLimit {
+        key: queue.to_string(),
+        default_max_concurrency: 1,
+        refresh_interval_ms,
+        metadata: vec![],
+    })
+}
+
+async fn enqueue_floating(shard: &silo::job_store_shard::JobStoreShard, queue: &str, tag: u32) {
+    shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": tag})),
+            vec![floating_limit(queue, 100)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue floating job");
+}
+
+/// Overwrite the durable floating limit state row for `queue` with the flag
+/// set and no task row or lease behind it, stamped at `scheduled_at_ms`.
+async fn write_orphaned_refresh_state(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    scheduled_at_ms: Option<i64>,
+) {
+    let state = silo::job::FloatingLimitState {
+        current_max_concurrency: 1,
+        last_refreshed_at_ms: 0,
+        refresh_task_scheduled: true,
+        refresh_interval_ms: 100,
+        default_max_concurrency: 1,
+        retry_count: 0,
+        next_retry_at_ms: None,
+        metadata: vec![],
+        refresh_scheduled_at_ms: scheduled_at_ms,
+    };
+    shard
+        .db()
+        .put(
+            &silo::keys::floating_limit_state_key("-", queue),
+            &silo::codec::encode_floating_limit_state(&state),
+        )
+        .await
+        .expect("put state");
+    shard.db().flush().await.expect("flush state");
+}
+
+async fn count_refresh_tasks(shard: &silo::job_store_shard::JobStoreShard, queue: &str) -> usize {
+    shard
+        .peek_tasks("default", 100)
+        .await
+        .expect("peek tasks")
+        .iter()
+        .filter(|t| matches!(t, Task::RefreshFloatingLimit { queue_key, .. } if queue_key == queue))
+        .count()
+}
+
+async fn read_floating_state(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+) -> silo::codec::DecodedFloatingLimitState {
+    let raw = shard
+        .db()
+        .get(&silo::keys::floating_limit_state_key("-", queue))
+        .await
+        .expect("db get")
+        .expect("state should exist");
+    silo::codec::decode_floating_limit_state(raw).expect("decode state")
+}
+
+fn read_refresh_reset_total(metrics: &silo::metrics::Metrics) -> f64 {
+    metrics
+        .registry()
+        .gather()
+        .into_iter()
+        .find(|f| f.get_name() == "silo_floating_limit_refresh_reset_total")
+        .map(|f| {
+            f.get_metric()
+                .iter()
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "reason" && l.get_value() == "stale_scheduled")
+                })
+                .map(|m| m.get_counter().get_value())
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
+/// The env-614696 shape: `refresh_task_scheduled` is set but no task row and
+/// no lease exist, so nothing will ever clear it. A waiter-producing enqueue
+/// must schedule a replacement refresh once the stamp is older than the
+/// threshold, and must not while the stamp is fresh.
+#[silo::test]
+async fn floating_limit_orphaned_refresh_flag_ages_out_after_threshold() {
+    let (_tmp, shard, _metrics) = open_temp_shard_with_floating_refresh_stale_ms(60_000).await;
+    let queue = "fl-orphaned-flag-q";
+
+    // j1 holds the single slot so every later enqueue is a waiter.
+    enqueue_floating(&shard, queue, 1).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+
+    // Fresh stamp: the outstanding refresh is trusted, no replacement.
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms())).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        0,
+        "a refresh scheduled within the threshold must not be replaced"
+    );
+
+    // Stamp older than the threshold: the flag is aged out and replaced.
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 60_001)).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        1,
+        "a refresh scheduled longer ago than the threshold must be replaced"
+    );
+    let state = read_floating_state(&shard, queue).await;
+    assert!(state.refresh_task_scheduled());
+    let stamp = state
+        .refresh_scheduled_at_ms()
+        .expect("replacement is stamped");
+    assert!(
+        now_ms() - stamp < 60_000,
+        "replacement stamp {stamp} should be current"
+    );
+}
+
+/// Schedule a refresh for `queue` by parking a waiter behind a holder, then
+/// lease it. The returned dequeue holds the refresh task and the holder job.
+async fn schedule_and_lease_refresh(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+) -> silo::job_store_shard::DequeueResult {
+    enqueue_floating(shard, queue, 1).await;
+    enqueue_floating(shard, queue, 2).await;
+    assert_eq!(count_refresh_tasks(shard, queue).await, 1);
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
+    assert_eq!(
+        result.refresh_tasks.len(),
+        1,
+        "refresh task should be leased"
+    );
+    result
+}
+
+#[silo::test]
+async fn floating_limit_just_scheduled_refresh_is_stamped_and_not_replaced() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-just-scheduled-q";
+
+    enqueue_floating(&shard, queue, 1).await;
+    enqueue_floating(&shard, queue, 2).await;
+    let state = read_floating_state(&shard, queue).await;
+    assert!(state.refresh_task_scheduled());
+    let stamp = state
+        .refresh_scheduled_at_ms()
+        .expect("scheduling stamps the row");
+    assert!(
+        (now_ms() - stamp).abs() < 5_000,
+        "stamp {stamp} should be now"
+    );
+
+    // A later waiter in a different millisecond sees a trusted refresh.
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    assert_eq!(
+        read_floating_state(&shard, queue)
+            .await
+            .refresh_scheduled_at_ms(),
+        Some(stamp),
+        "a trusted refresh keeps its original stamp"
+    );
+}
+
+#[silo::test]
+async fn floating_limit_refresh_success_clears_scheduled_stamp() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-success-stamp-q";
+    let task_id = schedule_and_lease_refresh(&shard, queue)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone();
+
+    shard
+        .report_refresh_success(&task_id, 4)
+        .await
+        .expect("report success");
+
+    let state = read_floating_state(&shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.refresh_scheduled_at_ms(), None);
+    assert_eq!(state.current_max_concurrency(), 4);
+}
+
+#[silo::test]
+async fn floating_limit_refresh_failure_with_waiters_stamps_retry_start_time() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-failure-waiters-stamp-q";
+    let task_id = schedule_and_lease_refresh(&shard, queue)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone();
+
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+
+    let state = read_floating_state(&shard, queue).await;
+    assert!(
+        state.refresh_task_scheduled(),
+        "waiters keep a retry outstanding"
+    );
+    let next_retry = state.next_retry_at_ms().expect("failure sets a retry time");
+    assert_eq!(
+        state.refresh_scheduled_at_ms(),
+        Some(next_retry),
+        "the retry is stamped with its own start time, not the failure time"
+    );
+    assert!(next_retry > now_ms() - 5_000);
+}
+
+#[silo::test]
+async fn floating_limit_refresh_failure_without_waiters_clears_scheduled_stamp() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-failure-no-waiters-stamp-q";
+    let leased = schedule_and_lease_refresh(&shard, queue).await;
+    let task_id = leased.refresh_tasks[0].task_id.clone();
+
+    // Finish the holder so the waiter is granted and no request row remains
+    // when the failure is reported. The grant scanner runs asynchronously.
+    for task in &leased.tasks {
+        shard
+            .report_attempt_outcome(
+                task.attempt().task_id(),
+                AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("finish holder");
+    }
+    let cleared = poll_until(
+        || async { first_concurrency_request_kv(shard.db()).await.is_none() },
+        |&is_none| is_none,
+        5000,
+    )
+    .await;
+    assert!(cleared, "waiting requests should be cleared");
+
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+
+    let state = read_floating_state(&shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.refresh_scheduled_at_ms(), None);
+    assert!(
+        state.next_retry_at_ms().is_some(),
+        "backoff is still recorded"
+    );
+}
+
+#[silo::test]
+async fn floating_limit_refresh_lease_expiry_clears_scheduled_stamp() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-reaper-stamp-q";
+    let task_id = schedule_and_lease_refresh(&shard, queue)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone();
+    assert!(
+        read_floating_state(&shard, queue)
+            .await
+            .refresh_scheduled_at_ms()
+            .is_some()
+    );
+
+    let lease_key = silo::keys::leased_task_key(&task_id);
+    let lease_raw = shard
+        .db()
+        .get(&lease_key)
+        .await
+        .expect("db get")
+        .expect("lease exists");
+    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
+    let expired = LeaseRecord {
+        worker_id: decoded_lease.worker_id().to_string(),
+        task: decoded_lease.to_task().unwrap(),
+        expiry_ms: now_ms() - 1,
+        started_at_ms: decoded_lease.started_at_ms(),
+    };
+    shard
+        .db()
+        .put(&lease_key, &encode_lease(&expired))
+        .await
+        .expect("put expired lease");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(shard.reap_expired_leases("-").await.expect("reap"), 1);
+
+    let state = read_floating_state(&shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.refresh_scheduled_at_ms(), None);
+}
+
+/// A refresh task leased before its flag was aged out reports back after a
+/// replacement was scheduled. The late success applies and clears the flag.
+#[silo::test]
+async fn floating_limit_late_success_on_superseded_refresh_applies_cleanly() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-late-success-q";
+    let stale_task_id = schedule_and_lease_refresh(&shard, queue)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone();
+
+    // Age the outstanding flag out and let a new waiter schedule a replacement.
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 120_000)).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+
+    shard
+        .report_refresh_success(&stale_task_id, 9)
+        .await
+        .expect("late success applies");
+
+    let state = read_floating_state(&shard, queue).await;
+    assert_eq!(state.current_max_concurrency(), 9);
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.refresh_scheduled_at_ms(), None);
+
+    // The replacement is still leasable and its outcome applies too.
+    let result = shard
+        .dequeue("worker-2", "default", 10)
+        .await
+        .expect("dequeue replacement");
+    assert_eq!(result.refresh_tasks.len(), 1);
+    shard
+        .report_refresh_success(&result.refresh_tasks[0].task_id, 11)
+        .await
+        .expect("replacement success applies");
+    let state = read_floating_state(&shard, queue).await;
+    assert_eq!(state.current_max_concurrency(), 11);
+    assert!(!state.refresh_task_scheduled());
+}
+
+#[silo::test]
+async fn floating_limit_stale_flag_reset_counts_only_when_replacement_written() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(60_000).await;
+    let queue = "fl-reset-metric-q";
+
+    // Stale flag but the enqueue is granted and nothing waits: no reset.
+    write_orphaned_refresh_state(&shard, queue, None).await;
+    enqueue_floating(&shard, queue, 1).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+
+    // Same stale flag with a waiter: the replacement is written and counted.
+    write_orphaned_refresh_state(&shard, queue, None).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+
+    // A trusted refresh is not a reset.
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+}
+
+#[silo::test]
+async fn floating_limit_stale_threshold_setting_governs_age_out() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(300_000).await;
+    let queue = "fl-threshold-setting-q";
+    enqueue_floating(&shard, queue, 1).await;
+
+    // 61 s old is past the default threshold but inside this shard's 300 s.
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 61_000)).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 300_001)).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+}
