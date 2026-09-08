@@ -16,6 +16,7 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use slatedb::WriteBatch;
 
+use crate::codec::DecodedFloatingLimitState;
 use crate::concurrency::{ConcurrencyError, LimitChainResumer, ResumeChainParams};
 use crate::job_store_shard::helpers::DbWriteBatcher;
 use crate::job_store_shard::{
@@ -117,6 +118,28 @@ impl LimitChainResumer for ShardChainResumer {
     fn wakeup_task_groups(&self, groups: &[String]) {
         if let Some(shard) = self.shard.upgrade() {
             shard.brokers.wakeup_groups(groups);
+        }
+    }
+
+    async fn maybe_schedule_floating_refresh(
+        &self,
+        tenant: &str,
+        queue: &str,
+        state: &DecodedFloatingLimitState,
+    ) {
+        let Some(shard) = self.shard.upgrade() else {
+            return;
+        };
+        if let Err(e) = shard
+            .schedule_floating_refresh_from_scanner(tenant, queue, state)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                tenant = %tenant,
+                queue = %queue,
+                "grant scanner: failed to schedule floating limit refresh"
+            );
         }
     }
 }

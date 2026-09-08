@@ -838,6 +838,33 @@ impl JobStoreShard {
                 &task_id,
                 &limits,
             )?;
+            // The ticket just became a waiter on this queue. Its request row
+            // sits in the uncommitted batch, invisible to the durable waiter
+            // probe, so the ticket supplies the waiter signal directly (as
+            // the enqueue path does for a job that just requested a ticket).
+            // A task under an empty group lands where no broker scans.
+            let floating = limits.iter().find_map(|limit| match limit {
+                Limit::FloatingConcurrency(fl) if fl.key == queue => Some(fl),
+                _ => None,
+            });
+            if let Some(fl) = floating
+                && !req_task_group.is_empty()
+            {
+                let fl_state = self
+                    .get_or_create_floating_limit_state(&mut writer, &tenant, fl)
+                    .await?;
+                if self.floating_limit_refresh_ready(&fl_state, now_ms) {
+                    self.maybe_schedule_floating_limit_refresh(
+                        &mut writer,
+                        &tenant,
+                        fl,
+                        &fl_state,
+                        now_ms,
+                        &req_task_group,
+                        true,
+                    )?;
+                }
+            }
             state
                 .converted_requests
                 .push((tenant.clone(), queue.clone()));

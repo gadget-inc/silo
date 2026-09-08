@@ -2647,3 +2647,344 @@ async fn floating_limit_stale_threshold_setting_governs_age_out() {
     assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
     assert_eq!(read_refresh_reset_total(&metrics), 1.0);
 }
+
+// ---------------------------------------------------------------------------
+// Scheduling refreshes from the grant-scanner and RequestTicket paths
+// ---------------------------------------------------------------------------
+
+/// Park j2 behind j1 on `queue`, lease j1 and the refresh the enqueue path
+/// scheduled, and report that refresh as succeeded so the flag is clear and
+/// `last_refreshed_at_ms` is current. Leaves one durable waiter and a warm
+/// limit cache with no refresh outstanding.
+async fn settle_backlog_with_fresh_refresh(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+) {
+    let leased = schedule_and_lease_refresh(shard, queue).await;
+    shard
+        .report_refresh_success(&leased.refresh_tasks[0].task_id, 1)
+        .await
+        .expect("report refresh success");
+    let state = read_floating_state(shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(count_refresh_tasks(shard, queue).await, 0);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+}
+
+/// A deep backlog with no fresh enqueues: the grant scanner's at-capacity
+/// pass over the queue schedules the refresh once the interval has elapsed.
+#[silo::test]
+async fn floating_limit_scanner_pass_schedules_refresh_for_waiting_backlog() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-scanner-refresh-q";
+    settle_backlog_with_fresh_refresh(&shard, queue).await;
+
+    // Interval (100 ms) elapses with no enqueue activity.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    shard.process_concurrency_grants("-", queue, 1).await;
+
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        1,
+        "the scanner pass over a saturated floating queue schedules the refresh"
+    );
+    let state = read_floating_state(&shard, queue).await;
+    assert!(state.refresh_task_scheduled());
+    assert!(state.refresh_scheduled_at_ms().is_some());
+
+    let result = shard
+        .dequeue("worker-3", "default", 10)
+        .await
+        .expect("dequeue");
+    assert_eq!(
+        result.refresh_tasks.len(),
+        1,
+        "the refresh task is claimable"
+    );
+    assert_eq!(result.refresh_tasks[0].queue_key, queue);
+    assert_eq!(result.refresh_tasks[0].task_group, "default");
+}
+
+#[silo::test]
+async fn floating_limit_scanner_pass_is_noop_without_resumer() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-scanner-no-resumer-q";
+    settle_backlog_with_fresh_refresh(&shard, queue).await;
+    let _resumer = shard
+        .take_chain_resumer_for_test()
+        .expect("resumer installed at open");
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    shard.process_concurrency_grants("-", queue, 1).await;
+
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert!(
+        !read_floating_state(&shard, queue)
+            .await
+            .refresh_task_scheduled()
+    );
+}
+
+/// A scheduled-start job whose RequestTicket lands as the queue's only waiter
+/// supplies the waiter signal itself: no durable waiter exists before the
+/// ticket is processed, and the enqueue path never counted it as one.
+#[silo::test]
+async fn floating_limit_request_ticket_landing_as_only_waiter_schedules_refresh() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-ticket-waiter-q";
+
+    // j1 holds the single slot; its enqueue schedules nothing (no waiters).
+    enqueue_floating(&shard, queue, 1).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+
+    // j2 starts in the future: its enqueue writes a RequestTicket task, not a
+    // durable waiter, so it schedules no refresh either.
+    let start_at = now_ms() + 300;
+    shard
+        .enqueue(
+            "-",
+            Some("fl-ticket-job".to_string()),
+            10u8,
+            start_at,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![floating_limit(queue, 100)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue scheduled job");
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    assert!(
+        !read_floating_state(&shard, queue)
+            .await
+            .refresh_task_scheduled()
+    );
+
+    // Once due, the ticket is claimed, finds the queue full, and lands as the
+    // only waiter. The interval (100 ms, last refreshed at 0) has elapsed.
+    let scheduled = poll_until(
+        || async {
+            let _ = shard
+                .dequeue("worker-1", "default", 10)
+                .await
+                .expect("dequeue");
+            read_floating_state(&shard, queue)
+                .await
+                .refresh_task_scheduled()
+        },
+        |&scheduled| scheduled,
+        5000,
+    )
+    .await;
+    assert!(
+        scheduled,
+        "the ticket landing as a waiter schedules the refresh"
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+}
+
+/// The scanner-originated refresh is written under the head waiter's task
+/// group, which need not be the holder's group.
+#[silo::test]
+async fn floating_limit_scanner_refresh_carries_head_waiter_task_group() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-scanner-group-q";
+
+    enqueue_floating(&shard, queue, 1).await;
+    shard
+        .enqueue(
+            "-",
+            None,
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![floating_limit(queue, 100)],
+            None,
+            "beta",
+        )
+        .await
+        .expect("enqueue beta waiter");
+    // The beta enqueue scheduled a refresh under beta; settle it.
+    let leased = shard.dequeue("w", "beta", 10).await.expect("dequeue beta");
+    assert_eq!(leased.refresh_tasks.len(), 1);
+    shard
+        .report_refresh_success(&leased.refresh_tasks[0].task_id, 1)
+        .await
+        .expect("settle refresh");
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    shard.process_concurrency_grants("-", queue, 1).await;
+
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        0,
+        "not under default"
+    );
+    let beta_tasks = shard.peek_tasks("beta", 100).await.expect("peek beta");
+    assert_eq!(
+        beta_tasks
+            .iter()
+            .filter(
+                |t| matches!(t, Task::RefreshFloatingLimit { queue_key, .. } if queue_key == queue)
+            )
+            .count(),
+        1,
+        "the refresh is written under the head waiter's group"
+    );
+}
+
+/// Rewrite the queue's single waiting request record with the given task
+/// group, keeping every other field.
+async fn rewrite_head_waiter_task_group(
+    shard: &silo::job_store_shard::JobStoreShard,
+    task_group: &str,
+    limits: Vec<silo::job::Limit>,
+) {
+    let (key, value) = first_concurrency_request_kv(shard.db())
+        .await
+        .expect("one waiting request");
+    let decoded = silo::codec::decode_concurrency_action(value).expect("decode request");
+    let fb = decoded.fb();
+    let et = fb.variant_as_enqueue_task().expect("enqueue task variant");
+    let action = silo::task::ConcurrencyAction::EnqueueTask {
+        start_time_ms: et.start_time_ms(),
+        priority: et.priority(),
+        job_id: et.job_id().unwrap_or_default().to_string(),
+        attempt_number: et.attempt_number(),
+        relative_attempt_number: et.relative_attempt_number(),
+        task_group: task_group.to_string(),
+        limit_index: et.limit_index(),
+        held_queues: et
+            .held_queues()
+            .map(|v| v.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default(),
+        task_id: et.task_id().unwrap_or_default().to_string(),
+        limits,
+    };
+    shard
+        .db()
+        .put(&key, &silo::codec::encode_concurrency_action(&action))
+        .await
+        .expect("rewrite request");
+    shard.db().flush().await.expect("flush");
+}
+
+#[silo::test]
+async fn floating_limit_scanner_refresh_falls_back_to_job_info_task_group() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-scanner-fallback-q";
+    settle_backlog_with_fresh_refresh(&shard, queue).await;
+    rewrite_head_waiter_task_group(&shard, "", vec![floating_limit(queue, 100)]).await;
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    shard.process_concurrency_grants("-", queue, 1).await;
+
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        1,
+        "an empty stored group falls back to the job's task group"
+    );
+}
+
+#[silo::test]
+async fn floating_limit_scanner_refresh_skips_unreadable_head_waiter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-scanner-unreadable-q";
+    settle_backlog_with_fresh_refresh(&shard, queue).await;
+    let (key, _) = first_concurrency_request_kv(shard.db())
+        .await
+        .expect("one waiting request");
+    shard
+        .db()
+        .put(&key, &[0xFF, 0x00, 0x13])
+        .await
+        .expect("corrupt request");
+    shard.db().flush().await.expect("flush");
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    shard.process_concurrency_grants("-", queue, 1).await;
+
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert!(
+        !read_floating_state(&shard, queue)
+            .await
+            .refresh_task_scheduled()
+    );
+}
+
+/// Two refresh rows for one queue, as racing writers in different
+/// milliseconds produce. Both are leased and reported; the last outcome
+/// wins and the flag ends cleared.
+#[silo::test]
+async fn floating_limit_two_refresh_rows_are_both_leased_and_reported() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-two-rows-q";
+    enqueue_floating(&shard, queue, 1).await;
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms())).await;
+
+    let base = now_ms();
+    for (i, task_id) in ["refresh-a", "refresh-b"].iter().enumerate() {
+        let at = base + i as i64;
+        let task = Task::RefreshFloatingLimit {
+            task_id: task_id.to_string(),
+            tenant: "-".to_string(),
+            queue_key: queue.to_string(),
+            current_max_concurrency: 1,
+            last_refreshed_at_ms: 0,
+            metadata: vec![],
+            task_group: "default".to_string(),
+        };
+        let key = silo::keys::task_key(
+            "default",
+            at,
+            0,
+            &format!("floating_refresh:{queue}"),
+            0,
+            at,
+        );
+        shard
+            .db()
+            .put(&key, &silo::codec::encode_task(&task))
+            .await
+            .expect("seed refresh row");
+    }
+    shard.db().flush().await.expect("flush");
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 2);
+
+    let mut leased: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        let result = shard.dequeue("w", "default", 10).await.expect("dequeue");
+        leased.extend(result.refresh_tasks.iter().map(|t| t.task_id.clone()));
+        if leased.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(leased.len(), 2, "both refresh rows are leased");
+    for (i, task_id) in leased.iter().enumerate() {
+        shard
+            .report_refresh_success(task_id, 5 + i as u32)
+            .await
+            .expect("report success");
+    }
+
+    let state = read_floating_state(&shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.refresh_scheduled_at_ms(), None);
+    assert_eq!(state.current_max_concurrency(), 6, "the last outcome wins");
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert_eq!(
+        count_lease_keys(shard.db()).await,
+        1,
+        "only the holder's lease remains"
+    );
+}
