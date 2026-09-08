@@ -853,22 +853,28 @@ impl JobStoreShard {
                 .converted_requests
                 .iter()
                 .any(|(t, q)| t == &tenant && q == &queue);
+            // The refresh is optional: an unreadable state row must not fail
+            // the conversion, or the same head ticket would be retried on
+            // every claim and stall the task group.
             if let Some(fl) = floating
                 && !req_task_group.is_empty()
                 && !already_converted
+                && let Err(e) = self
+                    .schedule_floating_refresh_for_ticket(
+                        &mut writer,
+                        &tenant,
+                        fl,
+                        now_ms,
+                        &req_task_group,
+                    )
+                    .await
             {
-                let fl_state = self
-                    .get_or_create_floating_limit_state(&mut writer, &tenant, fl)
-                    .await?;
-                self.maybe_schedule_floating_limit_refresh(
-                    &mut writer,
-                    &tenant,
-                    &fl.key,
-                    &fl_state,
-                    now_ms,
-                    &req_task_group,
-                    true,
-                )?;
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue = %queue,
+                    error = %e,
+                    "converted ticket to a waiter but could not schedule a floating limit refresh"
+                );
             }
             state
                 .converted_requests

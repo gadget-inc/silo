@@ -257,8 +257,10 @@ fn default_grant_scanner_live_headroom_fraction() -> f64 {
 
 /// Default for `floating_refresh_stale_ms`: how long a floating limit's
 /// outstanding-refresh flag is trusted before silo treats the refresh as
-/// lost and allows a replacement to be scheduled. Well past any worker
-/// lease duration, so a legitimately in-flight refresh is never this old.
+/// lost and allows a replacement to be scheduled. A refresh whose lease is
+/// heartbeated past this, or that waited this long to be leased, gets a
+/// surplus replacement; both are leased and reported through the same
+/// path and the last outcome wins.
 pub const DEFAULT_FLOATING_REFRESH_STALE_MS: u64 = 60_000;
 
 fn default_floating_refresh_stale_ms() -> u64 {

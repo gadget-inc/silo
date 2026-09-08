@@ -178,6 +178,26 @@ impl JobStoreShard {
         Ok(true)
     }
 
+    /// Schedule a refresh for a RequestTicket that just landed as a waiter on
+    /// a floating queue. The ticket's own request row sits in the uncommitted
+    /// batch, invisible to the durable waiter probe, so the ticket supplies
+    /// the waiter signal directly. Returns whether a task was written.
+    pub(crate) async fn schedule_floating_refresh_for_ticket<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        fl: &FloatingConcurrencyLimit,
+        now_ms: i64,
+        task_group: &str,
+    ) -> Result<bool, JobStoreShardError> {
+        let state = self
+            .get_or_create_floating_limit_state(writer, tenant, fl)
+            .await?;
+        self.maybe_schedule_floating_limit_refresh(
+            writer, tenant, &fl.key, &state, now_ms, task_group, true,
+        )
+    }
+
     /// Get or create the floating limit state for a given queue key.
     /// Returns a zero-copy decoded view. For the rare "just created" case,
     /// we encode then decode to return the same type (extra decode is fine for cold path).

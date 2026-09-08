@@ -2989,3 +2989,56 @@ async fn floating_limit_two_refresh_rows_are_both_leased_and_reported() {
     assert_eq!(state.current_max_concurrency(), 6, "the last outcome wins");
     assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
 }
+
+/// A floating limit state row that cannot be decoded must not stall the task
+/// group: the ticket still converts into a waiter, and only the optional
+/// refresh scheduling is skipped.
+#[silo::test]
+async fn floating_limit_request_ticket_converts_despite_unreadable_state_row() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-ticket-corrupt-state-q";
+
+    enqueue_floating(&shard, queue, 1).await;
+    shard
+        .enqueue(
+            "-",
+            Some("fl-ticket-corrupt-job".to_string()),
+            10u8,
+            now_ms() + 300,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 2})),
+            vec![floating_limit(queue, REFRESH_INTERVAL_MS)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue scheduled job");
+    shard
+        .db()
+        .put(
+            &silo::keys::floating_limit_state_key("-", queue),
+            &[0xFF, 0x00, 0x13],
+        )
+        .await
+        .expect("corrupt state row");
+    shard.db().flush().await.expect("flush");
+
+    let converted = poll_until(
+        || async {
+            let _ = shard
+                .dequeue("worker-1", "default", 10)
+                .await
+                .expect("dequeue");
+            count_concurrency_requests(shard.db()).await
+        },
+        |&n| n == 1,
+        5000,
+    )
+    .await;
+    assert_eq!(
+        converted, 1,
+        "the ticket becomes a waiter despite the unreadable state row"
+    );
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+}
