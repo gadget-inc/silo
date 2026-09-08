@@ -210,6 +210,8 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             terminal_job_expire_s: None,
             count_from_status_counters: true,
             floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
+            broker_tombstone_revive_after_generations:
+                silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
         },
         ShardRange::full(),
     )
@@ -257,6 +259,8 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             terminal_job_expire_s: None,
             count_from_status_counters: true,
             floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
+            broker_tombstone_revive_after_generations:
+                silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
         },
         ShardRange::full(),
     )
@@ -717,6 +721,38 @@ pub async fn open_temp_shard_with_floating_refresh_stale_ms(
         path: tmp.path().to_string_lossy().to_string(),
         slatedb: Some(fast_flush_slatedb_settings()),
         floating_refresh_stale_ms: stale_ms,
+        ..Default::default()
+    };
+    let metrics = silo::metrics::init().expect("init metrics");
+    let shard = JobStoreShard::open(
+        &cfg,
+        rate_limiter,
+        Some(metrics.clone()),
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+    (tmp, shard, metrics)
+}
+
+/// Open a temp shard with a custom `broker_tombstone_revive_after_generations`
+/// bound and a fresh Metrics registry, for tests that revive a task row the
+/// broker is still suppressing behind an ack tombstone.
+pub async fn open_temp_shard_with_tombstone_revive_after_generations(
+    revive_after: u64,
+) -> (
+    tempfile::TempDir,
+    std::sync::Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        broker_tombstone_revive_after_generations: revive_after,
         ..Default::default()
     };
     let metrics = silo::metrics::init().expect("init metrics");

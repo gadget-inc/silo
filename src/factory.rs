@@ -305,6 +305,8 @@ impl ShardFactory {
                         terminal_job_expire_s: template.terminal_job_expire_s,
                         count_from_status_counters: template.count_from_status_counters,
                         floating_refresh_stale_ms: template.floating_refresh_stale_ms,
+                        broker_tombstone_revive_after_generations: template
+                            .broker_tombstone_revive_after_generations,
                     },
                     range.clone(),
                 )
@@ -1129,6 +1131,9 @@ impl ShardFactory {
                 terminal_job_expire_s: self.template.terminal_job_expire_s,
                 count_from_status_counters: self.template.count_from_status_counters,
                 floating_refresh_stale_ms: self.template.floating_refresh_stale_ms,
+                broker_tombstone_revive_after_generations: self
+                    .template
+                    .broker_tombstone_revive_after_generations,
             },
             ShardRange::full(),
         )

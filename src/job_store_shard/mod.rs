@@ -132,6 +132,10 @@ pub struct OpenShardOptions {
     /// before a replacement refresh may be scheduled. Populated from
     /// `DatabaseConfig::floating_refresh_stale_ms`.
     pub floating_refresh_stale_ms: u64,
+    /// Scan generations an ack tombstone may keep suppressing a re-observed
+    /// task key before the broker point-reads the row. Populated from
+    /// `DatabaseConfig::broker_tombstone_revive_after_generations`.
+    pub broker_tombstone_revive_after_generations: u64,
 }
 
 /// Compute the row TTL (`expire_ts`, epoch ms) for a job that reached the
@@ -434,6 +438,8 @@ impl JobStoreShard {
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 count_from_status_counters: cfg.count_from_status_counters,
                 floating_refresh_stale_ms: cfg.floating_refresh_stale_ms,
+                broker_tombstone_revive_after_generations: cfg
+                    .broker_tombstone_revive_after_generations,
             },
             range,
         )
@@ -479,6 +485,7 @@ impl JobStoreShard {
             terminal_job_expire_s,
             count_from_status_counters,
             floating_refresh_stale_ms,
+            broker_tombstone_revive_after_generations,
         } = options;
 
         // Wall-clock timer for the whole open, used to emit per-phase debug
@@ -572,6 +579,7 @@ impl JobStoreShard {
             name.clone(),
             metrics.clone(),
             range.clone(),
+            broker_tombstone_revive_after_generations,
         );
 
         let shard = Arc::new(Self {

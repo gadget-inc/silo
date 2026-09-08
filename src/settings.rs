@@ -266,6 +266,16 @@ fn default_floating_refresh_stale_ms() -> u64 {
     DEFAULT_FLOATING_REFRESH_STALE_MS
 }
 
+/// Default for `broker_tombstone_revive_after_generations`: how many scan
+/// generations an ack tombstone may keep suppressing a re-observed task key
+/// before the broker point-reads the row and, if it is still durable,
+/// buffers it again. The same order as tombstone retention.
+pub const DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS: u64 = 64;
+
+fn default_broker_tombstone_revive_after_generations() -> u64 {
+    DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS
+}
+
 /// Default for `grant_scanner_commit_chunk_size`: max grants a
 /// `process_grants` pass accumulates before committing their edits durably
 /// and waking the granted task groups' brokers. Smaller chunks stream grants
@@ -379,6 +389,11 @@ pub struct DatabaseTemplate {
     /// immediately. Defaults to 60000.
     #[serde(default = "default_floating_refresh_stale_ms")]
     pub floating_refresh_stale_ms: u64,
+    /// Scan generations an ack tombstone may keep suppressing a task key the
+    /// scanner keeps re-observing before the broker point-reads the row and
+    /// revives it if it is still durable. Defaults to 64.
+    #[serde(default = "default_broker_tombstone_revive_after_generations")]
+    pub broker_tombstone_revive_after_generations: u64,
     /// When set, jobs that finished successfully (Succeeded) have all of their
     /// associated KV records re-put with a SlateDB row TTL expiring this many
     /// seconds in the future. `None` (the default) disables the behaviour for
@@ -455,6 +470,8 @@ impl Default for DatabaseTemplate {
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
+            broker_tombstone_revive_after_generations:
+                default_broker_tombstone_revive_after_generations(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
@@ -821,6 +838,11 @@ pub struct DatabaseConfig {
     /// immediately. Defaults to 60000.
     #[serde(default = "default_floating_refresh_stale_ms")]
     pub floating_refresh_stale_ms: u64,
+    /// Scan generations an ack tombstone may keep suppressing a task key the
+    /// scanner keeps re-observing before the broker point-reads the row and
+    /// revives it if it is still durable. Defaults to 64.
+    #[serde(default = "default_broker_tombstone_revive_after_generations")]
+    pub broker_tombstone_revive_after_generations: u64,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
     /// `DatabaseTemplate::completed_job_expire_s` for details.
     #[serde(default)]
@@ -873,6 +895,8 @@ impl Default for DatabaseConfig {
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
+            broker_tombstone_revive_after_generations:
+                default_broker_tombstone_revive_after_generations(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: default_count_from_status_counters(),

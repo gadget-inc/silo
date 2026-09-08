@@ -272,6 +272,8 @@ async fn open_shard(
             terminal_job_expire_s: None,
             count_from_status_counters: true,
             floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
+            broker_tombstone_revive_after_generations:
+                silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
             grant_scanner: silo::concurrency::GrantScannerConfig::default(),
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,

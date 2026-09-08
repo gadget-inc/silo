@@ -30,6 +30,17 @@ pub struct BrokerTask {
     pub decoded: DecodedTask,
 }
 
+/// Suppression record for a durably deleted task key.
+///
+/// Expiry is keyed to `last_seen` so persistent stale observations extend
+/// suppression; the revive bound is keyed to `inserted_at` so a key that a
+/// scan keeps yielding is eventually point-read rather than hidden forever.
+#[derive(Debug, Clone, Copy)]
+struct AckTombstone {
+    inserted_at: u64,
+    last_seen: u64,
+}
+
 /// A single per-task-group broker that scans only its own key range.
 ///
 /// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key bytes.
@@ -44,9 +55,12 @@ pub struct TaskBroker {
     buffer: Arc<SkipMap<Vec<u8>, BrokerTask>>,
     // The set of tasks already read out of the DB and claimed by a worker but not yet durably leased. Required so that the scanner doesn't re-add tasks that are in the middle of being dequeued to the buffer.
     inflight: Arc<Mutex<HashSet<Vec<u8>>>>,
-    // Tombstones for task keys that were durably acked, keyed by the most recent
-    // scan generation where that key should be suppressed.
-    ack_tombstones: Arc<Mutex<HashMap<Vec<u8>, u64>>>,
+    // Tombstones for task keys that were durably acked, so a stale scan cannot
+    // re-buffer a row the broker has already deleted.
+    ack_tombstones: Arc<Mutex<HashMap<Vec<u8>, AckTombstone>>>,
+    // Scan generations a tombstone may keep suppressing a re-observed key
+    // before the scanner point-reads the row to check the delete landed.
+    tombstone_revive_after_generations: u64,
     // Monotonic generation numbers for scanner iterations.
     scan_generation_started: Arc<AtomicU64>,
     scan_generation_completed: Arc<AtomicU64>,
@@ -79,6 +93,7 @@ impl TaskBroker {
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
+        tombstone_revive_after_generations: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             task_group,
@@ -101,6 +116,7 @@ impl TaskBroker {
             shard_name,
             metrics,
             range,
+            tombstone_revive_after_generations,
         })
     }
 
@@ -120,9 +136,8 @@ impl TaskBroker {
         self.scan_generation_completed
             .store(generation, Ordering::SeqCst);
         let mut tombstones = self.ack_tombstones.lock().unwrap();
-        tombstones.retain(|_, last_seen_generation| {
-            generation.saturating_sub(*last_seen_generation)
-                <= Self::ACK_TOMBSTONE_RETAIN_GENERATIONS
+        tombstones.retain(|_, tombstone| {
+            generation.saturating_sub(tombstone.last_seen) <= Self::ACK_TOMBSTONE_RETAIN_GENERATIONS
         });
     }
 
@@ -150,6 +165,7 @@ impl TaskBroker {
         let mut skipped_tombstone = 0u64;
         let mut skipped_already_buffered = 0u64;
         let mut skipped_defunct = 0u64;
+        let mut revived = 0u64;
         while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
             let Ok(Some(kv)) = iter.next().await else {
                 break;
@@ -179,22 +195,37 @@ impl TaskBroker {
             }
 
             // Skip keys that were recently durably acked to avoid stale scan re-inserts.
-            // Refresh generation so persistent stale observations extend suppression.
-            let suppress_due_to_tombstone = {
+            // Refresh last_seen so persistent stale observations extend suppression.
+            let tombstone_age = {
                 let mut tombstones = self.ack_tombstones.lock().unwrap();
-                if let Some(last_seen_generation) = tombstones.get_mut(&key_bytes) {
-                    *last_seen_generation = generation;
-                    true
-                } else {
-                    false
-                }
+                tombstones.get_mut(&key_bytes).map(|tombstone| {
+                    tombstone.last_seen = generation;
+                    generation.saturating_sub(tombstone.inserted_at)
+                })
             };
-            if suppress_due_to_tombstone {
-                skipped_tombstone += 1;
-                continue;
+            let mut value = kv.value;
+            if let Some(age) = tombstone_age {
+                if age <= self.tombstone_revive_after_generations {
+                    skipped_tombstone += 1;
+                    continue;
+                }
+                // A key re-observed past the bound may be a row whose delete
+                // never landed. A point get sees a fresher view than the range
+                // scan that yielded the key; the guard is not held across it.
+                match self.db.get(&key_bytes).await {
+                    Ok(Some(durable)) => {
+                        self.ack_tombstones.lock().unwrap().remove(&key_bytes);
+                        revived += 1;
+                        value = durable;
+                    }
+                    _ => {
+                        skipped_tombstone += 1;
+                        continue;
+                    }
+                }
             }
 
-            let decoded = match decode_task_validated(kv.value.clone()) {
+            let decoded = match decode_task_validated(value) {
                 Ok(t) => t,
                 Err(_) => continue, // Skip malformed tasks
             };
@@ -247,6 +278,7 @@ impl TaskBroker {
                 skipped_tombstone,
                 skipped_already_buffered,
                 skipped_defunct,
+                revived,
             );
             m.set_broker_tombstone_count(
                 &self.shard_name,
@@ -494,7 +526,13 @@ impl TaskBroker {
             inflight.remove(k);
         }
         for k in tombstone_keys {
-            tombstones.insert(k.clone(), generation);
+            tombstones.insert(
+                k.clone(),
+                AckTombstone {
+                    inserted_at: generation,
+                    last_seen: generation,
+                },
+            );
         }
     }
 
@@ -525,6 +563,7 @@ pub struct TaskBrokerRegistry {
     shard_name: String,
     metrics: Option<Metrics>,
     range: ShardRange,
+    tombstone_revive_after_generations: u64,
     brokers: DashMap<String, Arc<TaskBroker>>,
 }
 
@@ -534,12 +573,14 @@ impl TaskBrokerRegistry {
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
+        tombstone_revive_after_generations: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             shard_name,
             metrics,
             range,
+            tombstone_revive_after_generations,
             brokers: DashMap::new(),
         })
     }
@@ -561,6 +602,7 @@ impl TaskBrokerRegistry {
                     self.shard_name.clone(),
                     self.metrics.clone(),
                     self.range.clone(),
+                    self.tombstone_revive_after_generations,
                 );
                 b.start();
                 b
@@ -713,6 +755,7 @@ mod inflight_release_tests {
             "shard".to_string(),
             None,
             ShardRange::full(),
+            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
         )
     }
 

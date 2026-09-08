@@ -1633,7 +1633,13 @@ mod claimed_inflight_guard_tests {
             .await
             .expect("open in-memory db");
         let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
-        TaskBrokerRegistry::new(db, "shard".to_string(), None, ShardRange::full())
+        TaskBrokerRegistry::new(
+            db,
+            "shard".to_string(),
+            None,
+            ShardRange::full(),
+            crate::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+        )
     }
 
     /// Drop without disarm releases in-flight on the broker registry.

@@ -573,6 +573,7 @@ impl Metrics {
         skipped_tombstone: u64,
         skipped_already_buffered: u64,
         skipped_defunct: u64,
+        revived: u64,
     ) {
         for (outcome, count) in [
             ("inserted", inserted),
@@ -581,6 +582,7 @@ impl Metrics {
             ("skipped_tombstone", skipped_tombstone),
             ("skipped_already_buffered", skipped_already_buffered),
             ("skipped_defunct", skipped_defunct),
+            ("revived", revived),
         ] {
             self.broker_scan_tasks_read
                 .with_label_values(&[shard, task_group, outcome])
