@@ -16,7 +16,9 @@ use crate::job_store_shard::helpers::{
     DbWriteBatcher, decode_job_status_owned, live_terminal_row_exists, now_epoch_ms,
 };
 use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
-use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
+use crate::job_store_shard::{
+    DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
+};
 use crate::keys::{
     ParsedTaskKey, attempt_key, concurrency_holder_key, job_info_key, job_status_key,
     leased_task_key, parse_task_key,
@@ -61,6 +63,9 @@ struct DequeueIterationState {
     /// so a second RequestTicket / CheckRateLimit for the same attempt within
     /// one iteration is caught here.
     materialized_attempts: HashSet<(String, String, u32)>,
+    /// Floating queues whose refresh a chain continuation in this
+    /// iteration's batch already scheduled.
+    scheduled_refreshes: ScheduledRefreshes,
     processed_internal: bool,
 }
 
@@ -78,6 +83,7 @@ impl DequeueIterationState {
             converted_requests: Vec::new(),
             leased_task_ids: HashSet::new(),
             materialized_attempts: HashSet::new(),
+            scheduled_refreshes: ScheduledRefreshes::default(),
             processed_internal: false,
         }
     }
@@ -939,6 +945,7 @@ impl JobStoreShard {
                     held_queues: new_held,
                     task_group: &req_task_group,
                     skip_try_reserve: false,
+                    scheduled_refreshes: &mut state.scheduled_refreshes,
                 },
             )
             .await?;
@@ -1154,6 +1161,7 @@ impl JobStoreShard {
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,
                             skip_try_reserve: false,
+                            scheduled_refreshes: &mut state.scheduled_refreshes,
                         },
                     )
                     .await?;

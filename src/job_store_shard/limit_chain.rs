@@ -20,7 +20,7 @@ use crate::codec::DecodedFloatingLimitState;
 use crate::concurrency::{ConcurrencyError, LimitChainResumer, ResumeChainParams};
 use crate::job_store_shard::helpers::DbWriteBatcher;
 use crate::job_store_shard::{
-    JobStoreShard, JobStoreShardError, LimitTaskParams, LimitTaskWriteResult,
+    JobStoreShard, JobStoreShardError, LimitTaskParams, LimitTaskWriteResult, ScheduledRefreshes,
 };
 
 pub(crate) struct ShardChainResumer {
@@ -40,6 +40,7 @@ impl LimitChainResumer for ShardChainResumer {
     async fn resume_chain(
         &self,
         batch: &mut WriteBatch,
+        scheduled_refreshes: &mut ScheduledRefreshes,
         params: ResumeChainParams,
     ) -> Result<Vec<(String, String)>, ConcurrencyError> {
         let shard = self
@@ -98,6 +99,7 @@ impl LimitChainResumer for ShardChainResumer {
                     held_queues: params.held_queues.clone(),
                     task_group: &params.task_group,
                     skip_try_reserve: false,
+                    scheduled_refreshes,
                 },
             )
             .await

@@ -26,6 +26,23 @@ use crate::keys::{
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
 
+/// Floating queues for which one write batch has already scheduled a
+/// refresh. Batch reads see the durable state row, not the batch's pending
+/// puts, so without this record every chain walked into the same batch
+/// would judge the same stale flag and write its own replacement refresh.
+#[derive(Debug, Default)]
+pub struct ScheduledRefreshes(Vec<(String, String)>);
+
+impl ScheduledRefreshes {
+    fn contains(&self, tenant: &str, queue_key: &str) -> bool {
+        self.0.iter().any(|(t, q)| t == tenant && q == queue_key)
+    }
+
+    fn record(&mut self, tenant: &str, queue_key: &str) {
+        self.0.push((tenant.to_string(), queue_key.to_string()));
+    }
+}
+
 /// Parameters for creating limit-processing tasks.
 /// Bundles the many fields needed by `enqueue_limit_task_at_index` into a single struct.
 pub(crate) struct LimitTaskParams<'a> {
@@ -63,6 +80,9 @@ pub(crate) struct LimitTaskParams<'a> {
     /// This matches the Alloy model's completeFailureRetryReleaseTicket which creates a
     /// TicketRequest, not an immediate holder.
     pub skip_try_reserve: bool,
+    /// The record shared by every chain walked into the same write batch,
+    /// so a floating queue's refresh is scheduled once per batch.
+    pub scheduled_refreshes: &'a mut ScheduledRefreshes,
 }
 
 /// Result of walking a job's remaining limits.
@@ -473,6 +493,7 @@ impl JobStoreShard {
                     held_queues: Vec::new(),
                     task_group,
                     skip_try_reserve: false,
+                    scheduled_refreshes: &mut ScheduledRefreshes::default(),
                 },
             )
             .await
@@ -589,6 +610,7 @@ impl JobStoreShard {
             held_queues,
             task_group,
             skip_try_reserve,
+            scheduled_refreshes,
         } = params;
         // Walk limits in the order the client provided them — silo no longer
         // reorders. `current_index` and the `limit_index` stored in
@@ -701,7 +723,11 @@ impl JobStoreShard {
                     let state = self
                         .get_or_create_floating_limit_state(writer, tenant, fl)
                         .await?;
-                    let refresh_ready = self.floating_limit_refresh_ready(&state, now_ms);
+                    // A refresh this batch already scheduled is invisible to
+                    // the durable read above, so the row would read as stale
+                    // again from every later walk into the same batch.
+                    let refresh_ready = !scheduled_refreshes.contains(tenant, &fl.key)
+                        && self.floating_limit_refresh_ready(&state, now_ms);
 
                     // Try immediate grant using current max concurrency
                     let current_max = state.current_max_concurrency();
@@ -749,8 +775,8 @@ impl JobStoreShard {
                             .has_waiting_concurrency_requests(tenant, &fl.key)
                             .await?;
                     }
-                    if refresh_ready {
-                        self.maybe_schedule_floating_limit_refresh(
+                    if refresh_ready
+                        && self.maybe_schedule_floating_limit_refresh(
                             writer,
                             tenant,
                             &fl.key,
@@ -758,7 +784,9 @@ impl JobStoreShard {
                             now_ms,
                             task_group,
                             has_waiters,
-                        )?;
+                        )?
+                    {
+                        scheduled_refreshes.record(tenant, &fl.key);
                     }
 
                     match record_grant_outcome(

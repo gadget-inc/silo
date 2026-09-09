@@ -2665,6 +2665,72 @@ async fn floating_limit_stale_threshold_setting_governs_age_out() {
     assert_eq!(read_refresh_reset_total(&metrics), 1.0);
 }
 
+/// Twenty jobs whose chains continue from a rate limit into a floating queue
+/// at capacity are walked into one dequeue batch. The batch's reads see the
+/// durable state row, so every walk finds the same stale flag; the batch
+/// must still write one replacement refresh and count one reset.
+#[silo::test]
+async fn floating_limit_one_batch_of_waiters_schedules_one_replacement_refresh() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(60_000).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-batch-dedupe-q";
+
+    // j1 holds the single slot, so every later job lands as a waiter.
+    enqueue_floating(&shard, queue, 1).await;
+    // A flag with no stamp behind it is stale on sight.
+    write_orphaned_refresh_state(&shard, queue, None).await;
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+
+    // Each chain parks on a rate limit first, so the floating queue is only
+    // reached by the dequeue that passes the rate limit, which walks all
+    // twenty chains into a single batch under the `batch` group.
+    let rate_limit = silo::job::GubernatorRateLimit {
+        name: "batch-dedupe".to_string(),
+        unique_key: format!("batch-dedupe-{}", uuid::Uuid::new_v4()),
+        limit: 100,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: silo::job::GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: silo::job::RateLimitRetryPolicy::default(),
+    };
+    for tag in 0..20u32 {
+        shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"j": tag})),
+                vec![
+                    silo::job::Limit::RateLimit(rate_limit.clone()),
+                    floating_limit(queue, REFRESH_INTERVAL_MS),
+                ],
+                None,
+                "batch",
+            )
+            .await
+            .expect("enqueue chained job");
+    }
+
+    let result = shard
+        .dequeue("worker-1", "batch", 100)
+        .await
+        .expect("dequeue");
+    assert!(
+        result.tasks.is_empty(),
+        "every chained job waits on the floating queue"
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 20);
+    assert_eq!(
+        count_refresh_tasks_in_group(&shard, queue, "batch").await + result.refresh_tasks.len(),
+        1,
+        "one batch schedules one replacement refresh"
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+}
+
 // ---------------------------------------------------------------------------
 // Scheduling refreshes from the grant-scanner and RequestTicket paths
 // ---------------------------------------------------------------------------

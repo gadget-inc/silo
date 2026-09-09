@@ -17,7 +17,9 @@ use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms,
     put_with_optional_expire, retry_on_txn_conflict,
 };
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
+use crate::job_store_shard::{
+    JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
+};
 use crate::keys::{
     attempt_key, attempt_prefix, concurrency_holder_key, end_bound, idx_metadata_key,
     job_cancelled_key, job_info_key, job_status_key,
@@ -296,6 +298,7 @@ impl JobStoreShard {
                         held_queues: Vec::new(),
                         task_group: &params.task_group,
                         skip_try_reserve: false,
+                        scheduled_refreshes: &mut ScheduledRefreshes::default(),
                     },
                 )
                 .await?
@@ -748,6 +751,7 @@ impl JobStoreShard {
                         held_queues: Vec::new(),
                         task_group: &task_group,
                         skip_try_reserve: false,
+                        scheduled_refreshes: &mut ScheduledRefreshes::default(),
                     },
                 )
                 .await

@@ -14,7 +14,9 @@ use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
+use crate::job_store_shard::{
+    JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
+};
 use crate::keys::{
     attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_tenant_prefix,
     end_bound, floating_limit_state_key, idx_metadata_key, job_cancelled_key, job_info_key,
@@ -293,6 +295,7 @@ impl JobStoreShard {
                                     held_queues: Vec::new(),
                                     task_group,
                                     skip_try_reserve: true,
+                                    scheduled_refreshes: &mut ScheduledRefreshes::default(),
                                 },
                             )
                             .await?

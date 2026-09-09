@@ -492,7 +492,11 @@ async fn concurrent_chain_resumes_in_two_batches_keep_single_terminal_row() {
     for offset in [0, 1] {
         let mut batch = WriteBatch::new();
         let grants = resumer
-            .resume_chain(&mut batch, resume_params(epoch_base + offset))
+            .resume_chain(
+                &mut batch,
+                &mut silo::job_store_shard::ScheduledRefreshes::default(),
+                resume_params(epoch_base + offset),
+            )
             .await
             .expect("resume chain");
         assert!(

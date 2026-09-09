@@ -50,6 +50,7 @@ use slatedb::config::WriteOptions;
 
 use crate::instrumented_db::InstrumentedDb;
 
+use crate::job_store_shard::ScheduledRefreshes;
 use crate::job_store_shard::counters::{decode_counter, encode_counter};
 use crate::job_store_shard::helpers::{WriteBatcher, live_terminal_row_exists};
 
@@ -138,12 +139,15 @@ pub struct ResumeChainParams {
 #[async_trait::async_trait]
 pub trait LimitChainResumer: Send + Sync {
     /// Append edits to `batch` that continue the limit chain from
-    /// `params.limit_index`. Returns the `(queue, task_id)` pairs of any
-    /// additional in-memory concurrency reservations the chain made (so the
-    /// caller can roll them back if the batch write fails).
+    /// `params.limit_index`. `scheduled_refreshes` is shared by every chain
+    /// resumed into the same batch, so a downstream floating queue's refresh
+    /// is scheduled once per batch. Returns the `(queue, task_id)` pairs of
+    /// any additional in-memory concurrency reservations the chain made (so
+    /// the caller can roll them back if the batch write fails).
     async fn resume_chain(
         &self,
         batch: &mut slatedb::WriteBatch,
+        scheduled_refreshes: &mut ScheduledRefreshes,
         params: ResumeChainParams,
     ) -> Result<Vec<(String, String)>, ConcurrencyError>;
 
@@ -2412,6 +2416,7 @@ impl ConcurrencyManager {
             let needed = (count as usize - total_granted).min(self.grant_scanner_batch_size);
 
             let mut batch = WriteBatch::new();
+            let mut chunk_scheduled_refreshes = ScheduledRefreshes::default();
             let mut stale_and_corrupt_count: usize = 0;
 
             // --- Scan batch of candidates ---
@@ -2979,7 +2984,10 @@ impl ConcurrencyManager {
                     read_cache: read_cache.clone(),
                 };
 
-                match resumer.resume_chain(&mut batch, resume_params).await {
+                match resumer
+                    .resume_chain(&mut batch, &mut chunk_scheduled_refreshes, resume_params)
+                    .await
+                {
                     Ok(chain_grants) => {
                         // Each (queue, task_id) the chain reserved must roll back
                         // alongside ours if this chunk's write fails.
@@ -3005,6 +3013,7 @@ impl ConcurrencyManager {
 
                 if chunk_grants.len() >= self.grant_scanner_commit_chunk_size {
                     let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
+                    chunk_scheduled_refreshes = ScheduledRefreshes::default();
                     let stale_deletes = std::mem::take(&mut chunk_stale);
                     if self
                         .commit_grant_chunk(
