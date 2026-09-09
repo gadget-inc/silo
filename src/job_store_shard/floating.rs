@@ -41,6 +41,23 @@ fn stale_window_ms(base_ms: i64, stale_reset_count: u32, max_ms: i64) -> i64 {
     widened.min(max_ms).max(base_ms)
 }
 
+/// The state a floating queue starts with: the limit's defaults, nothing
+/// refreshed, no refresh outstanding.
+fn default_floating_limit_state(fl: &FloatingConcurrencyLimit) -> FloatingLimitState {
+    FloatingLimitState {
+        current_max_concurrency: fl.default_max_concurrency,
+        last_refreshed_at_ms: 0,
+        refresh_task_scheduled: false,
+        refresh_interval_ms: fl.refresh_interval_ms,
+        default_max_concurrency: fl.default_max_concurrency,
+        retry_count: 0,
+        next_retry_at_ms: None,
+        metadata: fl.metadata.clone(),
+        refresh_scheduled_at_ms: None,
+        stale_reset_count: 0,
+    }
+}
+
 impl JobStoreShard {
     /// Mark `task_group` as possibly holding a refresh index row. Called
     /// only after the put's batch is durable: a mark made before the row is
@@ -477,24 +494,32 @@ impl JobStoreShard {
         }
 
         // Cold path: first time seeing this queue key, create and write new state
-        let state = FloatingLimitState {
-            current_max_concurrency: fl.default_max_concurrency,
-            last_refreshed_at_ms: 0,
-            refresh_task_scheduled: false,
-            refresh_interval_ms: fl.refresh_interval_ms,
-            default_max_concurrency: fl.default_max_concurrency,
-            retry_count: 0,
-            next_retry_at_ms: None,
-            metadata: fl.metadata.clone(),
-            refresh_scheduled_at_ms: None,
-            stale_reset_count: 0,
-        };
-
-        let state_bytes = encode_floating_limit_state(&state);
+        let state_bytes = encode_floating_limit_state(&default_floating_limit_state(fl));
         writer.put(&state_key, &state_bytes)?;
 
         // Decode what we just encoded so we return the same type
         Ok(decode_floating_limit_state(state_bytes)?)
+    }
+
+    /// The queue's durable state, or an unwritten default when no row exists
+    /// yet. For a queue this batch has already scheduled a refresh for: the
+    /// batch holds the queue's real row with the flag set, a durable read
+    /// cannot see that put, and a second cold-path create would overwrite
+    /// the flag when the batch commits.
+    pub(crate) async fn floating_limit_state_or_default<W: WriteBatcher>(
+        &self,
+        writer: &W,
+        tenant: &str,
+        fl: &FloatingConcurrencyLimit,
+    ) -> Result<DecodedFloatingLimitState, JobStoreShardError> {
+        let raw = match writer
+            .get(&floating_limit_state_key(tenant, &fl.key))
+            .await?
+        {
+            Some(raw) => raw,
+            None => encode_floating_limit_state(&default_floating_limit_state(fl)).into(),
+        };
+        Ok(decode_floating_limit_state(raw)?)
     }
 
     /// Check if a floating limit refresh is needed and schedule it if so.

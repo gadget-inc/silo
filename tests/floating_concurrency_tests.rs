@@ -3863,3 +3863,62 @@ async fn floating_limit_scanner_chunk_of_waiters_schedules_one_replacement_refre
     );
     assert_eq!(read_refresh_reset_total(&metrics), 1.0);
 }
+
+/// Chains walked into one batch onto a floating queue with no state row yet:
+/// the second chain schedules the refresh and sets the flag, and later
+/// chains must not overwrite that flag with a fresh default row.
+#[silo::test]
+async fn floating_limit_new_queue_scheduled_in_one_batch_keeps_its_flag() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-batch-new-queue-q";
+    let rate_limit = silo::job::GubernatorRateLimit {
+        name: "batch-new-queue".to_string(),
+        unique_key: format!("batch-new-queue-{}", uuid::Uuid::new_v4()),
+        limit: 100,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: silo::job::GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: silo::job::RateLimitRetryPolicy::default(),
+    };
+    for tag in 0..5u32 {
+        shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"j": tag})),
+                vec![
+                    silo::job::Limit::RateLimit(rate_limit.clone()),
+                    floating_limit(queue, REFRESH_INTERVAL_MS),
+                ],
+                None,
+                "batch",
+            )
+            .await
+            .expect("enqueue chained job");
+    }
+
+    // The first chain takes the single slot, the second becomes a waiter and
+    // schedules the refresh, the rest wait too; nothing is drained yet.
+    let result = shard
+        .dequeue("worker-1", "batch", 100)
+        .await
+        .expect("dequeue");
+    assert_eq!(result.tasks.len(), 1);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 4);
+    let state = read_floating_state(&shard, queue).await;
+    assert!(
+        state.refresh_task_scheduled(),
+        "the flag set by the second chain survives the later chains' walks"
+    );
+    assert!(state.refresh_scheduled_at_ms().is_some());
+    assert_eq!(
+        count_refresh_tasks_in_group(&shard, queue, "batch").await + result.refresh_tasks.len(),
+        1
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+}

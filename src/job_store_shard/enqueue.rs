@@ -739,14 +739,20 @@ impl JobStoreShard {
 
                 Limit::FloatingConcurrency(fl) => {
                     // Get/create floating limit state and maybe schedule refresh
-                    let state = self
-                        .get_or_create_floating_limit_state(writer, tenant, fl)
-                        .await?;
                     // A refresh this batch already scheduled is invisible to
-                    // the durable read above, so the row would read as stale
-                    // again from every later walk into the same batch.
-                    let refresh_ready = !scheduled_refreshes.contains(tenant, &fl.key)
-                        && self.floating_limit_refresh_ready(&state, now_ms);
+                    // durable reads: the row would read as stale again from
+                    // every later walk into the same batch, and a cold-path
+                    // create would overwrite the batch's flag on commit.
+                    let already_scheduled = scheduled_refreshes.contains(tenant, &fl.key);
+                    let state = if already_scheduled {
+                        self.floating_limit_state_or_default(writer, tenant, fl)
+                            .await?
+                    } else {
+                        self.get_or_create_floating_limit_state(writer, tenant, fl)
+                            .await?
+                    };
+                    let refresh_ready =
+                        !already_scheduled && self.floating_limit_refresh_ready(&state, now_ms);
 
                     // Try immediate grant using current max concurrency
                     let current_max = state.current_max_concurrency();
