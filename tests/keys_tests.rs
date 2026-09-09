@@ -457,3 +457,22 @@ fn test_task_key_lookup_prefix_matches_any_epoch() {
     let other = task_key("group1", 1000, 10, "job124", 1, 0);
     assert!(!other.starts_with(&prefix));
 }
+
+#[test]
+fn test_refresh_task_key_roundtrip_and_prefixes() {
+    use silo::keys::{
+        parse_refresh_task_key, refresh_task_group_prefix, refresh_task_key,
+        refresh_task_tenant_prefix, refresh_tasks_prefix,
+    };
+    let key = refresh_task_key("emails", "tenant-a", "queue/one");
+    let parsed = parse_refresh_task_key(&key).expect("parse refresh task key");
+    assert_eq!(parsed.task_group, "emails");
+    assert_eq!(parsed.tenant, "tenant-a");
+    assert_eq!(parsed.queue_key, "queue/one");
+
+    assert!(key.starts_with(&refresh_tasks_prefix()));
+    assert!(key.starts_with(&refresh_task_group_prefix("emails")));
+    assert!(key.starts_with(&refresh_task_tenant_prefix("emails", "tenant-a")));
+    assert!(!key.starts_with(&refresh_task_group_prefix("email")));
+    assert!(parse_refresh_task_key(&floating_limit_state_key("tenant-a", "queue/one")).is_none());
+}

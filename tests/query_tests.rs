@@ -5719,3 +5719,144 @@ fn extract_queue_counts_partial(
     }
     results
 }
+
+// ===== floating_refresh_tasks table tests =====
+
+/// Seed a pending refresh for `queue` under `task_group` in the refresh index.
+async fn seed_pending_refresh(
+    shard: &JobStoreShard,
+    tenant: &str,
+    queue: &str,
+    task_group: &str,
+    not_before_ms: Option<i64>,
+) {
+    shard
+        .put_refresh_index_row_for_test(
+            &silo::task::Task::RefreshFloatingLimit {
+                task_id: format!("{task_group}-{tenant}-{queue}"),
+                tenant: tenant.to_string(),
+                queue_key: queue.to_string(),
+                current_max_concurrency: 7,
+                last_refreshed_at_ms: 4_000,
+                metadata: vec![],
+                task_group: task_group.to_string(),
+            },
+            not_before_ms,
+        )
+        .await
+        .expect("seed refresh index row");
+}
+
+#[silo::test]
+async fn floating_refresh_tasks_table_lists_pending_refreshes() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed_pending_refresh(&shard, "-", "q-a", "emails", None).await;
+    seed_pending_refresh(&shard, "-", "q-b", "emails", Some(1_234)).await;
+    seed_pending_refresh(&shard, "t2", "q-c", "emails", None).await;
+    seed_pending_refresh(&shard, "-", "q-d", "other", None).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql(
+            "SELECT task_group, tenant, queue_key, task_id, not_before_ms, current_max_concurrency, last_refreshed_at_ms \
+             FROM floating_refresh_tasks ORDER BY task_group, tenant, queue_key",
+        )
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert_eq!(
+        extract_string_column(&batches, 0),
+        vec!["emails", "emails", "emails", "other"]
+    );
+    assert_eq!(
+        extract_string_column(&batches, 1),
+        vec!["-", "-", "t2", "-"]
+    );
+    assert_eq!(
+        extract_string_column(&batches, 2),
+        vec!["q-a", "q-b", "q-c", "q-d"]
+    );
+    assert_eq!(extract_string_column(&batches, 3)[1], "emails---q-b");
+    let not_before = batches[0]
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("not_before_ms column");
+    assert!(
+        not_before.is_null(0),
+        "a claimable row has no not_before_ms"
+    );
+    assert_eq!(not_before.value(1), 1_234);
+    let current_max = batches[0]
+        .column(5)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("current_max_concurrency column");
+    assert_eq!(current_max.value(0), 7);
+    let last_refreshed = batches[0]
+        .column(6)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("last_refreshed_at_ms column");
+    assert_eq!(last_refreshed.value(0), 4_000);
+}
+
+/// `task_group` and `tenant` equality filters bound the scan to a key
+/// prefix and are handled exactly: the plan carries them into the scan and
+/// adds no post-filter.
+#[silo::test]
+async fn floating_refresh_tasks_table_pushes_task_group_and_tenant_down() {
+    use silo::query::{
+        FloatingRefreshTasksScanStrategy, parse_floating_refresh_tasks_scan_strategy,
+    };
+    let (_tmp, shard) = open_temp_shard().await;
+    seed_pending_refresh(&shard, "-", "q-a", "emails", None).await;
+    seed_pending_refresh(&shard, "t2", "q-b", "emails", None).await;
+    seed_pending_refresh(&shard, "-", "q-c", "other", None).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let query = "SELECT queue_key FROM floating_refresh_tasks WHERE task_group = 'emails' AND tenant = '-' ORDER BY queue_key";
+    let batches = sql
+        .sql(query)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(extract_string_column(&batches, 0), vec!["q-a"]);
+
+    let plan = sql.get_physical_plan(query).await.expect("plan");
+    let exprs =
+        ShardQueryEngine::extract_pushed_filter_exprs(&plan).expect("should have filter exprs");
+    assert_eq!(
+        parse_floating_refresh_tasks_scan_strategy(&exprs),
+        FloatingRefreshTasksScanStrategy::Prefix {
+            task_group: "emails".to_string(),
+            tenant: Some("-".to_string()),
+        }
+    );
+    let explain = sql.explain(query).await.expect("explain");
+    assert!(
+        !explain.contains("FilterExec"),
+        "prefix filters are exact and need no post-filter: {explain}"
+    );
+
+    // A tenant filter alone cannot bound the prefix and is re-applied.
+    let tenant_only = "SELECT queue_key FROM floating_refresh_tasks WHERE tenant = 't2'";
+    let batches = sql
+        .sql(tenant_only)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(extract_string_column(&batches, 0), vec!["q-b"]);
+    let explain = sql.explain(tenant_only).await.expect("explain");
+    assert!(
+        explain.contains("FilterExec"),
+        "a tenant filter without task_group is a post-filter: {explain}"
+    );
+}

@@ -31,6 +31,7 @@ pub use restart::JobNotRestartableError;
 
 pub use enqueue::ScheduledRefreshes;
 pub(crate) use enqueue::{LimitTaskParams, LimitTaskWriteResult};
+pub use floating::{REFRESH_DRAIN_MAX_LEASED, REFRESH_INDEX_ROW_TTL_MS};
 use helpers::DbWriteBatcher;
 use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
@@ -245,6 +246,12 @@ pub struct JobStoreShard {
     /// Age (ms) past which a set `refresh_task_scheduled` flag is treated as
     /// a lost refresh rather than an outstanding one.
     pub(crate) floating_refresh_stale_ms: i64,
+    /// Task groups that may hold a refresh index row, each with a generation
+    /// bumped by every index put. A drain skips groups not present here and
+    /// removes a group only when its scan found the range empty at an
+    /// unchanged generation. `BTreeMap` keeps iteration deterministic for
+    /// the simulation harness.
+    pub(crate) refresh_pending_groups: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 #[derive(Debug, Error)]
@@ -608,7 +615,19 @@ impl JobStoreShard {
             // Epoch-ms arithmetic needs an i64; a value past i64::MAX saturates
             // and means only stamp-less rows ever read as stale.
             floating_refresh_stale_ms: i64::try_from(floating_refresh_stale_ms).unwrap_or(i64::MAX),
+            refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         });
+
+        // The refresh index holds at most one row per floating queue with a
+        // pending refresh, so warming the pending-group gate from it is one
+        // small prefix scan, and it runs on every open.
+        let warm_started = std::time::Instant::now();
+        shard.warm_refresh_pending_groups().await?;
+        tracing::debug!(
+            shard = %shard.name,
+            elapsed_ms = warm_started.elapsed().as_millis() as u64,
+            "shard open: warm refresh pending groups"
+        );
 
         // Install the chain resumer before starting the grant scanner so the
         // scanner's first wake-up has a working callback for resuming limit

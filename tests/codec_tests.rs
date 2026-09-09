@@ -3,7 +3,7 @@ use silo::codec::{
     decode_floating_limit_state, decode_holder_granted_at_ms, decode_job_info,
     decode_job_status_owned, decode_lease, decode_task, decode_task_validated, encode_attempt,
     encode_concurrency_action, encode_floating_limit_state, encode_holder, encode_job_cancellation,
-    encode_job_info, encode_job_status, encode_lease, encode_task,
+    encode_job_info, encode_job_status, encode_lease, encode_refresh_index_row, encode_task,
 };
 use silo::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
@@ -667,4 +667,65 @@ fn test_floating_limit_state_roundtrip_refresh_scheduled_at() {
     assert_eq!(decoded.next_retry_at_ms(), None);
     assert_eq!(decoded.metadata().len(), 1);
     assert_eq!(decoded.to_owned().refresh_scheduled_at_ms, Some(5500));
+}
+
+/// A `RefreshFloatingLimit` task encoded for the task line or a lease
+/// carries no `not_before_ms`, so its decoded view reads the field as null.
+#[silo::test]
+fn test_refresh_floating_limit_without_not_before_decodes_as_null() {
+    let task = Task::RefreshFloatingLimit {
+        task_id: "refresh-1".to_string(),
+        tenant: "tenant-3".to_string(),
+        queue_key: "queue-key-abc".to_string(),
+        current_max_concurrency: 50,
+        last_refreshed_at_ms: 123456,
+        metadata: vec![],
+        task_group: "workers".to_string(),
+    };
+    let decoded = decode_task_validated(encode_task(&task)).unwrap();
+    assert_eq!(decoded.not_before_ms(), None);
+    assert_eq!(
+        decoded
+            .as_refresh_floating_limit()
+            .and_then(|r| r.queue_key())
+            .unwrap_or_default(),
+        "queue-key-abc"
+    );
+}
+
+#[silo::test]
+fn test_refresh_index_row_roundtrip_carries_not_before() {
+    let task = Task::RefreshFloatingLimit {
+        task_id: "refresh-2".to_string(),
+        tenant: "tenant-3".to_string(),
+        queue_key: "queue-key-abc".to_string(),
+        current_max_concurrency: 50,
+        last_refreshed_at_ms: 123456,
+        metadata: vec![("key1".to_string(), "val1".to_string())],
+        task_group: "workers".to_string(),
+    };
+    let claimable = decode_task_validated(encode_refresh_index_row(&task, None)).unwrap();
+    assert_eq!(claimable.not_before_ms(), None);
+
+    let backed_off =
+        decode_task_validated(encode_refresh_index_row(&task, Some(1_756_400_060_000))).unwrap();
+    assert_eq!(backed_off.not_before_ms(), Some(1_756_400_060_000));
+    let owned = backed_off.to_task().unwrap();
+    match owned {
+        Task::RefreshFloatingLimit {
+            task_id,
+            queue_key,
+            current_max_concurrency,
+            metadata,
+            task_group,
+            ..
+        } => {
+            assert_eq!(task_id, "refresh-2");
+            assert_eq!(queue_key, "queue-key-abc");
+            assert_eq!(current_max_concurrency, 50);
+            assert_eq!(metadata, vec![("key1".to_string(), "val1".to_string())]);
+            assert_eq!(task_group, "workers");
+        }
+        _ => panic!("expected RefreshFloatingLimit variant"),
+    }
 }

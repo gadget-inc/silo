@@ -111,7 +111,8 @@ Concurrency limits control how many jobs with the same concurrency key can run s
 
 **Key insights:**
 - Track `silo_concurrency_tickets_granted_total` rate to understand throughput through limited queues
-- `silo_floating_limit_refresh_reset_total` should stay near zero. A steady rate means refresh tasks are being lost between scheduling and completion (a lost task row, lost lease, or broker suppression); the accompanying warn log names the tenant, queue key, and flag age. A state row with no stamp counts once, when its first replacement is written
+- Pending floating limit refreshes live in a per-shard refresh index, one row per queue per task group, and are handed to the next worker that polls the task group before any job work is claimed, so a refresh is never queued behind the group's job backlog. The `floating_refresh_tasks` SQL table lists them (see the [querying guide](/guides/querying))
+- `silo_floating_limit_refresh_reset_total` should stay near zero. A steady rate means refresh tasks are being lost between scheduling and completion (a lost index row or a lost lease); the accompanying warn log names the tenant, queue key, and flag age. A state row with no stamp counts once, when its first replacement is written
 
 ### gRPC Metrics
 

@@ -240,21 +240,28 @@ impl JobStoreShard {
     /// RunAttempt tasks for job execution and RefreshFloatingLimit tasks for workers to refresh floating limits.
     ///
     /// The `task_group` parameter specifies which task group to poll for tasks.
+    ///
+    /// Pending refreshes are drained from the group's refresh index before
+    /// any job work is claimed from the broker, so a refresh is handed over
+    /// regardless of the group's job backlog, even when `max_tasks` is zero
+    /// or the broker buffer is empty. Refresh rows still in the task line
+    /// are leased when the broker reaches them.
     pub async fn dequeue(
         &self,
         worker_id: &str,
         task_group: &str,
         max_tasks: usize,
     ) -> Result<DequeueResult, JobStoreShardError> {
+        let mut refresh_out: Vec<LeasedRefreshTask> =
+            self.drain_pending_refreshes(worker_id, task_group).await?;
         if max_tasks == 0 {
             return Ok(DequeueResult {
                 tasks: Vec::new(),
-                refresh_tasks: Vec::new(),
+                refresh_tasks: refresh_out,
             });
         }
 
         let mut out: Vec<LeasedTask> = Vec::new();
-        let mut refresh_out: Vec<LeasedRefreshTask> = Vec::new();
         // Tuple: (tenant, job_view, encoded_attempt_bytes)
         // We keep the encoded bytes to construct JobAttemptView without a DB readback.
         let mut pending_attempts: Vec<(String, JobView, Vec<u8>)> = Vec::with_capacity(max_tasks);
