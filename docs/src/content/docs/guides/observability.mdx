@@ -107,12 +107,12 @@ Concurrency limits control how many jobs with the same concurrency key can run s
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `silo_concurrency_tickets_granted_total` | Counter | - | Total concurrency tickets granted |
-| `silo_floating_limit_refresh_reset_total` | Counter | `shard`, `reason` | Floating limit refresh tasks scheduled over an outstanding-refresh flag that silo treated as lost. `reason` is `stale_scheduled`: the flag had been set longer than `floating_refresh_stale_ms` (default 60 s), or the state row carries no scheduled-at stamp |
+| `silo_floating_limit_refresh_reset_total` | Counter | `shard`, `reason` | Floating limit refresh tasks scheduled over an outstanding-refresh flag that silo treated as lost. `reason` is `stale_scheduled`: the flag had been set longer than the queue's stale window, or the state row carries no scheduled-at stamp. The window starts at `floating_refresh_stale_ms` (default 60 s) and doubles with each consecutive reset of the same queue up to `floating_refresh_stale_max_ms` (default 1 h); any refresh outcome returns it to the base |
 
 **Key insights:**
 - Track `silo_concurrency_tickets_granted_total` rate to understand throughput through limited queues
 - Pending floating limit refreshes live in a per-shard refresh index, one row per queue per task group, and are handed to the next worker that polls the task group before any job work is claimed, so a refresh is never queued behind the group's job backlog. The `floating_refresh_tasks` SQL table lists them (see the [querying guide](/guides/querying))
-- `silo_floating_limit_refresh_reset_total` should stay near zero. A steady rate means refresh tasks are being lost between scheduling and completion (a lost index row or a lost lease); the accompanying warn log names the tenant, queue key, and flag age. A state row with no stamp counts once, when its first replacement is written
+- `silo_floating_limit_refresh_reset_total` should stay near zero. A steady rate means refreshes are being scheduled but not leased: a task group no worker polls, or a lost index row. A leased refresh whose worker never reports clears the count when its lease expires, so it does not show up here. The accompanying warn log (`floating limit refresh flag is stale; scheduling a replacement refresh`) names the tenant, queue key, and flag age, plus `stale_resets` (the queue's consecutive reset count, including this one) and `next_stale_window_ms` (how long the replacement is trusted); a climbing `stale_resets` marks a queue stuck in backoff, a value of 1 a one-shot recovery. A state row with no stamp counts once, when its first replacement is written
 
 ### gRPC Metrics
 

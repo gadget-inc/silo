@@ -2258,6 +2258,18 @@ async fn write_orphaned_refresh_state(
     queue: &str,
     scheduled_at_ms: Option<i64>,
 ) {
+    write_refresh_state(shard, queue, scheduled_at_ms, 0).await;
+}
+
+/// Overwrite the durable floating limit state row for `queue` with the flag
+/// set, stamped at `scheduled_at_ms`, after `stale_reset_count` consecutive
+/// stale resets.
+async fn write_refresh_state(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    scheduled_at_ms: Option<i64>,
+    stale_reset_count: u32,
+) {
     let state = silo::job::FloatingLimitState {
         current_max_concurrency: 1,
         last_refreshed_at_ms: 0,
@@ -2268,6 +2280,7 @@ async fn write_orphaned_refresh_state(
         next_retry_at_ms: None,
         metadata: vec![],
         refresh_scheduled_at_ms: scheduled_at_ms,
+        stale_reset_count,
     };
     shard
         .db()
@@ -3554,4 +3567,185 @@ async fn floating_limit_index_rows_carry_the_row_ttl() {
         retried >= before + ttl - 5_000 && retried <= now_ms() + ttl + 5_000,
         "retry row expire_ts {retried} is not about {ttl} ms out"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bounded stale resets
+// ---------------------------------------------------------------------------
+
+/// Consecutive stale resets double the stale window from the base: after two
+/// resets a 100 ms base window is 400 ms wide.
+#[silo::test]
+async fn floating_limit_consecutive_stale_resets_double_the_stale_window() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(100).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-backoff-q";
+    // j1 holds the single slot, so every later enqueue is a waiter.
+    enqueue_floating(&shard, queue, 1).await;
+
+    // A stamp-less flag is stale on sight: the first reset.
+    write_refresh_state(&shard, queue, None, 0).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        1
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+
+    // One reset widens the window to 200 ms: a stamp older than that is stale.
+    write_refresh_state(&shard, queue, Some(now_ms() - 201), 1).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        2
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 2.0);
+
+    // Two resets widen it to 400 ms: a 150 ms old stamp is still trusted.
+    write_refresh_state(&shard, queue, Some(now_ms() - 150), 2).await;
+    enqueue_floating(&shard, queue, 4).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        2
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 2.0);
+
+    // Past 400 ms the flag is stale again and the count keeps climbing.
+    write_refresh_state(&shard, queue, Some(now_ms() - 401), 2).await;
+    enqueue_floating(&shard, queue, 5).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        3
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 3.0);
+}
+
+/// `floating_refresh_stale_max_ms` caps the widened window.
+#[silo::test]
+async fn floating_limit_stale_window_is_capped_by_the_max_setting() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_window(100, 300).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-cap-q";
+    enqueue_floating(&shard, queue, 1).await;
+
+    // Two resets would widen the window to 400 ms; the cap holds it at 300.
+    write_refresh_state(&shard, queue, Some(now_ms() - 250), 2).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        2
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+
+    write_refresh_state(&shard, queue, Some(now_ms() - 301), 2).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        3
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+}
+
+/// Age a stamp-less flag out on `queue` so a waiter writes a replacement
+/// that records one stale reset, then lease that replacement. Returns its
+/// task id.
+async fn lease_replacement_after_one_stale_reset(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+) -> String {
+    enqueue_floating(shard, queue, 1).await;
+    write_refresh_state(shard, queue, None, 0).await;
+    enqueue_floating(shard, queue, 2).await;
+    assert_eq!(
+        read_floating_state(shard, queue).await.stale_reset_count(),
+        1
+    );
+    dequeue_refresh_tasks_until(shard, "worker-1", "default", 1, DEQUEUE_TIMEOUT)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone()
+}
+
+/// A reported success clears the stale reset count, and the first schedule
+/// after that clean outcome leaves it at zero.
+#[silo::test]
+async fn floating_limit_refresh_success_clears_the_stale_reset_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-clear-success-q";
+    let task_id = lease_replacement_after_one_stale_reset(&shard, queue).await;
+
+    shard
+        .report_refresh_success(&task_id, 1)
+        .await
+        .expect("report success");
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        0
+    );
+
+    // The interval elapses and a new waiter schedules the next refresh: a
+    // first schedule after a clean outcome does not widen the window.
+    backdate_last_refreshed(&shard, queue).await;
+    enqueue_floating(&shard, queue, 3).await;
+    let state = read_floating_state(&shard, queue).await;
+    assert!(state.refresh_task_scheduled());
+    assert_eq!(state.stale_reset_count(), 0);
+}
+
+/// A reported failure clears the stale reset count.
+#[silo::test]
+async fn floating_limit_refresh_failure_clears_the_stale_reset_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-clear-failure-q";
+    let task_id = lease_replacement_after_one_stale_reset(&shard, queue).await;
+
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+    let state = read_floating_state(&shard, queue).await;
+    assert_eq!(state.stale_reset_count(), 0);
+    assert_eq!(
+        state.retry_count(),
+        1,
+        "the failure backoff is still recorded"
+    );
+}
+
+/// A refresh lease expiring clears the stale reset count.
+#[silo::test]
+async fn floating_limit_refresh_lease_expiry_clears_the_stale_reset_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-clear-expiry-q";
+    let task_id = lease_replacement_after_one_stale_reset(&shard, queue).await;
+
+    let lease_key = silo::keys::leased_task_key(&task_id);
+    let lease_raw = shard
+        .db()
+        .get(&lease_key)
+        .await
+        .expect("db get")
+        .expect("lease exists");
+    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
+    let expired = LeaseRecord {
+        worker_id: decoded_lease.worker_id().to_string(),
+        task: decoded_lease.to_task().unwrap(),
+        expiry_ms: now_ms() - 1,
+        started_at_ms: decoded_lease.started_at_ms(),
+    };
+    shard
+        .db()
+        .put(&lease_key, &encode_lease(&expired))
+        .await
+        .expect("put expired lease");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(shard.reap_expired_leases("-").await.expect("reap"), 1);
+    let state = read_floating_state(&shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.stale_reset_count(), 0);
 }

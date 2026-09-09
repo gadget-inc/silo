@@ -134,6 +134,9 @@ pub struct OpenShardOptions {
     /// before a replacement refresh may be scheduled. Populated from
     /// `DatabaseConfig::floating_refresh_stale_ms`.
     pub floating_refresh_stale_ms: u64,
+    /// Cap (ms) on the stale window widened by consecutive stale resets.
+    /// Populated from `DatabaseConfig::floating_refresh_stale_max_ms`.
+    pub floating_refresh_stale_max_ms: u64,
     /// Scan generations an ack tombstone may keep suppressing a re-observed
     /// task key before the broker point-reads the row. Populated from
     /// `DatabaseConfig::broker_tombstone_revive_after_generations`.
@@ -244,8 +247,11 @@ pub struct JobStoreShard {
     /// from per-status counters instead of a full status-index scan.
     pub(crate) count_from_status_counters: bool,
     /// Age (ms) past which a set `refresh_task_scheduled` flag is treated as
-    /// a lost refresh rather than an outstanding one.
+    /// a lost refresh rather than an outstanding one, before consecutive
+    /// stale resets widen it.
     pub(crate) floating_refresh_stale_ms: i64,
+    /// The widest the stale window grows under consecutive stale resets.
+    pub(crate) floating_refresh_stale_max_ms: i64,
     /// Task groups that may hold a refresh index row, each with a generation
     /// bumped by every index put. A drain skips groups not present here and
     /// removes a group only when its scan found the range empty at an
@@ -446,6 +452,7 @@ impl JobStoreShard {
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 count_from_status_counters: cfg.count_from_status_counters,
                 floating_refresh_stale_ms: cfg.floating_refresh_stale_ms,
+                floating_refresh_stale_max_ms: cfg.floating_refresh_stale_max_ms,
                 broker_tombstone_revive_after_generations: cfg
                     .broker_tombstone_revive_after_generations,
             },
@@ -493,6 +500,7 @@ impl JobStoreShard {
             terminal_job_expire_s,
             count_from_status_counters,
             floating_refresh_stale_ms,
+            floating_refresh_stale_max_ms,
             broker_tombstone_revive_after_generations,
         } = options;
 
@@ -615,6 +623,8 @@ impl JobStoreShard {
             // Epoch-ms arithmetic needs an i64; a value past i64::MAX saturates
             // and means only stamp-less rows ever read as stale.
             floating_refresh_stale_ms: i64::try_from(floating_refresh_stale_ms).unwrap_or(i64::MAX),
+            floating_refresh_stale_max_ms: i64::try_from(floating_refresh_stale_max_ms)
+                .unwrap_or(i64::MAX),
             refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         });
 

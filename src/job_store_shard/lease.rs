@@ -664,6 +664,7 @@ impl JobStoreShard {
         let new_state = FloatingLimitState {
             refresh_task_scheduled: false,
             refresh_scheduled_at_ms: None,
+            stale_reset_count: 0,
             ..decoded_state.to_owned()
         };
 

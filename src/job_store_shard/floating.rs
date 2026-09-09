@@ -29,6 +29,17 @@ pub const REFRESH_INDEX_ROW_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// range never hide a claimable row.
 pub const REFRESH_DRAIN_MAX_LEASED: usize = 16;
 
+/// `base_ms` doubled `stale_reset_count` times, capped at `max_ms`, with
+/// the shift saturating instead of overflowing.
+fn stale_window_ms(base_ms: i64, stale_reset_count: u32, max_ms: i64) -> i64 {
+    let widened = if stale_reset_count >= i64::BITS - 1 {
+        i64::MAX
+    } else {
+        base_ms.saturating_mul(1i64 << stale_reset_count)
+    };
+    widened.min(max_ms)
+}
+
 impl JobStoreShard {
     /// Mark `task_group` as possibly holding a refresh index row. Called
     /// before every index put's batch commits, so a drain never skips a
@@ -209,15 +220,26 @@ impl JobStoreShard {
         Ok(leased)
     }
 
+    /// The stale window for a state row: the shard's base window doubled per
+    /// consecutive stale reset the row records, capped at the shard's max.
+    /// Shifts saturate, so a large count reads as the cap.
+    fn floating_limit_stale_window_ms(&self, state: &DecodedFloatingLimitState) -> i64 {
+        stale_window_ms(
+            self.floating_refresh_stale_ms,
+            state.stale_reset_count(),
+            self.floating_refresh_stale_max_ms,
+        )
+    }
+
     /// True when the state's outstanding-refresh flag is set but the refresh
-    /// was scheduled longer ago than the shard's stale threshold, or carries
-    /// no stamp at all. Such a refresh is treated as lost: no task row,
-    /// lease, or in-memory suppression may pin a tenant's cap forever.
+    /// was scheduled longer ago than the row's stale window, or carries no
+    /// stamp at all. Such a refresh is treated as lost: no index row, lease,
+    /// or in-memory suppression may pin a tenant's cap forever.
     fn floating_limit_refresh_stale(&self, state: &DecodedFloatingLimitState, now_ms: i64) -> bool {
         state.refresh_task_scheduled()
             && state
                 .refresh_scheduled_at_ms()
-                .is_none_or(|at| now_ms - at > self.floating_refresh_stale_ms)
+                .is_none_or(|at| now_ms - at > self.floating_limit_stale_window_ms(state))
     }
 
     /// True when a refresh task is scheduled and still trusted to complete.
@@ -416,6 +438,7 @@ impl JobStoreShard {
             next_retry_at_ms: None,
             metadata: fl.metadata.clone(),
             refresh_scheduled_at_ms: None,
+            stale_reset_count: 0,
         };
 
         let state_bytes = encode_floating_limit_state(&state);
@@ -467,13 +490,24 @@ impl JobStoreShard {
         }
 
         // Reaching here with the flag still set means the outstanding refresh
-        // aged out; this write replaces it.
+        // aged out; this write replaces it and widens the next stale window.
+        // A first schedule after a clean outcome keeps the count the outcome
+        // wrote, so a healthy refresh cycle never widens the window.
+        let mut stale_reset_count = state.stale_reset_count();
         if state.refresh_task_scheduled() {
             let age_ms = state.refresh_scheduled_at_ms().map(|at| now_ms - at);
+            stale_reset_count = stale_reset_count.saturating_add(1);
+            let next_stale_window_ms = stale_window_ms(
+                self.floating_refresh_stale_ms,
+                stale_reset_count,
+                self.floating_refresh_stale_max_ms,
+            );
             tracing::warn!(
                 tenant = %tenant,
                 queue_key = %queue_key,
                 age_ms = ?age_ms,
+                stale_resets = stale_reset_count,
+                next_stale_window_ms,
                 "floating limit refresh flag is stale; scheduling a replacement refresh"
             );
             if let Some(m) = &self.metrics {
@@ -504,6 +538,7 @@ impl JobStoreShard {
         let new_state = FloatingLimitState {
             refresh_task_scheduled: true,
             refresh_scheduled_at_ms: Some(now_ms),
+            stale_reset_count,
             ..state.to_owned()
         };
         let state_key = floating_limit_state_key(tenant, queue_key);
@@ -561,6 +596,7 @@ impl JobStoreShard {
             refresh_scheduled_at_ms: None,
             retry_count: 0,
             next_retry_at_ms: None,
+            stale_reset_count: 0,
             ..decoded_state.to_owned()
         };
 
@@ -663,6 +699,7 @@ impl JobStoreShard {
             next_retry_at_ms: Some(next_retry_at),
             refresh_task_scheduled: has_waiters,
             refresh_scheduled_at_ms: has_waiters.then_some(next_retry_at),
+            stale_reset_count: 0,
             ..decoded_state.to_owned()
         };
 

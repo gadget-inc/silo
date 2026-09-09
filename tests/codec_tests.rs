@@ -347,6 +347,7 @@ fn test_floating_limit_state_roundtrip() {
         next_retry_at_ms: Some(8000),
         metadata: vec![("source".to_string(), "api".to_string())],
         refresh_scheduled_at_ms: None,
+        stale_reset_count: 0,
     };
     let encoded = encode_floating_limit_state(&state);
     let decoded = decode_floating_limit_state(encoded).unwrap();
@@ -372,6 +373,7 @@ fn test_floating_limit_state_roundtrip_none_retry() {
         next_retry_at_ms: None,
         metadata: vec![],
         refresh_scheduled_at_ms: None,
+        stale_reset_count: 0,
     };
     let encoded = encode_floating_limit_state(&state);
     let decoded = decode_floating_limit_state(encoded).unwrap();
@@ -660,6 +662,7 @@ fn test_floating_limit_state_roundtrip_refresh_scheduled_at() {
         next_retry_at_ms: None,
         metadata: vec![("source".to_string(), "api".to_string())],
         refresh_scheduled_at_ms: Some(5500),
+        stale_reset_count: 0,
     };
     let encoded = encode_floating_limit_state(&state);
     let decoded = decode_floating_limit_state(encoded).unwrap();
@@ -728,4 +731,64 @@ fn test_refresh_index_row_roundtrip_carries_not_before() {
         }
         _ => panic!("expected RefreshFloatingLimit variant"),
     }
+}
+
+/// A floating limit state row with nine vtable slots ending at
+/// `refresh_scheduled_at_ms` and no `stale_reset_count` slot. It carries the
+/// same fields as `FLOATING_LIMIT_STATE_WITHOUT_SCHEDULED_AT` plus
+/// `refresh_scheduled_at_ms: Some(1_756_400_030_000)` and one metadata pair.
+const FLOATING_LIMIT_STATE_WITHOUT_STALE_RESET_COUNT: &[u8] = &[
+    32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 0, 60, 0, 8, 0, 24, 0, 7, 0, 32, 0, 12, 0, 16, 0, 40, 0, 20,
+    0, 48, 0, 22, 0, 0, 0, 0, 0, 0, 1, 19, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0, 40, 0, 0, 0, 0, 28,
+    153, 241, 152, 1, 0, 0, 244, 1, 0, 0, 0, 0, 0, 0, 96, 6, 154, 241, 152, 1, 0, 0, 48, 145, 153,
+    241, 152, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 12, 0, 0, 0, 8, 0, 12, 0, 4, 0, 8, 0, 8, 0, 0, 0,
+    40, 0, 0, 0, 4, 0, 0, 0, 26, 0, 0, 0, 112, 108, 97, 116, 102, 111, 114, 109, 45, 116, 101, 110,
+    97, 110, 116, 45, 101, 110, 118, 45, 54, 49, 52, 54, 57, 54, 0, 0, 3, 0, 0, 0, 101, 110, 118,
+    0,
+];
+
+#[silo::test]
+fn test_floating_limit_state_without_stale_reset_count_decodes_as_zero() {
+    let decoded =
+        decode_floating_limit_state(FLOATING_LIMIT_STATE_WITHOUT_STALE_RESET_COUNT.to_vec())
+            .unwrap();
+    assert_eq!(decoded.current_max_concurrency(), 19);
+    assert_eq!(decoded.last_refreshed_at_ms(), 1_756_400_000_000);
+    assert!(decoded.refresh_task_scheduled());
+    assert_eq!(decoded.refresh_interval_ms(), 500);
+    assert_eq!(decoded.default_max_concurrency(), 5);
+    assert_eq!(decoded.retry_count(), 3);
+    assert_eq!(decoded.next_retry_at_ms(), Some(1_756_400_060_000));
+    assert_eq!(decoded.refresh_scheduled_at_ms(), Some(1_756_400_030_000));
+    assert_eq!(
+        decoded.metadata(),
+        vec![("env".to_string(), "platform-tenant-env-614696".to_string())]
+    );
+    assert_eq!(decoded.stale_reset_count(), 0);
+    assert_eq!(decoded.to_owned().stale_reset_count, 0);
+
+    let older =
+        decode_floating_limit_state(FLOATING_LIMIT_STATE_WITHOUT_SCHEDULED_AT.to_vec()).unwrap();
+    assert_eq!(older.stale_reset_count(), 0);
+}
+
+#[silo::test]
+fn test_floating_limit_state_roundtrip_stale_reset_count() {
+    let state = FloatingLimitState {
+        current_max_concurrency: 10,
+        last_refreshed_at_ms: 5000,
+        refresh_task_scheduled: true,
+        refresh_interval_ms: 30000,
+        default_max_concurrency: 5,
+        retry_count: 0,
+        next_retry_at_ms: None,
+        metadata: vec![],
+        refresh_scheduled_at_ms: Some(5500),
+        stale_reset_count: 7,
+    };
+    let encoded = encode_floating_limit_state(&state);
+    let decoded = decode_floating_limit_state(encoded).unwrap();
+    assert_eq!(decoded.stale_reset_count(), 7);
+    assert_eq!(decoded.refresh_scheduled_at_ms(), Some(5500));
+    assert_eq!(decoded.to_owned().stale_reset_count, 7);
 }

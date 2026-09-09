@@ -210,6 +210,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             terminal_job_expire_s: None,
             count_from_status_counters: true,
             floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
+            floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
         },
@@ -259,6 +260,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             terminal_job_expire_s: None,
             count_from_status_counters: true,
             floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
+            floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
         },
@@ -744,6 +746,23 @@ pub async fn open_temp_shard_with_floating_refresh_stale_ms(
     silo::metrics::Metrics,
 ) {
     open_temp_shard_with_metrics_and_config(|cfg| cfg.floating_refresh_stale_ms = stale_ms).await
+}
+
+/// Open a temp shard with a custom base stale window and cap, for tests
+/// that back consecutive stale resets off.
+pub async fn open_temp_shard_with_floating_refresh_stale_window(
+    stale_ms: u64,
+    stale_max_ms: u64,
+) -> (
+    tempfile::TempDir,
+    std::sync::Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
+    open_temp_shard_with_metrics_and_config(|cfg| {
+        cfg.floating_refresh_stale_ms = stale_ms;
+        cfg.floating_refresh_stale_max_ms = stale_max_ms;
+    })
+    .await
 }
 
 /// Open a temp shard with a custom `broker_tombstone_revive_after_generations`

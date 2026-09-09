@@ -666,6 +666,7 @@ pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Vec<u8> {
             next_retry_at_ms: state.next_retry_at_ms,
             metadata: Some(metadata),
             refresh_scheduled_at_ms: state.refresh_scheduled_at_ms,
+            stale_reset_count: state.stale_reset_count,
         },
     );
     builder.finish(root, None);
@@ -1205,7 +1206,14 @@ impl DecodedFloatingLimitState {
             next_retry_at_ms: f.next_retry_at_ms(),
             metadata: self.metadata(),
             refresh_scheduled_at_ms: f.refresh_scheduled_at_ms(),
+            stale_reset_count: f.stale_reset_count(),
         }
+    }
+
+    /// Consecutive stale resets of the outstanding-refresh flag; rows
+    /// written without the field read as 0.
+    pub fn stale_reset_count(&self) -> u32 {
+        self.fb().stale_reset_count()
     }
 }
 

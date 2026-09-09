@@ -310,4 +310,7 @@ table FloatingLimitState {
   // inserting a field earlier renumbers every later slot and misreads stored
   // rows.
   refresh_scheduled_at_ms: int64 = null;
+  // Consecutive stale resets of the outstanding-refresh flag; rows written
+  // without this field read as 0.
+  stale_reset_count: uint32;
 }
