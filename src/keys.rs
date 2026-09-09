@@ -24,6 +24,7 @@ pub mod prefix {
     pub const CONCURRENCY_HOLDER: u8 = 0x09;
     pub const JOB_CANCELLED: u8 = 0x0A;
     pub const FLOATING_LIMIT: u8 = 0x0B;
+    pub const REFRESH_TASK: u8 = 0x0C;
     pub const COUNTER_TOTAL_JOBS: u8 = 0xF0;
     pub const COUNTER_COMPLETED_JOBS: u8 = 0xF1;
     pub const CLEANUP_PROGRESS: u8 = 0xF2;
@@ -569,6 +570,51 @@ pub fn parse_floating_limit_key(key: &[u8]) -> Option<ParsedFloatingLimitKey> {
     }
     let (tenant, queue_key): (String, String) = decode(&key[1..]).ok()?;
     Some(ParsedFloatingLimitKey { tenant, queue_key })
+}
+
+/// The refresh index row for a floating queue's pending refresh task. One
+/// row per queue per task group; a drain for `task_group` scans its prefix
+/// and hands every claimable row to the polling worker, independent of the
+/// group's job backlog in the task line.
+pub fn refresh_task_key(task_group: &str, tenant: &str, queue_key: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::REFRESH_TASK, &(task_group, tenant, queue_key))
+}
+
+/// Prefix for scanning the refresh index rows of one task group.
+pub fn refresh_task_group_prefix(task_group: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::REFRESH_TASK, &(task_group,))
+}
+
+/// Prefix for scanning the refresh index rows of one tenant within a task
+/// group.
+pub fn refresh_task_tenant_prefix(task_group: &str, tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::REFRESH_TASK, &(task_group, tenant))
+}
+
+/// Prefix for scanning every refresh index row.
+pub fn refresh_tasks_prefix() -> Vec<u8> {
+    vec![prefix::REFRESH_TASK]
+}
+
+/// Parsed refresh index key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRefreshTaskKey {
+    pub task_group: String,
+    pub tenant: String,
+    pub queue_key: String,
+}
+
+/// Parse a refresh index key back to its components.
+pub fn parse_refresh_task_key(key: &[u8]) -> Option<ParsedRefreshTaskKey> {
+    if key.first() != Some(&prefix::REFRESH_TASK) {
+        return None;
+    }
+    let (task_group, tenant, queue_key): (String, String, String) = decode(&key[1..]).ok()?;
+    Some(ParsedRefreshTaskKey {
+        task_group,
+        tenant,
+        queue_key,
+    })
 }
 
 /// Key for the total jobs counter for this shard.

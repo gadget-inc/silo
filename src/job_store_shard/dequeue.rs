@@ -16,7 +16,9 @@ use crate::job_store_shard::helpers::{
     DbWriteBatcher, decode_job_status_owned, live_terminal_row_exists, now_epoch_ms,
 };
 use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
-use crate::job_store_shard::{DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams};
+use crate::job_store_shard::{
+    DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
+};
 use crate::keys::{
     ParsedTaskKey, attempt_key, concurrency_holder_key, job_info_key, job_status_key,
     leased_task_key, parse_task_key,
@@ -61,6 +63,9 @@ struct DequeueIterationState {
     /// so a second RequestTicket / CheckRateLimit for the same attempt within
     /// one iteration is caught here.
     materialized_attempts: HashSet<(String, String, u32)>,
+    /// Floating queues whose refresh a chain continuation in this
+    /// iteration's batch already scheduled.
+    scheduled_refreshes: ScheduledRefreshes,
     processed_internal: bool,
 }
 
@@ -78,6 +83,7 @@ impl DequeueIterationState {
             converted_requests: Vec::new(),
             leased_task_ids: HashSet::new(),
             materialized_attempts: HashSet::new(),
+            scheduled_refreshes: ScheduledRefreshes::default(),
             processed_internal: false,
         }
     }
@@ -234,21 +240,28 @@ impl JobStoreShard {
     /// RunAttempt tasks for job execution and RefreshFloatingLimit tasks for workers to refresh floating limits.
     ///
     /// The `task_group` parameter specifies which task group to poll for tasks.
+    ///
+    /// Pending refreshes are drained from the group's refresh index before
+    /// any job work is claimed from the broker, so a refresh is handed over
+    /// regardless of the group's job backlog, even when `max_tasks` is zero
+    /// or the broker buffer is empty. Refresh rows still in the task line
+    /// are leased when the broker reaches them.
     pub async fn dequeue(
         &self,
         worker_id: &str,
         task_group: &str,
         max_tasks: usize,
     ) -> Result<DequeueResult, JobStoreShardError> {
+        let mut refresh_out: Vec<LeasedRefreshTask> =
+            self.drain_pending_refreshes(worker_id, task_group).await?;
         if max_tasks == 0 {
             return Ok(DequeueResult {
                 tasks: Vec::new(),
-                refresh_tasks: Vec::new(),
+                refresh_tasks: refresh_out,
             });
         }
 
         let mut out: Vec<LeasedTask> = Vec::new();
-        let mut refresh_out: Vec<LeasedRefreshTask> = Vec::new();
         // Tuple: (tenant, job_view, encoded_attempt_bytes)
         // We keep the encoded bytes to construct JobAttemptView without a DB readback.
         let mut pending_attempts: Vec<(String, JobView, Vec<u8>)> = Vec::with_capacity(max_tasks);
@@ -450,6 +463,7 @@ impl JobStoreShard {
                 return Err(JobStoreShardError::from(e));
             }
             dst_events::confirm_write(write_op);
+            self.mark_refresh_pending_groups(state.scheduled_refreshes.task_groups());
 
             // DB write succeeded — grants are now backed by durable holder
             // rows, no rollback needed. Clear the guard's buffer (keeps it
@@ -862,6 +876,7 @@ impl JobStoreShard {
                 && let Err(e) = self
                     .schedule_floating_refresh_for_ticket(
                         &mut writer,
+                        &mut state.scheduled_refreshes,
                         &tenant,
                         fl,
                         now_ms,
@@ -939,6 +954,7 @@ impl JobStoreShard {
                     held_queues: new_held,
                     task_group: &req_task_group,
                     skip_try_reserve: false,
+                    scheduled_refreshes: &mut state.scheduled_refreshes,
                 },
             )
             .await?;
@@ -1154,6 +1170,7 @@ impl JobStoreShard {
                             held_queues: held_queues.clone(),
                             task_group: check_task_group,
                             skip_try_reserve: false,
+                            scheduled_refreshes: &mut state.scheduled_refreshes,
                         },
                     )
                     .await?;

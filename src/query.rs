@@ -187,6 +187,14 @@ impl ShardQueryEngine {
         let tasks_provider = Arc::new(SiloTableProvider::new(tasks_schema, tasks_scanner));
         ctx.register_table("tasks", tasks_provider)?;
 
+        // Register floating_refresh_tasks table over the refresh index
+        let refresh_schema = FloatingRefreshTasksScanner::base_schema();
+        let refresh_scanner: ScannerRef = Arc::new(FloatingRefreshTasksScanner {
+            shard: Arc::clone(&shard),
+        });
+        let refresh_provider = Arc::new(SiloTableProvider::new(refresh_schema, refresh_scanner));
+        ctx.register_table("floating_refresh_tasks", refresh_provider)?;
+
         Ok(Self { ctx })
     }
 
@@ -3011,6 +3019,263 @@ impl Scan for TasksScanner {
                                 other
                             )))?
                         }
+                    };
+                    cols.push(col);
+                }
+
+                yield RecordBatch::try_new(Arc::clone(&proj), cols).map_err(exec_err)?;
+            }
+        };
+
+        Box::pin(RecordBatchStreamAdapter::new(projection, Box::pin(stream)))
+    }
+}
+
+/// Scanner for the `floating_refresh_tasks` table over the refresh index:
+/// one row per floating queue with a pending cap refresh, keyed by
+/// `(task_group, tenant, queue_key)`. `task_group` and `tenant` equality
+/// filters push down as key prefix bounds; `tenant` narrows the prefix only
+/// together with `task_group`.
+///
+/// Schema: shard_id, task_group, tenant, queue_key, task_id, not_before_ms,
+/// current_max_concurrency, last_refreshed_at_ms
+pub struct FloatingRefreshTasksScanner {
+    pub(crate) shard: Arc<JobStoreShard>,
+}
+
+impl FloatingRefreshTasksScanner {
+    pub fn new(shard: Arc<JobStoreShard>) -> Self {
+        Self { shard }
+    }
+
+    pub fn base_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("shard_id", DataType::Utf8, false),
+            Field::new("task_group", DataType::Utf8, false),
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("queue_key", DataType::Utf8, false),
+            Field::new("task_id", DataType::Utf8, false),
+            Field::new("not_before_ms", DataType::Int64, true),
+            Field::new("current_max_concurrency", DataType::UInt32, false),
+            Field::new("last_refreshed_at_ms", DataType::Int64, false),
+        ]))
+    }
+}
+
+impl std::fmt::Debug for FloatingRefreshTasksScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FloatingRefreshTasksScanner")
+    }
+}
+
+/// Scan strategy for the `floating_refresh_tasks` table: the key prefix the
+/// pushed-down equality filters bound the scan to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloatingRefreshTasksScanStrategy {
+    /// Scan one task group, optionally one tenant within it.
+    Prefix {
+        task_group: String,
+        tenant: Option<String>,
+    },
+    /// Scan the whole index.
+    FullScan,
+}
+
+impl std::fmt::Display for FloatingRefreshTasksScanStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FloatingRefreshTasksScanStrategy::Prefix { task_group, tenant } => {
+                write!(
+                    f,
+                    "Prefix(task_group={:?}, tenant={:?})",
+                    task_group, tenant
+                )
+            }
+            FloatingRefreshTasksScanStrategy::FullScan => write!(f, "FullScan"),
+        }
+    }
+}
+
+/// Parse filters into a `FloatingRefreshTasksScanStrategy`.
+pub fn parse_floating_refresh_tasks_scan_strategy(
+    filters: &[Expr],
+) -> FloatingRefreshTasksScanStrategy {
+    let mut task_group: Option<String> = None;
+    let mut tenant: Option<String> = None;
+    for f in filters {
+        if let Some((col, val)) = parse_eq_filter(f) {
+            match col.as_str() {
+                "task_group" => task_group = Some(val),
+                "tenant" => tenant = Some(val),
+                _ => {}
+            }
+        }
+    }
+    match task_group {
+        Some(task_group) => FloatingRefreshTasksScanStrategy::Prefix { task_group, tenant },
+        None => FloatingRefreshTasksScanStrategy::FullScan,
+    }
+}
+
+/// Classify `floating_refresh_tasks` filters for pushdown: the equalities
+/// the prefix scan answers are Exact, everything else is re-applied.
+pub fn classify_floating_refresh_tasks_filters(
+    filters: &[&Expr],
+) -> Vec<TableProviderFilterPushDown> {
+    let unqualified_filters: Vec<Expr> = filters.iter().map(|f| unqualify_expr(f)).collect();
+    let strategy = parse_floating_refresh_tasks_scan_strategy(&unqualified_filters);
+    filters
+        .iter()
+        .map(|f| {
+            let exact = match (&strategy, parse_eq_filter(&unqualify_expr(f))) {
+                (FloatingRefreshTasksScanStrategy::Prefix { task_group, .. }, Some((col, val)))
+                    if col == "task_group" =>
+                {
+                    *task_group == val
+                }
+                (FloatingRefreshTasksScanStrategy::Prefix { tenant, .. }, Some((col, val)))
+                    if col == "tenant" =>
+                {
+                    tenant.as_deref() == Some(val.as_str())
+                }
+                _ => false,
+            };
+            if exact {
+                TableProviderFilterPushDown::Exact
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        })
+        .collect()
+}
+
+impl Scan for FloatingRefreshTasksScanner {
+    fn describe(&self, filters: &[Expr], limit: Option<usize>) -> String {
+        let strategy = parse_floating_refresh_tasks_scan_strategy(filters);
+        format!("floating_refresh_tasks[{}], limit={:?}", strategy, limit)
+    }
+
+    fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+        classify_floating_refresh_tasks_filters(filters)
+    }
+
+    fn scan(
+        &self,
+        projection: SchemaRef,
+        filters: &[Expr],
+        batch_size: usize,
+        limit: Option<usize>,
+    ) -> SendableRecordBatchStream {
+        let strategy = parse_floating_refresh_tasks_scan_strategy(filters);
+        let shard = Arc::clone(&self.shard);
+        let proj = Arc::clone(&projection);
+
+        let stream = async_stream::try_stream! {
+            let start = match &strategy {
+                FloatingRefreshTasksScanStrategy::Prefix {
+                    task_group,
+                    tenant: Some(tenant),
+                } => crate::keys::refresh_task_tenant_prefix(task_group, tenant),
+                FloatingRefreshTasksScanStrategy::Prefix { task_group, tenant: None } => {
+                    crate::keys::refresh_task_group_prefix(task_group)
+                }
+                FloatingRefreshTasksScanStrategy::FullScan => crate::keys::refresh_tasks_prefix(),
+            };
+            let end = crate::keys::end_bound(&start);
+
+            let mut cursor = shard
+                .open_range_cursor(start, end, &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
+            let shard_id = shard.name().to_string();
+            let mut buf: VecDeque<KeyValue> = VecDeque::new();
+            let mut exhausted = false;
+            let mut total_emitted: usize = 0;
+
+            loop {
+                if limit.is_some_and(|l| total_emitted >= l) {
+                    break;
+                }
+                let remaining = limit.map(|l| l - total_emitted).unwrap_or(batch_size);
+                let target = remaining.min(batch_size).max(1);
+
+                let mut shard_ids = Vec::with_capacity(target);
+                let mut task_groups = Vec::with_capacity(target);
+                let mut tenants = Vec::with_capacity(target);
+                let mut queue_keys = Vec::with_capacity(target);
+                let mut task_ids = Vec::with_capacity(target);
+                let mut not_befores: Vec<Option<i64>> = Vec::with_capacity(target);
+                let mut current_maxes = Vec::with_capacity(target);
+                let mut last_refreshed = Vec::with_capacity(target);
+                let mut batch_count: usize = 0;
+
+                while batch_count < target {
+                    if buf.is_empty() {
+                        if exhausted {
+                            break;
+                        }
+                        let chunk = cursor
+                            .next_kv_chunk(batch_size.max(DEFAULT_SCAN_CHUNK))
+                            .await
+                            .map_err(exec_err)?;
+                        if chunk.is_empty() {
+                            exhausted = true;
+                            break;
+                        }
+                        buf.extend(chunk);
+                    }
+                    let kv = buf.pop_front().expect("buffer non-empty");
+                    let Some(parsed) = crate::keys::parse_refresh_task_key(&kv.key) else {
+                        continue;
+                    };
+                    let decoded = match crate::codec::decode_task_validated(
+                        bytes::Bytes::copy_from_slice(&kv.value),
+                    ) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    let Some(rfl) = decoded.as_refresh_floating_limit() else {
+                        continue;
+                    };
+
+                    shard_ids.push(shard_id.clone());
+                    task_groups.push(parsed.task_group);
+                    tenants.push(parsed.tenant);
+                    queue_keys.push(parsed.queue_key);
+                    task_ids.push(rfl.task_id().unwrap_or_default().to_string());
+                    not_befores.push(rfl.not_before_ms());
+                    current_maxes.push(rfl.current_max_concurrency());
+                    last_refreshed.push(rfl.last_refreshed_at_ms());
+                    batch_count += 1;
+                }
+
+                if batch_count == 0 {
+                    break;
+                }
+                total_emitted += batch_count;
+
+                if proj.fields().is_empty() {
+                    yield make_empty_projection_batch(&proj, batch_count)?;
+                    continue;
+                }
+
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(proj.fields().len());
+                for f in proj.fields() {
+                    let col: ArrayRef = match f.name().as_str() {
+                        "shard_id" => Arc::new(StringArray::from(shard_ids.clone())),
+                        "task_group" => Arc::new(StringArray::from(task_groups.clone())),
+                        "tenant" => Arc::new(StringArray::from(tenants.clone())),
+                        "queue_key" => Arc::new(StringArray::from(queue_keys.clone())),
+                        "task_id" => Arc::new(StringArray::from(task_ids.clone())),
+                        "not_before_ms" => Arc::new(Int64Array::from(not_befores.clone())),
+                        "current_max_concurrency" => {
+                            Arc::new(UInt32Array::from(current_maxes.clone()))
+                        }
+                        "last_refreshed_at_ms" => Arc::new(Int64Array::from(last_refreshed.clone())),
+                        other => Err(DataFusionError::Execution(format!(
+                            "unknown floating_refresh_tasks column: {}",
+                            other
+                        )))?,
                     };
                     cols.push(col);
                 }

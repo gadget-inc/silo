@@ -618,6 +618,7 @@ pub async fn clone_golden_shard(
             terminal_job_expire_s: None,
             count_from_status_counters: true,
             floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
+            floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
             grant_scanner: silo::concurrency::GrantScannerConfig::default(),

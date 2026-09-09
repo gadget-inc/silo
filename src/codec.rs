@@ -336,36 +336,69 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
             );
             (fb::TaskVariant::CheckRateLimit, crl.as_union_value())
         }
-        Task::RefreshFloatingLimit {
-            task_id,
-            tenant,
-            queue_key,
-            current_max_concurrency,
-            last_refreshed_at_ms,
-            metadata,
-            task_group,
-        } => {
-            let task_id_s = builder.create_string(task_id);
-            let tenant = builder.create_string(tenant);
-            let queue_key = builder.create_string(queue_key);
-            let md = build_kv_pair_offsets(builder, metadata);
-            let metadata = builder.create_vector(&md);
-            let task_group = builder.create_string(task_group);
-            let rfl = fb::RefreshFloatingLimit::create(
-                builder,
-                &fb::RefreshFloatingLimitArgs {
-                    task_id: Some(task_id_s),
-                    tenant: Some(tenant),
-                    queue_key: Some(queue_key),
-                    current_max_concurrency: *current_max_concurrency,
-                    last_refreshed_at_ms: *last_refreshed_at_ms,
-                    metadata: Some(metadata),
-                    task_group: Some(task_group),
-                },
-            );
+        Task::RefreshFloatingLimit { .. } => {
+            let rfl = build_refresh_floating_limit(builder, task, None);
             (fb::TaskVariant::RefreshFloatingLimit, rfl.as_union_value())
         }
     }
+}
+
+/// Build the `RefreshFloatingLimit` table for `task`, which must be that
+/// variant. `not_before_ms` is set only on refresh index rows.
+fn build_refresh_floating_limit<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    task: &Task,
+    not_before_ms: Option<i64>,
+) -> flatbuffers::WIPOffset<fb::RefreshFloatingLimit<'a>> {
+    let Task::RefreshFloatingLimit {
+        task_id,
+        tenant,
+        queue_key,
+        current_max_concurrency,
+        last_refreshed_at_ms,
+        metadata,
+        task_group,
+    } = task
+    else {
+        unreachable!("build_refresh_floating_limit takes a RefreshFloatingLimit task");
+    };
+    let task_id_s = builder.create_string(task_id);
+    let tenant = builder.create_string(tenant);
+    let queue_key = builder.create_string(queue_key);
+    let md = build_kv_pair_offsets(builder, metadata);
+    let metadata = builder.create_vector(&md);
+    let task_group = builder.create_string(task_group);
+    fb::RefreshFloatingLimit::create(
+        builder,
+        &fb::RefreshFloatingLimitArgs {
+            task_id: Some(task_id_s),
+            tenant: Some(tenant),
+            queue_key: Some(queue_key),
+            current_max_concurrency: *current_max_concurrency,
+            last_refreshed_at_ms: *last_refreshed_at_ms,
+            metadata: Some(metadata),
+            task_group: Some(task_group),
+            not_before_ms,
+        },
+    )
+}
+
+/// Encode a refresh index row: the `RefreshFloatingLimit` task plus the
+/// time before which it is not claimable (`None` for claimable now). The
+/// row decodes through `decode_task_validated` like any task value.
+#[inline]
+pub fn encode_refresh_index_row(task: &Task, not_before_ms: Option<i64>) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let rfl = build_refresh_floating_limit(&mut builder, task, not_before_ms);
+    let root = fb::Task::create(
+        &mut builder,
+        &fb::TaskArgs {
+            variant_type: fb::TaskVariant::RefreshFloatingLimit,
+            variant: Some(rfl.as_union_value()),
+        },
+    );
+    builder.finish(root, None);
+    builder.finished_data().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +666,7 @@ pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Vec<u8> {
             next_retry_at_ms: state.next_retry_at_ms,
             metadata: Some(metadata),
             refresh_scheduled_at_ms: state.refresh_scheduled_at_ms,
+            stale_reset_count: state.stale_reset_count,
         },
     );
     builder.finish(root, None);
@@ -894,6 +928,14 @@ impl DecodedTask {
 
     pub fn as_refresh_floating_limit(&self) -> Option<fb::RefreshFloatingLimit<'_>> {
         self.fb().variant_as_refresh_floating_limit()
+    }
+
+    /// For a refresh index row, the time before which the refresh is not
+    /// claimable. `None` for rows claimable now, including rows encoded
+    /// without the field.
+    pub fn not_before_ms(&self) -> Option<i64> {
+        self.as_refresh_floating_limit()
+            .and_then(|r| r.not_before_ms())
     }
 
     /// Materialize a fully-owned Task from the FlatBuffer data.
@@ -1164,7 +1206,14 @@ impl DecodedFloatingLimitState {
             next_retry_at_ms: f.next_retry_at_ms(),
             metadata: self.metadata(),
             refresh_scheduled_at_ms: f.refresh_scheduled_at_ms(),
+            stale_reset_count: f.stale_reset_count(),
         }
+    }
+
+    /// Consecutive stale resets of the outstanding-refresh flag; rows
+    /// written without the field read as 0.
+    pub fn stale_reset_count(&self) -> u32 {
+        self.fb().stale_reset_count()
     }
 }
 

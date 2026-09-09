@@ -80,7 +80,7 @@ Use `siloctl cluster info` to see all shards and their owners. If you know the t
 
 ## Tables
 
-Silo exposes five tables: `jobs`, `tasks`, `queues`, `tenant_counts`, and `queue_counts`.
+Silo exposes six tables: `jobs`, `tasks`, `floating_refresh_tasks`, `queues`, `tenant_counts`, and `queue_counts`.
 
 ### `jobs` Table
 
@@ -119,6 +119,23 @@ This table scans the raw task queue storage. Performance may be poor for large d
 | `job_id` | String | The job this task belongs to |
 | `attempt` | UInt32 | Attempt number |
 | `variant_type` | String | Task type: `RunAttempt`, `RequestTicket`, `CheckRateLimit`, `RefreshFloatingLimit` |
+
+### `floating_refresh_tasks` Table
+
+Lists the pending floating limit refreshes. Each row is a refresh task waiting in a shard's refresh index for the next worker that polls its task group; the row is removed when a worker leases it. A backed-off retry carries the time before which it will not be handed out.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `shard_id` | String | UUID of the shard holding the pending refresh |
+| `task_group` | String | Task group whose workers receive the refresh |
+| `tenant` | String | Tenant identifier |
+| `queue_key` | String | The floating concurrency queue being refreshed |
+| `task_id` | String | Task ID the worker leases and reports on |
+| `not_before_ms` | Int64 (nullable) | Earliest time the refresh is handed out, set on a retry after a reported failure; null means claimable now |
+| `current_max_concurrency` | UInt32 | The queue's max concurrency when the refresh was scheduled |
+| `last_refreshed_at_ms` | Int64 | Unix timestamp in milliseconds of the queue's last successful refresh |
+
+Filtering by `task_group`, and by `tenant` together with `task_group`, narrows the scan to a key prefix.
 
 ### `queues` Table
 
@@ -422,6 +439,14 @@ WHERE task_group = 'emails'
 
 -- Slow: full scan across all task groups
 SELECT * FROM tasks
+```
+
+The `floating_refresh_tasks` table follows the same rule: filter by `task_group`, and add `tenant` to narrow the prefix further.
+
+```sql
+-- Pending refreshes one tenant's workers in a group will receive
+SELECT queue_key, task_id, not_before_ms FROM floating_refresh_tasks
+WHERE task_group = 'emails' AND tenant = 'customer-123'
 ```
 
 ### Use LIMIT

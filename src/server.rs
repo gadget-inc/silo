@@ -103,6 +103,30 @@ fn proto_limit_to_job_limit(proto: Limit) -> Option<crate::job::Limit> {
     }
 }
 
+/// Convert a leased refresh task into its proto message. The default `-`
+/// tenant is reported as no tenant.
+fn refresh_task_to_proto(
+    rt: crate::task::LeasedRefreshTask,
+    shard_id: &crate::shard_range::ShardId,
+) -> RefreshFloatingLimitTask {
+    let tenant_id = if rt.tenant_id == "-" {
+        None
+    } else {
+        Some(rt.tenant_id)
+    };
+    RefreshFloatingLimitTask {
+        id: rt.task_id,
+        queue_key: rt.queue_key,
+        current_max_concurrency: rt.current_max_concurrency,
+        last_refreshed_at_ms: rt.last_refreshed_at_ms,
+        metadata: rt.metadata.into_iter().collect(),
+        lease_ms: DEFAULT_LEASE_MS,
+        shard: shard_id.to_string(),
+        task_group: rt.task_group,
+        tenant_id,
+    }
+}
+
 /// Convert a `LeasedTask` into a proto `Task` message.
 fn leased_task_to_proto(lt: &crate::task::LeasedTask, shard_id: &str) -> Task {
     let job = lt.job();
@@ -1302,10 +1326,22 @@ impl Silo for SiloService {
         let mut all_refresh_tasks = Vec::new();
         let mut remaining = max_tasks;
 
-        // Poll each shard until we have enough tasks or exhausted all shards
+        // Poll each shard until we have enough tasks or exhausted all shards.
+        // A shard skipped once the job budget is met still drains its
+        // pending refreshes for the group: a refresh is handed to the next
+        // worker asking for its group, whichever shard it waits on.
         for (shard_id, shard) in shards_to_poll {
             if remaining == 0 {
-                break;
+                let refreshes = shard
+                    .drain_pending_refreshes(&r.worker_id, &r.task_group)
+                    .await
+                    .map_err(map_err)?;
+                all_refresh_tasks.extend(
+                    refreshes
+                        .into_iter()
+                        .map(|rt| refresh_task_to_proto(rt, &shard_id)),
+                );
+                continue;
             }
 
             let poll_start = std::time::Instant::now();
@@ -1343,26 +1379,12 @@ impl Silo for SiloService {
                 all_tasks.push(leased_task_to_proto(&lt, &shard_str));
             }
 
-            for rt in result.refresh_tasks {
-                // Get tenant_id, using None if it's the default "-" tenant
-                let tenant_id = if rt.tenant_id == "-" {
-                    None
-                } else {
-                    Some(rt.tenant_id)
-                };
-
-                all_refresh_tasks.push(RefreshFloatingLimitTask {
-                    id: rt.task_id,
-                    queue_key: rt.queue_key,
-                    current_max_concurrency: rt.current_max_concurrency,
-                    last_refreshed_at_ms: rt.last_refreshed_at_ms,
-                    metadata: rt.metadata.into_iter().collect(),
-                    lease_ms: DEFAULT_LEASE_MS,
-                    shard: shard_id.to_string(),
-                    task_group: rt.task_group,
-                    tenant_id,
-                });
-            }
+            all_refresh_tasks.extend(
+                result
+                    .refresh_tasks
+                    .into_iter()
+                    .map(|rt| refresh_task_to_proto(rt, &shard_id)),
+            );
 
             // Record dequeue metrics per shard
             if let Some(ref m) = self.metrics
