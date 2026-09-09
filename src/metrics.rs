@@ -226,6 +226,9 @@ pub struct Metrics {
     /// Sizes of the grant scanner's pending lanes, labeled `lane=hot|cold`.
     concurrency_pending_grants: GaugeVec,
     concurrency_grant_next_hop_skips: CounterVec,
+    /// Floating limit refreshes forced open after the outstanding-refresh flag
+    /// was found stale, labelled by `reason`.
+    floating_limit_refresh_resets: CounterVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -570,6 +573,7 @@ impl Metrics {
         skipped_tombstone: u64,
         skipped_already_buffered: u64,
         skipped_defunct: u64,
+        revived: u64,
     ) {
         for (outcome, count) in [
             ("inserted", inserted),
@@ -578,6 +582,7 @@ impl Metrics {
             ("skipped_tombstone", skipped_tombstone),
             ("skipped_already_buffered", skipped_already_buffered),
             ("skipped_defunct", skipped_defunct),
+            ("revived", revived),
         ] {
             self.broker_scan_tasks_read
                 .with_label_values(&[shard, task_group, outcome])
@@ -815,6 +820,14 @@ impl Metrics {
     pub fn record_concurrency_grant_next_hop_skip(&self, shard: &str) {
         self.concurrency_grant_next_hop_skips
             .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record a floating limit refresh scheduled over an outstanding-refresh
+    /// flag that was treated as lost (`reason` = `stale_scheduled`).
+    pub fn record_floating_limit_refresh_reset(&self, shard: &str, reason: &str) {
+        self.floating_limit_refresh_resets
+            .with_label_values(&[shard, reason])
             .inc();
     }
 
@@ -2499,6 +2512,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let floating_limit_refresh_resets = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_floating_limit_refresh_reset_total",
+                "Floating limit refresh tasks scheduled over an outstanding-refresh flag that was treated as lost, by reason",
+            ),
+            &["shard", "reason"],
+        )?,
+    );
+
     // SlateDB watcher metrics (driven by Db::subscribe)
     let slatedb_durable_seq = register(
         &registry,
@@ -2625,6 +2649,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_reconcile_duration,
         concurrency_pending_grants,
         concurrency_grant_next_hop_skips,
+        floating_limit_refresh_resets,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
         slatedb_manifest_last_l0_seq,

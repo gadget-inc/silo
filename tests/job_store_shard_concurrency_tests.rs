@@ -2662,6 +2662,7 @@ async fn grant_scanner_precheck_floating_follows_durable_state() {
             retry_count: 0,
             next_retry_at_ms: None,
             metadata: vec![],
+            refresh_scheduled_at_ms: Some(now),
         })
     };
     let state_key = silo::keys::floating_limit_state_key(tenant, queue);
@@ -6253,6 +6254,7 @@ async fn grant_scanner_next_hop_skip_floating_follows_durable_state() {
             retry_count: 0,
             next_retry_at_ms: None,
             metadata: vec![],
+            refresh_scheduled_at_ms: Some(now),
         })
     };
 

@@ -4,23 +4,44 @@ use slatedb::WriteBatch;
 use uuid::Uuid;
 
 use crate::codec::{
-    DecodedFloatingLimitState, decode_floating_limit_state, decode_lease,
-    encode_floating_limit_state, encode_task,
+    DecodedFloatingLimitState, decode_concurrency_action, decode_floating_limit_state,
+    decode_lease, encode_floating_limit_state, encode_task,
 };
-use crate::job::{FloatingConcurrencyLimit, FloatingLimitState};
-use crate::job_store_shard::helpers::{WriteBatcher, now_epoch_ms};
+use crate::job::{FloatingConcurrencyLimit, FloatingLimitState, JobView};
+use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    concurrency_request_prefix, end_bound, floating_limit_state_key, leased_task_key,
+    concurrency_request_prefix, end_bound, floating_limit_state_key, job_info_key, leased_task_key,
 };
 use crate::task::Task;
 
 impl JobStoreShard {
-    pub(crate) fn floating_limit_refresh_ready(
+    /// True when the state's outstanding-refresh flag is set but the refresh
+    /// was scheduled longer ago than the shard's stale threshold, or carries
+    /// no stamp at all. Such a refresh is treated as lost: no task row,
+    /// lease, or in-memory suppression may pin a tenant's cap forever.
+    fn floating_limit_refresh_stale(&self, state: &DecodedFloatingLimitState, now_ms: i64) -> bool {
+        state.refresh_task_scheduled()
+            && state
+                .refresh_scheduled_at_ms()
+                .is_none_or(|at| now_ms - at > self.floating_refresh_stale_ms)
+    }
+
+    /// True when a refresh task is scheduled and still trusted to complete.
+    fn floating_limit_refresh_outstanding(
+        &self,
         state: &DecodedFloatingLimitState,
         now_ms: i64,
     ) -> bool {
-        if state.refresh_task_scheduled() {
+        state.refresh_task_scheduled() && !self.floating_limit_refresh_stale(state, now_ms)
+    }
+
+    pub(crate) fn floating_limit_refresh_ready(
+        &self,
+        state: &DecodedFloatingLimitState,
+        now_ms: i64,
+    ) -> bool {
+        if self.floating_limit_refresh_outstanding(state, now_ms) {
             return false;
         }
 
@@ -46,6 +67,135 @@ impl JobStoreShard {
         let end = end_bound(&start);
         let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
         Ok(iter.next().await?.is_some())
+    }
+
+    /// Task group of the head waiting request on `(tenant, queue_key)`, the
+    /// group a scanner-originated refresh task is written under. A stored
+    /// request record may carry an empty group; the job's info row supplies
+    /// it then, as the scanner's own resume path does. `None` when there is
+    /// no waiter, the record or job info is unreadable, or the group is still
+    /// empty: a task under an empty group lands in a range no broker serves.
+    pub(crate) async fn peek_head_waiting_request_task_group(
+        &self,
+        tenant: &str,
+        queue_key: &str,
+    ) -> Result<Option<String>, JobStoreShardError> {
+        let start = concurrency_request_prefix(tenant, queue_key);
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let Some(kv) = iter.next().await? else {
+            return Ok(None);
+        };
+        let decoded = match decode_concurrency_action(kv.value) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue_key = %queue_key,
+                    error = %e,
+                    "head waiting request is unreadable; not scheduling a floating limit refresh"
+                );
+                return Ok(None);
+            }
+        };
+        let Some(request) = decoded.fb().variant_as_enqueue_task() else {
+            return Ok(None);
+        };
+        let task_group = request.task_group().unwrap_or_default();
+        if !task_group.is_empty() {
+            return Ok(Some(task_group.to_string()));
+        }
+        let job_id = request.job_id().unwrap_or_default();
+        let Some(raw) = self.db.get(&job_info_key(tenant, job_id)).await? else {
+            return Ok(None);
+        };
+        let job = match JobView::new(raw) {
+            Ok(job) => job,
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue_key = %queue_key,
+                    job_id = %job_id,
+                    error = %e,
+                    "head waiter's job info is unreadable; not scheduling a floating limit refresh"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(Some(job.task_group().to_string()).filter(|g| !g.is_empty()))
+    }
+
+    /// Schedule a refresh for a floating queue the grant scanner found at
+    /// capacity with pending grant demand. Readiness is judged here with the
+    /// shard's stale threshold; the task group comes from the head waiter,
+    /// whose presence is what establishes the backlog. The task and state are
+    /// committed in their own batch and the group's broker is woken so the
+    /// task is claimable without waiting out scan backoff. Returns whether a
+    /// task was written.
+    pub(crate) async fn schedule_floating_refresh_from_scanner(
+        &self,
+        tenant: &str,
+        queue_key: &str,
+        state: &DecodedFloatingLimitState,
+    ) -> Result<bool, JobStoreShardError> {
+        let now_ms = now_epoch_ms();
+        if !self.floating_limit_refresh_ready(state, now_ms) {
+            return Ok(false);
+        }
+        // The scanner's row is a snapshot from its precheck. A refresh outcome
+        // committed since then must not be overwritten from that snapshot, so
+        // readiness and the write use a fresh read of the row.
+        let state_key = floating_limit_state_key(tenant, queue_key);
+        let Some(raw) = self.db.get(&state_key).await? else {
+            return Ok(false);
+        };
+        let state = &decode_floating_limit_state(raw)?;
+        if !self.floating_limit_refresh_ready(state, now_ms) {
+            return Ok(false);
+        }
+        let Some(task_group) = self
+            .peek_head_waiting_request_task_group(tenant, queue_key)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut batch = WriteBatch::new();
+        let mut writer = DbWriteBatcher::new(&self.db, &mut batch);
+        let written = self.maybe_schedule_floating_limit_refresh(
+            &mut writer,
+            tenant,
+            queue_key,
+            state,
+            now_ms,
+            &task_group,
+            true,
+        )?;
+        if !written {
+            return Ok(false);
+        }
+        self.db.write(batch).await?;
+        self.brokers.wakeup(&task_group);
+        Ok(true)
+    }
+
+    /// Schedule a refresh for a RequestTicket that just landed as a waiter on
+    /// a floating queue. The ticket's own request row sits in the uncommitted
+    /// batch, invisible to the durable waiter probe, so the ticket supplies
+    /// the waiter signal directly. Returns whether a task was written.
+    pub(crate) async fn schedule_floating_refresh_for_ticket<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        fl: &FloatingConcurrencyLimit,
+        now_ms: i64,
+        task_group: &str,
+    ) -> Result<bool, JobStoreShardError> {
+        let state = self
+            .get_or_create_floating_limit_state(writer, tenant, fl)
+            .await?;
+        self.maybe_schedule_floating_limit_refresh(
+            writer, tenant, &fl.key, &state, now_ms, task_group, true,
+        )
     }
 
     /// Get or create the floating limit state for a given queue key.
@@ -74,6 +224,7 @@ impl JobStoreShard {
             retry_count: 0,
             next_retry_at_ms: None,
             metadata: fl.metadata.clone(),
+            refresh_scheduled_at_ms: None,
         };
 
         let state_bytes = encode_floating_limit_state(&state);
@@ -84,21 +235,27 @@ impl JobStoreShard {
     }
 
     /// Check if a floating limit refresh is needed and schedule it if so.
-    /// This method is called during enqueue and dequeue operations to lazily trigger refreshes.
+    /// Returns whether a refresh task was written.
+    ///
+    /// Three call sites lazily trigger refreshes, each supplying its own
+    /// waiter signal and task group: the enqueue path (a job that just
+    /// became a waiter, or a durable-waiter probe), the RequestTicket
+    /// handler at dequeue (a scheduled-start ticket that just landed as a
+    /// waiter), and the grant scanner's at-capacity precheck via
+    /// `schedule_floating_refresh_from_scanner` (the head waiter's group).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn maybe_schedule_floating_limit_refresh<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
-        fl: &FloatingConcurrencyLimit,
+        queue_key: &str,
         state: &DecodedFloatingLimitState,
         now_ms: i64,
         task_group: &str,
         has_waiters: bool,
-    ) -> Result<(), JobStoreShardError> {
-        // Check if refresh is already scheduled
-        if state.refresh_task_scheduled() {
-            return Ok(());
+    ) -> Result<bool, JobStoreShardError> {
+        if self.floating_limit_refresh_outstanding(state, now_ms) {
+            return Ok(false);
         }
 
         // Check if we need to refresh based on interval
@@ -112,7 +269,22 @@ impl JobStoreShard {
             .unwrap_or(false);
 
         if !should_refresh || in_backoff || !has_waiters {
-            return Ok(());
+            return Ok(false);
+        }
+
+        // Reaching here with the flag still set means the outstanding refresh
+        // aged out; this write replaces it.
+        if state.refresh_task_scheduled() {
+            let age_ms = state.refresh_scheduled_at_ms().map(|at| now_ms - at);
+            tracing::warn!(
+                tenant = %tenant,
+                queue_key = %queue_key,
+                age_ms = ?age_ms,
+                "floating limit refresh flag is stale; scheduling a replacement refresh"
+            );
+            if let Some(m) = &self.metrics {
+                m.record_floating_limit_refresh_reset(&self.name, "stale_scheduled");
+            }
         }
 
         // Schedule a refresh task
@@ -120,7 +292,7 @@ impl JobStoreShard {
         let refresh_task = Task::RefreshFloatingLimit {
             task_id: task_id.clone(),
             tenant: tenant.to_string(),
-            queue_key: fl.key.clone(),
+            queue_key: queue_key.to_string(),
             current_max_concurrency: state.current_max_concurrency(),
             last_refreshed_at_ms: state.last_refreshed_at_ms(),
             metadata: state.metadata(),
@@ -129,7 +301,7 @@ impl JobStoreShard {
 
         // Use a synthetic task key with a special job_id format for floating refresh tasks
         let task_value = encode_task(&refresh_task);
-        let synthetic_job_id = format!("floating_refresh:{}", fl.key);
+        let synthetic_job_id = format!("floating_refresh:{queue_key}");
         let task_key_bytes = crate::keys::task_key(
             task_group,
             now_ms,
@@ -143,20 +315,21 @@ impl JobStoreShard {
         // Update state to mark refresh as scheduled
         let new_state = FloatingLimitState {
             refresh_task_scheduled: true,
+            refresh_scheduled_at_ms: Some(now_ms),
             ..state.to_owned()
         };
-        let state_key = floating_limit_state_key(tenant, &fl.key);
+        let state_key = floating_limit_state_key(tenant, queue_key);
         let state_value = encode_floating_limit_state(&new_state);
         writer.put(&state_key, &state_value)?;
 
         tracing::debug!(
-            queue_key = %fl.key,
+            queue_key = %queue_key,
             current_max = state.current_max_concurrency(),
             last_refreshed = state.last_refreshed_at_ms(),
             "scheduled floating limit refresh task"
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Report a successful floating limit refresh from a worker.
@@ -197,6 +370,7 @@ impl JobStoreShard {
             current_max_concurrency: new_max_concurrency,
             last_refreshed_at_ms: now_ms,
             refresh_task_scheduled: false,
+            refresh_scheduled_at_ms: None,
             retry_count: 0,
             next_retry_at_ms: None,
             ..decoded_state.to_owned()
@@ -293,10 +467,14 @@ impl JobStoreShard {
             .has_waiting_concurrency_requests(&tenant, &queue_key)
             .await?;
 
+        // The retry task's key starts at `next_retry_at`, which can sit up to
+        // the backoff cap in the future; stamping that (not now) keeps the
+        // retry from reading as stale before it is even claimable.
         let new_state = FloatingLimitState {
             retry_count: new_retry_count,
             next_retry_at_ms: Some(next_retry_at),
             refresh_task_scheduled: has_waiters,
+            refresh_scheduled_at_ms: has_waiters.then_some(next_retry_at),
             ..decoded_state.to_owned()
         };
 

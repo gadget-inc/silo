@@ -701,7 +701,7 @@ impl JobStoreShard {
                     let state = self
                         .get_or_create_floating_limit_state(writer, tenant, fl)
                         .await?;
-                    let refresh_ready = JobStoreShard::floating_limit_refresh_ready(&state, now_ms);
+                    let refresh_ready = self.floating_limit_refresh_ready(&state, now_ms);
 
                     // Try immediate grant using current max concurrency
                     let current_max = state.current_max_concurrency();
@@ -753,7 +753,7 @@ impl JobStoreShard {
                         self.maybe_schedule_floating_limit_refresh(
                             writer,
                             tenant,
-                            fl,
+                            &fl.key,
                             &state,
                             now_ms,
                             task_group,

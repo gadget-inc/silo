@@ -838,6 +838,44 @@ impl JobStoreShard {
                 &task_id,
                 &limits,
             )?;
+            // The ticket just became a waiter on this queue. Its request row
+            // sits in the uncommitted batch, invisible to the durable waiter
+            // probe, so the ticket supplies the waiter signal directly (as
+            // the enqueue path does for a job that just requested a ticket).
+            // A task under an empty group lands where no broker scans.
+            let floating = limits.iter().find_map(|limit| match limit {
+                Limit::FloatingConcurrency(fl) if fl.key == queue => Some(fl),
+                _ => None,
+            });
+            // An earlier ticket on this queue in the same iteration already ran
+            // this decision against the same durable row and `now_ms`.
+            let already_converted = state
+                .converted_requests
+                .iter()
+                .any(|(t, q)| t == &tenant && q == &queue);
+            // The refresh is optional: an unreadable state row must not fail
+            // the conversion, or the same head ticket would be retried on
+            // every claim and stall the task group.
+            if let Some(fl) = floating
+                && !req_task_group.is_empty()
+                && !already_converted
+                && let Err(e) = self
+                    .schedule_floating_refresh_for_ticket(
+                        &mut writer,
+                        &tenant,
+                        fl,
+                        now_ms,
+                        &req_task_group,
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    tenant = %tenant,
+                    queue = %queue,
+                    error = %e,
+                    "converted ticket to a waiter but could not schedule a floating limit refresh"
+                );
+            }
             state
                 .converted_requests
                 .push((tenant.clone(), queue.clone()));
@@ -1633,7 +1671,13 @@ mod claimed_inflight_guard_tests {
             .await
             .expect("open in-memory db");
         let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
-        TaskBrokerRegistry::new(db, "shard".to_string(), None, ShardRange::full())
+        TaskBrokerRegistry::new(
+            db,
+            "shard".to_string(),
+            None,
+            ShardRange::full(),
+            crate::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+        )
     }
 
     /// Drop without disarm releases in-flight on the broker registry.

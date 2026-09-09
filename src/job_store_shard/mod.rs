@@ -128,6 +128,14 @@ pub struct OpenShardOptions {
     /// statements from per-status counters instead of scanning the status index.
     /// Populated from `DatabaseConfig::count_from_status_counters`.
     pub count_from_status_counters: bool,
+    /// How long (ms) a floating limit's outstanding-refresh flag is trusted
+    /// before a replacement refresh may be scheduled. Populated from
+    /// `DatabaseConfig::floating_refresh_stale_ms`.
+    pub floating_refresh_stale_ms: u64,
+    /// Scan generations an ack tombstone may keep suppressing a re-observed
+    /// task key before the broker point-reads the row. Populated from
+    /// `DatabaseConfig::broker_tombstone_revive_after_generations`.
+    pub broker_tombstone_revive_after_generations: u64,
 }
 
 /// Compute the row TTL (`expire_ts`, epoch ms) for a job that reached the
@@ -233,6 +241,9 @@ pub struct JobStoreShard {
     /// When true, the query engine answers unfiltered per-tenant `COUNT(*)`
     /// from per-status counters instead of a full status-index scan.
     pub(crate) count_from_status_counters: bool,
+    /// Age (ms) past which a set `refresh_task_scheduled` flag is treated as
+    /// a lost refresh rather than an outstanding one.
+    pub(crate) floating_refresh_stale_ms: i64,
 }
 
 #[derive(Debug, Error)]
@@ -426,6 +437,9 @@ impl JobStoreShard {
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 count_from_status_counters: cfg.count_from_status_counters,
+                floating_refresh_stale_ms: cfg.floating_refresh_stale_ms,
+                broker_tombstone_revive_after_generations: cfg
+                    .broker_tombstone_revive_after_generations,
             },
             range,
         )
@@ -470,6 +484,8 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
+            floating_refresh_stale_ms,
+            broker_tombstone_revive_after_generations,
         } = options;
 
         // Wall-clock timer for the whole open, used to emit per-phase debug
@@ -563,6 +579,7 @@ impl JobStoreShard {
             name.clone(),
             metrics.clone(),
             range.clone(),
+            broker_tombstone_revive_after_generations,
         );
 
         let shard = Arc::new(Self {
@@ -587,6 +604,9 @@ impl JobStoreShard {
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
+            // Epoch-ms arithmetic needs an i64; a value past i64::MAX saturates
+            // and means only stamp-less rows ever read as stale.
+            floating_refresh_stale_ms: i64::try_from(floating_refresh_stale_ms).unwrap_or(i64::MAX),
         });
 
         // Install the chain resumer before starting the grant scanner so the

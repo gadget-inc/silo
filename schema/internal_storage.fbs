@@ -301,4 +301,8 @@ table FloatingLimitState {
   retry_count: uint32;
   next_retry_at_ms: int64 = null;
   metadata: [KeyValuePair];
+  // Append new fields after this one: the table uses implicit field ids, so
+  // inserting a field earlier renumbers every later slot and misreads stored
+  // rows.
+  refresh_scheduled_at_ms: int64 = null;
 }

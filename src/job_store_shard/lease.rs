@@ -660,6 +660,7 @@ impl JobStoreShard {
         // We don't increment retry_count here - we rely on the normal periodic refresh mechanism
         let new_state = FloatingLimitState {
             refresh_task_scheduled: false,
+            refresh_scheduled_at_ms: None,
             ..decoded_state.to_owned()
         };
 

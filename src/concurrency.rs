@@ -54,8 +54,8 @@ use crate::job_store_shard::counters::{decode_counter, encode_counter};
 use crate::job_store_shard::helpers::{WriteBatcher, live_terminal_row_exists};
 
 use crate::codec::{
-    decode_concurrency_action, decode_floating_limit_state, encode_concurrency_action,
-    encode_holder, encode_task,
+    DecodedFloatingLimitState, decode_concurrency_action, decode_floating_limit_state,
+    encode_concurrency_action, encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
@@ -152,6 +152,20 @@ pub trait LimitChainResumer: Send + Sync {
     /// scanner's drain iteration to finish every other queue's pass. Default
     /// is a no-op for resumers with no broker access.
     fn wakeup_task_groups(&self, _groups: &[String]) {}
+
+    /// The grant scanner found the floating queue `(tenant, queue)` at
+    /// capacity with pending grant demand and skipped its request scan. The
+    /// shard-side implementation verifies a waiter exists, decides whether a
+    /// refresh of the queue's cap is due and, if so, writes and commits the
+    /// refresh task. Default is a no-op
+    /// for resumers with no shard access.
+    async fn maybe_schedule_floating_refresh(
+        &self,
+        _tenant: &str,
+        _queue: &str,
+        _state: &DecodedFloatingLimitState,
+    ) {
+    }
 }
 
 impl From<slatedb::Error> for ConcurrencyError {
@@ -1150,24 +1164,33 @@ impl ConcurrencyManager {
         Self::resolve_queue_capacity_from_limits(db, tenant, queue, limits).await
     }
 
-    /// Point-read the durable floating-limit state row for (tenant, queue) and
-    /// return its current max concurrency. None when the row is missing or
-    /// unreadable — callers choose their own fallback (the scan path falls back
-    /// to the limit's default_max_concurrency; the pre-scan gate treats it as
-    /// unknown and lets the scan run).
+    /// Point-read the durable floating-limit state row for (tenant, queue).
+    /// None when the row is missing or unreadable — callers choose their own
+    /// fallback (the scan path falls back to the limit's
+    /// default_max_concurrency; the pre-scan gate treats it as unknown and
+    /// lets the scan run). The decoded row carries the capacity
+    /// (`current_max_concurrency`) and the refresh bookkeeping the pre-scan
+    /// gate hands to the chain resumer.
+    async fn floating_state(
+        db: &InstrumentedDb,
+        tenant: &str,
+        queue: &str,
+    ) -> Option<DecodedFloatingLimitState> {
+        let state_key = floating_limit_state_key(tenant, queue);
+        match db.get(&state_key).await {
+            Ok(Some(raw)) => decode_floating_limit_state(raw).ok(),
+            _ => None,
+        }
+    }
+
     async fn floating_state_capacity(
         db: &InstrumentedDb,
         tenant: &str,
         queue: &str,
     ) -> Option<usize> {
-        let state_key = floating_limit_state_key(tenant, queue);
-        match db.get(&state_key).await {
-            Ok(Some(raw)) => match decode_floating_limit_state(raw) {
-                Ok(state) => Some(state.current_max_concurrency() as usize),
-                Err(_) => None,
-            },
-            _ => None,
-        }
+        Self::floating_state(db, tenant, queue)
+            .await
+            .map(|state| state.current_max_concurrency() as usize)
     }
 
     async fn resolve_queue_capacity_from_limits(
@@ -1202,17 +1225,21 @@ impl ConcurrencyManager {
     /// or a Floating limit whose state row is missing/unreadable — in which
     /// case the caller must fall back to the scan, which resolves capacity
     /// from the request's embedded limits and re-populates the cache.
+    ///
+    /// For a Floating limit the decoded state row rides along so the pre-scan
+    /// gate can hand it to the chain resumer without a second read.
     async fn known_queue_capacity(
         &self,
         db: &InstrumentedDb,
         tenant: &str,
         queue: &str,
-    ) -> Option<usize> {
+    ) -> Option<(usize, Option<DecodedFloatingLimitState>)> {
         let cached = self.cached_queue_limit(tenant, queue)?;
         match cached.limit_type {
-            ConcurrencyLimitType::Fixed => Some(cached.max_concurrency as usize),
+            ConcurrencyLimitType::Fixed => Some((cached.max_concurrency as usize, None)),
             ConcurrencyLimitType::Floating => {
-                Self::floating_state_capacity(db, tenant, queue).await
+                let state = Self::floating_state(db, tenant, queue).await?;
+                Some((state.current_max_concurrency() as usize, Some(state)))
             }
         }
     }
@@ -2253,7 +2280,8 @@ impl ConcurrencyManager {
         // first request and re-warms the cache. Accepted trade-offs: stale
         // request cleanup for a saturated queue pauses until a slot frees, and
         // a lowered fixed limit gates old requests that embed a higher one.
-        if let Some(capacity) = self.known_queue_capacity(db, tenant, queue).await {
+        if let Some((capacity, floating_state)) = self.known_queue_capacity(db, tenant, queue).await
+        {
             let effective_capacity = self.scanner_effective_capacity(capacity);
             let holders = self.counts.holder_count(tenant, queue);
             if effective_capacity.saturating_sub(holders) == 0 {
@@ -2270,6 +2298,17 @@ impl ConcurrencyManager {
                     "grant scanner: queue at capacity, skipping request scan"
                 );
                 record_invocation(0, 0);
+                // A saturated floating queue with pending grant demand is exactly
+                // the shape whose cap should track the API-side controller. The
+                // shard verifies a waiter exists, judges readiness, and picks
+                // the task group; the scanner only reports the saturation. The
+                // invocation is recorded above so its duration stays the cost
+                // of the precheck itself.
+                if let (Some(state), Some(resumer)) = (floating_state, self.chain_resumer()) {
+                    resumer
+                        .maybe_schedule_floating_refresh(tenant, queue, &state)
+                        .await;
+                }
                 return Vec::new();
             }
         }
