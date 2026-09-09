@@ -168,6 +168,7 @@ impl JobStoreShard {
         let mut followup_next_time: Option<i64> = None;
         // Track grants from retry scheduling for rollback if DB write fails
         let mut retry_grants: Vec<(String, String)> = Vec::new();
+        let mut retry_scheduled_refreshes = ScheduledRefreshes::default();
         let mut background_action_transitions: Vec<BackgroundActionMetricTransition> = Vec::new();
         // Track the new job status for DST event emission
         let mut new_job_status_for_dst: Option<String> = None;
@@ -295,7 +296,7 @@ impl JobStoreShard {
                                     held_queues: Vec::new(),
                                     task_group,
                                     skip_try_reserve: true,
-                                    scheduled_refreshes: &mut ScheduledRefreshes::default(),
+                                    scheduled_refreshes: &mut retry_scheduled_refreshes,
                                 },
                             )
                             .await?
@@ -478,6 +479,7 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
+        self.mark_refresh_pending_groups(retry_scheduled_refreshes.task_groups());
 
         // Post-commit: release in-memory concurrency counts and signal grant
         // scanner. Drain the guard (leaving it armed-but-empty so its Drop is a

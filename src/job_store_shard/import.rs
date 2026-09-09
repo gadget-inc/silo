@@ -273,6 +273,7 @@ impl JobStoreShard {
         // [SILO-IMP-CONC-3] Queue at capacity -> try_reserve fails in enqueue_limit_task_at_index
         // [SILO-IMP-CONC-4] Request created (no task in DB) when concurrency queued
         let mut grants = Vec::new();
+        let mut scheduled_refreshes = ScheduledRefreshes::default();
         if !is_terminal {
             let next_attempt = num_attempts + 1;
             let task_id = Uuid::new_v4().to_string();
@@ -298,7 +299,7 @@ impl JobStoreShard {
                         held_queues: Vec::new(),
                         task_group: &params.task_group,
                         skip_try_reserve: false,
-                        scheduled_refreshes: &mut ScheduledRefreshes::default(),
+                        scheduled_refreshes: &mut scheduled_refreshes,
                     },
                 )
                 .await?
@@ -347,6 +348,7 @@ impl JobStoreShard {
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
         }
+        self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
@@ -723,6 +725,7 @@ impl JobStoreShard {
 
         // Create new scheduling state if non-terminal
         let mut grants = Vec::new();
+        let mut scheduled_refreshes = ScheduledRefreshes::default();
         if !is_terminal {
             let next_attempt = total_attempts + 1;
             let new_task_id = Uuid::new_v4().to_string();
@@ -751,7 +754,7 @@ impl JobStoreShard {
                         held_queues: Vec::new(),
                         task_group: &task_group,
                         skip_try_reserve: false,
-                        scheduled_refreshes: &mut ScheduledRefreshes::default(),
+                        scheduled_refreshes: &mut scheduled_refreshes,
                     },
                 )
                 .await
@@ -832,6 +835,7 @@ impl JobStoreShard {
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
         }
+        self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
         // [SILO-REIMP-6] Remove buffered tasks for this job.
         // Must happen after commit so the scanner cannot re-buffer old tasks from DB.

@@ -5747,6 +5747,87 @@ async fn seed_pending_refresh(
         .expect("seed refresh index row");
 }
 
+/// Enqueue a job on floating `queue` under `task_group`; the second job on a
+/// queue lands as a waiter and schedules the queue's refresh.
+async fn enqueue_floating_in_group(shard: &JobStoreShard, queue: &str, tag: u32, task_group: &str) {
+    shard
+        .enqueue(
+            "-",
+            Some(format!("{queue}-job-{tag}")),
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": tag})),
+            vec![silo::job::Limit::FloatingConcurrency(
+                silo::job::FloatingConcurrencyLimit {
+                    key: queue.to_string(),
+                    default_max_concurrency: 1,
+                    refresh_interval_ms: 100,
+                    metadata: vec![],
+                },
+            )],
+            None,
+            task_group,
+        )
+        .await
+        .expect("enqueue floating job");
+}
+
+/// Rows scheduled by the enqueue path and by the failure path are listed
+/// alongside seeded rows, with the retry's `not_before_ms` carried through.
+#[silo::test]
+async fn floating_refresh_tasks_table_lists_scheduled_and_retried_refreshes() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    enqueue_floating_in_group(&shard, "q-live", 1, "emails").await;
+    enqueue_floating_in_group(&shard, "q-live", 2, "emails").await;
+    enqueue_floating_in_group(&shard, "q-retry", 1, "emails").await;
+    enqueue_floating_in_group(&shard, "q-retry", 2, "emails").await;
+    let leased = shard
+        .dequeue("worker-1", "emails", 0)
+        .await
+        .expect("drain refreshes");
+    let retry_task = leased
+        .refresh_tasks
+        .iter()
+        .find(|rt| rt.queue_key == "q-retry")
+        .expect("q-retry refresh leased");
+    shard
+        .report_refresh_failure(&retry_task.task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+    let next_retry = {
+        let raw = shard
+            .db()
+            .get(&silo::keys::floating_limit_state_key("-", "q-retry"))
+            .await
+            .expect("get state")
+            .expect("state exists");
+        silo::codec::decode_floating_limit_state(raw)
+            .expect("decode state")
+            .next_retry_at_ms()
+            .expect("failure sets a retry time")
+    };
+    // The leased q-live refresh is gone from the index; a new waiter after
+    // the flag ages out would reschedule it, but here only the retry remains.
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql("SELECT queue_key, not_before_ms FROM floating_refresh_tasks WHERE task_group = 'emails' ORDER BY queue_key")
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(extract_string_column(&batches, 0), vec!["q-retry"]);
+    let not_before = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("not_before_ms column");
+    assert_eq!(not_before.value(0), next_retry);
+}
+
 #[silo::test]
 async fn floating_refresh_tasks_table_lists_pending_refreshes() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -5816,6 +5897,8 @@ async fn floating_refresh_tasks_table_pushes_task_group_and_tenant_down() {
     seed_pending_refresh(&shard, "-", "q-a", "emails", None).await;
     seed_pending_refresh(&shard, "t2", "q-b", "emails", None).await;
     seed_pending_refresh(&shard, "-", "q-c", "other", None).await;
+    // A group whose name extends the queried one sits outside its prefix.
+    seed_pending_refresh(&shard, "-", "q-e", "emails-2", None).await;
 
     let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
     let query = "SELECT queue_key FROM floating_refresh_tasks WHERE task_group = 'emails' AND tenant = '-' ORDER BY queue_key";
@@ -5842,6 +5925,22 @@ async fn floating_refresh_tasks_table_pushes_task_group_and_tenant_down() {
     assert!(
         !explain.contains("FilterExec"),
         "prefix filters are exact and need no post-filter: {explain}"
+    );
+
+    let limited =
+        "SELECT queue_key FROM floating_refresh_tasks WHERE task_group = 'emails' LIMIT 1";
+    let batches = sql
+        .sql(limited)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(extract_string_column(&batches, 0).len(), 1);
+    let explain = sql.explain(limited).await.expect("explain");
+    assert!(
+        explain.contains("limit=Some(1)"),
+        "the limit is pushed into the scan: {explain}"
     );
 
     // A tenant filter alone cannot bound the prefix and is re-applied.

@@ -792,3 +792,20 @@ fn test_floating_limit_state_roundtrip_stale_reset_count() {
     assert_eq!(decoded.refresh_scheduled_at_ms(), Some(5500));
     assert_eq!(decoded.to_owned().stale_reset_count, 7);
 }
+
+#[silo::test]
+fn test_refresh_index_row_zero_not_before_is_distinct_from_absent() {
+    let task = Task::RefreshFloatingLimit {
+        task_id: "refresh-3".to_string(),
+        tenant: "-".to_string(),
+        queue_key: "q".to_string(),
+        current_max_concurrency: 1,
+        last_refreshed_at_ms: 0,
+        metadata: vec![],
+        task_group: "workers".to_string(),
+    };
+    let zero = decode_task_validated(encode_refresh_index_row(&task, Some(0))).unwrap();
+    assert_eq!(zero.not_before_ms(), Some(0));
+    let absent = decode_task_validated(encode_refresh_index_row(&task, None)).unwrap();
+    assert_eq!(absent.not_before_ms(), None);
+}

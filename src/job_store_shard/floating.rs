@@ -11,7 +11,7 @@ use crate::codec::{
 };
 use crate::job::{FloatingConcurrencyLimit, FloatingLimitState, JobView};
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{JobStoreShard, JobStoreShardError, ScheduledRefreshes};
 use crate::keys::{
     concurrency_request_prefix, end_bound, floating_limit_state_key, job_info_key, leased_task_key,
     parse_refresh_task_key, refresh_task_group_prefix, refresh_task_key, refresh_tasks_prefix,
@@ -30,26 +30,48 @@ pub const REFRESH_INDEX_ROW_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 pub const REFRESH_DRAIN_MAX_LEASED: usize = 16;
 
 /// `base_ms` doubled `stale_reset_count` times, capped at `max_ms`, with
-/// the shift saturating instead of overflowing.
+/// the shift saturating instead of overflowing. A cap below the base is
+/// treated as the base: the cap bounds growth, it never shrinks the window.
 fn stale_window_ms(base_ms: i64, stale_reset_count: u32, max_ms: i64) -> i64 {
     let widened = if stale_reset_count >= i64::BITS - 1 {
         i64::MAX
     } else {
         base_ms.saturating_mul(1i64 << stale_reset_count)
     };
-    widened.min(max_ms)
+    widened.min(max_ms).max(base_ms)
 }
 
 impl JobStoreShard {
     /// Mark `task_group` as possibly holding a refresh index row. Called
-    /// before every index put's batch commits, so a drain never skips a
-    /// group with a row in flight.
+    /// only after the put's batch is durable: a mark made before the row is
+    /// visible could be cleared by a drain that scans the still-empty range,
+    /// leaving the committed row unmarked. A drain that runs between the
+    /// commit and the mark misses the row once; the next drain sees it.
     fn mark_refresh_pending(&self, task_group: &str) {
         let mut groups = self
             .refresh_pending_groups
             .lock()
             .expect("refresh pending groups lock");
         *groups.entry(task_group.to_string()).or_insert(0) += 1;
+    }
+
+    /// Mark every group in `task_groups` pending, after the batch that wrote
+    /// their index rows is durable.
+    pub(crate) fn mark_refresh_pending_groups<'a>(
+        &self,
+        task_groups: impl IntoIterator<Item = &'a str>,
+    ) {
+        for task_group in task_groups {
+            self.mark_refresh_pending(task_group);
+        }
+    }
+
+    /// Whether `task_group` may hold a refresh index row.
+    fn refresh_group_pending(&self, task_group: &str) -> bool {
+        self.refresh_pending_groups
+            .lock()
+            .expect("refresh pending groups lock")
+            .contains_key(task_group)
     }
 
     /// Warm the pending-group gate from the durable refresh index at shard
@@ -99,21 +121,30 @@ impl JobStoreShard {
                 ttl: Ttl::ExpireAt(now_epoch_ms() + REFRESH_INDEX_ROW_TTL_MS),
             },
         );
-        self.mark_refresh_pending(task_group);
         self.db.write(batch).await?;
+        self.mark_refresh_pending(task_group);
         Ok(())
     }
 
     /// Lease every claimable refresh index row under `task_group`, up to
     /// `REFRESH_DRAIN_MAX_LEASED`, in one durable batch. Rows for tenants
-    /// outside the shard range are deleted; rows whose `not_before_ms` is in
-    /// the future stay for a later drain. Index keys never reach the task
-    /// broker, so nothing here is acked or tombstoned.
+    /// outside the shard range and unreadable rows are deleted; rows whose
+    /// `not_before_ms` is in the future stay for a later drain. Index keys
+    /// never reach the task broker, so nothing here is acked or tombstoned.
+    /// Drains on one shard are serialized from scan to commit, so two
+    /// workers polling the same group cannot both lease one row; the
+    /// pending-group check runs first so idle groups never wait on the lock.
     pub async fn drain_pending_refreshes(
         &self,
         worker_id: &str,
         task_group: &str,
     ) -> Result<Vec<LeasedRefreshTask>, JobStoreShardError> {
+        if !self.refresh_group_pending(task_group) {
+            return Ok(Vec::new());
+        }
+        let _drain = self.refresh_drain_lock.lock().await;
+        // Re-read under the lock: the drain that just released it may have
+        // emptied the range and cleared the group.
         let generation = {
             let groups = self
                 .refresh_pending_groups
@@ -156,12 +187,16 @@ impl JobStoreShard {
             let decoded = match decode_task_validated(kv.value) {
                 Ok(decoded) => decoded,
                 Err(e) => {
+                    // The state row's stale window reschedules a readable
+                    // replacement; keeping the row would pin the group
+                    // pending until its TTL.
                     tracing::warn!(
                         tenant = %parsed.tenant,
                         queue_key = %parsed.queue_key,
                         error = %e,
-                        "refresh index row is unreadable; skipping"
+                        "refresh index row is unreadable; dropping it"
                     );
+                    batch.delete(&kv.key);
                     continue;
                 }
             };
@@ -195,8 +230,10 @@ impl JobStoreShard {
         }
 
         if range_empty {
-            // A put that landed since the scan began bumped the generation
-            // and keeps the group marked.
+            // A put committed and marked since the scan began bumped the
+            // generation and keeps the group marked. This relies on marks
+            // being made only after their row is durable (see
+            // `mark_refresh_pending`).
             let mut groups = self
                 .refresh_pending_groups
                 .lock()
@@ -388,27 +425,39 @@ impl JobStoreShard {
             return Ok(false);
         }
         self.db.write(batch).await?;
+        self.mark_refresh_pending(&task_group);
         Ok(true)
     }
 
     /// Schedule a refresh for a RequestTicket that just landed as a waiter on
     /// a floating queue. The ticket's own request row sits in the uncommitted
     /// batch, invisible to the durable waiter probe, so the ticket supplies
-    /// the waiter signal directly. Returns whether a task was written.
+    /// the waiter signal directly. `scheduled_refreshes` is the batch's
+    /// record: a queue already scheduled in this batch is skipped, and a
+    /// written row is recorded for the batch owner to mark once durable.
+    /// Returns whether a row was written.
     pub(crate) async fn schedule_floating_refresh_for_ticket<W: WriteBatcher>(
         &self,
         writer: &mut W,
+        scheduled_refreshes: &mut ScheduledRefreshes,
         tenant: &str,
         fl: &FloatingConcurrencyLimit,
         now_ms: i64,
         task_group: &str,
     ) -> Result<bool, JobStoreShardError> {
+        if scheduled_refreshes.contains(tenant, &fl.key) {
+            return Ok(false);
+        }
         let state = self
             .get_or_create_floating_limit_state(writer, tenant, fl)
             .await?;
-        self.maybe_schedule_floating_limit_refresh(
+        let written = self.maybe_schedule_floating_limit_refresh(
             writer, tenant, &fl.key, &state, now_ms, task_group, true,
-        )
+        )?;
+        if written {
+            scheduled_refreshes.record(tenant, &fl.key, task_group);
+        }
+        Ok(written)
     }
 
     /// Get or create the floating limit state for a given queue key.
@@ -532,7 +581,6 @@ impl JobStoreShard {
             encode_refresh_index_row(&refresh_task, None),
             now_ms + REFRESH_INDEX_ROW_TTL_MS,
         )?;
-        self.mark_refresh_pending(task_group);
 
         // Update state to mark refresh as scheduled
         let new_state = FloatingLimitState {
@@ -723,13 +771,13 @@ impl JobStoreShard {
                     ttl: Ttl::ExpireAt(now_ms + REFRESH_INDEX_ROW_TTL_MS),
                 },
             );
-            self.mark_refresh_pending(&task_group);
         }
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
 
         if has_waiters {
+            self.mark_refresh_pending(&task_group);
             tracing::warn!(
                 queue_key = %queue_key,
                 error_code = %error_code,
@@ -750,5 +798,43 @@ impl JobStoreShard {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stale_window_ms;
+
+    #[test]
+    fn stale_window_doubles_per_reset_up_to_the_cap() {
+        let cases = [
+            (60_000, 0, 3_600_000, 60_000),
+            (60_000, 1, 3_600_000, 120_000),
+            (60_000, 5, 3_600_000, 1_920_000),
+            (60_000, 6, 3_600_000, 3_600_000),
+            (100, 2, 300, 300),
+        ];
+        for (base, count, max, want) in cases {
+            assert_eq!(
+                stale_window_ms(base, count, max),
+                want,
+                "stale_window_ms({base}, {count}, {max})"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_window_saturates_instead_of_overflowing() {
+        assert_eq!(stale_window_ms(60_000, 62, i64::MAX), i64::MAX);
+        assert_eq!(stale_window_ms(60_000, 63, i64::MAX), i64::MAX);
+        assert_eq!(stale_window_ms(1, u32::MAX, i64::MAX), i64::MAX);
+        assert_eq!(stale_window_ms(i64::MAX, 1, i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn stale_window_never_shrinks_below_the_base() {
+        assert_eq!(stale_window_ms(60_000, 0, 1_000), 60_000);
+        assert_eq!(stale_window_ms(60_000, 3, 1_000), 60_000);
+        assert_eq!(stale_window_ms(0, 5, 3_600_000), 0);
     }
 }

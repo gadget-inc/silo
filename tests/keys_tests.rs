@@ -476,3 +476,27 @@ fn test_refresh_task_key_roundtrip_and_prefixes() {
     assert!(!key.starts_with(&refresh_task_group_prefix("email")));
     assert!(parse_refresh_task_key(&floating_limit_state_key("tenant-a", "queue/one")).is_none());
 }
+
+#[test]
+fn test_refresh_task_key_edge_strings_and_foreign_input() {
+    use silo::keys::{parse_refresh_task_key, refresh_task_group_prefix, refresh_task_key};
+    for (group, tenant, queue) in [("", "", ""), ("g\0x", "t\0", "q"), ("g", "-", "a/b:c")] {
+        let key = refresh_task_key(group, tenant, queue);
+        let parsed = parse_refresh_task_key(&key).expect("roundtrip");
+        assert_eq!(
+            (
+                parsed.task_group.as_str(),
+                parsed.tenant.as_str(),
+                parsed.queue_key.as_str()
+            ),
+            (group, tenant, queue)
+        );
+        assert!(key.starts_with(&refresh_task_group_prefix(group)));
+    }
+    // An embedded NUL is escaped, so a group is never a prefix of a longer group.
+    assert!(!refresh_task_key("g\0x", "t", "q").starts_with(&refresh_task_group_prefix("g")));
+    assert!(!refresh_task_key("gx", "t", "q").starts_with(&refresh_task_group_prefix("g")));
+    assert!(parse_refresh_task_key(&[]).is_none());
+    assert!(parse_refresh_task_key(&job_info_key("t", "j")).is_none());
+    assert!(parse_refresh_task_key(&task_key("g", 1, 0, "j", 1, 1)).is_none());
+}

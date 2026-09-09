@@ -27,19 +27,31 @@ use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
 
 /// Floating queues for which one write batch has already scheduled a
-/// refresh. Batch reads see the durable state row, not the batch's pending
-/// puts, so without this record every chain walked into the same batch
-/// would judge the same stale flag and write its own replacement refresh.
+/// refresh, with the task group each refresh index row was written under.
+/// Batch reads see the durable state row, not the batch's pending puts, so
+/// without this record every chain walked into the same batch would judge
+/// the same stale flag and write its own replacement refresh. Once the
+/// batch is durable, its owner marks the recorded groups pending for the
+/// refresh drain.
 #[derive(Debug, Default)]
-pub struct ScheduledRefreshes(Vec<(String, String)>);
+pub struct ScheduledRefreshes(Vec<(String, String, String)>);
 
 impl ScheduledRefreshes {
-    fn contains(&self, tenant: &str, queue_key: &str) -> bool {
-        self.0.iter().any(|(t, q)| t == tenant && q == queue_key)
+    pub(crate) fn contains(&self, tenant: &str, queue_key: &str) -> bool {
+        self.0.iter().any(|(t, q, _)| t == tenant && q == queue_key)
     }
 
-    fn record(&mut self, tenant: &str, queue_key: &str) {
-        self.0.push((tenant.to_string(), queue_key.to_string()));
+    pub(crate) fn record(&mut self, tenant: &str, queue_key: &str, task_group: &str) {
+        self.0.push((
+            tenant.to_string(),
+            queue_key.to_string(),
+            task_group.to_string(),
+        ));
+    }
+
+    /// Task groups that received an index row in this batch.
+    pub fn task_groups(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(_, _, g)| g.as_str())
     }
 }
 
@@ -225,10 +237,12 @@ impl JobStoreShard {
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let mut batch = WriteBatch::new();
+        let mut scheduled_refreshes = ScheduledRefreshes::default();
         let background_action_metadata = metadata.clone().unwrap_or_default();
         let grants = self
             .write_enqueue_data(
                 &mut DbWriteBatcher::new(&self.db, &mut batch),
+                &mut scheduled_refreshes,
                 tenant,
                 job_id,
                 priority,
@@ -289,6 +303,7 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
+        self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
         self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
             .await
@@ -350,9 +365,11 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobAlreadyExists(job_id.to_string()));
         }
 
+        let mut scheduled_refreshes = ScheduledRefreshes::default();
         let grants = self
             .write_enqueue_data(
                 &mut TxnWriter(&txn),
+                &mut scheduled_refreshes,
                 tenant,
                 job_id,
                 priority,
@@ -409,6 +426,7 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
+        self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
         self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
             .await
@@ -420,6 +438,7 @@ impl JobStoreShard {
     async fn write_enqueue_data<W: WriteBatcher>(
         &self,
         writer: &mut W,
+        scheduled_refreshes: &mut ScheduledRefreshes,
         tenant: &str,
         job_id: &str,
         priority: u8,
@@ -493,7 +512,7 @@ impl JobStoreShard {
                     held_queues: Vec::new(),
                     task_group,
                     skip_try_reserve: false,
-                    scheduled_refreshes: &mut ScheduledRefreshes::default(),
+                    scheduled_refreshes,
                 },
             )
             .await
@@ -786,7 +805,7 @@ impl JobStoreShard {
                             has_waiters,
                         )?
                     {
-                        scheduled_refreshes.record(tenant, &fl.key);
+                        scheduled_refreshes.record(tenant, &fl.key, task_group);
                     }
 
                     match record_grant_outcome(

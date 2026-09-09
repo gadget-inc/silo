@@ -3128,10 +3128,10 @@ pub fn classify_floating_refresh_tasks_filters(
         .iter()
         .map(|f| {
             let exact = match (&strategy, parse_eq_filter(&unqualify_expr(f))) {
-                (FloatingRefreshTasksScanStrategy::Prefix { .. }, Some((col, _)))
+                (FloatingRefreshTasksScanStrategy::Prefix { task_group, .. }, Some((col, val)))
                     if col == "task_group" =>
                 {
-                    true
+                    *task_group == val
                 }
                 (FloatingRefreshTasksScanStrategy::Prefix { tenant, .. }, Some((col, val)))
                     if col == "tenant" =>

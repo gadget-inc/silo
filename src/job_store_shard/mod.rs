@@ -258,6 +258,9 @@ pub struct JobStoreShard {
     /// unchanged generation. `BTreeMap` keeps iteration deterministic for
     /// the simulation harness.
     pub(crate) refresh_pending_groups: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Serializes refresh index drains from scan to commit, so concurrent
+    /// polls for one group cannot both lease the same row.
+    pub(crate) refresh_drain_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Error)]
@@ -626,6 +629,7 @@ impl JobStoreShard {
             floating_refresh_stale_max_ms: i64::try_from(floating_refresh_stale_max_ms)
                 .unwrap_or(i64::MAX),
             refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            refresh_drain_lock: tokio::sync::Mutex::new(()),
         });
 
         // The refresh index holds at most one row per floating queue with a

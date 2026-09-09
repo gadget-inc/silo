@@ -463,6 +463,7 @@ impl JobStoreShard {
                 return Err(JobStoreShardError::from(e));
             }
             dst_events::confirm_write(write_op);
+            self.mark_refresh_pending_groups(state.scheduled_refreshes.task_groups());
 
             // DB write succeeded — grants are now backed by durable holder
             // rows, no rollback needed. Clear the guard's buffer (keeps it
@@ -875,6 +876,7 @@ impl JobStoreShard {
                 && let Err(e) = self
                     .schedule_floating_refresh_for_ticket(
                         &mut writer,
+                        &mut state.scheduled_refreshes,
                         &tenant,
                         fl,
                         now_ms,

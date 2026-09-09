@@ -123,6 +123,12 @@ impl LimitChainResumer for ShardChainResumer {
         }
     }
 
+    fn refresh_index_rows_committed(&self, task_groups: &[String]) {
+        if let Some(shard) = self.shard.upgrade() {
+            shard.mark_refresh_pending_groups(task_groups.iter().map(String::as_str));
+        }
+    }
+
     async fn maybe_schedule_floating_refresh(
         &self,
         tenant: &str,

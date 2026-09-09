@@ -157,6 +157,11 @@ pub trait LimitChainResumer: Send + Sync {
     /// is a no-op for resumers with no broker access.
     fn wakeup_task_groups(&self, _groups: &[String]) {}
 
+    /// The chunk that wrote refresh index rows under `task_groups` is
+    /// durable; the shard marks those groups pending for its refresh drain.
+    /// Default is a no-op for resumers with no shard access.
+    fn refresh_index_rows_committed(&self, _task_groups: &[String]) {}
+
     /// The grant scanner found the floating queue `(tenant, queue)` at
     /// capacity with pending grant demand and skipped its request scan. The
     /// shard-side implementation verifies a waiter exists, decides whether a
@@ -3013,7 +3018,11 @@ impl ConcurrencyManager {
 
                 if chunk_grants.len() >= self.grant_scanner_commit_chunk_size {
                     let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
-                    chunk_scheduled_refreshes = ScheduledRefreshes::default();
+                    let refresh_groups: Vec<String> =
+                        std::mem::take(&mut chunk_scheduled_refreshes)
+                            .task_groups()
+                            .map(str::to_string)
+                            .collect();
                     let stale_deletes = std::mem::take(&mut chunk_stale);
                     if self
                         .commit_grant_chunk(
@@ -3033,6 +3042,9 @@ impl ConcurrencyManager {
                         record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted_groups;
                     }
+                    if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
+                        resumer.refresh_index_rows_committed(&refresh_groups);
+                    }
                     total_granted += chunk_grants.len();
                     total_stale_deleted += stale_deletes;
                     all_granted_groups.extend(chunk_grants.drain(..).map(|(_, tg)| tg));
@@ -3050,6 +3062,10 @@ impl ConcurrencyManager {
                 continue;
             }
             let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
+            let refresh_groups: Vec<String> = chunk_scheduled_refreshes
+                .task_groups()
+                .map(str::to_string)
+                .collect();
             let stale_deletes = std::mem::take(&mut chunk_stale);
             if self
                 .commit_grant_chunk(
@@ -3068,6 +3084,9 @@ impl ConcurrencyManager {
             {
                 record_invocation(scanned_this_invocation, total_stale_deleted);
                 return all_granted_groups;
+            }
+            if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
+                resumer.refresh_index_rows_committed(&refresh_groups);
             }
             total_granted += chunk_grants.len();
             total_stale_deleted += stale_deletes;

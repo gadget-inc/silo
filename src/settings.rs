@@ -404,7 +404,8 @@ pub struct DatabaseTemplate {
     /// Cap (ms) on the stale window after consecutive stale resets of one
     /// queue's flag: the window is `floating_refresh_stale_ms` doubled per
     /// consecutive reset, up to this value. Any refresh outcome resets the
-    /// count. Defaults to 3600000.
+    /// count. A cap below the base window is treated as the base. Defaults
+    /// to 3600000.
     #[serde(default = "default_floating_refresh_stale_max_ms")]
     pub floating_refresh_stale_max_ms: u64,
     /// Scan generations an ack tombstone may keep suppressing a task key the
