@@ -1029,3 +1029,42 @@ async fn factory_passes_slatedb_settings_to_shards() {
     let result = shard.db().get(b"key").await.expect("get");
     assert_eq!(result.unwrap().as_ref(), b"value");
 }
+
+/// The orphan holder sweep settings default to the documented production
+/// values and accept explicit TOML values on the database template.
+#[silo::test]
+fn parse_toml_orphan_holder_sweep_settings() {
+    let defaults: AppConfig = toml::from_str(
+        r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#,
+    )
+    .expect("parse TOML");
+    assert_eq!(
+        defaults.database.orphan_holder_sweep_slice,
+        silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE
+    );
+    assert_eq!(defaults.database.orphan_holder_grace_ms, 60_000);
+    assert_eq!(defaults.database.orphan_holder_stale_ms, 86_400_000);
+    assert_eq!(
+        DatabaseConfig::default().orphan_holder_stale_ms,
+        defaults.database.orphan_holder_stale_ms
+    );
+
+    let explicit: AppConfig = toml::from_str(
+        r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+orphan_holder_sweep_slice = 250
+orphan_holder_grace_ms = 5000
+orphan_holder_stale_ms = 0
+"#,
+    )
+    .expect("parse TOML");
+    assert_eq!(explicit.database.orphan_holder_sweep_slice, 250);
+    assert_eq!(explicit.database.orphan_holder_grace_ms, 5_000);
+    assert_eq!(explicit.database.orphan_holder_stale_ms, 0);
+}
