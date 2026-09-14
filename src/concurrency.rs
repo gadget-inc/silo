@@ -242,6 +242,19 @@ pub enum OrphanReason {
     Stale,
 }
 
+impl OrphanReason {
+    /// Stable label used for the purge counter's `reason` label and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JobMissing => "job_missing",
+            Self::JobTerminal => "job_terminal",
+            Self::RunningWithoutLease => "running_without_lease",
+            Self::AttemptSuperseded => "attempt_superseded",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 /// Verdict of the orphan holder classifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanVerdict {

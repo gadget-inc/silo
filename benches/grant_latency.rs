@@ -278,6 +278,9 @@ async fn open_shard(
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
             holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
+            orphan_holder_sweep_slice: silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
+            orphan_holder_grace_ms: silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
+            orphan_holder_stale_ms: silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
         },
         ShardRange::full(),
     )

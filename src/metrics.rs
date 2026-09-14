@@ -197,6 +197,7 @@ pub struct Metrics {
 
     // Concurrency metrics
     concurrency_tickets_granted: CounterVec,
+    concurrency_orphan_holders_purged: CounterVec,
     concurrency_tickets_converted: CounterVec,
     concurrency_grant_precheck_skips: CounterVec,
     concurrency_holders_cache_holders: GaugeVec,
@@ -705,6 +706,17 @@ impl Metrics {
         }
         self.concurrency_tickets_granted
             .with_label_values(&[shard, path.as_str()])
+            .inc_by(n as f64);
+    }
+
+    /// Record `n` orphaned concurrency holders purged on `shard` for `reason`
+    /// (an `OrphanReason::as_str` label).
+    pub fn record_concurrency_orphan_holders_purged(&self, shard: &str, reason: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.concurrency_orphan_holders_purged
+            .with_label_values(&[shard, reason])
             .inc_by(n as f64);
     }
 
@@ -2344,6 +2356,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_orphan_holders_purged = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_orphan_holders_purged_total",
+                "Total number of orphaned concurrency holders purged by the periodic sweep, labelled by shard and reason",
+            ),
+            &["shard", "reason"],
+        )?,
+    );
+
     let concurrency_tickets_converted = register(
         &registry,
         CounterVec::new(
@@ -2634,6 +2657,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
         concurrency_tickets_granted,
+        concurrency_orphan_holders_purged,
         concurrency_tickets_converted,
         concurrency_grant_precheck_skips,
         concurrency_holders_cache_holders,
