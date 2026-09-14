@@ -58,7 +58,7 @@ use crate::codec::{
     encode_concurrency_action, encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
-use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
+use crate::job::{ConcurrencyLimit, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
@@ -224,6 +224,83 @@ pub enum RequestTicketOutcome {
     TicketRequested { queue: String },
     /// Job queued as a RequestTicket task (for future start time)
     FutureRequestTaskWritten { queue: String, task_id: String },
+}
+
+/// Why the orphan sweep judged a durable holder to be dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanReason {
+    /// The owning job has no status row.
+    JobMissing,
+    /// The owning job is `Succeeded`, `Failed`, or `Cancelled`.
+    JobTerminal,
+    /// The owning job is `Running` but the holder's task has no unexpired
+    /// lease, so the holder belongs to a dead attempt.
+    RunningWithoutLease,
+    /// The owning job is `Scheduled` for a different attempt than the holder.
+    AttemptSuperseded,
+    /// The holder has had no lease for longer than the stale threshold.
+    Stale,
+}
+
+/// Verdict of the orphan holder classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanVerdict {
+    Live,
+    Orphan { reason: OrphanReason },
+}
+
+/// Classify a durable concurrency holder as live or orphaned.
+///
+/// Pure decision logic: the caller supplies the decoded holder, whether an
+/// unexpired lease exists for the holder's task id, the owning job's status
+/// row (`None` when missing), and the thresholds. A holder younger than
+/// `grace_ms` is always `Live`. A `stale_ms` of zero disables the age-only
+/// rule.
+pub fn classify_orphan_holder(
+    holder: &HolderRecord,
+    lease_present: bool,
+    status: Option<&JobStatus>,
+    grace_ms: i64,
+    stale_ms: i64,
+    now_ms: i64,
+) -> OrphanVerdict {
+    let age_ms = now_ms.saturating_sub(holder.granted_at_ms);
+    if age_ms < grace_ms || lease_present {
+        return OrphanVerdict::Live;
+    }
+    let past_stale = stale_ms > 0 && age_ms >= stale_ms;
+    let stale_or_live = if past_stale {
+        OrphanVerdict::Orphan {
+            reason: OrphanReason::Stale,
+        }
+    } else {
+        OrphanVerdict::Live
+    };
+
+    if holder.job_id.is_none() {
+        return stale_or_live;
+    }
+    let Some(status) = status else {
+        return OrphanVerdict::Orphan {
+            reason: OrphanReason::JobMissing,
+        };
+    };
+    match status.kind {
+        JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled => {
+            OrphanVerdict::Orphan {
+                reason: OrphanReason::JobTerminal,
+            }
+        }
+        JobStatusKind::Running => OrphanVerdict::Orphan {
+            reason: OrphanReason::RunningWithoutLease,
+        },
+        JobStatusKind::Scheduled if status.current_attempt != holder.attempt_number => {
+            OrphanVerdict::Orphan {
+                reason: OrphanReason::AttemptSuperseded,
+            }
+        }
+        JobStatusKind::Scheduled => stale_or_live,
+    }
 }
 
 /// Shared future driving a one-shot hydration scan for a queue.
