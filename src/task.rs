@@ -144,6 +144,11 @@ pub struct LeaseRecord {
 #[derive(Debug, Clone)]
 pub struct HolderRecord {
     pub granted_at_ms: i64,
+    /// Job that owns this slot. `None` when the record carries no owner.
+    pub job_id: Option<String>,
+    /// Total attempt number (monotonically increasing, 1-based) of the owning
+    /// job at grant time. `None` when the record carries no owner.
+    pub attempt_number: Option<u32>,
 }
 
 /// Action stored at requests/<queue>/<time>/<request-id>

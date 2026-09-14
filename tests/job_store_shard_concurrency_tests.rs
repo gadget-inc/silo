@@ -5414,7 +5414,11 @@ async fn cancel_request_ticket_releases_upstream_holders() {
         .db()
         .put(
             &concurrency_holder_key(tenant, &queue_a, &task_id),
-            &encode_holder(&HolderRecord { granted_at_ms: now }),
+            &encode_holder(&HolderRecord {
+                granted_at_ms: now,
+                job_id: Some(job_id.clone()),
+                attempt_number: Some(1),
+            }),
         )
         .await
         .expect("seed DB holder for A");

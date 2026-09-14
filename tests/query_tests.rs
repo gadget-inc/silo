@@ -1595,6 +1595,91 @@ async fn queues_table_shows_holders() {
     );
 }
 
+/// Holder rows report the job that owns the slot. A holder record without an
+/// owner reads as `NULL`.
+#[silo::test]
+async fn queues_table_shows_job_id_for_holders() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    shard
+        .enqueue(
+            "-",
+            Some("owned-holder-job".to_string()),
+            10,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "owned-queue".to_string(),
+                max_concurrency: 1,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    let tasks = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+
+    shard
+        .db()
+        .put(
+            &silo::keys::concurrency_holder_key("-", "unowned-queue", "planted-task"),
+            &silo::codec::encode_holder(&silo::task::HolderRecord {
+                granted_at_ms: now,
+                job_id: None,
+                attempt_number: None,
+            }),
+        )
+        .await
+        .expect("plant holder");
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let batches = sql
+        .sql(
+            "SELECT queue_name, job_id FROM queues \
+             WHERE tenant = '-' AND entry_type = 'holder' ORDER BY queue_name",
+        )
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+
+    let mut rows: Vec<(String, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let queues = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("queue_name column");
+        let job_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("job_id column");
+        for i in 0..batch.num_rows() {
+            let job_id = (!job_ids.is_null(i)).then(|| job_ids.value(i).to_string());
+            rows.push((queues.value(i).to_string(), job_id));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "owned-queue".to_string(),
+                Some("owned-holder-job".to_string())
+            ),
+            ("unowned-queue".to_string(), None),
+        ]
+    );
+}
+
 #[silo::test]
 async fn queues_table_shows_requesters() {
     let (_tmp, shard) = open_temp_shard().await;

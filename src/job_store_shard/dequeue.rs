@@ -890,6 +890,8 @@ impl JobStoreShard {
         // Write the holder for the just-won queue.
         let holder_val = encode_holder(&HolderRecord {
             granted_at_ms: now_ms,
+            job_id: Some(job_id.clone()),
+            attempt_number: Some(attempt_number),
         });
         state.batch.put(
             concurrency_holder_key(&tenant, &queue, &task_id),

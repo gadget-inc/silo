@@ -538,11 +538,14 @@ pub fn encode_job_status(status: &JobStatus) -> Vec<u8> {
 
 #[inline]
 pub fn encode_holder(holder: &HolderRecord) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(32);
+    let mut builder = FlatBufferBuilder::with_capacity(64);
+    let job_id = holder.job_id.as_deref().map(|j| builder.create_string(j));
     let root = fb::HolderRecord::create(
         &mut builder,
         &fb::HolderRecordArgs {
             granted_at_ms: holder.granted_at_ms,
+            job_id,
+            attempt_number: holder.attempt_number.unwrap_or(0),
         },
     );
     builder.finish(root, None);
@@ -1087,6 +1090,21 @@ pub fn decode_holder_granted_at_ms(bytes: &[u8]) -> Result<i64, CodecError> {
     let h = flatbuffers::root::<fb::HolderRecord>(bytes)
         .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
     Ok(h.granted_at_ms())
+}
+
+/// Decode a full holder record. Owner fields are `None` when the stored
+/// record does not carry a job id.
+#[inline]
+pub fn decode_holder(bytes: &[u8]) -> Result<HolderRecord, CodecError> {
+    let h = flatbuffers::root::<fb::HolderRecord>(bytes)
+        .map_err(|e| CodecError::Flatbuffer(e.to_string()))?;
+    let job_id = h.job_id().map(|j| j.to_string());
+    let attempt_number = job_id.is_some().then(|| h.attempt_number());
+    Ok(HolderRecord {
+        granted_at_ms: h.granted_at_ms(),
+        job_id,
+        attempt_number,
+    })
 }
 
 // ---------------------------------------------------------------------------
