@@ -1380,6 +1380,7 @@ impl JobStoreShard {
     pub async fn sweep_orphan_holders_for_test(&self, slice: usize) -> (usize, bool) {
         self.sweep_orphan_holders(slice).await
     }
+
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_metrics_recorder(&self) -> &Arc<DefaultMetricsRecorder> {

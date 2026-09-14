@@ -1,5 +1,7 @@
 //! Lease management: heartbeat, outcome reporting, and expired lease reaping.
 
+use std::collections::BTreeSet;
+
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 use uuid::Uuid;
@@ -789,8 +791,7 @@ impl JobStoreShard {
         holders: Vec<ParsedConcurrencyHolderKey>,
     ) -> Result<Vec<ParsedConcurrencyHolderKey>, JobStoreShardError> {
         let range = self.get_range();
-        let mut hydrated: std::collections::BTreeSet<(&str, &str)> =
-            std::collections::BTreeSet::new();
+        let mut hydrated: BTreeSet<(&str, &str)> = BTreeSet::new();
         for h in &holders {
             if hydrated.insert((&h.tenant, &h.queue)) {
                 self.concurrency
