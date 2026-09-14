@@ -1441,7 +1441,15 @@ impl ConcurrencyManager {
                 // walker's terminal branch, carrying the full accumulated
                 // `held_queues`.
                 // Note: in-memory slot is already reserved by try_reserve
-                append_grant_edits(writer, now_ms, tenant, queue, task_id)?;
+                append_grant_edits(
+                    writer,
+                    now_ms,
+                    tenant,
+                    queue,
+                    task_id,
+                    job_id,
+                    attempt_number,
+                )?;
                 if let Some(ref m) = self.metrics {
                     m.record_concurrency_tickets_granted(
                         &self.shard,
@@ -2939,6 +2947,8 @@ impl ConcurrencyManager {
                 // [SILO-GRANT-3] Create holder for the just-won queue
                 let holder_val = encode_holder(&HolderRecord {
                     granted_at_ms: chunk_now,
+                    job_id: Some(req.job_id.clone()),
+                    attempt_number: Some(req.attempt_number),
                 });
                 batch.put(
                     concurrency_holder_key(tenant, queue, &req.task_id),
@@ -3285,9 +3295,13 @@ fn append_grant_edits<W: WriteBatcher>(
     tenant: &str,
     queue: &str,
     task_id: &str,
+    job_id: &str,
+    attempt_number: u32,
 ) -> Result<(), ConcurrencyError> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
+        job_id: Some(job_id.to_string()),
+        attempt_number: Some(attempt_number),
     };
     let holder_val = encode_holder(&holder);
     writer.put(concurrency_holder_key(tenant, queue, task_id), &holder_val)?;

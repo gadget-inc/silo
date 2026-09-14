@@ -1,6 +1,6 @@
 use silo::codec::{
     decode_attempt, decode_cancellation_at_ms, decode_concurrency_action,
-    decode_floating_limit_state, decode_holder_granted_at_ms, decode_job_info,
+    decode_floating_limit_state, decode_holder, decode_holder_granted_at_ms, decode_job_info,
     decode_job_status_owned, decode_lease, decode_task, decode_task_validated, encode_attempt,
     encode_concurrency_action, encode_floating_limit_state, encode_holder, encode_job_cancellation,
     encode_job_info, encode_job_status, encode_lease, encode_refresh_index_row, encode_task,
@@ -109,10 +109,32 @@ fn test_job_status_roundtrip() {
 fn test_holder_roundtrip() {
     let holder = HolderRecord {
         granted_at_ms: 9999,
+        job_id: Some("job-1".to_string()),
+        attempt_number: Some(3),
     };
     let encoded = encode_holder(&holder);
     let granted_at_ms = decode_holder_granted_at_ms(&encoded).unwrap();
     assert_eq!(granted_at_ms, 9999);
+
+    let decoded = decode_holder(&encoded).unwrap();
+    assert_eq!(decoded.granted_at_ms, 9999);
+    assert_eq!(decoded.job_id.as_deref(), Some("job-1"));
+    assert_eq!(decoded.attempt_number, Some(3));
+}
+
+/// A holder value whose flatbuffer carries only `granted_at_ms` decodes with
+/// both owner fields absent rather than failing.
+#[silo::test]
+fn test_holder_bytes_with_only_granted_at_decode_without_owner() {
+    // HolderRecord { granted_at_ms: 9999 } with no owner fields present.
+    let bytes: [u8; 24] = [
+        12, 0, 0, 0, 0, 0, 6, 0, 12, 0, 4, 0, 6, 0, 0, 0, 15, 39, 0, 0, 0, 0, 0, 0,
+    ];
+    let decoded = decode_holder(&bytes).unwrap();
+    assert_eq!(decoded.granted_at_ms, 9999);
+    assert_eq!(decoded.job_id, None);
+    assert_eq!(decoded.attempt_number, None);
+    assert_eq!(decode_holder_granted_at_ms(&bytes).unwrap(), 9999);
 }
 
 #[silo::test]

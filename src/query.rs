@@ -2236,16 +2236,15 @@ impl Scan for QueuesScanner {
                         {
                             continue;
                         }
-                        let timestamp_ms =
-                            crate::codec::decode_holder_granted_at_ms(&kv.value).unwrap_or_default();
+                        let holder = crate::codec::decode_holder(&kv.value).ok();
                         entries.push(QueueEntry {
                             tenant: parsed.tenant,
                             queue_name: parsed.queue,
                             entry_type: "holder".to_string(),
                             task_id: parsed.task_id,
-                            job_id: None,
+                            job_id: holder.as_ref().and_then(|h| h.job_id.clone()),
                             priority: None,
-                            timestamp_ms,
+                            timestamp_ms: holder.map(|h| h.granted_at_ms).unwrap_or_default(),
                         });
                     }
                 }

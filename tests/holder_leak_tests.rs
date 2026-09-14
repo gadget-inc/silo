@@ -23,6 +23,16 @@ fn conc_limit(queue: &str, max: u32) -> Limit {
     })
 }
 
+/// Encoded holder granted just now that carries no owning job. Planted
+/// fixtures use it so they read as young owner-unknown holders.
+fn holder_without_owner() -> Vec<u8> {
+    encode_holder(&HolderRecord {
+        granted_at_ms: now_ms(),
+        job_id: None,
+        attempt_number: None,
+    })
+}
+
 fn fc_limit(queue: &str, default_max: u32) -> Limit {
     Limit::FloatingConcurrency(FloatingConcurrencyLimit {
         key: queue.to_string(),
@@ -316,6 +326,8 @@ async fn check_rate_limit_max_retries_releases_held_queues() {
     let task_id = format!("crl-orphan-{}", uuid::Uuid::new_v4());
     let holder = encode_holder(&HolderRecord {
         granted_at_ms: now_ms(),
+        job_id: Some(job_id.clone()),
+        attempt_number: Some(1),
     });
     shard
         .db()
@@ -415,9 +427,7 @@ async fn check_rate_limit_missing_job_info_releases_held_queues() {
     let task_id = format!("crl-orphan-{}", uuid::Uuid::new_v4());
 
     // Plant the held concurrency holder we'll prove gets released.
-    let holder = encode_holder(&HolderRecord {
-        granted_at_ms: now_ms(),
-    });
+    let holder = holder_without_owner();
     shard
         .db()
         .put(&concurrency_holder_key(tenant, queue, &task_id), &holder)
@@ -507,9 +517,7 @@ async fn purge_orphaned_holders_for_task_removes_stranded_holders() {
     let other_task_id = "other-task-id";
 
     // Manually plant orphaned holders (no lease, no task).
-    let holder_val = encode_holder(&HolderRecord {
-        granted_at_ms: now_ms(),
-    });
+    let holder_val = holder_without_owner();
     shard
         .db()
         .put(
@@ -593,9 +601,7 @@ async fn late_report_outcome_followed_by_purge_clears_holder() {
         .db()
         .put(
             &concurrency_holder_key(tenant, stale_queue, &task_id),
-            &encode_holder(&HolderRecord {
-                granted_at_ms: now_ms(),
-            }),
+            &holder_without_owner(),
         )
         .await
         .expect("plant stale");
@@ -1755,7 +1761,7 @@ async fn reconcile_pending_holders_four_quadrants() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "hydrate-seed"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("seed write");
         shard.db().flush().await.expect("flush seed");
@@ -1766,7 +1772,7 @@ async fn reconcile_pending_holders_four_quadrants() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "task-both"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
@@ -1781,7 +1787,7 @@ async fn reconcile_pending_holders_four_quadrants() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "task-durable-only"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable-only write");
         shard.db().flush().await.expect("flush");
@@ -1851,7 +1857,7 @@ async fn reconcile_pending_holders_kicks_grant_per_release() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "hydrate-seed"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("seed write");
         shard.db().flush().await.expect("flush seed");
@@ -1911,7 +1917,7 @@ async fn report_holder_drift_self_heals_ghost() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "keep"),
-            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
@@ -1972,7 +1978,7 @@ async fn report_holder_drift_skips_unconfirmed_inflight_reservation() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "keep"),
-            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
@@ -2001,7 +2007,7 @@ async fn report_holder_drift_skips_unconfirmed_inflight_reservation() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "inflight"),
-            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
