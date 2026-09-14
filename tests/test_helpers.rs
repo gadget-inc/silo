@@ -223,9 +223,11 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
     (tmp, shard)
 }
 
-/// Open a temp shard with caller-supplied orphan sweep settings, a short
-/// concurrency reconcile interval, and an optional metrics handle. Used by
-/// tests that must observe the periodic sweep tick itself.
+/// Open a temp shard with caller-supplied orphan sweep settings, a
+/// concurrency reconcile interval, an optional metrics handle, and a tenant
+/// range. Pass a short interval to observe the periodic sweep tick, or a long
+/// one so `sweep_orphan_holders_for_test` is the only thing advancing sweep
+/// state.
 #[allow(dead_code)]
 pub async fn open_temp_shard_with_orphan_sweep(
     sweep_slice: usize,
@@ -233,6 +235,7 @@ pub async fn open_temp_shard_with_orphan_sweep(
     stale_ms: u64,
     reconcile_interval_ms: u64,
     metrics: Option<silo::metrics::Metrics>,
+    range: ShardRange,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let rate_limiter = MockGubernatorClient::new_arc();
     let tmp = tempfile::tempdir().unwrap();
@@ -266,7 +269,7 @@ pub async fn open_temp_shard_with_orphan_sweep(
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
         },
-        ShardRange::full(),
+        range,
     )
     .await
     .expect("open shard");

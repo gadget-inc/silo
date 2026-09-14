@@ -31,7 +31,7 @@ type HolderId = (String, String, String);
 
 /// Sweep state carried between reconcile ticks. Never persisted: a shard
 /// restart begins a fresh pass with no candidates.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct OrphanSweepPass {
     /// Resume point in the durable holder keyspace. `None` starts a new pass
     /// at the prefix start.
@@ -59,11 +59,12 @@ impl JobStoreShard {
     /// pass (reached the end of the holder keyspace).
     ///
     /// Each holder past the grace window costs one lease point read and, when
-    /// the record names an owner, one job status point read. Holders for
-    /// tenants outside the shard range and holders whose value does not
-    /// decode are skipped. A holder is purged only when the previous
-    /// completed pass also classified it orphan; a candidate that classifies
-    /// live, or is not revisited, drops out at the next pass boundary.
+    /// no unexpired lease exists and the record names an owner, one job
+    /// status point read. Holders for tenants outside the shard range and
+    /// holders whose value does not decode are skipped. A holder is purged
+    /// only when the previous completed pass also classified it orphan; a
+    /// candidate that classifies live, or is not revisited, drops out at the
+    /// next pass boundary.
     pub(crate) async fn sweep_orphan_holders(&self, slice: usize) -> (usize, bool) {
         // Clamp to >= 1 so the cursor always advances; a slice of zero would
         // never walk a row and never complete a pass.
@@ -213,8 +214,9 @@ impl JobStoreShard {
         (purged.len(), pass_completed)
     }
 
-    /// Point-read the lease and, when the record names an owner, the job
-    /// status for one holder, then run the classifier. Returns the orphan
+    /// Point-read the lease and, when no unexpired lease exists and the record
+    /// names an owner, the job status for one holder, then run the
+    /// classifier. Returns the orphan
     /// reason, or `None` when the holder is live or a read failed (a read
     /// failure skips the holder for this pass rather than guessing).
     async fn orphan_reason_for(
@@ -234,6 +236,10 @@ impl JobStoreShard {
                 return None;
             }
         };
+        // An unexpired lease settles the verdict; skip the status read.
+        if lease_present {
+            return None;
+        }
         let status: Option<JobStatus> = match &holder.job_id {
             None => None,
             Some(job_id) => match self.db.get(&job_status_key(&key.tenant, job_id)).await {

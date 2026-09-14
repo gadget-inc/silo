@@ -238,7 +238,8 @@ pub enum OrphanReason {
     RunningWithoutLease,
     /// The owning job is `Scheduled` for a different attempt than the holder.
     AttemptSuperseded,
-    /// The holder has had no lease for longer than the stale threshold.
+    /// The holder was granted at least `stale_ms` ago and its task has no
+    /// unexpired lease.
     Stale,
 }
 
@@ -266,9 +267,11 @@ pub enum OrphanVerdict {
 ///
 /// Pure decision logic: the caller supplies the decoded holder, whether an
 /// unexpired lease exists for the holder's task id, the owning job's status
-/// row (`None` when missing), and the thresholds. A holder younger than
-/// `grace_ms` is always `Live`. A `stale_ms` of zero disables the age-only
-/// rule.
+/// row (`None` when missing), and the thresholds. Age is measured from
+/// `granted_at_ms`: a holder whose age is below `grace_ms` is always `Live`,
+/// and one whose age is at least `stale_ms` with no unexpired lease is
+/// `Stale` unless a job-derived reason applies first. A `stale_ms` of zero
+/// disables the age-only rule.
 pub fn classify_orphan_holder(
     holder: &HolderRecord,
     lease_present: bool,

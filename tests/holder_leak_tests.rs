@@ -2125,6 +2125,17 @@ async fn has_unexpired_lease_ignores_expired_rows() {
         now - 10_000,
     )
     .await;
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        "lease-at-now",
+        "-",
+        "lease-job",
+        "default",
+        now,
+        now - 10_000,
+    )
+    .await;
 
     assert!(
         shard
@@ -2139,6 +2150,13 @@ async fn has_unexpired_lease_ignores_expired_rows() {
             .await
             .expect("read expired lease"),
         "expired lease row must count as absent"
+    );
+    assert!(
+        !shard
+            .has_unexpired_lease("lease-at-now", now)
+            .await
+            .expect("read lease expiring now"),
+        "a lease whose expiry equals now must count as absent"
     );
     assert!(
         !shard
@@ -2336,8 +2354,9 @@ async fn orphan_sweep_recovers_queue_wedged_by_stale_holders() {
         silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
         silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
         silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
-        400,
+        2_000,
         None,
+        ShardRange::full(),
     )
     .await;
     let tenant = "-";
@@ -2404,15 +2423,23 @@ async fn orphan_sweep_recovers_queue_wedged_by_stale_holders() {
     assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
 }
 
+/// Full-range variant of `open_temp_shard_for_sweep_hook_in_range`.
+async fn open_temp_shard_for_sweep_hook() -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    open_temp_shard_for_sweep_hook_in_range(ShardRange::full()).await
+}
+
 /// Open a shard whose periodic reconcile tick never fires during a test, so
 /// the sweep hook is the only thing advancing sweep state.
-async fn open_temp_shard_for_sweep_hook() -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+async fn open_temp_shard_for_sweep_hook_in_range(
+    range: ShardRange,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     open_temp_shard_with_orphan_sweep(
         silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
         silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
         silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
         3_600_000,
         None,
+        range,
     )
     .await
 }
@@ -2611,7 +2638,7 @@ async fn orphan_sweep_skips_tenants_outside_shard_range() {
     let half_range = ShardRange::new("", "8");
     assert!(half_range.contains_tenant(&lo_tenant));
     assert!(!half_range.contains_tenant(&hi_tenant));
-    let (_tmp, shard) = open_temp_shard_with_range(half_range).await;
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook_in_range(half_range).await;
 
     for tenant in [&lo_tenant, &hi_tenant] {
         shard
@@ -2659,6 +2686,7 @@ async fn orphan_sweep_counts_purged_holders_by_reason() {
         silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
         200,
         Some(metrics.clone()),
+        ShardRange::full(),
     )
     .await;
     run_job_to_success(&shard, "metric-job").await;
@@ -2684,5 +2712,80 @@ async fn orphan_sweep_counts_purged_holders_by_reason() {
         ),
         "expected one job_terminal purge in scrape:\n{body}"
     );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+}
+
+/// A candidate that classifies live on the next pass drops out of the
+/// candidate set and needs two fresh consecutive orphan passes again.
+#[silo::test]
+async fn orphan_sweep_drops_candidate_that_turns_live() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "dropout-q";
+    let task_id = "dropout-task";
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, task_id),
+            &stale_holder_without_owner(),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 0, "pass 1 flags");
+
+    let now = now_ms();
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        task_id,
+        tenant,
+        "dropout-job",
+        "default",
+        now + 60_000,
+        now,
+    )
+    .await;
+    assert_eq!(
+        run_orphan_sweep_pass(&shard, 2).await,
+        0,
+        "pass 2 sees a live lease and drops the candidate"
+    );
+
+    let mut batch = slatedb::WriteBatch::new();
+    batch.delete(silo::keys::leased_task_key(task_id));
+    shard.db().write(batch).await.expect("delete lease");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(
+        run_orphan_sweep_pass(&shard, 2).await,
+        0,
+        "pass 3 flags afresh rather than purging"
+    );
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 1, "pass 4 purges");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+}
+
+/// A slice smaller than the holder count still covers every row over a pass.
+#[silo::test]
+async fn orphan_sweep_covers_every_row_with_small_slice() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "slice-q";
+    for i in 0..5 {
+        shard
+            .db()
+            .put(
+                &concurrency_holder_key(tenant, queue, &format!("small-slice-{i}")),
+                &stale_holder_without_owner(),
+            )
+            .await
+            .expect("plant holder");
+    }
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 0);
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 5);
     assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }

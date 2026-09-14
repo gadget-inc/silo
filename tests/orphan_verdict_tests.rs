@@ -86,6 +86,14 @@ fn classifier_decision_table() {
             want: orphan(OrphanReason::JobMissing),
         },
         Case {
+            name: "job-derived reason wins over stale for an owned holder past the threshold",
+            holder: owned(STALE_MS, 1),
+            lease_present: false,
+            status: None,
+            stale_ms: STALE_MS,
+            want: orphan(OrphanReason::JobMissing),
+        },
+        Case {
             name: "owned holder whose job succeeded",
             holder: owned(GRACE_MS, 1),
             lease_present: false,

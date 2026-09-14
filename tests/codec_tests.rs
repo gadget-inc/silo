@@ -126,7 +126,9 @@ fn test_holder_roundtrip() {
 /// both owner fields absent rather than failing.
 #[silo::test]
 fn test_holder_bytes_with_only_granted_at_decode_without_owner() {
-    // HolderRecord { granted_at_ms: 9999 } with no owner fields present.
+    // HolderRecord { granted_at_ms: 9999 } with a one-slot vtable: root offset
+    // 12; vtable [6, 12, 4] (vtable size, table size, field 0 at +4); table
+    // soffset 6; then 0x270F as a little-endian int64 at +4.
     let bytes: [u8; 24] = [
         12, 0, 0, 0, 0, 0, 6, 0, 12, 0, 4, 0, 6, 0, 0, 0, 15, 39, 0, 0, 0, 0, 0, 0,
     ];
