@@ -18,9 +18,9 @@ use crate::job_store_shard::{
     JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
 };
 use crate::keys::{
-    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_tenant_prefix,
-    end_bound, floating_limit_state_key, idx_metadata_key, job_cancelled_key, job_info_key,
-    leased_task_key, parse_concurrency_holder_key,
+    ParsedConcurrencyHolderKey, attempt_key, attempt_prefix, concurrency_holder_key,
+    concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key, idx_metadata_key,
+    job_cancelled_key, job_info_key, leased_task_key, parse_concurrency_holder_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
@@ -755,6 +755,83 @@ impl JobStoreShard {
         }
 
         Ok(to_delete.len())
+    }
+
+    /// Whether `task_id` holds a lease whose `expiry_ms` is still in the
+    /// future at `now_ms`. An expired row awaiting the reaper counts as
+    /// absent, so a stranded lease cannot shadow a leaked holder.
+    pub async fn has_unexpired_lease(
+        &self,
+        task_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, JobStoreShardError> {
+        let Some(raw) = self.db.get(&leased_task_key(task_id)).await? else {
+            return Ok(false);
+        };
+        Ok(decode_lease(raw)?.expiry_ms() > now_ms)
+    }
+
+    /// Delete the durable rows of known-orphan holders and release their
+    /// in-memory reservations so waiting requesters can be admitted.
+    ///
+    /// Order matters. Each affected `(tenant, queue)` is hydrated first:
+    /// `atomic_release` only mutates a hydrated entry, and a hydrate that
+    /// raced the delete would merge a pre-delete snapshot back in as a ghost.
+    /// Each holder key is then point-read so only rows that exist are
+    /// deleted, counted, and released; the deletes go in one durable batch;
+    /// and the in-memory release plus grant wake run only after that write
+    /// lands, so a failed write leaves memory untouched for a later retry.
+    ///
+    /// Returns the holders whose rows were deleted. A holder whose row is
+    /// already absent is skipped, so repeated calls purge nothing.
+    pub async fn purge_orphan_holders(
+        &self,
+        holders: Vec<ParsedConcurrencyHolderKey>,
+    ) -> Result<Vec<ParsedConcurrencyHolderKey>, JobStoreShardError> {
+        let range = self.get_range();
+        let mut hydrated: std::collections::BTreeSet<(&str, &str)> =
+            std::collections::BTreeSet::new();
+        for h in &holders {
+            if hydrated.insert((&h.tenant, &h.queue)) {
+                self.concurrency
+                    .counts()
+                    .ensure_hydrated(&self.db, &range, &h.tenant, &h.queue)
+                    .await?;
+            }
+        }
+
+        let mut present: Vec<ParsedConcurrencyHolderKey> = Vec::new();
+        for h in holders {
+            let key = concurrency_holder_key(&h.tenant, &h.queue, &h.task_id);
+            if self.db.get(&key).await?.is_some() {
+                present.push(h);
+            }
+        }
+        if present.is_empty() {
+            return Ok(present);
+        }
+
+        let mut batch = WriteBatch::new();
+        for h in &present {
+            batch.delete(concurrency_holder_key(&h.tenant, &h.queue, &h.task_id));
+        }
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        for h in &present {
+            self.concurrency
+                .counts()
+                .atomic_release(&h.tenant, &h.queue, &h.task_id);
+            self.concurrency.request_grant(&h.tenant, &h.queue);
+        }
+        Ok(present)
     }
 
     /// Re-put all KV records associated with a job that has reached a terminal

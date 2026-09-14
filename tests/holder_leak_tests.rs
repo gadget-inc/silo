@@ -10,7 +10,7 @@ use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, JobStatusKind, Limit
 use silo::job_attempt::AttemptOutcome;
 use silo::job_store_shard::JobStoreShardError;
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
-use silo::keys::{concurrency_holder_key, job_info_key, task_key};
+use silo::keys::{ParsedConcurrencyHolderKey, concurrency_holder_key, job_info_key, task_key};
 use silo::retry::RetryPolicy;
 use silo::task::{GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
@@ -2094,4 +2094,207 @@ async fn reconcile_pending_requests_uses_requester_counters() {
         1,
         "reconcile_pending_requests read the requester counter (=1) and kicked exactly one grant"
     );
+}
+
+/// `has_unexpired_lease` reports a lease only while its `expiry_ms` is in the
+/// future; an expired row still awaiting the reaper counts as absent.
+#[silo::test]
+async fn has_unexpired_lease_ignores_expired_rows() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        "lease-live",
+        "-",
+        "lease-job",
+        "default",
+        now + 60_000,
+        now,
+    )
+    .await;
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        "lease-expired",
+        "-",
+        "lease-job",
+        "default",
+        now - 1,
+        now - 10_000,
+    )
+    .await;
+
+    assert!(
+        shard
+            .has_unexpired_lease("lease-live", now)
+            .await
+            .expect("read live lease"),
+        "unexpired lease row must count as present"
+    );
+    assert!(
+        !shard
+            .has_unexpired_lease("lease-expired", now)
+            .await
+            .expect("read expired lease"),
+        "expired lease row must count as absent"
+    );
+    assert!(
+        !shard
+            .has_unexpired_lease("lease-none", now)
+            .await
+            .expect("read missing lease"),
+        "missing lease row must count as absent"
+    );
+}
+
+fn holder_key_parts(tenant: &str, queue: &str, task_id: &str) -> ParsedConcurrencyHolderKey {
+    ParsedConcurrencyHolderKey {
+        tenant: tenant.to_string(),
+        queue: queue.to_string(),
+        task_id: task_id.to_string(),
+    }
+}
+
+/// Purging an orphan holder on a cap-1 queue frees the slot for a real
+/// requester parked behind it: the requester is granted and its task becomes
+/// dequeueable.
+#[silo::test]
+async fn purge_orphan_holders_admits_parked_requester() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "purge-prim-q";
+    let orphan_task = "purge-prim-orphan";
+
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, orphan_task),
+            &holder_without_owner(),
+        )
+        .await
+        .expect("plant orphan holder");
+    shard.db().flush().await.expect("flush");
+
+    // The enqueue hydrates the queue, sees the orphan at cap, and parks.
+    shard
+        .enqueue(
+            tenant,
+            Some("purge-prim-job".to_string()),
+            10,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![conc_limit(queue, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+
+    let purged = shard
+        .purge_orphan_holders(vec![holder_key_parts(tenant, queue, orphan_task)])
+        .await
+        .expect("purge");
+    assert_eq!(purged.len(), 1);
+    assert!(!shard.concurrency_contains_holder(tenant, queue, orphan_task));
+
+    let tasks = poll_until(
+        || async {
+            shard
+                .dequeue("w1", "default", 1)
+                .await
+                .expect("dequeue")
+                .tasks
+        },
+        |tasks| !tasks.is_empty(),
+        10_000,
+    )
+    .await;
+    assert_eq!(tasks.len(), 1, "requester should be granted and dequeued");
+    assert_eq!(tasks[0].attempt().job_id(), "purge-prim-job");
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+}
+
+/// The purge hydrates a queue it has never touched before releasing, so the
+/// surviving holder is present in memory and the purged one is not.
+#[silo::test]
+async fn purge_orphan_holders_hydrates_the_queue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "purge-hydrate-q";
+
+    for task_id in ["purge-hydrate-keep", "purge-hydrate-gone"] {
+        shard
+            .db()
+            .put(
+                &concurrency_holder_key(tenant, queue, task_id),
+                &holder_without_owner(),
+            )
+            .await
+            .expect("plant holder");
+    }
+    shard.db().flush().await.expect("flush");
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        0,
+        "queue must not be hydrated before the purge"
+    );
+
+    let purged = shard
+        .purge_orphan_holders(vec![holder_key_parts(tenant, queue, "purge-hydrate-gone")])
+        .await
+        .expect("purge");
+    assert_eq!(purged.len(), 1);
+
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+    assert!(shard.concurrency_contains_holder(tenant, queue, "purge-hydrate-keep"));
+    assert!(
+        !shard.concurrency_contains_holder(tenant, queue, "purge-hydrate-gone"),
+        "purged task id must not survive as an in-memory ghost"
+    );
+}
+
+/// Holders whose rows are already absent are skipped: they are not counted,
+/// not released in memory, and a repeat call purges nothing.
+#[silo::test]
+async fn purge_orphan_holders_skips_absent_rows() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "purge-idem-q";
+
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, "purge-idem-present"),
+            &holder_without_owner(),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    let requested = vec![
+        holder_key_parts(tenant, queue, "purge-idem-present"),
+        holder_key_parts(tenant, queue, "purge-idem-absent"),
+    ];
+    let purged = shard
+        .purge_orphan_holders(requested.clone())
+        .await
+        .expect("purge");
+    assert_eq!(
+        purged,
+        vec![holder_key_parts(tenant, queue, "purge-idem-present")]
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 0);
+
+    let purged_again = shard
+        .purge_orphan_holders(requested)
+        .await
+        .expect("purge again");
+    assert!(purged_again.is_empty());
 }
