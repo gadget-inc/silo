@@ -39,7 +39,8 @@ use crate::job_store_shard::JobStoreShard;
 use crate::pb::QueryArrowRequest;
 use crate::pb::silo_client::SiloClient;
 use crate::query::{
-    JobsScanner, QueueCountsScanner, QueuesScanner, ScannerRef, TasksScanner, TenantCountsScanner,
+    FloatingRefreshTasksScanner, JobsScanner, QueueCountsScanner, QueuesScanner, ScannerRef,
+    TasksScanner, TenantCountsScanner, classify_floating_refresh_tasks_filters,
     classify_jobs_filters, classify_tasks_filters, explain_dataframe,
 };
 use crate::shard_range::ShardId;
@@ -135,12 +136,23 @@ impl ClusterQueryEngine {
         let tasks_schema = TasksScanner::base_schema();
         let tasks_provider = Arc::new(ClusterTableProvider::new(
             tasks_schema,
-            factory,
-            coordinator,
+            factory.clone(),
+            coordinator.clone(),
             TableKind::Tasks,
-            auth_token,
+            auth_token.clone(),
         ));
         ctx.register_table("tasks", tasks_provider)?;
+
+        // Register cluster-wide floating_refresh_tasks table over each shard's refresh index
+        let refresh_schema = FloatingRefreshTasksScanner::base_schema();
+        let refresh_provider = Arc::new(ClusterTableProvider::new(
+            refresh_schema,
+            factory,
+            coordinator,
+            TableKind::FloatingRefreshTasks,
+            auth_token,
+        ));
+        ctx.register_table("floating_refresh_tasks", refresh_provider)?;
 
         Ok(Self { ctx })
     }
@@ -227,6 +239,7 @@ enum TableKind {
     TenantCounts,
     QueueCounts,
     Tasks,
+    FloatingRefreshTasks,
 }
 
 /// A TableProvider that spans multiple shards in the cluster.
@@ -335,7 +348,10 @@ impl TableProvider for ClusterTableProvider {
         match self.table_kind {
             TableKind::Jobs => Ok(classify_jobs_filters(filters)),
             TableKind::Tasks => Ok(classify_tasks_filters(filters)),
-            _ => Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]),
+            TableKind::FloatingRefreshTasks => Ok(classify_floating_refresh_tasks_filters(filters)),
+            TableKind::Queues | TableKind::TenantCounts | TableKind::QueueCounts => {
+                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+            }
         }
     }
 }
@@ -495,6 +511,9 @@ impl ExecutionPlan for ClusterExecutionPlan {
                             Arc::new(QueueCountsScanner::new(Arc::clone(&shard)))
                         }
                         TableKind::Tasks => Arc::new(TasksScanner::new(Arc::clone(&shard))),
+                        TableKind::FloatingRefreshTasks => {
+                            Arc::new(FloatingRefreshTasksScanner::new(Arc::clone(&shard)))
+                        }
                     };
 
                     // Execute the scan - scanner handles projection via schema
@@ -606,6 +625,7 @@ async fn query_remote_shard_batches(
         TableKind::TenantCounts => "tenant_counts",
         TableKind::QueueCounts => "queue_counts",
         TableKind::Tasks => "tasks",
+        TableKind::FloatingRefreshTasks => "floating_refresh_tasks",
     };
 
     let sql = build_sql_query(table_name, filters, limit);

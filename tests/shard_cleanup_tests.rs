@@ -909,3 +909,75 @@ async fn raw_cleanup_status_reader_distinguishes_absent_from_present() {
         "raw reader returns the present status"
     );
 }
+
+/// The sweep removes refresh index rows for tenants outside the child's
+/// range alongside the other key families.
+#[silo::test]
+async fn cleanup_removes_refresh_index_rows_outside_range() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    // IN range: bbb; OUT range: aaa.
+    for tenant in ["aaa", "bbb"] {
+        shard
+            .put_refresh_index_row_for_test(
+                &silo::task::Task::RefreshFloatingLimit {
+                    task_id: format!("{tenant}-refresh"),
+                    tenant: tenant.to_string(),
+                    queue_key: "floating-q".to_string(),
+                    current_max_concurrency: 1,
+                    last_refreshed_at_ms: 0,
+                    metadata: vec![],
+                    task_group: "default".to_string(),
+                },
+                None,
+            )
+            .await
+            .expect("seed refresh index row");
+    }
+    shard.db().flush().await.unwrap();
+    let prefix = silo::keys::refresh_tasks_prefix();
+    assert_eq!(
+        test_helpers::count_with_binary_prefix(shard.db(), &prefix).await,
+        2
+    );
+
+    let left_range = ShardRange::new("", RANGE_BOUNDARY);
+    let result = shard
+        .after_split_cleanup_defunct_data(&left_range, 10)
+        .await
+        .expect("cleanup should succeed");
+    assert!(result.complete);
+    shard.db().flush().await.unwrap();
+
+    assert_eq!(
+        test_helpers::count_with_binary_prefix(shard.db(), &prefix).await,
+        1,
+        "only the in-range tenant's refresh row remains"
+    );
+    assert!(
+        shard
+            .db()
+            .get(&silo::keys::refresh_task_key(
+                "default",
+                "bbb",
+                "floating-q"
+            ))
+            .await
+            .unwrap()
+            .is_some(),
+        "bbb's refresh row remains (hash in range)"
+    );
+    assert!(
+        shard
+            .db()
+            .get(&silo::keys::refresh_task_key(
+                "default",
+                "aaa",
+                "floating-q"
+            ))
+            .await
+            .unwrap()
+            .is_none(),
+        "aaa's refresh row is deleted (hash out of range)"
+    );
+}

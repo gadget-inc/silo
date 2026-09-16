@@ -129,6 +129,11 @@ table RefreshFloatingLimit {
   last_refreshed_at_ms: int64;
   metadata: [KeyValuePair];
   task_group: string;
+  // Append new fields at the end of this table: it uses implicit field ids,
+  // so inserting a field earlier renumbers every later slot and misreads
+  // stored rows. Set only on refresh index rows: a backed-off retry is not
+  // claimable before this time. Null means claimable now.
+  not_before_ms: int64 = null;
 }
 
 union TaskVariant {
@@ -301,8 +306,11 @@ table FloatingLimitState {
   retry_count: uint32;
   next_retry_at_ms: int64 = null;
   metadata: [KeyValuePair];
-  // Append new fields after this one: the table uses implicit field ids, so
-  // inserting a field earlier renumbers every later slot and misreads stored
-  // rows.
+  // Append new fields at the end of this table: it uses implicit field ids,
+  // so inserting a field earlier renumbers every later slot and misreads
+  // stored rows.
   refresh_scheduled_at_ms: int64 = null;
+  // Consecutive stale resets of the outstanding-refresh flag; rows written
+  // without this field read as 0.
+  stale_reset_count: uint32;
 }

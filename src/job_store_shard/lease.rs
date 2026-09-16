@@ -14,7 +14,9 @@ use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError, LimitTaskParams};
+use crate::job_store_shard::{
+    JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
+};
 use crate::keys::{
     attempt_key, attempt_prefix, concurrency_holder_key, concurrency_holders_tenant_prefix,
     end_bound, floating_limit_state_key, idx_metadata_key, job_cancelled_key, job_info_key,
@@ -166,6 +168,7 @@ impl JobStoreShard {
         let mut followup_next_time: Option<i64> = None;
         // Track grants from retry scheduling for rollback if DB write fails
         let mut retry_grants: Vec<(String, String)> = Vec::new();
+        let mut retry_scheduled_refreshes = ScheduledRefreshes::default();
         let mut background_action_transitions: Vec<BackgroundActionMetricTransition> = Vec::new();
         // Track the new job status for DST event emission
         let mut new_job_status_for_dst: Option<String> = None;
@@ -293,6 +296,7 @@ impl JobStoreShard {
                                     held_queues: Vec::new(),
                                     task_group,
                                     skip_try_reserve: true,
+                                    scheduled_refreshes: &mut retry_scheduled_refreshes,
                                 },
                             )
                             .await?
@@ -475,6 +479,7 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
+        self.mark_refresh_pending_groups(retry_scheduled_refreshes.task_groups());
 
         // Post-commit: release in-memory concurrency counts and signal grant
         // scanner. Drain the guard (leaving it armed-but-empty so its Drop is a
@@ -661,6 +666,7 @@ impl JobStoreShard {
         let new_state = FloatingLimitState {
             refresh_task_scheduled: false,
             refresh_scheduled_at_ms: None,
+            stale_reset_count: 0,
             ..decoded_state.to_owned()
         };
 

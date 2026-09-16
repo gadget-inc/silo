@@ -1942,3 +1942,68 @@ async fn cluster_query_tasks_table_group_by_across_shards() {
     assert_eq!(groups, vec!["alpha", "beta"]);
     assert_eq!(counts, vec![3, 2]);
 }
+
+/// Seed a pending refresh for `queue` under `task_group` in `shard`'s
+/// refresh index.
+async fn seed_pending_refresh(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    task_group: &str,
+) {
+    shard
+        .put_refresh_index_row_for_test(
+            &silo::task::Task::RefreshFloatingLimit {
+                task_id: format!("{task_group}-{queue}"),
+                tenant: "-".to_string(),
+                queue_key: queue.to_string(),
+                current_max_concurrency: 1,
+                last_refreshed_at_ms: 0,
+                metadata: vec![],
+                task_group: task_group.to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("seed refresh index row");
+}
+
+/// `floating_refresh_tasks` lists every shard's pending refreshes, and its
+/// `task_group` and `tenant` filters are handled by the scan without a
+/// post-filter; a `queue_key` filter is re-applied.
+#[silo::test]
+async fn cluster_query_floating_refresh_tasks_multi_shard_pushdown() {
+    let (_temps, factory, shard_map) = create_multi_shard_factory(2).await;
+    let shard0 = get_shard(&factory, &shard_map, 0);
+    let shard1 = get_shard(&factory, &shard_map, 1);
+    seed_pending_refresh(&shard0, "q-s0", "emails").await;
+    seed_pending_refresh(&shard1, "q-s1", "emails").await;
+    seed_pending_refresh(&shard1, "q-other", "other").await;
+
+    let engine = ClusterQueryEngine::new(factory.clone(), None)
+        .await
+        .expect("create engine");
+
+    let query = "SELECT shard_id, queue_key FROM floating_refresh_tasks \
+                 WHERE task_group = 'emails' AND tenant = '-' ORDER BY queue_key";
+    let batches = query_collect(&engine, query).await;
+    assert_eq!(extract_string_column(&batches, 1), vec!["q-s0", "q-s1"]);
+    let shard_ids = extract_string_column(&batches, 0);
+    assert_eq!(shard_ids[0], shard0.name());
+    assert_eq!(shard_ids[1], shard1.name());
+
+    let explain = engine.explain(query).await.expect("explain");
+    assert!(
+        !explain.contains("FilterExec"),
+        "task_group and tenant are exact prefix filters: {explain}"
+    );
+
+    let post_filtered = "SELECT queue_key FROM floating_refresh_tasks \
+                         WHERE task_group = 'emails' AND queue_key = 'q-s1'";
+    let batches = query_collect(&engine, post_filtered).await;
+    assert_eq!(extract_string_column(&batches, 0), vec!["q-s1"]);
+    let explain = engine.explain(post_filtered).await.expect("explain");
+    assert!(
+        explain.contains("FilterExec"),
+        "queue_key is re-applied as a post-filter: {explain}"
+    );
+}

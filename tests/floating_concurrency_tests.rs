@@ -512,15 +512,11 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale() {
         .await
         .expect("enqueue j2");
 
-    // Check that a refresh task was scheduled
-    let tasks = shard.peek_tasks("default", 50).await.expect("peek tasks");
-    let has_refresh_task = tasks.iter().any(|t| {
-        matches!(
-            t,
-            Task::RefreshFloatingLimit { queue_key, .. } if queue_key == &queue
-        )
-    });
-    assert!(has_refresh_task, "refresh task should be scheduled");
+    assert_eq!(
+        count_refresh_tasks(&shard, &queue).await,
+        1,
+        "refresh task should be scheduled"
+    );
 }
 
 #[silo::test]
@@ -587,15 +583,9 @@ async fn floating_concurrency_limit_schedules_refresh_when_stale_with_waiters_ab
         "expected a waiting request after exceeding max"
     );
 
-    let tasks = shard.peek_tasks("default", 50).await.expect("peek tasks");
-    let has_refresh_task = tasks.iter().any(|t| {
-        matches!(
-            t,
-            Task::RefreshFloatingLimit { queue_key, .. } if queue_key == &queue
-        )
-    });
-    assert!(
-        has_refresh_task,
+    assert_eq!(
+        count_refresh_tasks(&shard, &queue).await,
+        1,
         "refresh task should be scheduled when waiters exist"
     );
 }
@@ -1132,10 +1122,11 @@ async fn floating_limit_refresh_failure_triggers_backoff() {
     // A new refresh task should be scheduled
     assert!(decoded.refresh_task_scheduled());
 
-    // Verify a task key exists with the floating_refresh prefix in the DB
-    // (checking peek_tasks would require advancing time past backoff)
-    let has_retry_task = first_task_kv(shard.db()).await.is_some();
-    assert!(has_retry_task, "retry task should exist in db");
+    // The retry sits in the refresh index, not claimable before its retry time.
+    let retry = read_refresh_index_row(&shard, &queue, "default")
+        .await
+        .expect("retry row exists in the refresh index");
+    assert_eq!(retry.not_before_ms(), Some(next_retry_at));
 }
 
 #[silo::test]
@@ -1304,20 +1295,9 @@ async fn floating_limit_concurrent_enqueues_no_duplicate_refresh() {
             .expect("enqueue");
     }
 
-    // Count refresh tasks
-    let tasks = shard.peek_tasks("default", 100).await.expect("peek tasks");
-    let refresh_count = tasks
-        .iter()
-        .filter(|t| {
-            matches!(
-                t,
-                Task::RefreshFloatingLimit { queue_key, .. } if queue_key == &queue
-            )
-        })
-        .count();
-
     assert_eq!(
-        refresh_count, 1,
+        count_refresh_tasks(&shard, &queue).await,
+        1,
         "should have exactly one refresh task, not duplicates"
     );
 }
@@ -1863,19 +1843,9 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
         .await
         .expect("enqueue j3");
 
-    // Check that a new refresh task was scheduled
-    let tasks = shard.peek_tasks("default", 50).await.expect("peek tasks");
-    let refresh_count = tasks
-        .iter()
-        .filter(|t| {
-            matches!(
-                t,
-                Task::RefreshFloatingLimit { queue_key, .. } if queue_key == &queue
-            )
-        })
-        .count();
     assert_eq!(
-        refresh_count, 1,
+        count_refresh_tasks(&shard, &queue).await,
+        1,
         "new refresh task should be scheduled after lease expiry cleanup"
     );
 }
@@ -2288,6 +2258,18 @@ async fn write_orphaned_refresh_state(
     queue: &str,
     scheduled_at_ms: Option<i64>,
 ) {
+    write_refresh_state(shard, queue, scheduled_at_ms, 0).await;
+}
+
+/// Overwrite the durable floating limit state row for `queue` with the flag
+/// set, stamped at `scheduled_at_ms`, after `stale_reset_count` consecutive
+/// stale resets.
+async fn write_refresh_state(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    scheduled_at_ms: Option<i64>,
+    stale_reset_count: u32,
+) {
     let state = silo::job::FloatingLimitState {
         current_max_concurrency: 1,
         last_refreshed_at_ms: 0,
@@ -2298,6 +2280,7 @@ async fn write_orphaned_refresh_state(
         next_retry_at_ms: None,
         metadata: vec![],
         refresh_scheduled_at_ms: scheduled_at_ms,
+        stale_reset_count,
     };
     shard
         .db()
@@ -2310,7 +2293,46 @@ async fn write_orphaned_refresh_state(
     shard.db().flush().await.expect("flush state");
 }
 
+/// The refresh index row for `queue` under `task_group`, if one is pending.
+async fn read_refresh_index_row(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    task_group: &str,
+) -> Option<silo::codec::DecodedTask> {
+    shard
+        .db()
+        .get(&silo::keys::refresh_task_key(task_group, "-", queue))
+        .await
+        .expect("get refresh index row")
+        .map(|raw| silo::codec::decode_task_validated(raw).expect("decode refresh index row"))
+}
+
+/// Count the refresh index rows for `queue` under `task_group`. Every
+/// pending refresh is visible here, including a backed-off retry.
 async fn count_refresh_tasks_in_group(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    task_group: &str,
+) -> usize {
+    let start = silo::keys::refresh_task_group_prefix(task_group);
+    let end = silo::keys::end_bound(&start);
+    let mut iter = shard
+        .db()
+        .scan::<Vec<u8>, _>(start..end)
+        .await
+        .expect("scan refresh index");
+    let mut count = 0;
+    while let Some(kv) = iter.next().await.expect("iterate refresh index") {
+        if silo::keys::parse_refresh_task_key(&kv.key).is_some_and(|p| p.queue_key == queue) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Count the `RefreshFloatingLimit` rows for `queue` in the task line under
+/// `task_group`.
+async fn count_task_line_refresh_tasks(
     shard: &silo::job_store_shard::JobStoreShard,
     queue: &str,
     task_group: &str,
@@ -2438,8 +2460,8 @@ async fn floating_limit_just_scheduled_refresh_is_stamped_and_not_replaced() {
     );
 
     // A later waiter in a different millisecond sees a trusted refresh and
-    // writes no second row. Refresh task keys are millisecond-keyed, so a
-    // wrongly written second row would be distinct and observable.
+    // writes nothing. A wrongly written replacement would land on the same
+    // index key, so the unchanged stamp is what shows no write happened.
     std::thread::sleep(std::time::Duration::from_millis(2));
     enqueue_floating(&shard, queue, 3).await;
     assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
@@ -2500,6 +2522,14 @@ async fn floating_limit_refresh_failure_with_waiters_stamps_retry_start_time() {
         "the retry is stamped with its own start time, not the failure time"
     );
     assert!(next_retry > now_ms() - 5_000);
+    let retry = read_refresh_index_row(&shard, queue, "default")
+        .await
+        .expect("the retry is pending in the refresh index");
+    assert_eq!(
+        retry.not_before_ms(),
+        Some(next_retry),
+        "the retry row is not claimable before its retry time"
+    );
 }
 
 #[silo::test]
@@ -2662,6 +2692,72 @@ async fn floating_limit_stale_threshold_setting_governs_age_out() {
     write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 300_001)).await;
     enqueue_floating(&shard, queue, 3).await;
     assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+}
+
+/// Twenty jobs whose chains continue from a rate limit into a floating queue
+/// at capacity are walked into one dequeue batch. The batch's reads see the
+/// durable state row, so every walk finds the same stale flag; the batch
+/// must still write one replacement refresh and count one reset.
+#[silo::test]
+async fn floating_limit_one_batch_of_waiters_schedules_one_replacement_refresh() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(60_000).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-batch-dedupe-q";
+
+    // j1 holds the single slot, so every later job lands as a waiter.
+    enqueue_floating(&shard, queue, 1).await;
+    // A flag with no stamp behind it is stale on sight.
+    write_orphaned_refresh_state(&shard, queue, None).await;
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+
+    // Each chain parks on a rate limit first, so the floating queue is only
+    // reached by the dequeue that passes the rate limit, which walks all
+    // twenty chains into a single batch under the `batch` group.
+    let rate_limit = silo::job::GubernatorRateLimit {
+        name: "batch-dedupe".to_string(),
+        unique_key: format!("batch-dedupe-{}", uuid::Uuid::new_v4()),
+        limit: 100,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: silo::job::GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: silo::job::RateLimitRetryPolicy::default(),
+    };
+    for tag in 0..20u32 {
+        shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"j": tag})),
+                vec![
+                    silo::job::Limit::RateLimit(rate_limit.clone()),
+                    floating_limit(queue, REFRESH_INTERVAL_MS),
+                ],
+                None,
+                "batch",
+            )
+            .await
+            .expect("enqueue chained job");
+    }
+
+    let result = shard
+        .dequeue("worker-1", "batch", 100)
+        .await
+        .expect("dequeue");
+    assert!(
+        result.tasks.is_empty(),
+        "every chained job waits on the floating queue"
+    );
+    assert_eq!(count_concurrency_requests(shard.db()).await, 20);
+    assert_eq!(
+        count_refresh_tasks_in_group(&shard, queue, "batch").await + result.refresh_tasks.len(),
+        1,
+        "one batch schedules one replacement refresh"
+    );
     assert_eq!(read_refresh_reset_total(&metrics), 1.0);
 }
 
@@ -2957,26 +3053,38 @@ async fn floating_limit_scanner_refresh_skips_unreadable_head_waiter() {
     );
 }
 
-/// Two refresh rows for one queue, as racing writers in different
-/// milliseconds produce: the first waiter schedules one, and a second waiter
-/// schedules another after the flag is aged out while the first row is still
-/// durable. Both are leased and reported; the last outcome wins and the flag
-/// ends cleared.
+/// Two refresh outcomes for one queue: the first refresh is leased, then its
+/// flag is aged out while the lease is still held and a new waiter schedules
+/// a replacement. Both are reported; the last outcome wins and the flag ends
+/// cleared.
 #[silo::test]
-async fn floating_limit_two_refresh_rows_are_both_leased_and_reported() {
+async fn floating_limit_leased_refresh_and_its_replacement_are_both_reported() {
     let (_tmp, shard) = open_temp_shard().await;
     shard.stop_grant_scanner();
-    let queue = "fl-two-rows-q";
+    let queue = "fl-two-outcomes-q";
     enqueue_floating(&shard, queue, 1).await;
     enqueue_floating(&shard, queue, 2).await;
     assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
-    write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 120_000)).await;
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    enqueue_floating(&shard, queue, 3).await;
-    assert_eq!(count_refresh_tasks(&shard, queue).await, 2);
 
-    let leased = dequeue_refresh_tasks_until(&shard, "w", "default", 2, DEQUEUE_TIMEOUT).await;
-    for (i, task) in leased.refresh_tasks.iter().enumerate() {
+    let first = dequeue_refresh_tasks_until(&shard, "w", "default", 1, DEQUEUE_TIMEOUT).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert_eq!(
+        count_lease_keys(shard.db()).await,
+        2,
+        "the holder and the refresh are leased"
+    );
+
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 120_000)).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    let second = dequeue_refresh_tasks_until(&shard, "w", "default", 1, DEQUEUE_TIMEOUT).await;
+
+    for (i, task) in first
+        .refresh_tasks
+        .iter()
+        .chain(second.refresh_tasks.iter())
+        .enumerate()
+    {
         shard
             .report_refresh_success(&task.task_id, 5 + i as u32)
             .await
@@ -3041,4 +3149,776 @@ async fn floating_limit_request_ticket_converts_despite_unreadable_state_row() {
         "the ticket becomes a waiter despite the unreadable state row"
     );
     assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Refresh delivery through the refresh index
+// ---------------------------------------------------------------------------
+
+/// Enqueue `n` plain due jobs under `task_group`.
+async fn enqueue_backlog(shard: &silo::job_store_shard::JobStoreShard, task_group: &str, n: usize) {
+    for i in 0..n {
+        shard
+            .enqueue(
+                "-",
+                Some(format!("{task_group}-backlog-{i}")),
+                10u8,
+                now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"backlog": i})),
+                vec![],
+                None,
+                task_group,
+            )
+            .await
+            .expect("enqueue backlog job");
+    }
+}
+
+/// Fifty due jobs sit ahead of the refresh in the head waiter's task group.
+/// A dequeue of ten still hands the pending refresh to the worker: refresh
+/// delivery does not depend on how deep the group's job backlog is.
+#[silo::test]
+async fn floating_limit_refresh_is_delivered_ahead_of_a_deep_backlog() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-front-of-line-q";
+
+    enqueue_backlog(&shard, "default", 50).await;
+    // j1 holds the single slot; j2 lands as a waiter and schedules the refresh.
+    enqueue_floating(&shard, queue, 1).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
+    assert_eq!(
+        result.refresh_tasks.len(),
+        1,
+        "the pending refresh is handed over ahead of the backlog"
+    );
+    assert_eq!(result.refresh_tasks[0].queue_key, queue);
+    assert_eq!(result.tasks.len(), 10, "the job budget is still filled");
+}
+
+/// A `RefreshFloatingLimit` task for `queue` under `task_group`, the value
+/// a refresh index row holds.
+fn refresh_task(tenant: &str, queue: &str, task_group: &str) -> Task {
+    Task::RefreshFloatingLimit {
+        task_id: uuid::Uuid::new_v4().to_string(),
+        tenant: tenant.to_string(),
+        queue_key: queue.to_string(),
+        current_max_concurrency: 1,
+        last_refreshed_at_ms: 0,
+        metadata: vec![],
+        task_group: task_group.to_string(),
+    }
+}
+
+/// Count every refresh index row under `task_group`, whatever its queue.
+async fn count_refresh_index_rows(
+    shard: &silo::job_store_shard::JobStoreShard,
+    task_group: &str,
+) -> usize {
+    count_with_binary_prefix(
+        shard.db(),
+        &silo::keys::refresh_task_group_prefix(task_group),
+    )
+    .await
+}
+
+/// A task group with nothing in its broker buffer still hands over the
+/// pending refresh: the drain runs before, and independently of, the claim
+/// loop.
+#[silo::test]
+async fn floating_limit_refresh_is_delivered_from_an_idle_task_group() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-idle-group-q";
+
+    // The holder runs under `default`; the waiter's group `idle` has no task
+    // rows at all, only the refresh its enqueue scheduled.
+    enqueue_floating(&shard, queue, 1).await;
+    enqueue_floating_in_group(&shard, queue, 2, "idle").await;
+    assert_eq!(count_refresh_tasks_in_group(&shard, queue, "idle").await, 1);
+    assert!(shard.peek_tasks("idle", 10).await.expect("peek").is_empty());
+
+    let result = shard
+        .dequeue("worker-1", "idle", 10)
+        .await
+        .expect("dequeue");
+    assert!(result.tasks.is_empty());
+    assert_eq!(result.refresh_tasks.len(), 1);
+    assert_eq!(result.refresh_tasks[0].queue_key, queue);
+    assert_eq!(count_refresh_tasks_in_group(&shard, queue, "idle").await, 0);
+}
+
+/// Scheduling over a stale flag replaces the queue's unclaimed row in place:
+/// the index holds one row for the queue and the reset counter moves by one.
+#[silo::test]
+async fn floating_limit_stale_replacement_rewrites_the_index_row_in_place() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(60_000).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-in-place-q";
+
+    enqueue_floating(&shard, queue, 1).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    let first_task_id = read_refresh_index_row(&shard, queue, "default")
+        .await
+        .and_then(|row| {
+            row.as_refresh_floating_limit()
+                .map(|r| r.task_id().unwrap_or_default().to_string())
+        })
+        .expect("the first refresh is pending");
+
+    write_orphaned_refresh_state(&shard, queue, Some(now_ms() - 120_000)).await;
+    enqueue_floating(&shard, queue, 3).await;
+
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+    let replacement = read_refresh_index_row(&shard, queue, "default")
+        .await
+        .and_then(|row| {
+            row.as_refresh_floating_limit()
+                .map(|r| r.task_id().unwrap_or_default().to_string())
+        })
+        .expect("the replacement is pending");
+    assert_ne!(replacement, first_task_id, "the replacement is a new task");
+}
+
+/// A backed-off retry stays in the index unclaimable until its retry time.
+#[silo::test]
+async fn floating_limit_backed_off_retry_is_not_delivered_before_its_retry_time() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-retry-gate-q";
+    let task_id = schedule_and_lease_refresh(&shard, queue)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone();
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+    let next_retry = read_floating_state(&shard, queue)
+        .await
+        .next_retry_at_ms()
+        .expect("failure sets a retry time");
+    assert!(now_ms() < next_retry, "the retry is in the future");
+
+    let early = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue before retry time");
+    assert!(
+        early.refresh_tasks.is_empty(),
+        "the retry is not claimable before its retry time"
+    );
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        1,
+        "the retry is still pending"
+    );
+
+    // The gate compares against the system clock, so the first-failure
+    // backoff (`INITIAL_BACKOFF_MS` in the failure path, one second) has to
+    // elapse for real.
+    let wait = (next_retry - now_ms()).max(0) as u64 + 50;
+    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    let due = dequeue_refresh_tasks_until(&shard, "worker-1", "default", 1, DEQUEUE_TIMEOUT).await;
+    assert_eq!(due.refresh_tasks[0].queue_key, queue);
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+}
+
+/// An index row for a tenant outside the shard range is dropped by the
+/// drain, not leased.
+#[silo::test]
+async fn floating_limit_defunct_index_row_is_dropped_on_dequeue() {
+    // `aaa` hashes outside the left half of the keyspace.
+    let left_half = silo::shard_range::ShardRange::new("", "8000000000000000");
+    assert!(!left_half.contains_tenant("aaa"));
+    let (_tmp, shard) = open_temp_shard_with_range(left_half).await;
+    shard.stop_grant_scanner();
+
+    shard
+        .put_refresh_index_row_for_test(&refresh_task("aaa", "fl-defunct-q", "default"), None)
+        .await
+        .expect("seed defunct row");
+    assert_eq!(count_refresh_index_rows(&shard, "default").await, 1);
+
+    let result = shard
+        .dequeue("worker-1", "default", 10)
+        .await
+        .expect("dequeue");
+    assert!(
+        result.refresh_tasks.is_empty(),
+        "a defunct row is never leased"
+    );
+    assert_eq!(count_refresh_index_rows(&shard, "default").await, 0);
+    assert_eq!(count_lease_keys(shard.db()).await, 0);
+}
+
+/// A group with more pending refreshes than one drain leases hands over at
+/// most the drain bound per dequeue and the rest on the next.
+#[silo::test]
+async fn floating_limit_drain_leases_at_most_the_bound_per_dequeue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let bound = silo::job_store_shard::REFRESH_DRAIN_MAX_LEASED;
+    let pending = bound + 4;
+    for i in 0..pending {
+        shard
+            .put_refresh_index_row_for_test(
+                &refresh_task("-", &format!("fl-fan-q-{i:02}"), "fan"),
+                None,
+            )
+            .await
+            .expect("seed row");
+    }
+
+    let first = shard
+        .dequeue("worker-1", "fan", 100)
+        .await
+        .expect("dequeue 1");
+    assert_eq!(first.refresh_tasks.len(), bound);
+    let second = shard
+        .dequeue("worker-1", "fan", 100)
+        .await
+        .expect("dequeue 2");
+    assert_eq!(second.refresh_tasks.len(), pending - bound);
+    assert_eq!(count_refresh_index_rows(&shard, "fan").await, 0);
+    let third = shard
+        .dequeue("worker-1", "fan", 100)
+        .await
+        .expect("dequeue 3");
+    assert!(third.refresh_tasks.is_empty());
+}
+
+/// The drain bound counts leased rows, not scanned rows: a claimable row
+/// sorting after more than a bound's worth of backed-off rows is still
+/// returned on the first dequeue.
+#[silo::test]
+async fn floating_limit_claimable_row_behind_backed_off_rows_is_delivered() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let far_future = now_ms() + 3_600_000;
+    for i in 0..silo::job_store_shard::REFRESH_DRAIN_MAX_LEASED + 4 {
+        shard
+            .put_refresh_index_row_for_test(
+                &refresh_task("-", &format!("fl-backed-off-q-{i:02}"), "fan"),
+                Some(far_future),
+            )
+            .await
+            .expect("seed backed-off row");
+    }
+    // `z` sorts after every `fl-backed-off-*` key.
+    shard
+        .put_refresh_index_row_for_test(&refresh_task("-", "z-claimable-q", "fan"), None)
+        .await
+        .expect("seed claimable row");
+
+    let result = shard
+        .dequeue("worker-1", "fan", 100)
+        .await
+        .expect("dequeue");
+    assert_eq!(result.refresh_tasks.len(), 1);
+    assert_eq!(result.refresh_tasks[0].queue_key, "z-claimable-q");
+}
+
+/// A `RefreshFloatingLimit` row in the task line is leased when the broker
+/// reaches it.
+#[silo::test]
+async fn floating_limit_task_line_refresh_row_is_leased_by_the_broker() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-task-line-q";
+    let now = now_ms();
+    let task = refresh_task("-", queue, "default");
+    shard
+        .db()
+        .put(
+            &silo::keys::task_key(
+                "default",
+                now,
+                0,
+                &format!("floating_refresh:{queue}"),
+                0,
+                now,
+            ),
+            &silo::codec::encode_task(&task),
+        )
+        .await
+        .expect("write task-line refresh row");
+    shard.db().flush().await.expect("flush");
+    assert_eq!(
+        count_task_line_refresh_tasks(&shard, queue, "default").await,
+        1
+    );
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+
+    let leased =
+        dequeue_refresh_tasks_until(&shard, "worker-1", "default", 1, DEQUEUE_TIMEOUT).await;
+    assert_eq!(leased.refresh_tasks[0].queue_key, queue);
+    assert_eq!(
+        count_task_line_refresh_tasks(&shard, queue, "default").await,
+        0
+    );
+    assert_eq!(count_lease_keys(shard.db()).await, 1);
+}
+
+/// A shard reopened with stock settings warms its pending-group gate from
+/// the durable index, so a refresh left pending is drained on the first
+/// dequeue after the reopen.
+#[silo::test]
+async fn floating_limit_pending_refresh_survives_a_shard_reopen() {
+    use silo::settings::{Backend, DatabaseConfig};
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = DatabaseConfig {
+        name: "test".to_string(),
+        backend: Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+        ..Default::default()
+    };
+    let queue = "fl-reopen-q";
+    {
+        let shard = silo::job_store_shard::JobStoreShard::open(
+            &cfg,
+            silo::gubernator::MockGubernatorClient::new_arc(),
+            None,
+            silo::shard_range::ShardRange::full(),
+        )
+        .await
+        .expect("open shard");
+        shard.stop_grant_scanner();
+        enqueue_floating(&shard, queue, 1).await;
+        enqueue_floating(&shard, queue, 2).await;
+        assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+        shard.close().await.expect("close shard");
+    }
+    let shard = silo::job_store_shard::JobStoreShard::open(
+        &cfg,
+        silo::gubernator::MockGubernatorClient::new_arc(),
+        None,
+        silo::shard_range::ShardRange::full(),
+    )
+    .await
+    .expect("reopen shard");
+    shard.stop_grant_scanner();
+
+    let result = shard
+        .dequeue("worker-1", "default", 0)
+        .await
+        .expect("dequeue");
+    assert_eq!(
+        result.refresh_tasks.len(),
+        1,
+        "the pending refresh is drained after the reopen"
+    );
+    assert_eq!(result.refresh_tasks[0].queue_key, queue);
+}
+
+/// Index rows written by the scheduler and by the failure path carry the
+/// index row TTL.
+#[silo::test]
+async fn floating_limit_index_rows_carry_the_row_ttl() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-row-ttl-q";
+    let ttl = silo::job_store_shard::REFRESH_INDEX_ROW_TTL_MS;
+    let key = silo::keys::refresh_task_key("default", "-", queue);
+
+    let before = now_ms();
+    enqueue_floating(&shard, queue, 1).await;
+    enqueue_floating(&shard, queue, 2).await;
+    let scheduled = shard
+        .db()
+        .get_key_value(&key)
+        .await
+        .expect("get_key_value")
+        .expect("scheduled row present")
+        .expire_ts
+        .expect("scheduled row carries expire_ts");
+    assert!(
+        scheduled >= before + ttl - 5_000 && scheduled <= now_ms() + ttl + 5_000,
+        "scheduled row expire_ts {scheduled} is not about {ttl} ms out"
+    );
+
+    let task_id = dequeue_refresh_tasks_until(&shard, "worker-1", "default", 1, DEQUEUE_TIMEOUT)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone();
+    let before = now_ms();
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+    let retried = shard
+        .db()
+        .get_key_value(&key)
+        .await
+        .expect("get_key_value")
+        .expect("retry row present")
+        .expire_ts
+        .expect("retry row carries expire_ts");
+    assert!(
+        retried >= before + ttl - 5_000 && retried <= now_ms() + ttl + 5_000,
+        "retry row expire_ts {retried} is not about {ttl} ms out"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bounded stale resets
+// ---------------------------------------------------------------------------
+
+/// Consecutive stale resets double the stale window from the base: after two
+/// resets a 10 s base window is 40 s wide. Windows are sized in seconds so
+/// the wall-clock between writing a backdated row and reading it cannot
+/// cross a threshold.
+#[silo::test]
+async fn floating_limit_consecutive_stale_resets_double_the_stale_window() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(10_000).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-backoff-q";
+    // j1 holds the single slot, so every later enqueue is a waiter.
+    enqueue_floating(&shard, queue, 1).await;
+
+    // A stamp-less flag is stale on sight: the first reset.
+    write_refresh_state(&shard, queue, None, 0).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        1
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+
+    // One reset widens the window to 20 s: a stamp older than that is stale.
+    write_refresh_state(&shard, queue, Some(now_ms() - 20_001), 1).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        2
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 2.0);
+
+    // Two resets widen it to 40 s: a 15 s old stamp is still trusted.
+    write_refresh_state(&shard, queue, Some(now_ms() - 15_000), 2).await;
+    enqueue_floating(&shard, queue, 4).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        2
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 2.0);
+
+    // Past 40 s the flag is stale again and the count keeps climbing.
+    write_refresh_state(&shard, queue, Some(now_ms() - 40_001), 2).await;
+    enqueue_floating(&shard, queue, 5).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        3
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 3.0);
+}
+
+/// `floating_refresh_stale_max_ms` caps the widened window.
+#[silo::test]
+async fn floating_limit_stale_window_is_capped_by_the_max_setting() {
+    let (_tmp, shard, metrics) =
+        open_temp_shard_with_floating_refresh_stale_window(10_000, 30_000).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-cap-q";
+    enqueue_floating(&shard, queue, 1).await;
+
+    // Two resets would widen the window to 40 s; the cap holds it at 30 s.
+    write_refresh_state(&shard, queue, Some(now_ms() - 25_000), 2).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        2
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+
+    write_refresh_state(&shard, queue, Some(now_ms() - 30_001), 2).await;
+    enqueue_floating(&shard, queue, 3).await;
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        3
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+}
+
+/// Age a stamp-less flag out on `queue` so a waiter writes a replacement
+/// that records one stale reset, then lease that replacement. Returns its
+/// task id.
+async fn lease_replacement_after_one_stale_reset(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+) -> String {
+    enqueue_floating(shard, queue, 1).await;
+    write_refresh_state(shard, queue, None, 0).await;
+    enqueue_floating(shard, queue, 2).await;
+    assert_eq!(
+        read_floating_state(shard, queue).await.stale_reset_count(),
+        1
+    );
+    dequeue_refresh_tasks_until(shard, "worker-1", "default", 1, DEQUEUE_TIMEOUT)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone()
+}
+
+/// A reported success clears the stale reset count, and the first schedule
+/// after that clean outcome leaves it at zero.
+#[silo::test]
+async fn floating_limit_refresh_success_clears_the_stale_reset_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-clear-success-q";
+    let task_id = lease_replacement_after_one_stale_reset(&shard, queue).await;
+
+    shard
+        .report_refresh_success(&task_id, 1)
+        .await
+        .expect("report success");
+    assert_eq!(
+        read_floating_state(&shard, queue).await.stale_reset_count(),
+        0
+    );
+
+    // The interval elapses and a new waiter schedules the next refresh: a
+    // first schedule after a clean outcome does not widen the window.
+    backdate_last_refreshed(&shard, queue).await;
+    enqueue_floating(&shard, queue, 3).await;
+    let state = read_floating_state(&shard, queue).await;
+    assert!(state.refresh_task_scheduled());
+    assert_eq!(state.stale_reset_count(), 0);
+}
+
+/// A reported failure clears the stale reset count.
+#[silo::test]
+async fn floating_limit_refresh_failure_clears_the_stale_reset_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-clear-failure-q";
+    let task_id = lease_replacement_after_one_stale_reset(&shard, queue).await;
+
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+    let state = read_floating_state(&shard, queue).await;
+    assert_eq!(state.stale_reset_count(), 0);
+    assert_eq!(
+        state.retry_count(),
+        1,
+        "the failure backoff is still recorded"
+    );
+}
+
+/// A refresh lease expiring clears the stale reset count.
+#[silo::test]
+async fn floating_limit_refresh_lease_expiry_clears_the_stale_reset_count() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-reset-clear-expiry-q";
+    let task_id = lease_replacement_after_one_stale_reset(&shard, queue).await;
+
+    let lease_key = silo::keys::leased_task_key(&task_id);
+    let lease_raw = shard
+        .db()
+        .get(&lease_key)
+        .await
+        .expect("db get")
+        .expect("lease exists");
+    let decoded_lease = decode_lease(lease_raw).expect("decode lease");
+    let expired = LeaseRecord {
+        worker_id: decoded_lease.worker_id().to_string(),
+        task: decoded_lease.to_task().unwrap(),
+        expiry_ms: now_ms() - 1,
+        started_at_ms: decoded_lease.started_at_ms(),
+    };
+    shard
+        .db()
+        .put(&lease_key, &encode_lease(&expired))
+        .await
+        .expect("put expired lease");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(shard.reap_expired_leases("-").await.expect("reap"), 1);
+    let state = read_floating_state(&shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.stale_reset_count(), 0);
+}
+
+/// Two workers polling one group at the same time lease a pending refresh
+/// once: drains on a shard are serialized from scan to commit.
+#[silo::test]
+async fn floating_limit_concurrent_drains_lease_a_refresh_once() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-concurrent-drain-q";
+    enqueue_floating(&shard, queue, 1).await;
+    enqueue_floating(&shard, queue, 2).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+
+    let (a, b) = tokio::join!(
+        shard.dequeue("worker-a", "default", 10),
+        shard.dequeue("worker-b", "default", 10)
+    );
+    let (a, b) = (a.expect("dequeue a"), b.expect("dequeue b"));
+    assert_eq!(
+        a.refresh_tasks.len() + b.refresh_tasks.len(),
+        1,
+        "one pending refresh is leased by exactly one of the two polls"
+    );
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert_eq!(
+        count_lease_keys(shard.db()).await,
+        2,
+        "the holder's attempt and the refresh are the only leases"
+    );
+}
+
+/// Chains the grant scanner resumes in one commit chunk share the batch's
+/// refresh record: twelve waiters on a fixed queue whose chains continue
+/// into a floating queue at capacity with a stale flag schedule one
+/// replacement refresh and count one reset.
+#[silo::test]
+async fn floating_limit_scanner_chunk_of_waiters_schedules_one_replacement_refresh() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_floating_refresh_stale_ms(60_000).await;
+    shard.stop_grant_scanner();
+    let queue = "fl-chunk-dedupe-q";
+    let gate = "fl-chunk-gate-q";
+    let waiters = 12usize;
+    let fixed = || {
+        silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: gate.to_string(),
+            max_concurrency: waiters as u32,
+        })
+    };
+
+    // The floating queue's single slot is held from another task group.
+    enqueue_floating_in_group(&shard, queue, 1, "other").await;
+    // Blockers fill the fixed queue so every chained job parks on it.
+    for i in 0..waiters {
+        shard
+            .enqueue(
+                "-",
+                Some(format!("blocker-{i}")),
+                10u8,
+                now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"blocker": i})),
+                vec![fixed()],
+                None,
+                "chunk",
+            )
+            .await
+            .expect("enqueue blocker");
+    }
+    for i in 0..waiters {
+        shard
+            .enqueue(
+                "-",
+                Some(format!("chained-{i}")),
+                10u8,
+                now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"chained": i})),
+                vec![fixed(), floating_limit(queue, REFRESH_INTERVAL_MS)],
+                None,
+                "chunk",
+            )
+            .await
+            .expect("enqueue chained job");
+    }
+    write_refresh_state(&shard, queue, None, 0).await;
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
+
+    // Finish the blockers so the fixed queue frees all of its slots at once.
+    let leased = dequeue_task_ids_until(&shard, "worker-1", "chunk", waiters).await;
+    assert_eq!(leased.len(), waiters);
+    for task_id in &leased {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("finish blocker");
+    }
+
+    // One synchronous grant pass resumes every chained job into one chunk.
+    shard
+        .process_concurrency_grants("-", gate, waiters as u32)
+        .await;
+
+    assert_eq!(count_concurrency_requests(shard.db()).await, waiters);
+    assert_eq!(
+        count_refresh_tasks_in_group(&shard, queue, "chunk").await,
+        1
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 1.0);
+}
+
+/// Chains walked into one batch onto a floating queue with no state row yet:
+/// the second chain schedules the refresh and sets the flag, and later
+/// chains must not overwrite that flag with a fresh default row.
+#[silo::test]
+async fn floating_limit_new_queue_scheduled_in_one_batch_keeps_its_flag() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-batch-new-queue-q";
+    let rate_limit = silo::job::GubernatorRateLimit {
+        name: "batch-new-queue".to_string(),
+        unique_key: format!("batch-new-queue-{}", uuid::Uuid::new_v4()),
+        limit: 100,
+        duration_ms: 60_000,
+        hits: 1,
+        algorithm: silo::job::GubernatorAlgorithm::TokenBucket,
+        behavior: 0,
+        retry_policy: silo::job::RateLimitRetryPolicy::default(),
+    };
+    for tag in 0..5u32 {
+        shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({"j": tag})),
+                vec![
+                    silo::job::Limit::RateLimit(rate_limit.clone()),
+                    floating_limit(queue, REFRESH_INTERVAL_MS),
+                ],
+                None,
+                "batch",
+            )
+            .await
+            .expect("enqueue chained job");
+    }
+
+    // The first chain takes the single slot, the second becomes a waiter and
+    // schedules the refresh, the rest wait too; nothing is drained yet.
+    let result = shard
+        .dequeue("worker-1", "batch", 100)
+        .await
+        .expect("dequeue");
+    assert_eq!(result.tasks.len(), 1);
+    assert_eq!(count_concurrency_requests(shard.db()).await, 4);
+    let state = read_floating_state(&shard, queue).await;
+    assert!(
+        state.refresh_task_scheduled(),
+        "the flag set by the second chain survives the later chains' walks"
+    );
+    assert!(state.refresh_scheduled_at_ms().is_some());
+    assert_eq!(
+        count_refresh_tasks_in_group(&shard, queue, "batch").await + result.refresh_tasks.len(),
+        1
+    );
+    assert_eq!(read_refresh_reset_total(&metrics), 0.0);
 }

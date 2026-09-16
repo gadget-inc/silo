@@ -26,6 +26,35 @@ use crate::keys::{
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
 
+/// Floating queues for which one write batch has already scheduled a
+/// refresh, with the task group each refresh index row was written under.
+/// Batch reads see the durable state row, not the batch's pending puts, so
+/// without this record every chain walked into the same batch would judge
+/// the same stale flag and write its own replacement refresh. Once the
+/// batch is durable, its owner marks the recorded groups pending for the
+/// refresh drain.
+#[derive(Debug, Default)]
+pub struct ScheduledRefreshes(Vec<(String, String, String)>);
+
+impl ScheduledRefreshes {
+    pub(crate) fn contains(&self, tenant: &str, queue_key: &str) -> bool {
+        self.0.iter().any(|(t, q, _)| t == tenant && q == queue_key)
+    }
+
+    pub(crate) fn record(&mut self, tenant: &str, queue_key: &str, task_group: &str) {
+        self.0.push((
+            tenant.to_string(),
+            queue_key.to_string(),
+            task_group.to_string(),
+        ));
+    }
+
+    /// Task groups that received an index row in this batch.
+    pub fn task_groups(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(_, _, g)| g.as_str())
+    }
+}
+
 /// Parameters for creating limit-processing tasks.
 /// Bundles the many fields needed by `enqueue_limit_task_at_index` into a single struct.
 pub(crate) struct LimitTaskParams<'a> {
@@ -63,6 +92,9 @@ pub(crate) struct LimitTaskParams<'a> {
     /// This matches the Alloy model's completeFailureRetryReleaseTicket which creates a
     /// TicketRequest, not an immediate holder.
     pub skip_try_reserve: bool,
+    /// The record shared by every chain walked into the same write batch,
+    /// so a floating queue's refresh is scheduled once per batch.
+    pub scheduled_refreshes: &'a mut ScheduledRefreshes,
 }
 
 /// Result of walking a job's remaining limits.
@@ -205,10 +237,12 @@ impl JobStoreShard {
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         let mut batch = WriteBatch::new();
+        let mut scheduled_refreshes = ScheduledRefreshes::default();
         let background_action_metadata = metadata.clone().unwrap_or_default();
         let grants = self
             .write_enqueue_data(
                 &mut DbWriteBatcher::new(&self.db, &mut batch),
+                &mut scheduled_refreshes,
                 tenant,
                 job_id,
                 priority,
@@ -269,6 +303,7 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
+        self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
         self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
             .await
@@ -330,9 +365,11 @@ impl JobStoreShard {
             return Err(JobStoreShardError::JobAlreadyExists(job_id.to_string()));
         }
 
+        let mut scheduled_refreshes = ScheduledRefreshes::default();
         let grants = self
             .write_enqueue_data(
                 &mut TxnWriter(&txn),
+                &mut scheduled_refreshes,
                 tenant,
                 job_id,
                 priority,
@@ -389,6 +426,7 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
+        self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
         self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
             .await
@@ -400,6 +438,7 @@ impl JobStoreShard {
     async fn write_enqueue_data<W: WriteBatcher>(
         &self,
         writer: &mut W,
+        scheduled_refreshes: &mut ScheduledRefreshes,
         tenant: &str,
         job_id: &str,
         priority: u8,
@@ -473,6 +512,7 @@ impl JobStoreShard {
                     held_queues: Vec::new(),
                     task_group,
                     skip_try_reserve: false,
+                    scheduled_refreshes,
                 },
             )
             .await
@@ -589,6 +629,7 @@ impl JobStoreShard {
             held_queues,
             task_group,
             skip_try_reserve,
+            scheduled_refreshes,
         } = params;
         // Walk limits in the order the client provided them — silo no longer
         // reorders. `current_index` and the `limit_index` stored in
@@ -698,10 +739,20 @@ impl JobStoreShard {
 
                 Limit::FloatingConcurrency(fl) => {
                     // Get/create floating limit state and maybe schedule refresh
-                    let state = self
-                        .get_or_create_floating_limit_state(writer, tenant, fl)
-                        .await?;
-                    let refresh_ready = self.floating_limit_refresh_ready(&state, now_ms);
+                    // A refresh this batch already scheduled is invisible to
+                    // durable reads: the row would read as stale again from
+                    // every later walk into the same batch, and a cold-path
+                    // create would overwrite the batch's flag on commit.
+                    let already_scheduled = scheduled_refreshes.contains(tenant, &fl.key);
+                    let state = if already_scheduled {
+                        self.floating_limit_state_or_default(writer, tenant, fl)
+                            .await?
+                    } else {
+                        self.get_or_create_floating_limit_state(writer, tenant, fl)
+                            .await?
+                    };
+                    let refresh_ready =
+                        !already_scheduled && self.floating_limit_refresh_ready(&state, now_ms);
 
                     // Try immediate grant using current max concurrency
                     let current_max = state.current_max_concurrency();
@@ -749,8 +800,8 @@ impl JobStoreShard {
                             .has_waiting_concurrency_requests(tenant, &fl.key)
                             .await?;
                     }
-                    if refresh_ready {
-                        self.maybe_schedule_floating_limit_refresh(
+                    if refresh_ready
+                        && self.maybe_schedule_floating_limit_refresh(
                             writer,
                             tenant,
                             &fl.key,
@@ -758,7 +809,9 @@ impl JobStoreShard {
                             now_ms,
                             task_group,
                             has_waiters,
-                        )?;
+                        )?
+                    {
+                        scheduled_refreshes.record(tenant, &fl.key, task_group);
                     }
 
                     match record_grant_outcome(

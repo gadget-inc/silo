@@ -267,6 +267,17 @@ fn default_floating_refresh_stale_ms() -> u64 {
     DEFAULT_FLOATING_REFRESH_STALE_MS
 }
 
+/// Default for `floating_refresh_stale_max_ms`: the widest the stale window
+/// grows. Each consecutive stale reset of one queue's flag doubles the
+/// window from `floating_refresh_stale_ms`, so a refresh that is scheduled
+/// but never leased costs a bounded number of resets per hour instead of
+/// one per base window.
+pub const DEFAULT_FLOATING_REFRESH_STALE_MAX_MS: u64 = 3_600_000;
+
+fn default_floating_refresh_stale_max_ms() -> u64 {
+    DEFAULT_FLOATING_REFRESH_STALE_MAX_MS
+}
+
 /// Default for `broker_tombstone_revive_after_generations`: how many scan
 /// generations an ack tombstone may keep suppressing a re-observed task key
 /// before the broker point-reads the row and, if it is still durable,
@@ -390,6 +401,13 @@ pub struct DatabaseTemplate {
     /// immediately. Defaults to 60000.
     #[serde(default = "default_floating_refresh_stale_ms")]
     pub floating_refresh_stale_ms: u64,
+    /// Cap (ms) on the stale window after consecutive stale resets of one
+    /// queue's flag: the window is `floating_refresh_stale_ms` doubled per
+    /// consecutive reset, up to this value. Any refresh outcome resets the
+    /// count. A cap below the base window is treated as the base. Defaults
+    /// to 3600000.
+    #[serde(default = "default_floating_refresh_stale_max_ms")]
+    pub floating_refresh_stale_max_ms: u64,
     /// Scan generations an ack tombstone may keep suppressing a task key the
     /// scanner keeps re-observing before the broker point-reads the row and
     /// revives it if it is still durable. Defaults to 64.
@@ -471,6 +489,7 @@ impl Default for DatabaseTemplate {
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
+            floating_refresh_stale_max_ms: default_floating_refresh_stale_max_ms(),
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
             completed_job_expire_s: None,
@@ -838,6 +857,11 @@ pub struct DatabaseConfig {
     /// to 60000.
     #[serde(default = "default_floating_refresh_stale_ms")]
     pub floating_refresh_stale_ms: u64,
+    /// Cap (ms) on the stale window after consecutive stale resets. See
+    /// `DatabaseTemplate::floating_refresh_stale_max_ms` for details.
+    /// Defaults to 3600000.
+    #[serde(default = "default_floating_refresh_stale_max_ms")]
+    pub floating_refresh_stale_max_ms: u64,
     /// Scan generations an ack tombstone may suppress a re-observed task key.
     /// See `DatabaseTemplate::broker_tombstone_revive_after_generations` for
     /// details. Defaults to 64.
@@ -895,6 +919,7 @@ impl Default for DatabaseConfig {
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
+            floating_refresh_stale_max_ms: default_floating_refresh_stale_max_ms(),
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
             completed_job_expire_s: None,
@@ -1099,6 +1124,7 @@ mod tests {
         )
         .expect("template without refresh settings should parse");
         assert_eq!(template.floating_refresh_stale_ms, 60_000);
+        assert_eq!(template.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(template.broker_tombstone_revive_after_generations, 64);
 
         let config: DatabaseConfig = toml::from_str(
@@ -1110,6 +1136,7 @@ mod tests {
         )
         .expect("config without refresh settings should parse");
         assert_eq!(config.floating_refresh_stale_ms, 60_000);
+        assert_eq!(config.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(config.broker_tombstone_revive_after_generations, 64);
     }
 }

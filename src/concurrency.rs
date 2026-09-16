@@ -50,6 +50,7 @@ use slatedb::config::WriteOptions;
 
 use crate::instrumented_db::InstrumentedDb;
 
+use crate::job_store_shard::ScheduledRefreshes;
 use crate::job_store_shard::counters::{decode_counter, encode_counter};
 use crate::job_store_shard::helpers::{WriteBatcher, live_terminal_row_exists};
 
@@ -138,12 +139,15 @@ pub struct ResumeChainParams {
 #[async_trait::async_trait]
 pub trait LimitChainResumer: Send + Sync {
     /// Append edits to `batch` that continue the limit chain from
-    /// `params.limit_index`. Returns the `(queue, task_id)` pairs of any
-    /// additional in-memory concurrency reservations the chain made (so the
-    /// caller can roll them back if the batch write fails).
+    /// `params.limit_index`. `scheduled_refreshes` is shared by every chain
+    /// resumed into the same batch, so a downstream floating queue's refresh
+    /// is scheduled once per batch. Returns the `(queue, task_id)` pairs of
+    /// any additional in-memory concurrency reservations the chain made (so
+    /// the caller can roll them back if the batch write fails).
     async fn resume_chain(
         &self,
         batch: &mut slatedb::WriteBatch,
+        scheduled_refreshes: &mut ScheduledRefreshes,
         params: ResumeChainParams,
     ) -> Result<Vec<(String, String)>, ConcurrencyError>;
 
@@ -152,6 +156,11 @@ pub trait LimitChainResumer: Send + Sync {
     /// scanner's drain iteration to finish every other queue's pass. Default
     /// is a no-op for resumers with no broker access.
     fn wakeup_task_groups(&self, _groups: &[String]) {}
+
+    /// The chunk that wrote refresh index rows under `task_groups` is
+    /// durable; the shard marks those groups pending for its refresh drain.
+    /// Default is a no-op for resumers with no shard access.
+    fn refresh_index_rows_committed(&self, _task_groups: &[String]) {}
 
     /// The grant scanner found the floating queue `(tenant, queue)` at
     /// capacity with pending grant demand and skipped its request scan. The
@@ -2412,6 +2421,7 @@ impl ConcurrencyManager {
             let needed = (count as usize - total_granted).min(self.grant_scanner_batch_size);
 
             let mut batch = WriteBatch::new();
+            let mut chunk_scheduled_refreshes = ScheduledRefreshes::default();
             let mut stale_and_corrupt_count: usize = 0;
 
             // --- Scan batch of candidates ---
@@ -2979,7 +2989,10 @@ impl ConcurrencyManager {
                     read_cache: read_cache.clone(),
                 };
 
-                match resumer.resume_chain(&mut batch, resume_params).await {
+                match resumer
+                    .resume_chain(&mut batch, &mut chunk_scheduled_refreshes, resume_params)
+                    .await
+                {
                     Ok(chain_grants) => {
                         // Each (queue, task_id) the chain reserved must roll back
                         // alongside ours if this chunk's write fails.
@@ -3005,6 +3018,11 @@ impl ConcurrencyManager {
 
                 if chunk_grants.len() >= self.grant_scanner_commit_chunk_size {
                     let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
+                    let refresh_groups: Vec<String> =
+                        std::mem::take(&mut chunk_scheduled_refreshes)
+                            .task_groups()
+                            .map(str::to_string)
+                            .collect();
                     let stale_deletes = std::mem::take(&mut chunk_stale);
                     if self
                         .commit_grant_chunk(
@@ -3024,6 +3042,9 @@ impl ConcurrencyManager {
                         record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted_groups;
                     }
+                    if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
+                        resumer.refresh_index_rows_committed(&refresh_groups);
+                    }
                     total_granted += chunk_grants.len();
                     total_stale_deleted += stale_deletes;
                     all_granted_groups.extend(chunk_grants.drain(..).map(|(_, tg)| tg));
@@ -3041,6 +3062,10 @@ impl ConcurrencyManager {
                 continue;
             }
             let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
+            let refresh_groups: Vec<String> = chunk_scheduled_refreshes
+                .task_groups()
+                .map(str::to_string)
+                .collect();
             let stale_deletes = std::mem::take(&mut chunk_stale);
             if self
                 .commit_grant_chunk(
@@ -3059,6 +3084,9 @@ impl ConcurrencyManager {
             {
                 record_invocation(scanned_this_invocation, total_stale_deleted);
                 return all_granted_groups;
+            }
+            if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
+                resumer.refresh_index_rows_committed(&refresh_groups);
             }
             total_granted += chunk_grants.len();
             total_stale_deleted += stale_deletes;

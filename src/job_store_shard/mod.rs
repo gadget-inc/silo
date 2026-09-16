@@ -29,7 +29,9 @@ pub use import::JobNotReimportableError;
 pub use lease_task::JobNotLeaseableError;
 pub use restart::JobNotRestartableError;
 
+pub use enqueue::ScheduledRefreshes;
 pub(crate) use enqueue::{LimitTaskParams, LimitTaskWriteResult};
+pub use floating::{REFRESH_DRAIN_MAX_LEASED, REFRESH_INDEX_ROW_TTL_MS};
 use helpers::DbWriteBatcher;
 use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
@@ -132,6 +134,9 @@ pub struct OpenShardOptions {
     /// before a replacement refresh may be scheduled. Populated from
     /// `DatabaseConfig::floating_refresh_stale_ms`.
     pub floating_refresh_stale_ms: u64,
+    /// Cap (ms) on the stale window widened by consecutive stale resets.
+    /// Populated from `DatabaseConfig::floating_refresh_stale_max_ms`.
+    pub floating_refresh_stale_max_ms: u64,
     /// Scan generations an ack tombstone may keep suppressing a re-observed
     /// task key before the broker point-reads the row. Populated from
     /// `DatabaseConfig::broker_tombstone_revive_after_generations`.
@@ -242,8 +247,20 @@ pub struct JobStoreShard {
     /// from per-status counters instead of a full status-index scan.
     pub(crate) count_from_status_counters: bool,
     /// Age (ms) past which a set `refresh_task_scheduled` flag is treated as
-    /// a lost refresh rather than an outstanding one.
+    /// a lost refresh rather than an outstanding one, before consecutive
+    /// stale resets widen it.
     pub(crate) floating_refresh_stale_ms: i64,
+    /// The widest the stale window grows under consecutive stale resets.
+    pub(crate) floating_refresh_stale_max_ms: i64,
+    /// Task groups that may hold a refresh index row, each with a generation
+    /// bumped by every index put. A drain skips groups not present here and
+    /// removes a group only when its scan found the range empty at an
+    /// unchanged generation. `BTreeMap` keeps iteration deterministic for
+    /// the simulation harness.
+    pub(crate) refresh_pending_groups: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Serializes refresh index drains from scan to commit, so concurrent
+    /// polls for one group cannot both lease the same row.
+    pub(crate) refresh_drain_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Error)]
@@ -438,6 +455,7 @@ impl JobStoreShard {
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 count_from_status_counters: cfg.count_from_status_counters,
                 floating_refresh_stale_ms: cfg.floating_refresh_stale_ms,
+                floating_refresh_stale_max_ms: cfg.floating_refresh_stale_max_ms,
                 broker_tombstone_revive_after_generations: cfg
                     .broker_tombstone_revive_after_generations,
             },
@@ -485,6 +503,7 @@ impl JobStoreShard {
             terminal_job_expire_s,
             count_from_status_counters,
             floating_refresh_stale_ms,
+            floating_refresh_stale_max_ms,
             broker_tombstone_revive_after_generations,
         } = options;
 
@@ -607,7 +626,22 @@ impl JobStoreShard {
             // Epoch-ms arithmetic needs an i64; a value past i64::MAX saturates
             // and means only stamp-less rows ever read as stale.
             floating_refresh_stale_ms: i64::try_from(floating_refresh_stale_ms).unwrap_or(i64::MAX),
+            floating_refresh_stale_max_ms: i64::try_from(floating_refresh_stale_max_ms)
+                .unwrap_or(i64::MAX),
+            refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            refresh_drain_lock: tokio::sync::Mutex::new(()),
         });
+
+        // The refresh index holds at most one row per floating queue with a
+        // pending refresh, so warming the pending-group gate from it is one
+        // small prefix scan, and it runs on every open.
+        let warm_started = std::time::Instant::now();
+        shard.warm_refresh_pending_groups().await?;
+        tracing::debug!(
+            shard = %shard.name,
+            elapsed_ms = warm_started.elapsed().as_millis() as u64,
+            "shard open: warm refresh pending groups"
+        );
 
         // Install the chain resumer before starting the grant scanner so the
         // scanner's first wake-up has a working callback for resuming limit

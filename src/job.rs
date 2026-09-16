@@ -55,6 +55,11 @@ pub struct FloatingLimitState {
     /// than the shard's stale threshold, or with this field absent, is
     /// treated as no outstanding refresh so a lost task cannot pin the cap.
     pub refresh_scheduled_at_ms: Option<i64>,
+    /// Consecutive times the outstanding-refresh flag was found stale and
+    /// replaced. Each doubles the stale window from the shard's base up to
+    /// its cap; any refresh outcome (success, reported failure, lease
+    /// expiry) resets it to 0.
+    pub stale_reset_count: u32,
 }
 
 /// Rate limiting algorithm used by Gubernator
