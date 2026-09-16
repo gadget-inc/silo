@@ -91,6 +91,10 @@ path = "gs://my-bucket/silo/%shard%"
 apply_wal_on_close = true
 # Optional: periodic self-healing scan for pending concurrency requests
 # concurrency_reconcile_interval_ms = 5000
+# Optional: orphan concurrency holder sweep (see the per-option sections below)
+# orphan_holder_sweep_slice = 5000
+# orphan_holder_grace_ms = 60000
+# orphan_holder_stale_ms = 86400000
 
 # Optional: separate WAL storage
 [database.wal]
@@ -106,6 +110,9 @@ path = "/var/lib/silo/wal/%shard%"
 | `path` | string | `"/tmp/silo/%shard%"` | Path or URL for data storage. Use `%shard%` as a placeholder for the shard number. |
 | `apply_wal_on_close` | bool | `true` | Flush WAL to object storage before closing shards (recommended for durability) |
 | `concurrency_reconcile_interval_ms` | number | `5000` | Optional interval for periodic pending-request reconciliation in the concurrency manager |
+| `orphan_holder_sweep_slice` | number | `5000` | Max durable concurrency holder rows the orphan holder sweep walks per reconcile tick; values below 1 are treated as 1 |
+| `orphan_holder_grace_ms` | number | `60000` | Minimum age of a concurrency holder before the orphan holder sweep classifies it |
+| `orphan_holder_stale_ms` | number | `86400000` | Age past which a concurrency holder with no unexpired lease is purged regardless of its job's status; `0` disables this rule |
 
 <Aside type="caution">
 The `%shard%` placeholder must be an independent directory segment—it cannot have a prefix or suffix within the same path component.
@@ -167,6 +174,18 @@ Note that `apply_wal_on_close` only applies during **graceful** shutdowns. If a 
 Silo runs a background reconciliation loop while each shard is open. This loop periodically scans pending concurrency request records and re-signals grant processing. It is a self-healing mechanism for cases where durable requests exist but in-memory notifications were missed (for example, due to a crash between separate write/notify phases).
 
 This option is **optional**. If omitted, Silo uses the default value of `5000` milliseconds.
+
+#### `orphan_holder_sweep_slice`
+
+On the same reconciliation loop, each shard walks its durable concurrency holder rows and releases holders whose task is gone, so a leaked holder cannot wedge a queue indefinitely. The [Internals guide](/silo/guides/internals/#orphan-holder-sweep) describes how holders are classified. This option caps how many holder rows one tick walks; the sweep resumes from a cursor on the next tick, so a full pass over a shard's holders spans several ticks. Defaults to `5000`; values below 1 are treated as 1.
+
+#### `orphan_holder_grace_ms`
+
+A concurrency holder younger than this many milliseconds is never classified by the orphan holder sweep, so a freshly granted holder whose lease or task write is still landing is left alone. Defaults to `60000`.
+
+#### `orphan_holder_stale_ms`
+
+A concurrency holder with no unexpired lease that is older than this many milliseconds is purged regardless of its job's status. This recovers holders whose record carries no owner, and chains parked or tasks queued for longer than any legitimate wait, at the cost of a single over-admit on that queue. Defaults to `86400000` (24 hours). `0` disables this age-only rule, and holders whose record carries no owner are then never purged.
 
 ### SlateDB Configuration
 

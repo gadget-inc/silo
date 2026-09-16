@@ -59,7 +59,7 @@ use crate::codec::{
     encode_concurrency_action, encode_holder, encode_task,
 };
 use crate::dst_events::{self, DstEvent};
-use crate::job::{ConcurrencyLimit, JobStatusKind, JobView, Limit};
+use crate::job::{ConcurrencyLimit, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
@@ -233,6 +233,99 @@ pub enum RequestTicketOutcome {
     TicketRequested { queue: String },
     /// Job queued as a RequestTicket task (for future start time)
     FutureRequestTaskWritten { queue: String, task_id: String },
+}
+
+/// Why the orphan sweep judged a durable holder to be dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanReason {
+    /// The owning job has no status row.
+    JobMissing,
+    /// The owning job is `Succeeded`, `Failed`, or `Cancelled`.
+    JobTerminal,
+    /// The owning job is `Running` but the holder's task has no unexpired
+    /// lease, so the holder belongs to a dead attempt.
+    RunningWithoutLease,
+    /// The owning job is `Scheduled` for a different attempt than the holder.
+    AttemptSuperseded,
+    /// The holder was granted at least `stale_ms` ago and its task has no
+    /// unexpired lease.
+    Stale,
+}
+
+impl OrphanReason {
+    /// Stable label used for the purge counter's `reason` label and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JobMissing => "job_missing",
+            Self::JobTerminal => "job_terminal",
+            Self::RunningWithoutLease => "running_without_lease",
+            Self::AttemptSuperseded => "attempt_superseded",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+/// Verdict of the orphan holder classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanVerdict {
+    Live,
+    Orphan { reason: OrphanReason },
+}
+
+/// Classify a durable concurrency holder as live or orphaned.
+///
+/// Pure decision logic: the caller supplies the decoded holder, whether an
+/// unexpired lease exists for the holder's task id, the owning job's status
+/// row (`None` when missing), and the thresholds. Age is measured from
+/// `granted_at_ms`: a holder whose age is below `grace_ms` is always `Live`,
+/// and one whose age is at least `stale_ms` with no unexpired lease is
+/// `Stale` unless a job-derived reason applies first. A `stale_ms` of zero
+/// disables the age-only rule.
+pub fn classify_orphan_holder(
+    holder: &HolderRecord,
+    lease_present: bool,
+    status: Option<&JobStatus>,
+    grace_ms: i64,
+    stale_ms: i64,
+    now_ms: i64,
+) -> OrphanVerdict {
+    let age_ms = now_ms.saturating_sub(holder.granted_at_ms);
+    if age_ms < grace_ms || lease_present {
+        return OrphanVerdict::Live;
+    }
+    let past_stale = stale_ms > 0 && age_ms >= stale_ms;
+    let stale_or_live = if past_stale {
+        OrphanVerdict::Orphan {
+            reason: OrphanReason::Stale,
+        }
+    } else {
+        OrphanVerdict::Live
+    };
+
+    if holder.job_id.is_none() {
+        return stale_or_live;
+    }
+    let Some(status) = status else {
+        return OrphanVerdict::Orphan {
+            reason: OrphanReason::JobMissing,
+        };
+    };
+    match status.kind {
+        JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled => {
+            OrphanVerdict::Orphan {
+                reason: OrphanReason::JobTerminal,
+            }
+        }
+        JobStatusKind::Running => OrphanVerdict::Orphan {
+            reason: OrphanReason::RunningWithoutLease,
+        },
+        JobStatusKind::Scheduled if status.current_attempt != holder.attempt_number => {
+            OrphanVerdict::Orphan {
+                reason: OrphanReason::AttemptSuperseded,
+            }
+        }
+        JobStatusKind::Scheduled => stale_or_live,
+    }
 }
 
 /// Shared future driving a one-shot hydration scan for a queue.
@@ -1441,7 +1534,15 @@ impl ConcurrencyManager {
                 // walker's terminal branch, carrying the full accumulated
                 // `held_queues`.
                 // Note: in-memory slot is already reserved by try_reserve
-                append_grant_edits(writer, now_ms, tenant, queue, task_id)?;
+                append_grant_edits(
+                    writer,
+                    now_ms,
+                    tenant,
+                    queue,
+                    task_id,
+                    job_id,
+                    attempt_number,
+                )?;
                 if let Some(ref m) = self.metrics {
                     m.record_concurrency_tickets_granted(
                         &self.shard,
@@ -2939,6 +3040,8 @@ impl ConcurrencyManager {
                 // [SILO-GRANT-3] Create holder for the just-won queue
                 let holder_val = encode_holder(&HolderRecord {
                     granted_at_ms: chunk_now,
+                    job_id: Some(req.job_id.clone()),
+                    attempt_number: Some(req.attempt_number),
                 });
                 batch.put(
                     concurrency_holder_key(tenant, queue, &req.task_id),
@@ -3285,9 +3388,13 @@ fn append_grant_edits<W: WriteBatcher>(
     tenant: &str,
     queue: &str,
     task_id: &str,
+    job_id: &str,
+    attempt_number: u32,
 ) -> Result<(), ConcurrencyError> {
     let holder = HolderRecord {
         granted_at_ms: now_ms,
+        job_id: Some(job_id.to_string()),
+        attempt_number: Some(attempt_number),
     };
     let holder_val = encode_holder(&holder);
     writer.put(concurrency_holder_key(tenant, queue, task_id), &holder_val)?;

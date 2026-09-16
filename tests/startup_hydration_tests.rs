@@ -20,6 +20,8 @@ use test_helpers::*;
 fn fresh_holder() -> Vec<u8> {
     encode_holder(&HolderRecord {
         granted_at_ms: now_ms(),
+        job_id: None,
+        attempt_number: None,
     })
 }
 

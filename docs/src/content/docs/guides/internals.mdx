@@ -172,6 +172,20 @@ The two key concepts are **requesters** and **holders**:
 
 When a holder finishes (or is cancelled), the system promotes the next eligible requester into a holder — this is the core "release and grant next" operation.
 
+Each holder record stores the time it was granted plus the owning `job_id` and total `attempt_number`, so the `queues` SQL table can show which job holds a slot. A record that carries no owner decodes with those fields absent and is treated as owner-unknown.
+
+### Orphan holder sweep
+
+A holder can outlive its task: if the expired lease reaper reaps its lease and nothing ever reports an outcome for the task, the holder row stays behind and occupies a slot forever. On the periodic concurrency-reconcile tick, each shard walks its durable holder rows in bounded slices (`orphan_holder_sweep_slice` rows per tick, resuming from a cursor) and classifies every holder older than `orphan_holder_grace_ms` using point reads only:
+
+- An unexpired lease for the holder's task means the holder is **live**. An expired lease row still awaiting the reaper does not count.
+- When the record names an owner, a missing job status row, a terminal status (`Succeeded`, `Failed`, `Cancelled`), a `Running` job with no lease for this task, or a `Scheduled` job on a different attempt all mean the holder is an **orphan**.
+- A `Scheduled` job on the holder's own attempt (a chain parked between limits, or a task still waiting in the task queue) and an owner-unknown record, which has nothing to check, are both **live** until they pass `orphan_holder_stale_ms`, after which a lease-less holder is an orphan regardless of owner.
+
+A holder is purged only after two consecutive full passes classify it as an orphan, so a snapshot racing an in-flight grant or lease write never releases a live slot. Purging deletes the durable row, releases the in-memory reservation, and wakes the grant scanner for the queue so a waiting requester can be admitted. Every purge is logged at `warn` with the tenant, queue, task id, owner, and reason, and counted in `silo_concurrency_orphan_holders_purged_total{shard, reason}`.
+
+The stale rule trades safety for recovery: a chain parked between limits or a task waiting in the task queue for longer than the threshold can lose its holder, and the queue then over-admits by one slot. That is the same tradeoff the web UI's Drop holders action makes for a whole tenant, applied here to one holder at a time. The `Running`-without-lease rule can likewise purge the holder of a worker whose lease lapsed before the reaper ran; the reaper is about to fail that attempt anyway. The sweep never touches leases, tasks, requests, or job status.
+
 ### Why in-memory counts?
 
 Checking concurrency capacity requires knowing how many holders exist for a queue. Scanning the durable holder keys in SlateDB on every enqueue or grant would be too slow, so we maintain an in-memory `HashMap<queue, HashSet<task_id>>` of current holders (`ConcurrencyCounts` in `src/concurrency.rs`). This makes capacity checks a fast set-size lookup.

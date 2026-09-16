@@ -206,6 +206,9 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
             holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
+            orphan_holder_sweep_slice: silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
+            orphan_holder_grace_ms: silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
+            orphan_holder_stale_ms: silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
@@ -215,6 +218,59 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
         },
         ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+    (tmp, shard)
+}
+
+/// Open a temp shard with caller-supplied orphan sweep settings, a
+/// concurrency reconcile interval, an optional metrics handle, and a tenant
+/// range. Pass a short interval to observe the periodic sweep tick, or a long
+/// one so `sweep_orphan_holders_for_test` is the only thing advancing sweep
+/// state.
+#[allow(dead_code)]
+pub async fn open_temp_shard_with_orphan_sweep(
+    sweep_slice: usize,
+    grace_ms: u64,
+    stale_ms: u64,
+    reconcile_interval_ms: u64,
+    metrics: Option<silo::metrics::Metrics>,
+    range: ShardRange,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    let rate_limiter = MockGubernatorClient::new_arc();
+    let tmp = tempfile::tempdir().unwrap();
+    let resolved = resolve_object_store(&Backend::Fs, tmp.path().to_string_lossy().as_ref())
+        .expect("resolve fs object store");
+    let shard = JobStoreShard::open_with_resolved_store(
+        "test".to_string(),
+        &resolved.canonical_path,
+        OpenShardOptions {
+            store: resolved.store,
+            wal_store: None,
+            wal_close_config: None,
+            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            memory_cache: None,
+            rate_limiter,
+            metrics,
+            concurrency_reconcile_interval: Duration::from_millis(reconcile_interval_ms.max(1)),
+            counter_reconciliation_seconds: None,
+            hydrate_all_at_startup: false,
+            grant_scanner: silo::concurrency::GrantScannerConfig::default(),
+            concurrency_reconcile_scan_slice:
+                silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
+            holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
+            orphan_holder_sweep_slice: sweep_slice,
+            orphan_holder_grace_ms: grace_ms,
+            orphan_holder_stale_ms: stale_ms,
+            completed_job_expire_s: None,
+            terminal_job_expire_s: None,
+            count_from_status_counters: true,
+            floating_refresh_stale_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MS,
+            broker_tombstone_revive_after_generations:
+                silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+        },
+        range,
     )
     .await
     .expect("open shard");
@@ -256,6 +312,9 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
             holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
+            orphan_holder_sweep_slice: silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
+            orphan_holder_grace_ms: silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
+            orphan_holder_stale_ms: silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: true,
