@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use silo::coordination::{
-    CoordinationError, CoordinatorBase, MemberInfo, ShardGuardState, ShardOwnerMap, ShardPhase,
+    CloseRetryBackoff, CoordinationError, CoordinatorBase, MemberInfo, ShardGuardState,
+    ShardOwnerMap, ShardPhase,
 };
 use silo::factory::ShardFactory;
 use silo::shard_range::{ShardId, ShardMap};
@@ -432,4 +433,33 @@ async fn compute_shard_owner_map_basic() {
         );
         assert_eq!(owner_map.get_node(&shard_id), Some(&"node-1".to_string()));
     }
+}
+
+// --- CloseRetryBackoff ---
+
+#[silo::test]
+fn close_retry_backoff_doubles_from_one_second_to_a_thirty_second_cap() {
+    let mut backoff = CloseRetryBackoff::new();
+
+    let delays: Vec<u64> = (0..7).map(|_| backoff.next_delay().as_secs()).collect();
+
+    assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30]);
+    assert_eq!(
+        backoff.attempts(),
+        7,
+        "each delay records one failed attempt"
+    );
+}
+
+#[silo::test]
+fn close_retry_backoff_returns_to_one_second_after_reset() {
+    let mut backoff = CloseRetryBackoff::new();
+    for _ in 0..6 {
+        backoff.next_delay();
+    }
+
+    backoff.reset();
+
+    assert_eq!(backoff.attempts(), 0);
+    assert_eq!(backoff.next_delay().as_secs(), 1);
 }

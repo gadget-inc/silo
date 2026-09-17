@@ -2613,13 +2613,192 @@ mod splitter_unit_tests {
         );
     }
 
-    /// Test that without recovery, a failed split after parent close leaves
-    /// the shard permanently unusable. This is the "before fix" scenario that
-    /// validates the test setup would catch the bug.
+    /// Open a shard from a fresh 4-shard map in a unit-test factory and wire a
+    /// splitter whose shard map update fails, so `execute_split` closes the
+    /// parent during cloning and then runs parent recovery.
+    async fn setup_failing_update_split(
+        test_name: &str,
+    ) -> (
+        Arc<ShardFactory>,
+        Arc<Mutex<ShardMap>>,
+        Arc<Mutex<HashSet<ShardId>>>,
+        Arc<FailingUpdateMockBackend>,
+        Arc<ShardSplitter>,
+        ShardId,
+    ) {
+        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let factory = make_test_factory_for_unit_test(test_name);
+
+        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let range = shard_map
+            .lock()
+            .await
+            .get_shard(&shard_id)
+            .unwrap()
+            .range
+            .clone();
+        factory.open(&shard_id, &range).await.unwrap();
+        owned.lock().await.insert(shard_id);
+
+        let mock = Arc::new(FailingUpdateMockBackend::new(
+            shard_map.clone(),
+            owned.clone(),
+            factory.clone(),
+        ));
+        mock.fail_shard_map_update
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let splitter = Arc::new(ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>));
+        splitter
+            .request_split(shard_id, "2".to_string())
+            .await
+            .unwrap();
+
+        (factory, shard_map, owned, mock, splitter, shard_id)
+    }
+
+    async fn execute_failing_split(
+        splitter: &ShardSplitter,
+        shard_map: &Arc<Mutex<ShardMap>>,
+        shard_id: ShardId,
+    ) -> Result<(), CoordinationError> {
+        splitter
+            .execute_split(shard_id, || async {
+                Ok(ShardOwnerMap {
+                    shard_map: shard_map.lock().await.clone(),
+                    shard_to_node: HashMap::new(),
+                    shard_to_addr: HashMap::new(),
+                })
+            })
+            .await
+    }
+
+    /// Parent recovery drives a failed close to completion before reopening:
+    /// the first recovery close fails, the retried close succeeds, and the
+    /// parent comes back open and leases a job.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parent_recovery_retries_failed_close_then_reopens() {
+        let (factory, shard_map, _owned, _mock, splitter, shard_id) =
+            setup_failing_update_split("recover-retries-close").await;
+        let original = factory.get(&shard_id).unwrap();
+        factory.inject_close_failures(shard_id, 1);
+
+        let result = execute_failing_split(&splitter, &shard_map, shard_id).await;
+        assert!(result.is_err(), "split should fail at shard map update");
+
+        assert!(
+            !factory.is_closing(&shard_id),
+            "recovery should complete the pending close"
+        );
+        let recovered = factory
+            .get(&shard_id)
+            .expect("parent should be open again after recovery retried its close");
+        assert!(
+            !Arc::ptr_eq(&original, &recovered),
+            "recovery should reopen a fresh shard object"
+        );
+
+        let tenant = "recovered-tenant";
+        recovered
+            .enqueue(
+                tenant,
+                Some("job-after-recovery".to_string()),
+                5,
+                crate::test_helpers::now_ms(),
+                None,
+                crate::test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue on recovered parent");
+        let leased =
+            crate::test_helpers::dequeue_task_ids_until(&recovered, "worker-1", "default", 1).await;
+        assert_eq!(leased.len(), 1, "recovered parent should lease the job");
+    }
+
+    /// Spawn the failing split and wait until parent recovery's first close
+    /// attempt has failed, which opens recovery's retry window.
+    async fn spawn_split_and_wait_for_pending_close(
+        factory: &Arc<ShardFactory>,
+        shard_map: &Arc<Mutex<ShardMap>>,
+        splitter: &Arc<ShardSplitter>,
+        shard_id: ShardId,
+    ) -> tokio::task::JoinHandle<Result<(), CoordinationError>> {
+        let split_task = {
+            let splitter = Arc::clone(splitter);
+            let shard_map = Arc::clone(shard_map);
+            tokio::spawn(
+                async move { execute_failing_split(&splitter, &shard_map, shard_id).await },
+            )
+        };
+        let close_pending = crate::test_helpers::poll_until(
+            || async { factory.is_closing(&shard_id) },
+            |closing| *closing,
+            10_000,
+        )
+        .await;
+        assert!(close_pending, "recovery's first close should fail");
+        split_task
+    }
+
+    /// Recovery holds no ownership guarantee across its retry window: when
+    /// this node stops owning the parent meanwhile, recovery completes the
+    /// close but does not reopen the shard.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parent_recovery_does_not_reopen_after_losing_ownership() {
+        let (factory, shard_map, owned, _mock, splitter, shard_id) =
+            setup_failing_update_split("recover-lost-ownership").await;
+        factory.inject_close_failures(shard_id, 1);
+
+        let split_task =
+            spawn_split_and_wait_for_pending_close(&factory, &shard_map, &splitter, shard_id).await;
+        owned.lock().await.remove(&shard_id);
+
+        let result = split_task.await.expect("split task panicked");
+        assert!(result.is_err(), "split should fail at shard map update");
+        assert!(
+            !factory.is_closing(&shard_id),
+            "recovery should still complete the pending close"
+        );
+        assert!(
+            factory.get(&shard_id).is_none(),
+            "recovery should not reopen a parent this node no longer owns"
+        );
+    }
+
+    /// Recovery's close-retry loop exits on coordinator shutdown and leaves
+    /// the entry closing for the shutdown path.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parent_recovery_close_retry_stops_on_shutdown() {
+        let (factory, shard_map, _owned, mock, splitter, shard_id) =
+            setup_failing_update_split("recover-shutdown").await;
+        factory.inject_close_failures(shard_id, u32::MAX);
+
+        let split_task =
+            spawn_split_and_wait_for_pending_close(&factory, &shard_map, &splitter, shard_id).await;
+        mock.base().signal_shutdown();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), split_task)
+            .await
+            .expect("recovery should stop retrying once shutdown is signalled")
+            .expect("split task panicked");
+        assert!(result.is_err(), "split should fail at shard map update");
+        assert!(
+            factory.is_closing(&shard_id),
+            "the close stays pending for the shutdown path"
+        );
+        assert!(factory.get(&shard_id).is_none());
+    }
+
+    /// Without recovery, a parent closed directly on the shard object (as the
+    /// split cloning phase does) is out of service: the factory does not serve
+    /// it, and `open` alone cannot replace it. Only `factory.close` followed
+    /// by `factory.open` builds a fresh instance, which is what recovery does.
     #[silo::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_parent_shard_unusable_without_recovery_after_close() {
         let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
-        let _owned: Arc<Mutex<HashSet<ShardId>>> = Arc::new(Mutex::new(HashSet::new()));
         let factory = make_test_factory_for_unit_test("unusable-without-recovery");
 
         // Pick a shard and open it in the factory
@@ -2640,26 +2819,25 @@ mod splitter_unit_tests {
         // Close the shard directly (simulating what happens during SplitCloning)
         shard.close().await.unwrap();
 
-        // The shard is still in the factory but its DB is closed.
-        // Operations on it should fail.
-        let shard_closed = factory.get(&shard_id).unwrap();
         assert!(
-            shard_closed.get_job("test", "nonexistent").await.is_err(),
-            "shard should be unusable after close without factory removal"
+            factory.get(&shard_id).is_none(),
+            "factory should not serve a shard whose database was closed directly"
         );
 
-        // Re-opening via factory.open won't help because OnceCell already has
-        // the closed entry — it returns the same closed instance.
-        let reopen_result = factory.open(&shard_id, &range).await;
-        assert!(reopen_result.is_ok(), "factory.open returns existing entry");
-        let shard_still_closed = factory.get(&shard_id).unwrap();
+        // factory.open alone hands back the entry's existing closed instance.
+        let stale = factory
+            .open(&shard_id, &range)
+            .await
+            .expect("factory.open returns the existing entry");
         assert!(
-            shard_still_closed
-                .get_job("test", "nonexistent")
-                .await
-                .is_err(),
-            "shard should still be unusable — factory.open returned the stale entry"
+            Arc::ptr_eq(&stale, &shard),
+            "factory.open should return the entry's closed instance"
         );
+        assert!(
+            stale.get_job("test", "nonexistent").await.is_err(),
+            "the closed instance should be unusable"
+        );
+        assert!(factory.get(&shard_id).is_none());
 
         // Only factory.close() + factory.open() creates a fresh instance
         factory.close(&shard_id).await.unwrap();
@@ -2668,6 +2846,7 @@ mod splitter_unit_tests {
             shard_recovered.get_job("test", "nonexistent").await.is_ok(),
             "shard should be usable after factory.close + factory.open"
         );
+        assert!(factory.get(&shard_id).is_some());
     }
 
     /// Guard-free harness for asserting exact child cleanup metadata: a

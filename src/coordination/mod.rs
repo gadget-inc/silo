@@ -215,6 +215,41 @@ impl std::fmt::Display for ShardPhase {
     }
 }
 
+/// Delay policy for retrying a failed shard close: 1s, doubling per failed
+/// attempt, capped at 30s. Callers add their own jitter.
+#[derive(Debug, Clone, Default)]
+pub struct CloseRetryBackoff {
+    attempts: u32,
+}
+
+impl CloseRetryBackoff {
+    const INITIAL_DELAY: Duration = Duration::from_secs(1);
+    const MAX_DELAY: Duration = Duration::from_secs(30);
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a failed close attempt and return the delay before the next one.
+    pub fn next_delay(&mut self) -> Duration {
+        let factor = 2u32.saturating_pow(self.attempts);
+        self.attempts = self.attempts.saturating_add(1);
+        Self::INITIAL_DELAY
+            .saturating_mul(factor)
+            .min(Self::MAX_DELAY)
+    }
+
+    /// Number of failed attempts recorded since the last reset.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// Clear the recorded attempts once a close succeeds.
+    pub fn reset(&mut self) {
+        self.attempts = 0;
+    }
+}
+
 /// Generic state for a shard guard.
 ///
 /// The ownership token type varies by backend:

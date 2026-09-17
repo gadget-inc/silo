@@ -303,6 +303,8 @@ pub enum JobStoreShardError {
     JobNotLeaseable(#[from] JobNotLeaseableError),
     #[error("transaction conflict during {0}, exceeded max retries")]
     TransactionConflict(String),
+    #[error("shard {0} has a close pending")]
+    ClosePending(crate::shard_range::ShardId),
 }
 
 /// Information about the LSM tree state of a shard's SlateDB instance.
@@ -820,6 +822,12 @@ impl JobStoreShard {
         );
 
         Ok(())
+    }
+
+    /// Whether `close()` has been called on this shard object. A closing
+    /// shard's brokers and grant scanner are stopped for good.
+    pub fn is_closing(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
 
     /// Returns the WAL close configuration, if any.

@@ -4,12 +4,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-use crate::coordination::{CoordinationError, ShardOwnerMap};
+use crate::coordination::{CloseRetryBackoff, CoordinationError, ShardOwnerMap};
 
 /// Log markers for the split's pre-commit child verification. Operational
 /// tooling asserts on these exact strings in deployed logs -- do not reword.
@@ -778,8 +778,10 @@ impl ShardSplitter {
     /// During the SplitCloning phase, the parent shard's database is closed before
     /// cloning. If the split fails after this point but before the commit (shard map
     /// update), the parent shard is left in the factory with a closed database,
-    /// permanently unusable. This method removes the stale entry and reopens the
-    /// shard with a fresh database so it can resume serving requests.
+    /// permanently unusable. This method closes the stale entry, retrying until
+    /// the close succeeds, and reopens the shard with a fresh database so it can
+    /// resume serving requests. It opens only after the close has completed and
+    /// only while this node still owns the parent.
     async fn recover_parent_shard(
         &self,
         parent_shard_id: &ShardId,
@@ -798,12 +800,16 @@ impl ShardSplitter {
         };
 
         // Close the stale factory entry (handles already-closed DB gracefully).
-        if let Err(e) = self.ctx.factory.close(parent_shard_id).await {
-            warn!(
-                parent_shard_id = %parent_shard_id,
-                error = %e,
-                "failed to close stale parent shard entry during recovery, continuing"
-            );
+        // The parent's guard is `Held` during a split, so no guard loop retries
+        // this close: recovery drives it to completion itself.
+        self.close_parent_until_done(parent_shard_id).await?;
+
+        // Recovery runs detached from the parent's guard, which can close the
+        // shard and release its lease while the close above is retrying.
+        // Reopening a parent this node stopped owning would put a second
+        // database handle beside the new owner's.
+        if !self.ctx.owns_shard(parent_shard_id).await {
+            return Err(CoordinationError::NotShardOwner(*parent_shard_id));
         }
 
         // Reopen the parent shard with a fresh database.
@@ -824,6 +830,40 @@ impl ShardSplitter {
             "recovered parent shard after failed split"
         );
         Ok(())
+    }
+
+    /// Retry `factory.close` on the parent with capped exponential backoff
+    /// until it succeeds. Returns an error when the coordinator shuts down
+    /// first; the entry then stays closing for the shutdown path to close.
+    async fn close_parent_until_done(
+        &self,
+        parent_shard_id: &ShardId,
+    ) -> Result<(), CoordinationError> {
+        let mut backoff = CloseRetryBackoff::new();
+        let mut shutdown_rx = self.coordinator.base().shutdown_rx.clone();
+        loop {
+            let Err(e) = self.ctx.factory.close(parent_shard_id).await else {
+                return Ok(());
+            };
+            let delay = backoff.next_delay();
+            error!(
+                parent_shard_id = %parent_shard_id,
+                error = %e,
+                attempt = backoff.attempts(),
+                next_retry_ms = delay.as_millis() as u64,
+                "failed to close parent shard during recovery, retrying"
+            );
+
+            // A dropped shutdown sender means the coordinator is gone, which
+            // ends the retry loop the same way a shutdown signal does.
+            let shutdown_observed = tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                _ = shutdown_rx.wait_for(|shutdown| *shutdown) => true,
+            };
+            if shutdown_observed {
+                return Err(CoordinationError::ShuttingDown);
+            }
+        }
     }
 
     /// Re-hydrate the local paused-shards cache from persisted split records.

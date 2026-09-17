@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod etcd_test_helpers;
+mod test_helpers;
 
 use etcd_test_helpers::EtcdConnection;
 use silo::coordination::etcd::{EtcdCoordinator, EtcdShardGuard};
@@ -11,6 +12,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
 use silo::shard_range::{ShardId, ShardMap};
+use test_helpers::{make_dir_tree_readonly, restore_dir_tree_writable};
 
 // Atomic counter for truly unique prefixes even within the same nanosecond
 static PREFIX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3687,40 +3689,6 @@ async fn make_guard_with_factory(
         runner.run(owned_arc, factory, shard_map, coordinator).await;
     });
     (guard, owned, tx, handle)
-}
-
-/// Make a directory tree read-only so SlateDB writes fail, simulating a storage failure.
-fn make_dir_tree_readonly(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                make_dir_tree_readonly(&entry_path);
-            } else {
-                let _ =
-                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o444));
-            }
-        }
-    }
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555));
-}
-
-/// Restore a directory tree to writable after a test.
-fn restore_dir_tree_writable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                restore_dir_tree_writable(&entry_path);
-            } else {
-                let _ =
-                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644));
-            }
-        }
-    }
 }
 
 /// If factory.close() fails during a normal release, the guard should keep retrying
