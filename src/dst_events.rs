@@ -70,6 +70,9 @@ pub enum DstEvent {
 
     /// A node released ownership of a shard.
     ShardReleased { node_id: String, shard_id: String },
+
+    /// A node reopened a shard after closing it, keeping ownership throughout.
+    ShardReopened { node_id: String, shard_id: String },
 }
 
 #[cfg(feature = "dst")]

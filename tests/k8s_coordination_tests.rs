@@ -13,6 +13,11 @@
 
 #![cfg(feature = "k8s")]
 
+// The in-memory K8s API from the DST crate lets the guard's close-recovery
+// tests run without a cluster.
+#[path = "turmoil_runner/mock_k8s.rs"]
+#[allow(dead_code)]
+mod mock_k8s;
 mod test_helpers;
 
 use std::collections::HashSet;
@@ -5414,12 +5419,13 @@ async fn make_k8s_guard_with_factory(
     Ok((guard, owned, tx, handle))
 }
 
-/// If factory.close() fails during a normal release, the guard should revert to Held
-/// and the lease should remain held in K8s, preventing another node from acquiring it.
+/// If factory.close() fails during a normal release, the guard stays in Releasing with
+/// the close pending and the lease remains held in K8s, preventing another node from
+/// acquiring it.
 ///
 /// With slatedb's current close semantics, a timed-out close internally marks the DB
-/// as closed. On the guard's next retry cycle, factory.close() detects the
-/// "already closed" state and treats it as a successful close. The shard is then
+/// as closed. On the guard's next attempt, after its backoff, factory.close() detects
+/// the "already closed" state and treats it as a successful close. The shard is then
 /// released normally. This verifies the graceful recovery path.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
 async fn k8s_shard_close_failure_keeps_lease() {
@@ -5473,7 +5479,7 @@ async fn k8s_shard_close_failure_keeps_lease() {
 
     // The first close attempt will time out (3s) because the directory is read-only
     // and slatedb's retrying_object_store retries indefinitely. After the timeout,
-    // the guard reverts to Held and retries. On the second attempt, slatedb reports
+    // the guard backs off and retries. On the second attempt, slatedb reports
     // the DB as already closed, and factory.close() treats this as success.
     //
     // Wait for the shard to be fully released after the close timeout + retry cycle.
@@ -5647,4 +5653,574 @@ async fn k8s_lease_renewals_do_not_trigger_membership_notifications() {
     // Cleanup
     c1.shutdown().await.unwrap();
     h1.abort();
+}
+
+// --- Close-failure recovery: a failed close is driven to completion ---
+//
+// Each scenario is written once over `K8sBackend` and runs twice: against the
+// real cluster (skipped when the API is unreachable) and against the
+// in-memory mock API.
+
+/// Close timeout for the recovery scenarios. The read-only-directory fault
+/// fails exactly one close attempt: SlateDB retries for the whole timeout, and
+/// afterwards reports the database closed, so the next attempt succeeds.
+const RECOVERY_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A real-cluster backend, or `None` (with a skip notice) when no K8s API answers.
+async fn reachable_kube_backend(test_name: &str) -> Option<KubeBackend> {
+    let backend = match KubeBackend::try_default().await {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("Skipping {test_name}: K8S not available: {e}");
+            return None;
+        }
+    };
+    let probe = tokio::time::timeout(
+        Duration::from_secs(3),
+        backend.list_leases(&get_namespace(), "silo-reachability-probe=true"),
+    )
+    .await;
+    match probe {
+        Ok(Ok(_)) => Some(backend),
+        Ok(Err(e)) => {
+            eprintln!("Skipping {test_name}: K8S API unreachable: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("Skipping {test_name}: K8S API probe timed out");
+            None
+        }
+    }
+}
+
+fn mock_backend() -> mock_k8s::MockK8sBackend {
+    mock_k8s::MockK8sBackend::new(mock_k8s::MockK8sState::new(), get_namespace())
+}
+
+/// One node in a close-recovery scenario: a guard running against `backend`
+/// with a filesystem factory rooted at a directory the test controls.
+struct RecoveryNode<B: K8sBackend> {
+    node_id: String,
+    guard: Arc<K8sShardGuard<B>>,
+    owned: Arc<Mutex<HashSet<ShardId>>>,
+    factory: Arc<ShardFactory>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl<B: K8sBackend> RecoveryNode<B> {
+    async fn start(
+        backend: B,
+        prefix: &str,
+        node_id: &str,
+        shard_id: ShardId,
+        data_root: &std::path::Path,
+        reopen_timeout: Duration,
+    ) -> Self {
+        let mut factory = ShardFactory::new(
+            DatabaseTemplate {
+                backend: Backend::Fs,
+                path: data_root.join("%shard%").to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            MockGubernatorClient::new_arc(),
+            None,
+        );
+        factory.set_close_timeout(RECOVERY_CLOSE_TIMEOUT);
+        factory.set_reopen_timeout(reopen_timeout);
+        let factory = Arc::new(factory);
+
+        let owned = Arc::new(Mutex::new(HashSet::new()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let guard = K8sShardGuard::new(
+            shard_id,
+            backend,
+            get_namespace(),
+            prefix.to_string(),
+            node_id.to_string(),
+            10,
+            shutdown_rx,
+            Arc::new(Notify::new()),
+        );
+
+        let mut shard_map = ShardMap::default();
+        shard_map.add_shard(ShardInfo::new(shard_id, ShardRange::full()));
+        let shard_map = Arc::new(Mutex::new(shard_map));
+        let coordinator: Arc<dyn silo::coordination::Coordinator> = Arc::new(
+            silo::coordination::NoneCoordinator::new(
+                node_id,
+                "http://127.0.0.1:0",
+                1,
+                factory.clone(),
+                Vec::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let handle = {
+            let runner = guard.clone();
+            let owned = owned.clone();
+            let factory = factory.clone();
+            tokio::spawn(async move { runner.run(owned, factory, shard_map, coordinator).await })
+        };
+
+        Self {
+            node_id: node_id.to_string(),
+            guard,
+            owned,
+            factory,
+            shutdown_tx,
+            handle,
+        }
+    }
+
+    fn shard_id(&self) -> ShardId {
+        self.guard.ctx.shard_id
+    }
+
+    async fn phase(&self) -> ShardPhase {
+        self.guard.ctx.state.lock().await.phase
+    }
+
+    async fn holds_shard(&self) -> bool {
+        let st = self.guard.ctx.state.lock().await;
+        st.phase == ShardPhase::Held
+            && st.has_token()
+            && self.owned.lock().await.contains(&self.shard_id())
+    }
+
+    async fn acquire(&self) -> Arc<silo::job_store_shard::JobStoreShard> {
+        self.guard.ctx.set_desired(true).await;
+        let acquired = wait_until(Duration::from_secs(30), || self.holds_shard()).await;
+        assert!(acquired, "{} should acquire the shard", self.node_id);
+        self.factory
+            .get(&self.shard_id())
+            .expect("an acquired shard should be served by the factory")
+    }
+
+    /// Wait until the guard has recorded a failed close attempt, which proves
+    /// the close-pending path ran.
+    async fn wait_for_failed_close(&self) {
+        let failed = wait_until(Duration::from_secs(15), || async {
+            self.guard.ctx.state.lock().await.failed_close_attempts() >= 1
+        })
+        .await;
+        assert!(failed, "the guard should record a failed close attempt");
+    }
+}
+
+/// The holder recorded on the shard's K8s lease. A released lease keeps its
+/// object with an empty holder identity.
+async fn lease_holder<B: K8sBackend>(
+    backend: &B,
+    prefix: &str,
+    shard_id: &ShardId,
+) -> Option<String> {
+    let lease_name = silo::coordination::keys::k8s_shard_lease_name(prefix, shard_id);
+    backend
+        .get_lease(&get_namespace(), &lease_name)
+        .await
+        .expect("get shard lease")
+        .and_then(|lease| lease.spec)
+        .and_then(|spec| spec.holder_identity)
+        .filter(|holder| !holder.is_empty())
+}
+
+async fn assert_shard_leases_a_job(shard: &silo::job_store_shard::JobStoreShard, job_id: &str) {
+    shard
+        .enqueue(
+            "close-recovery-tenant",
+            Some(job_id.to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    let leased = test_helpers::dequeue_task_ids_until(shard, "worker-1", "default", 1).await;
+    assert_eq!(leased.len(), 1, "the shard should lease the enqueued job");
+}
+
+fn recovery_data_root(scenario: &str, backend_kind: &str) -> std::path::PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("silo-k8s-close-recovery-{scenario}-{backend_kind}"));
+    if root.exists() {
+        restore_dir_tree_writable(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    root
+}
+
+/// The node is re-selected as owner while its close is failing: the guard
+/// keeps the lease, finishes the close, and ends up `Held` on a fresh shard.
+async fn close_failure_recovers_when_desired_flips_back<B: K8sBackend>(backend: B, kind: &str) {
+    let prefix = unique_prefix();
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("flips-back", kind);
+    let node = RecoveryNode::start(
+        backend.clone(),
+        &prefix,
+        "recover-flip",
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    let original = node.acquire().await;
+
+    let shard_dir = data_root.join(shard_id.to_string());
+    begin_failing_release(&node, &shard_dir).await;
+    node.guard.ctx.set_desired(true).await;
+
+    // While the close is pending the shard is out of service, the guard stays
+    // in Releasing, and the lease stays with this node.
+    let mut saw_failed_close = false;
+    let mut recovered = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !recovered && Instant::now() < deadline {
+        assert_eq!(
+            lease_holder(&backend, &prefix, &shard_id).await.as_deref(),
+            Some("recover-flip"),
+            "the lease must stay with this node throughout recovery"
+        );
+        if node.factory.is_closing(&shard_id) {
+            assert!(node.factory.get(&shard_id).is_none());
+            assert_eq!(node.phase().await, ShardPhase::Releasing);
+        }
+        if !saw_failed_close && node.guard.ctx.state.lock().await.failed_close_attempts() >= 1 {
+            saw_failed_close = true;
+            restore_dir_tree_writable(&shard_dir);
+        }
+        recovered = saw_failed_close
+            && node.holds_shard().await
+            && node
+                .factory
+                .get(&shard_id)
+                .is_some_and(|shard| !Arc::ptr_eq(&shard, &original));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    restore_dir_tree_writable(&shard_dir);
+    assert!(saw_failed_close, "the close-pending path should have run");
+    assert!(recovered, "the guard should end up Held on a fresh shard");
+
+    let fresh = node.factory.get(&shard_id).unwrap();
+    assert_shard_leases_a_job(&fresh, "job-after-recovery").await;
+
+    node.handle.abort();
+    let _ = node.shutdown_tx.send(true);
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_close_failure_recovers_when_desired_flips_back() {
+    let Some(backend) =
+        reachable_kube_backend("k8s_close_failure_recovers_when_desired_flips_back").await
+    else {
+        return;
+    };
+    close_failure_recovers_when_desired_flips_back(backend, "kube").await;
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_mock_close_failure_recovers_when_desired_flips_back() {
+    close_failure_recovers_when_desired_flips_back(mock_backend(), "mock").await;
+}
+
+/// Revoke write access to the shard's data and start a release, returning
+/// once the factory reports the close as begun.
+async fn begin_failing_release<B: K8sBackend>(node: &RecoveryNode<B>, shard_dir: &std::path::Path) {
+    make_dir_tree_readonly(shard_dir);
+    node.guard.ctx.set_desired(false).await;
+    let shard_id = node.shard_id();
+    let closing = wait_until(Duration::from_secs(10), || async {
+        node.factory.is_closing(&shard_id)
+    })
+    .await;
+    assert!(closing, "the release should begin closing the shard");
+}
+
+/// The node stays undesired while its close is failing: the lease is held
+/// until the retried close succeeds, then released, and another node can
+/// acquire the shard and lease work from it.
+async fn close_failure_releases_once_close_succeeds<B: K8sBackend>(backend: B, kind: &str) {
+    let prefix = unique_prefix();
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("stays-undesired", kind);
+    let first = RecoveryNode::start(
+        backend.clone(),
+        &prefix,
+        "recover-release-a",
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    first.acquire().await;
+
+    let shard_dir = data_root.join(shard_id.to_string());
+    begin_failing_release(&first, &shard_dir).await;
+
+    // Until the close completes, the lease stays with the first node and the
+    // guard never claims Held on the torn-down shard.
+    let mut saw_failed_close = false;
+    let mut released = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !released && Instant::now() < deadline {
+        let phase = first.phase().await;
+        assert_ne!(
+            phase,
+            ShardPhase::Held,
+            "an undesired guard must not return to Held"
+        );
+        if first.factory.is_closing(&shard_id) {
+            assert_eq!(
+                lease_holder(&backend, &prefix, &shard_id).await.as_deref(),
+                Some("recover-release-a"),
+                "the lease must not be released while the close is pending"
+            );
+            assert!(first.factory.get(&shard_id).is_none());
+        }
+        saw_failed_close |= first.guard.ctx.state.lock().await.failed_close_attempts() >= 1;
+        released = phase == ShardPhase::Idle
+            && !first.guard.ctx.state.lock().await.has_token()
+            && !first.owned.lock().await.contains(&shard_id);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    restore_dir_tree_writable(&shard_dir);
+    assert!(saw_failed_close, "the close-pending path should have run");
+    assert!(
+        released,
+        "the lease should be released once the retried close succeeds"
+    );
+    assert!(!first.factory.is_closing(&shard_id));
+
+    let second = RecoveryNode::start(
+        backend.clone(),
+        &prefix,
+        "recover-release-b",
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    let shard = second.acquire().await;
+    assert_eq!(
+        lease_holder(&backend, &prefix, &shard_id).await.as_deref(),
+        Some("recover-release-b")
+    );
+    assert_shard_leases_a_job(&shard, "job-on-second-node").await;
+
+    first.handle.abort();
+    second.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_close_failure_releases_once_close_succeeds() {
+    let Some(backend) =
+        reachable_kube_backend("k8s_close_failure_releases_once_close_succeeds").await
+    else {
+        return;
+    };
+    close_failure_releases_once_close_succeeds(backend, "kube").await;
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_mock_close_failure_releases_once_close_succeeds() {
+    close_failure_releases_once_close_succeeds(mock_backend(), "mock").await;
+}
+
+/// Shutdown arrives while a close is pending: the guard leaves its backoff
+/// without waiting it out and the shutdown arm makes its single close attempt
+/// on the closing entry. With this fault that attempt finds the database
+/// already closed, so the lease is released. The keep-the-lease outcome, where
+/// the shutdown close is the first attempt, is
+/// `k8s_shard_close_failure_during_shutdown_keeps_lease`.
+async fn shutdown_during_pending_close_reaches_shut_down<B: K8sBackend>(backend: B, kind: &str) {
+    let prefix = unique_prefix();
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("shutdown-pending", kind);
+    let node = RecoveryNode::start(
+        backend.clone(),
+        &prefix,
+        "recover-shutdown",
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    node.acquire().await;
+
+    let shard_dir = data_root.join(shard_id.to_string());
+    begin_failing_release(&node, &shard_dir).await;
+    node.wait_for_failed_close().await;
+
+    let _ = node.shutdown_tx.send(true);
+    let shut_down = wait_until(Duration::from_secs(10), || async {
+        node.phase().await == ShardPhase::ShutDown
+    })
+    .await;
+    restore_dir_tree_writable(&shard_dir);
+    assert!(
+        shut_down,
+        "the guard should reach ShutDown from a pending close"
+    );
+
+    assert!(
+        !node.factory.is_closing(&shard_id),
+        "the shutdown close attempt should complete the pending close"
+    );
+    assert!(!node.guard.ctx.state.lock().await.has_token());
+    assert_eq!(lease_holder(&backend, &prefix, &shard_id).await, None);
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_shutdown_during_pending_close_reaches_shut_down() {
+    let Some(backend) =
+        reachable_kube_backend("k8s_shutdown_during_pending_close_reaches_shut_down").await
+    else {
+        return;
+    };
+    shutdown_during_pending_close_reaches_shut_down(backend, "kube").await;
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_mock_shutdown_during_pending_close_reaches_shut_down() {
+    shutdown_during_pending_close_reaches_shut_down(mock_backend(), "mock").await;
+}
+
+/// The reopen after a completed close cannot finish (storage still
+/// unwritable): the guard gives up after the reopen timeout, releases the
+/// lease, and re-acquires from scratch once storage is back.
+async fn failed_reopen_releases_then_reacquires<B: K8sBackend>(backend: B, kind: &str) {
+    let prefix = unique_prefix();
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("reopen-fails", kind);
+    let node = RecoveryNode::start(
+        backend.clone(),
+        &prefix,
+        "recover-reopen-fail",
+        shard_id,
+        &data_root,
+        Duration::from_secs(1),
+    )
+    .await;
+    let original = node.acquire().await;
+
+    let shard_dir = data_root.join(shard_id.to_string());
+    begin_failing_release(&node, &shard_dir).await;
+    node.guard.ctx.set_desired(true).await;
+    node.wait_for_failed_close().await;
+
+    // Write access stays revoked, so the reopen times out and the guard gives
+    // the shard up. It is still desired, so it re-takes the lease at once and
+    // then blocks in the acquisition's open: the release shows as a guard that
+    // is acquiring from scratch, without an ownership token.
+    let released = wait_until(Duration::from_secs(20), || async {
+        let st = node.guard.ctx.state.lock().await;
+        matches!(st.phase, ShardPhase::Idle | ShardPhase::Acquiring)
+            && !st.has_token()
+            && !node.owned.lock().await.contains(&shard_id)
+    })
+    .await;
+    assert!(released, "a failed reopen should release the lease");
+    assert!(
+        !node.factory.is_closing(&shard_id),
+        "the lease is released only after the close completed"
+    );
+
+    restore_dir_tree_writable(&shard_dir);
+    let reacquired = wait_until(Duration::from_secs(60), || async {
+        node.holds_shard().await
+            && node
+                .factory
+                .get(&shard_id)
+                .is_some_and(|shard| !Arc::ptr_eq(&shard, &original))
+    })
+    .await;
+    assert!(
+        reacquired,
+        "the guard should re-acquire once storage is writable"
+    );
+    assert_eq!(
+        lease_holder(&backend, &prefix, &shard_id).await.as_deref(),
+        Some("recover-reopen-fail")
+    );
+    let fresh = node.factory.get(&shard_id).unwrap();
+    assert_shard_leases_a_job(&fresh, "job-after-reacquire").await;
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_failed_reopen_releases_then_reacquires() {
+    let Some(backend) = reachable_kube_backend("k8s_failed_reopen_releases_then_reacquires").await
+    else {
+        return;
+    };
+    failed_reopen_releases_then_reacquires(backend, "kube").await;
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_mock_failed_reopen_releases_then_reacquires() {
+    failed_reopen_releases_then_reacquires(mock_backend(), "mock").await;
+}
+
+/// Shutdown's own close attempt fails (it is the first attempt, so nothing
+/// has marked the database closed yet): the guard stops but keeps the lease,
+/// so no other node can acquire a shard with unflushed data.
+async fn close_failure_during_shutdown_keeps_lease<B: K8sBackend>(backend: B, kind: &str) {
+    let prefix = unique_prefix();
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("shutdown-first-attempt", kind);
+    let node = RecoveryNode::start(
+        backend.clone(),
+        &prefix,
+        "recover-shutdown-keep",
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    node.acquire().await;
+
+    let shard_dir = data_root.join(shard_id.to_string());
+    make_dir_tree_readonly(&shard_dir);
+    let _ = node.shutdown_tx.send(true);
+    node.guard.ctx.notify.notify_one();
+
+    let shut_down = wait_until(Duration::from_secs(15), || async {
+        node.phase().await == ShardPhase::ShutDown
+    })
+    .await;
+    restore_dir_tree_writable(&shard_dir);
+    assert!(shut_down, "the guard should reach ShutDown");
+
+    assert!(
+        node.guard.ctx.state.lock().await.has_token(),
+        "the ownership token should be kept after a failed shutdown close"
+    );
+    assert!(node.owned.lock().await.contains(&shard_id));
+    assert_eq!(
+        lease_holder(&backend, &prefix, &shard_id).await.as_deref(),
+        Some("recover-shutdown-keep"),
+        "the lease must not be released after a failed shutdown close"
+    );
+    assert!(node.factory.get(&shard_id).is_none());
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_mock_close_failure_during_shutdown_keeps_lease() {
+    close_failure_during_shutdown_keeps_lease(mock_backend(), "mock").await;
 }

@@ -1001,6 +1001,7 @@ impl EtcdShardGuard {
                     desired: true,
                     phase: ShardPhase::Held,
                     ownership_token: Some(()),
+                    ..ShardGuardState::new()
                 },
             ),
             client,

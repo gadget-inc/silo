@@ -19,7 +19,7 @@ use crate::coordination::k8s_backend::{
     ConfigMapWatchEvent, K8sBackend, KubeBackend, LeaseWatchEvent,
 };
 use crate::coordination::{
-    CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo,
+    CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo, OpenShardError,
     ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend,
     compute_desired_shards_for_node, get_hostname, keys,
 };
@@ -1604,6 +1604,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         resource_version,
                         lease_uid,
                     }),
+                    ..ShardGuardState::new()
                 },
             ),
             backend,
@@ -1691,31 +1692,23 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                     elapsed_ms = lease_cas_started.elapsed().as_millis() as u64,
                                     "k8s acquire: lease CAS"
                                 );
-                                // Look up the shard's range and parent from the shard map
-                                let (range, parent_shard_id) = {
-                                    let map = shard_map.lock().await;
-                                    match map.get_shard(&self.ctx.shard_id) {
-                                        Some(info) => (info.range.clone(), info.parent_shard_id),
-                                        None => {
-                                            tracing::error!(shard_id = %self.ctx.shard_id, "shard not found in shard map");
-                                            let _ = self.release_lease_cas(&lease_name).await;
-                                            continue;
-                                        }
-                                    }
-                                };
                                 // Open the shard BEFORE marking as Held - if open fails,
                                 // we should release the lease and not claim ownership.
                                 let factory_open_started = std::time::Instant::now();
-                                let shard = match factory.open(&self.ctx.shard_id, &range).await {
-                                    Ok(shard) => {
+                                match self.open_shard(&factory, &shard_map).await {
+                                    Ok(()) => {
                                         debug!(
                                             shard_id = %self.ctx.shard_id,
                                             elapsed_ms = factory_open_started.elapsed().as_millis() as u64,
                                             "k8s acquire: factory.open"
                                         );
-                                        shard
                                     }
-                                    Err(e) => {
+                                    Err(OpenShardError::NotInShardMap) => {
+                                        tracing::error!(shard_id = %self.ctx.shard_id, "shard not found in shard map");
+                                        let _ = self.release_lease_cas(&lease_name).await;
+                                        continue;
+                                    }
+                                    Err(OpenShardError::Open(e)) => {
                                         // Failed to open - release the lease and retry
                                         tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to open shard, releasing lease");
                                         let _ = self.release_lease_cas(&lease_name).await;
@@ -1725,11 +1718,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                                         attempt = attempt.wrapping_add(1);
                                         continue;
                                     }
-                                };
-
-                                // Spawn background cleanup if this shard has pending cleanup work
-                                // (e.g., it's a split child or was re-acquired after a crash)
-                                drop(shard.maybe_spawn_background_cleanup(range, parent_shard_id));
+                                }
 
                                 // Check for shutdown BEFORE marking as Held. If shutdown was
                                 // triggered during the shard open, we should not claim ownership.
@@ -1833,9 +1822,13 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         (self.ctx.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(17)) % 20;
                     tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
 
+                    // A release can be cancelled only before its close begins. Once
+                    // a close has begun the shard's runtime is torn down for good,
+                    // so the close is driven to completion whatever `desired` does.
+                    let close_pending = factory.is_closing(&self.ctx.shard_id);
                     let cancelled = {
                         let mut st = self.ctx.state.lock().await;
-                        if st.phase == ShardPhase::ShuttingDown {
+                        if st.phase == ShardPhase::ShuttingDown || close_pending {
                             false
                         } else if st.desired {
                             st.phase = ShardPhase::Held;
@@ -1844,84 +1837,102 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                             false
                         }
                     };
+                    if cancelled {
+                        continue;
+                    }
 
-                    if !cancelled {
-                        let release_started = std::time::Instant::now();
-                        // Close the shard before releasing the lease
-                        let factory_close_started = std::time::Instant::now();
-                        match factory.close(&self.ctx.shard_id).await {
-                            Ok(()) => {
-                                debug!(
-                                    shard_id = %self.ctx.shard_id,
-                                    elapsed_ms = factory_close_started.elapsed().as_millis() as u64,
-                                    "k8s release: factory.close"
-                                );
-                                dst_events::emit(DstEvent::ShardClosed {
-                                    node_id: self.node_id.clone(),
-                                    shard_id: self.ctx.shard_id.to_string(),
-                                });
+                    let release_started = std::time::Instant::now();
+                    // Close the shard before releasing the lease
+                    let factory_close_started = std::time::Instant::now();
+                    if let Err(e) = factory.close(&self.ctx.shard_id).await {
+                        // Close pending: stay in Releasing and keep the lease. The
+                        // outer loop makes the next attempt after the backoff, or
+                        // moves to ShuttingDown if shutdown arrived meanwhile.
+                        let (attempt, backoff) = {
+                            let mut st = self.ctx.state.lock().await;
+                            let backoff = st.close_backoff.next_delay();
+                            (st.close_backoff.attempts(), backoff)
+                        };
+                        let delay = backoff + Duration::from_millis(jitter_ms);
+                        tracing::error!(
+                            shard_id = %self.ctx.shard_id,
+                            error = %e,
+                            attempt,
+                            next_retry_ms = delay.as_millis() as u64,
+                            "failed to close shard, keeping lease and retrying close"
+                        );
+                        self.ctx.wait_close_backoff(delay).await;
+                        continue;
+                    }
+                    debug!(
+                        shard_id = %self.ctx.shard_id,
+                        elapsed_ms = factory_close_started.elapsed().as_millis() as u64,
+                        "k8s release: factory.close"
+                    );
+                    dst_events::emit(DstEvent::ShardClosed {
+                        node_id: self.node_id.clone(),
+                        shard_id: self.ctx.shard_id.to_string(),
+                    });
 
-                                // Release the lease by clearing holderIdentity with CAS
-                                let has_token = {
-                                    let st = self.ctx.state.lock().await;
-                                    st.has_token()
-                                };
+                    let reopen = {
+                        let mut st = self.ctx.state.lock().await;
+                        st.close_backoff.reset();
+                        if st.phase == ShardPhase::ShuttingDown {
+                            // The shutdown arm releases the lease.
+                            continue;
+                        }
+                        st.desired
+                    };
 
-                                if has_token {
-                                    let release_timeout = Duration::from_secs(5);
-                                    let release_cas_started = std::time::Instant::now();
-                                    match tokio::time::timeout(
-                                        release_timeout,
-                                        self.release_lease_cas(&lease_name),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(_)) => {
-                                            debug!(
-                                                shard_id = %self.ctx.shard_id,
-                                                elapsed_ms = release_cas_started.elapsed().as_millis() as u64,
-                                                "k8s shard: released with CAS"
-                                            );
-                                        }
-                                        Ok(Err(e)) => {
-                                            // This is okay - we may have already lost the lease
-                                            debug!(shard_id = %self.ctx.shard_id, error = %e, "k8s shard: release CAS failed (may have lost lease)");
-                                        }
-                                        Err(_) => {
-                                            warn!(shard_id = %self.ctx.shard_id, "timed out releasing shard lease (K8s API may be slow)");
-                                        }
-                                    }
-                                }
-
+                    if reopen {
+                        // This node is the desired owner again: keep the lease and
+                        // serve a fresh shard. `open` has no timeout of its own.
+                        let reopen_started = std::time::Instant::now();
+                        let reopened = tokio::time::timeout(
+                            factory.reopen_timeout(),
+                            self.open_shard(&factory, &shard_map),
+                        )
+                        .await;
+                        match reopened {
+                            Ok(Ok(())) => {
                                 {
                                     let mut st = self.ctx.state.lock().await;
-                                    st.ownership_token = None;
-                                    st.phase = ShardPhase::Idle;
+                                    if st.phase == ShardPhase::Releasing {
+                                        st.phase = ShardPhase::Held;
+                                    }
                                 }
-                                let mut owned = owned_arc.lock().await;
-                                owned.remove(&self.ctx.shard_id);
-                                dst_events::emit(DstEvent::ShardReleased {
+                                dst_events::emit(DstEvent::ShardReopened {
                                     node_id: self.node_id.clone(),
                                     shard_id: self.ctx.shard_id.to_string(),
                                 });
-                                debug!(
+                                info!(
                                     shard_id = %self.ctx.shard_id,
-                                    total_ms = release_started.elapsed().as_millis() as u64,
-                                    "k8s shard: released"
+                                    reopen_ms = reopen_started.elapsed().as_millis() as u64,
+                                    "k8s shard: reopened after close, lease kept"
                                 );
+                                continue;
                             }
-                            Err(e) => {
-                                // Close failed - revert to Held so reconciliation retries
+                            Ok(Err(e)) => {
+                                tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to reopen shard after close, releasing lease");
+                            }
+                            Err(_elapsed) => {
                                 tracing::error!(
                                     shard_id = %self.ctx.shard_id,
-                                    error = %e,
-                                    "failed to close shard, reverting to Held to prevent data loss"
+                                    timeout_ms = factory.reopen_timeout().as_millis() as u64,
+                                    "timed out reopening shard after close, releasing lease"
                                 );
-                                let mut st = self.ctx.state.lock().await;
-                                st.phase = ShardPhase::Held;
                             }
                         }
                     }
+
+                    // The shard is closed cleanly, so the lease can go. When this
+                    // node is still desired, Idle -> Acquiring retries from scratch.
+                    self.release_lease_to_idle(&lease_name, &owned_arc).await;
+                    debug!(
+                        shard_id = %self.ctx.shard_id,
+                        total_ms = release_started.elapsed().as_millis() as u64,
+                        "k8s shard: released"
+                    );
                 }
                 ShardPhase::ShuttingDown => {
                     // Debug: log entry into shutdown processing
@@ -2019,6 +2030,68 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                 }
             }
         }
+    }
+
+    /// Open this guard's shard from its shard map entry and start any pending
+    /// split cleanup (e.g., it's a split child or was re-acquired after a crash).
+    /// Shared by the post-acquisition open and the reopen after a completed close.
+    async fn open_shard(
+        &self,
+        factory: &ShardFactory,
+        shard_map: &Mutex<ShardMap>,
+    ) -> Result<(), OpenShardError> {
+        let (range, parent_shard_id) = {
+            let map = shard_map.lock().await;
+            let info = map
+                .get_shard(&self.ctx.shard_id)
+                .ok_or(OpenShardError::NotInShardMap)?;
+            (info.range.clone(), info.parent_shard_id)
+        };
+        let shard = factory.open(&self.ctx.shard_id, &range).await?;
+        drop(shard.maybe_spawn_background_cleanup(range, parent_shard_id));
+        Ok(())
+    }
+
+    /// Release the lease of a cleanly closed shard and return the guard to Idle.
+    async fn release_lease_to_idle(&self, lease_name: &str, owned_arc: &Mutex<HashSet<ShardId>>) {
+        // Release the lease by clearing holderIdentity with CAS
+        let has_token = {
+            let st = self.ctx.state.lock().await;
+            st.has_token()
+        };
+
+        if has_token {
+            let release_timeout = Duration::from_secs(5);
+            let release_cas_started = std::time::Instant::now();
+            match tokio::time::timeout(release_timeout, self.release_lease_cas(lease_name)).await {
+                Ok(Ok(_)) => {
+                    debug!(
+                        shard_id = %self.ctx.shard_id,
+                        elapsed_ms = release_cas_started.elapsed().as_millis() as u64,
+                        "k8s shard: released with CAS"
+                    );
+                }
+                Ok(Err(e)) => {
+                    // This is okay - we may have already lost the lease
+                    debug!(shard_id = %self.ctx.shard_id, error = %e, "k8s shard: release CAS failed (may have lost lease)");
+                }
+                Err(_) => {
+                    warn!(shard_id = %self.ctx.shard_id, "timed out releasing shard lease (K8s API may be slow)");
+                }
+            }
+        }
+
+        {
+            let mut st = self.ctx.state.lock().await;
+            st.ownership_token = None;
+            st.phase = ShardPhase::Idle;
+        }
+        let mut owned = owned_arc.lock().await;
+        owned.remove(&self.ctx.shard_id);
+        dst_events::emit(DstEvent::ShardReleased {
+            node_id: self.node_id.clone(),
+            shard_id: self.ctx.shard_id.to_string(),
+        });
     }
 
     /// [SILO-COORD-INV-1] Try to acquire the lease using compare-and-swap semantics.

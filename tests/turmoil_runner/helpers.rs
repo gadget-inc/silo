@@ -1107,6 +1107,30 @@ impl ShardOwnershipTracker {
         }
     }
 
+    /// Record that a node reopened a shard it kept ownership of after closing it.
+    /// The reopen consumes the pending close, so a later release needs a close
+    /// of its own; the current owner is unchanged.
+    pub fn shard_reopened(&self, node_id: &str, shard_id: &str) {
+        let timestamp = self
+            .event_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let mut pending = self.pending_closes.lock().unwrap();
+        pending.remove(&(node_id.to_string(), shard_id.to_string()));
+        tracing::trace!(
+            shard_id = %shard_id,
+            node_id = %node_id,
+            timestamp = timestamp,
+            "shard_reopened"
+        );
+    }
+
+    /// Check if any close-before-release violations have been detected (non-panicking).
+    pub fn has_close_order_violations(&self) -> bool {
+        let violations = self.close_order_violations.lock().unwrap();
+        !violations.is_empty()
+    }
+
     /// Check if any split-brain violations have been detected (non-panicking).
     pub fn has_violations(&self) -> bool {
         let violations = self.violations.lock().unwrap();
@@ -1581,6 +1605,12 @@ impl InvariantTracker {
                 } => {
                     self.shards.shard_released(node_id, shard_id);
                 }
+                DstEvent::ShardReopened {
+                    ref node_id,
+                    ref shard_id,
+                } => {
+                    self.shards.shard_reopened(node_id, shard_id);
+                }
             }
         }
     }
@@ -1856,4 +1886,50 @@ pub fn check_holder_limits(
 /// Parse a MessagePack-encoded row into a JSON value for easy field access.
 fn parse_msgpack_row(data: &[u8]) -> Result<serde_json::Value, String> {
     rmp_serde::from_slice(data).map_err(|e| format!("failed to parse msgpack row: {}", e))
+}
+
+mod shard_ownership_tracker_tests {
+    use crate::helpers::ShardOwnershipTracker;
+
+    const NODE: &str = "node-a";
+    const SHARD: &str = "shard-1";
+
+    /// A reopen consumes the close that preceded it, so a later release with
+    /// no close of its own is a close-before-release violation.
+    #[test]
+    fn reopen_clears_the_pending_close() {
+        let tracker = ShardOwnershipTracker::new();
+        tracker.shard_acquired(NODE, SHARD);
+
+        tracker.shard_closed(NODE, SHARD);
+        tracker.shard_reopened(NODE, SHARD);
+        tracker.shard_released(NODE, SHARD);
+
+        assert!(
+            tracker.has_close_order_violations(),
+            "a release after close + reopen has no close of its own"
+        );
+    }
+
+    #[test]
+    fn close_then_release_is_not_a_violation() {
+        let tracker = ShardOwnershipTracker::new();
+        tracker.shard_acquired(NODE, SHARD);
+
+        tracker.shard_closed(NODE, SHARD);
+        tracker.shard_released(NODE, SHARD);
+
+        assert!(!tracker.has_close_order_violations());
+    }
+
+    #[test]
+    fn reopen_keeps_the_current_owner() {
+        let tracker = ShardOwnershipTracker::new();
+        tracker.shard_acquired(NODE, SHARD);
+
+        tracker.shard_closed(NODE, SHARD);
+        tracker.shard_reopened(NODE, SHARD);
+
+        assert_eq!(tracker.get_owner(SHARD).as_deref(), Some(NODE));
+    }
 }
