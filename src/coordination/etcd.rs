@@ -12,8 +12,9 @@ use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use crate::coordination::{
-    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, OpenShardError, ShardGuardContext,
-    ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend, get_hostname, keys,
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, OpenShardError, OwnershipCheck,
+    ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend,
+    get_hostname, keys,
 };
 
 /// etcd-based coordinator for distributed shard ownership.
@@ -1101,6 +1102,19 @@ impl EtcdShardGuard {
         if let Err(e) = self.release_ownership().await {
             tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to release shard ownership");
         }
+        self.finish_release_to_idle().await;
+    }
+
+    /// Give up a cleanly closed shard whose ownership another node has taken:
+    /// the same bookkeeping as a release, without a release call against an
+    /// owner key this node does not hold.
+    async fn abandon_lost_ownership_to_idle(&self, owned_arc: &Mutex<HashSet<ShardId>>) {
+        owned_arc.lock().await.remove(&self.ctx.shard_id);
+        self.finish_release_to_idle().await;
+    }
+
+    /// Drop the ownership token and return a releasing guard to Idle.
+    async fn finish_release_to_idle(&self) {
         {
             let mut st = self.ctx.state.lock().await;
             st.ownership_token = None;
@@ -1113,6 +1127,37 @@ impl EtcdShardGuard {
             node_id: self.node_id.clone(),
             shard_id: self.ctx.shard_id.to_string(),
         });
+    }
+
+    /// Whether the shard's owner key still names this node. A read that fails
+    /// or times out is `Unknown`: the caller neither reopens nor assumes
+    /// ownership is gone, and takes the ordinary release path, which compares
+    /// the owner itself.
+    async fn check_ownership(&self) -> OwnershipCheck {
+        let read_timeout = Duration::from_secs(5);
+        let owner_key = self.owner_key();
+        let mut kv = self.client.kv_client();
+        match tokio::time::timeout(read_timeout, kv.get(owner_key, None)).await {
+            Ok(Ok(resp)) => {
+                let is_ours = resp
+                    .kvs()
+                    .first()
+                    .is_some_and(|kv| kv.value() == self.node_id.as_bytes());
+                if is_ours {
+                    OwnershipCheck::Ours
+                } else {
+                    OwnershipCheck::Lost
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(shard_id = %self.ctx.shard_id, error = %e, "failed to read shard owner key before reopening");
+                OwnershipCheck::Unknown
+            }
+            Err(_) => {
+                warn!(shard_id = %self.ctx.shard_id, "timed out reading shard owner key before reopening");
+                OwnershipCheck::Unknown
+            }
+        }
     }
 
     pub async fn run(
@@ -1303,7 +1348,25 @@ impl EtcdShardGuard {
                             st.desired
                         };
 
-                        if reopen {
+                        // A close can stay pending for a long time, long enough for an
+                        // operator to force-release ownership and another node to take
+                        // it. The shard is reopened only under an owner key that still
+                        // names this node.
+                        let ownership_check = if reopen {
+                            self.check_ownership().await
+                        } else {
+                            OwnershipCheck::Ours
+                        };
+                        if ownership_check == OwnershipCheck::Lost {
+                            tracing::error!(
+                                shard_id = %self.ctx.shard_id,
+                                "shard owner key no longer names this node after a pending close, giving the shard up without reopening"
+                            );
+                            self.abandon_lost_ownership_to_idle(&owned_arc).await;
+                            return;
+                        }
+
+                        if reopen && ownership_check == OwnershipCheck::Ours {
                             // This node is the desired owner again: keep ownership and
                             // serve a fresh shard. `open` has no timeout of its own.
                             let reopened = tokio::time::timeout(

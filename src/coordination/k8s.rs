@@ -20,8 +20,8 @@ use crate::coordination::k8s_backend::{
 };
 use crate::coordination::{
     CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo, OpenShardError,
-    ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend,
-    compute_desired_shards_for_node, get_hostname, keys,
+    OwnershipCheck, ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase,
+    SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
@@ -1884,7 +1884,25 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         st.desired
                     };
 
-                    if reopen {
+                    // A close can stay pending for a long time, long enough for an
+                    // operator to force-release the lease and another node to take
+                    // it. The shard is reopened only under a lease that still names
+                    // this node.
+                    let lease_check = if reopen {
+                        self.check_lease_holder(&lease_name).await
+                    } else {
+                        OwnershipCheck::Ours
+                    };
+                    if lease_check == OwnershipCheck::Lost {
+                        tracing::error!(
+                            shard_id = %self.ctx.shard_id,
+                            "shard lease no longer names this node after a pending close, giving the shard up without reopening"
+                        );
+                        self.abandon_lost_lease_to_idle(&owned_arc).await;
+                        continue;
+                    }
+
+                    if reopen && lease_check == OwnershipCheck::Ours {
                         // This node is the desired owner again: keep the lease and
                         // serve a fresh shard. `open` has no timeout of its own.
                         let reopen_started = std::time::Instant::now();
@@ -2093,6 +2111,19 @@ impl<B: K8sBackend> K8sShardGuard<B> {
             }
         }
 
+        self.finish_release_to_idle().await;
+    }
+
+    /// Give up a cleanly closed shard whose lease another holder has taken:
+    /// the same bookkeeping as a release, without a release call against a
+    /// lease this node does not hold.
+    async fn abandon_lost_lease_to_idle(&self, owned_arc: &Mutex<HashSet<ShardId>>) {
+        owned_arc.lock().await.remove(&self.ctx.shard_id);
+        self.finish_release_to_idle().await;
+    }
+
+    /// Drop the ownership token and return a releasing guard to Idle.
+    async fn finish_release_to_idle(&self) {
         {
             let mut st = self.ctx.state.lock().await;
             st.ownership_token = None;
@@ -2105,6 +2136,39 @@ impl<B: K8sBackend> K8sShardGuard<B> {
             node_id: self.node_id.clone(),
             shard_id: self.ctx.shard_id.to_string(),
         });
+    }
+
+    /// Whether the shard's lease still names this node. A read that fails or
+    /// times out is `Unknown`: the caller neither reopens nor assumes the
+    /// lease is gone, and takes the ordinary release path, which verifies the
+    /// holder itself.
+    async fn check_lease_holder(&self, lease_name: &str) -> OwnershipCheck {
+        let read_timeout = Duration::from_secs(5);
+        let lease = tokio::time::timeout(
+            read_timeout,
+            self.backend.get_lease(&self.namespace, lease_name),
+        )
+        .await;
+        match lease {
+            Ok(Ok(lease)) => {
+                let holder = lease
+                    .and_then(|lease| lease.spec)
+                    .and_then(|spec| spec.holder_identity);
+                if holder.as_deref() == Some(self.node_id.as_str()) {
+                    OwnershipCheck::Ours
+                } else {
+                    OwnershipCheck::Lost
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(shard_id = %self.ctx.shard_id, error = %e, "failed to read shard lease before reopening");
+                OwnershipCheck::Unknown
+            }
+            Err(_) => {
+                warn!(shard_id = %self.ctx.shard_id, "timed out reading shard lease before reopening");
+                OwnershipCheck::Unknown
+            }
+        }
     }
 
     /// [SILO-COORD-INV-1] Try to acquire the lease using compare-and-swap semantics.

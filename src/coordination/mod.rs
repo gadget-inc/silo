@@ -192,6 +192,18 @@ pub enum OpenShardError {
     Open(#[from] crate::job_store_shard::JobStoreShardError),
 }
 
+/// What the coordination backend records about a shard this guard holds a
+/// token for, read before the guard reopens the shard after a pending close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnershipCheck {
+    /// The backend still names this node as the shard's owner.
+    Ours,
+    /// The backend names another owner, or none.
+    Lost,
+    /// The backend could not be read.
+    Unknown,
+}
+
 /// Phase of a shard guard's lifecycle.
 ///
 /// Shared by all coordination backends (etcd, k8s).

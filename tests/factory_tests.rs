@@ -372,22 +372,43 @@ async fn close_all_failure_leaves_shard_closing() {
 
 /// Concurrent `open` and `close` for one shard id must never strand a live
 /// shard: every shard object an `open` handed out is either the one the
-/// factory serves or has had `close()` called on it.
+/// factory serves, has had `close()` called on it, or sits in an entry whose
+/// close is pending. Odd iterations fail the first closes that reach the
+/// shard, which leaves the entry closing with its shard object still live;
+/// no `open` may build a second shard object beside it.
 #[silo::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_open_and_close_never_strand_a_live_shard() {
     const ITERATIONS: usize = 40;
     const CALLERS_PER_SIDE: usize = 4;
+    const INJECTED_CLOSE_FAILURES: u32 = 2;
 
     let factory = make_memory_factory();
     for iteration in 0..ITERATIONS {
         let shard_id = ShardId::new();
+        let injected = if iteration % 2 == 1 {
+            INJECTED_CLOSE_FAILURES
+        } else {
+            0
+        };
+        factory.inject_close_failures(shard_id, injected);
 
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut opens = Vec::new();
         let mut closes = Vec::new();
         for _ in 0..CALLERS_PER_SIDE {
             let open_factory = Arc::clone(&factory);
+            let open_log = Arc::clone(&opened);
             opens.push(tokio::spawn(async move {
-                open_factory.open(&shard_id, &ShardRange::full()).await
+                let result = open_factory.open(&shard_id, &ShardRange::full()).await;
+                if let Ok(shard) = &result {
+                    let mut opened = open_log.lock().unwrap();
+                    opened.push(Arc::clone(shard));
+                    assert!(
+                        count_live_shard_objects(&opened) <= 1,
+                        "iteration {iteration}: open built a shard beside one that is still live"
+                    );
+                }
+                result.map(|_| ())
             }));
             let close_factory = Arc::clone(&factory);
             closes.push(tokio::spawn(async move {
@@ -396,29 +417,33 @@ async fn concurrent_open_and_close_never_strand_a_live_shard() {
             }));
         }
 
-        let mut opened = Vec::new();
         for open in opens {
             match open.await.expect("open task panicked") {
-                Ok(shard) => opened.push(shard),
-                Err(silo::job_store_shard::JobStoreShardError::ClosePending(_)) => {}
+                Ok(()) | Err(silo::job_store_shard::JobStoreShardError::ClosePending(_)) => {}
                 Err(other) => panic!("iteration {iteration}: open failed: {other}"),
             }
         }
+        let mut failed_closes = 0;
         for close in closes {
-            close
-                .await
-                .expect("close task panicked")
-                .unwrap_or_else(|e| panic!("iteration {iteration}: close failed: {e}"));
+            if let Err(e) = close.await.expect("close task panicked") {
+                failed_closes += 1;
+                assert!(
+                    failed_closes <= injected,
+                    "iteration {iteration}: more closes failed than were injected: {e}"
+                );
+            }
         }
 
+        let opened = opened.lock().unwrap().clone();
         let served = factory.get(&shard_id);
+        let close_pending = factory.is_closing(&shard_id);
         for shard in &opened {
             let is_served = served
                 .as_ref()
                 .is_some_and(|served| Arc::ptr_eq(served, shard));
             assert!(
-                is_served || shard.is_closing(),
-                "iteration {iteration}: an opened shard is neither served by the factory nor closed"
+                is_served || shard.is_closing() || close_pending,
+                "iteration {iteration}: an opened shard is neither served by the factory, closed, nor pending a close"
             );
         }
         if let Some(served) = &served {
@@ -428,8 +453,24 @@ async fn concurrent_open_and_close_never_strand_a_live_shard() {
             );
         }
 
+        factory.inject_close_failures(shard_id, 0);
         factory.close(&shard_id).await.expect("cleanup close");
+        assert!(
+            opened.iter().all(|shard| shard.is_closing()),
+            "iteration {iteration}: the completed close left an opened shard live"
+        );
     }
+}
+
+/// Distinct shard objects on which `close()` has not been called.
+fn count_live_shard_objects(shards: &[Arc<silo::job_store_shard::JobStoreShard>]) -> usize {
+    let mut live: Vec<&Arc<silo::job_store_shard::JobStoreShard>> = Vec::new();
+    for shard in shards.iter().filter(|shard| !shard.is_closing()) {
+        if !live.iter().any(|seen| Arc::ptr_eq(seen, shard)) {
+            live.push(shard);
+        }
+    }
+    live.len()
 }
 
 /// A shard closed directly on the shard object (as the split cloning phase
@@ -511,6 +552,50 @@ async fn close_returns_within_its_timeout_while_an_open_is_stuck() {
         "the pending close closes the opened shard"
     );
     assert!(!factory.is_closing(&shard_id));
+}
+
+/// `close_all` is the shutdown safety net and nothing retries after it. When
+/// its close of an entry times out waiting behind a stuck open, it makes one
+/// more attempt, which closes the shard that open produced.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_all_finishes_a_close_that_timed_out_behind_an_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory_with_close_timeout(&tmp);
+    let shard_id = ShardId::new();
+
+    // The shard's directory cannot be created, so the open keeps retrying.
+    make_dir_tree_readonly(tmp.path());
+    let stuck_open = {
+        let factory = Arc::clone(&factory);
+        tokio::spawn(async move { factory.open(&shard_id, &ShardRange::full()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!stuck_open.is_finished(), "the open should be stuck");
+
+    let close_all = {
+        let factory = Arc::clone(&factory);
+        tokio::spawn(async move { factory.close_all().await })
+    };
+    // Storage comes back only after the first attempt's deadline has passed.
+    tokio::time::sleep(FAILING_CLOSE_TIMEOUT + Duration::from_millis(500)).await;
+    restore_dir_tree_writable(tmp.path());
+
+    let opened = stuck_open
+        .await
+        .expect("open task panicked")
+        .expect("open should finish once storage is writable");
+    let closed = tokio::time::timeout(FAILING_CLOSE_TIMEOUT * 3, close_all)
+        .await
+        .expect("close_all should return within its bounded attempts")
+        .expect("close_all task panicked");
+    closed.expect("close_all's second attempt should close the opened shard");
+
+    assert!(
+        opened.is_closing(),
+        "close_all should close the shard the stuck open produced"
+    );
+    assert!(factory.get(&shard_id).is_none());
+    assert!(!factory.is_closing(&shard_id), "no close is left pending");
 }
 
 /// The retried close here runs a real `shard.close()`: the first attempt
@@ -598,6 +683,60 @@ async fn reset_with_a_failing_pending_close_deletes_nothing() {
         .await
         .expect("reset should succeed once the close can complete");
     assert_eq!(fresh.get_counters().await.expect("counters").total_jobs, 0);
+    assert!(!factory.is_closing(&shard_id));
+}
+
+/// Between `reset`'s close and its reopen the shard's data is being deleted,
+/// so an `open` in that window must not build a database on the path.
+#[silo::test]
+async fn open_during_reset_gets_close_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory(&tmp);
+    let shard_id = ShardId::new();
+
+    let original = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+    enqueue_job(&original, "job-before-reset").await;
+
+    let pause = factory.inject_reset_pause(shard_id);
+    let reset = {
+        let factory = Arc::clone(&factory);
+        tokio::spawn(async move { factory.reset(&shard_id, &ShardRange::full()).await })
+    };
+    pause
+        .reached
+        .await
+        .expect("reset should reach the window between its close and its delete");
+
+    let during_reset = factory.open(&shard_id, &ShardRange::full()).await;
+    match during_reset {
+        Err(silo::job_store_shard::JobStoreShardError::ClosePending(id)) => {
+            assert_eq!(id, shard_id, "close-pending error should name the shard")
+        }
+        Err(other) => panic!("open during reset: expected ClosePending, got {other}"),
+        Ok(_) => panic!("open during reset: expected ClosePending, got a shard"),
+    }
+    assert!(
+        factory.get(&shard_id).is_none(),
+        "no shard should be served while reset is deleting its data"
+    );
+
+    pause.release.send(()).expect("reset should be parked");
+    let fresh = reset
+        .await
+        .expect("reset task panicked")
+        .expect("reset should complete once released");
+    assert!(
+        !Arc::ptr_eq(&original, &fresh),
+        "reset should return a fresh shard object"
+    );
+    assert_eq!(fresh.get_counters().await.expect("counters").total_jobs, 0);
+    let served = factory
+        .get(&shard_id)
+        .expect("reset shard should be served");
+    assert!(Arc::ptr_eq(&served, &fresh));
     assert!(!factory.is_closing(&shard_id));
 }
 

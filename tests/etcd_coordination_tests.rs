@@ -4246,6 +4246,78 @@ async fn etcd_shutdown_during_pending_close_reaches_shut_down() {
     let _ = std::fs::remove_dir_all(&data_root);
 }
 
+/// Ownership moves to another node while this node's close is pending and the
+/// node is desired again: once the close completes the guard must not reopen
+/// the shard under an owner key that names someone else, and must leave that
+/// key alone.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_lost_ownership_during_pending_close_is_not_reopened() {
+    const FAILED_ATTEMPTS: u32 = 2;
+    const OTHER_OWNER: &str = "recover-lost-other";
+    /// How long the guard is watched after its close completes.
+    const SETTLE_WINDOW: Duration = Duration::from_millis(1500);
+
+    let prefix = unique_prefix();
+    let coord = connect_for_recovery().await;
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("lost-ownership");
+    let node = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    node.acquire().await;
+
+    node.factory
+        .inject_close_failures(shard_id, FAILED_ATTEMPTS);
+    node.guard.ctx.set_desired(false).await;
+    node.wait_for_failed_close().await;
+    // An operator force-release followed by an acquisition on another node.
+    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
+    coord
+        .client()
+        .put(owner_key.as_bytes(), OTHER_OWNER, None)
+        .await
+        .expect("rewrite the owner key");
+    node.guard.ctx.set_desired(true).await;
+
+    let close_completed = wait_until(Duration::from_secs(30), || async {
+        !node.factory.is_closing(&shard_id)
+    })
+    .await;
+    assert!(close_completed, "the pending close should complete");
+
+    let settled_at = Instant::now();
+    while settled_at.elapsed() < SETTLE_WINDOW {
+        assert!(
+            node.factory.get(&shard_id).is_none(),
+            "the shard must not be reopened under ownership this node lost"
+        );
+        assert_eq!(
+            shard_owner(&coord, &prefix, &shard_id).await.as_deref(),
+            Some(OTHER_OWNER),
+            "the other node's owner key must be left untouched"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The still-desired guard keeps trying to acquire, so its resting state is
+    // Idle or Acquiring; either way it holds nothing.
+    let phase = node.phase().await;
+    assert!(
+        matches!(phase, ShardPhase::Idle | ShardPhase::Acquiring),
+        "the guard should give the shard up, got {phase:?}"
+    );
+    assert!(!node.guard.ctx.state.lock().await.has_token());
+    assert!(!node.owned.lock().await.contains(&shard_id));
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
 /// The reopen after a completed close cannot finish (storage still
 /// unwritable): the guard gives up after the reopen timeout, releases
 /// ownership, and re-acquires from scratch once storage is back.

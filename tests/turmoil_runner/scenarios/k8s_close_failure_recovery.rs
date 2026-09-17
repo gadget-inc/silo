@@ -386,7 +386,9 @@ fn job_route(
     job_num: u32,
 ) -> (ShardId, String) {
     if job_num == num_jobs
-        && let Some(route) = shards.iter().find(|(shard_id, _)| Some(*shard_id) == target)
+        && let Some(route) = shards
+            .iter()
+            .find(|(shard_id, _)| Some(*shard_id) == target)
     {
         return route.clone();
     }
@@ -567,13 +569,9 @@ pub fn run() {
                     }
                     tracing::info!(node_id = %node_id, "node activated");
 
-                    let handle = setup_node_server(
-                        node_num,
-                        k8s_state,
-                        registry,
-                        node_num == STABLE_NODE,
-                    )
-                    .await?;
+                    let handle =
+                        setup_node_server(node_num, k8s_state, registry, node_num == STABLE_NODE)
+                            .await?;
 
                     while *state_rx.borrow() != NodeState::Shutdown {
                         if state_rx.changed().await.is_err() {
