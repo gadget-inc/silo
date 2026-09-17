@@ -174,3 +174,8 @@ harness = false
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"
 required-features = ["dst"]
+
+[[test]]
+name = "turmoil_object_store_tests"
+path = "tests/turmoil_object_store_tests.rs"
+required-features = ["dst"]

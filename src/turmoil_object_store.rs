@@ -19,8 +19,9 @@ use rand::Rng;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
     Attributes, CopyMode, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange, GetResult,
-    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, UploadPart,
+    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    UploadPart,
 };
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -44,11 +45,57 @@ fn get_shared_storage() -> &'static Mutex<BTreeMap<PathBuf, StorageEntry>> {
     SHARED_STORAGE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// Clear all data from the shared storage.
+/// Path prefixes whose writes are stalled. Process-global like the shared
+/// storage, so a stall applies to every store instance on every turmoil host.
+static WRITE_STALLS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+/// Clear all data from the shared storage, and any armed write stall.
 /// This should be called between test runs to ensure isolation.
 pub fn clear_shared_storage() {
     if let Some(storage) = SHARED_STORAGE.get() {
         storage.lock().unwrap().clear();
+    }
+    release_write_stalls();
+}
+
+/// Arm a write stall: puts and multipart completions for objects under
+/// `prefix` (a full path, store root included) hang until
+/// [`release_write_stalls`] is called. Simulates an object store that stops
+/// accepting writes for one shard.
+pub fn stall_writes_under(prefix: impl Into<PathBuf>) {
+    WRITE_STALLS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(prefix.into());
+}
+
+/// How often a stalled write re-checks whether its stall was released.
+const WRITE_STALL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn is_write_stalled(full_path: &std::path::Path) -> bool {
+    WRITE_STALLS.get().is_some_and(|stalls| {
+        stalls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prefix| full_path.starts_with(prefix))
+    })
+}
+
+/// Hold a write while a stall covers its path. With no stall armed this
+/// returns without awaiting or drawing randomness, so unstalled runs keep
+/// identical traces. Polling on simulated time keeps the release deterministic.
+async fn wait_while_write_stalled(full_path: &std::path::Path) {
+    while is_write_stalled(full_path) {
+        tokio::time::sleep(WRITE_STALL_POLL_INTERVAL).await;
+    }
+}
+
+/// Release every armed write stall, letting the stalled writes complete.
+pub fn release_write_stalls() {
+    if let Some(stalls) = WRITE_STALLS.get() {
+        stalls.lock().unwrap().clear();
     }
 }
 
@@ -117,12 +164,14 @@ impl ObjectStore for TurmoilObjectStore {
         &self,
         location: &Path,
         payload: PutPayload,
-        _opts: PutOptions,
+        opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
+        let full_path = self.full_path(location);
+        wait_while_write_stalled(&full_path).await;
+
         // Simulate network latency for write operations (1-5ms)
         simulate_latency(1, 5).await;
 
-        let full_path = self.full_path(location);
         let bytes: Bytes = payload.into();
 
         let entry = StorageEntry {
@@ -130,10 +179,20 @@ impl ObjectStore for TurmoilObjectStore {
             last_modified: current_time(),
         };
 
-        get_shared_storage()
-            .lock()
-            .unwrap()
-            .insert(full_path, entry);
+        // The existence check and the insert share one lock acquisition, so a
+        // `Create` is an atomic put-if-absent. SlateDB fences stale writers
+        // through it: two writers racing on a manifest version must not both win.
+        let mut storage = get_shared_storage().lock().unwrap();
+        if matches!(opts.mode, PutMode::Create) && storage.contains_key(&full_path) {
+            return Err(ObjectStoreError::AlreadyExists {
+                path: location.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "object already exists",
+                )),
+            });
+        }
+        storage.insert(full_path, entry);
 
         Ok(PutResult {
             e_tag: None,
@@ -457,6 +516,8 @@ impl MultipartUpload for TurmoilMultipartUpload {
     }
 
     async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
+        wait_while_write_stalled(&self.path).await;
+
         // Simulate network latency for multipart complete (2-8ms)
         simulate_latency(2, 8).await;
 

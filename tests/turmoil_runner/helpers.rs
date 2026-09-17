@@ -917,6 +917,9 @@ pub struct ShardOwnershipTracker {
     pending_closes: Mutex<HashSet<(String, String)>>,
     /// Records close-before-release violations: (shard_id, node_id, timestamp)
     close_order_violations: Mutex<Vec<(String, String, u64)>>,
+    /// Number of reopens observed per shard. Lets a scenario prove it exercised
+    /// the reopen path rather than passing vacuously.
+    reopens: Mutex<HashMap<String, u32>>,
     /// Nodes that have been marked as crashed. When a crashed node's shards are
     /// acquired by another node, it is not considered split-brain since the crashed
     /// node is no longer running (even though it never emitted ShardReleased events).
@@ -1117,12 +1120,29 @@ impl ShardOwnershipTracker {
 
         let mut pending = self.pending_closes.lock().unwrap();
         pending.remove(&(node_id.to_string(), shard_id.to_string()));
+        *self
+            .reopens
+            .lock()
+            .unwrap()
+            .entry(shard_id.to_string())
+            .or_insert(0) += 1;
         tracing::trace!(
             shard_id = %shard_id,
             node_id = %node_id,
             timestamp = timestamp,
             "shard_reopened"
         );
+    }
+
+    /// Number of reopens observed for a shard.
+    #[allow(dead_code)]
+    pub fn reopen_count(&self, shard_id: &str) -> u32 {
+        self.reopens
+            .lock()
+            .unwrap()
+            .get(shard_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Check if any close-before-release violations have been detected (non-panicking).
@@ -1931,5 +1951,17 @@ mod shard_ownership_tracker_tests {
         tracker.shard_reopened(NODE, SHARD);
 
         assert_eq!(tracker.get_owner(SHARD).as_deref(), Some(NODE));
+    }
+
+    #[test]
+    fn reopens_are_counted_per_shard() {
+        let tracker = ShardOwnershipTracker::new();
+        assert_eq!(tracker.reopen_count(SHARD), 0);
+
+        tracker.shard_reopened(NODE, SHARD);
+        tracker.shard_reopened(NODE, SHARD);
+
+        assert_eq!(tracker.reopen_count(SHARD), 2);
+        assert_eq!(tracker.reopen_count("other-shard"), 0);
     }
 }

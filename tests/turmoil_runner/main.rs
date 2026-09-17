@@ -176,6 +176,16 @@ fn high_latency() {
 
 #[test]
 #[cfg(feature = "k8s")]
+fn k8s_close_failure_recovery() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::k8s_close_failure_recovery::run();
+    } else {
+        verify_determinism("k8s_close_failure_recovery", get_seed());
+    }
+}
+
+#[test]
+#[cfg(feature = "k8s")]
 fn k8s_coordination() {
     if is_subprocess() || is_fuzz_mode() {
         scenarios::k8s_coordination::run();
