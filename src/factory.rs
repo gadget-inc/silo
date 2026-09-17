@@ -19,7 +19,8 @@ use crate::shard_range::{ShardId, ShardRange};
 use crate::storage::resolve_object_store;
 
 /// A shard entry that supports atomic initialization and is either open or closing.
-/// Uses OnceCell to ensure only one caller opens each database even under concurrent access.
+/// The OnceCell holds the shard once it is opened; the lifecycle mutex is what
+/// lets only one caller open or close it at a time.
 struct ShardEntry {
     cell: OnceCell<Arc<JobStoreShard>>,
     /// Set once a close has begun on this entry. A closing entry is never
@@ -75,8 +76,8 @@ impl ShardEntry {
 ///
 /// Uses interior mutability (DashMap) so it can be shared across tasks
 /// and shards can be opened/closed dynamically as ownership changes.
-/// Per-shard OnceCell ensures that concurrent opens for the same shard
-/// are serialized while opens for different shards proceed in parallel.
+/// A per-shard lifecycle mutex serializes opens and closes of the same shard
+/// while different shards proceed in parallel.
 /// Default timeout for shard close operations (30 seconds).
 /// SlateDB's internal retrying_object_store retries indefinitely on transient errors,
 /// so we need a timeout to prevent close from hanging forever if the object store is
@@ -304,9 +305,11 @@ impl ShardFactory {
     /// specifies the tenant keyspace this shard is responsible for - this is immutable
     /// after opening.
     ///
-    /// Uses per-shard OnceCell to ensure atomic initialization: if two callers try to
-    /// open the same shard concurrently, only one will actually open the database and
-    /// the other will wait and receive the same instance.
+    /// Initialization is atomic per shard: if two callers try to open the same shard
+    /// concurrently, only one will actually open the database and the other will wait
+    /// and receive the same instance.
+    ///
+    /// Returns `ClosePending` when a close has begun on this shard and has not completed.
     ///
     /// **Note on path resolution:**
     /// For `Backend::Fs`, we resolve the object store at the storage root level (not
@@ -321,13 +324,13 @@ impl ShardFactory {
         let shard_id = *shard_id;
 
         // Wall-clock timer for this open call. Compared against the per-init
-        // timer below to expose time spent waiting on a concurrent opener
-        // (OnceCell contention) vs. time spent actually opening.
+        // timer below to expose time spent waiting on a concurrent opener or
+        // closer (lifecycle lock contention) vs. time spent actually opening.
         let call_started = std::time::Instant::now();
 
-        // Get or create the entry for this shard. The entry contains a OnceCell
-        // that ensures only one caller actually opens the database. The closing
-        // check runs under the map's per-key lock, the same lock `close` marks
+        // Get or create the entry for this shard, then take its lifecycle lock so
+        // only one caller opens the database and no close runs meanwhile. The
+        // closing check runs under the map's per-key lock, the same lock `close` marks
         // under, so a second database handle is never opened on a shard path
         // whose close is pending.
         let (entry, _lifecycle) = loop {
@@ -350,8 +353,8 @@ impl ShardFactory {
             }
         };
 
-        // OnceCell::get_or_try_init ensures only one caller opens the database,
-        // even if multiple callers reach this point concurrently.
+        // A caller that waited for the lifecycle lock behind another opener finds
+        // the cell filled and gets that instance.
         let name = shard_id.to_string();
         let range = range.clone();
         let template = &self.template;
@@ -360,8 +363,8 @@ impl ShardFactory {
 
         let result = entry
             .get_or_try_init(|| async {
-                // Timer for the actual open work (only the caller that wins the
-                // OnceCell runs this closure).
+                // Timer for the actual open work (only the caller that finds the
+                // cell empty runs this closure).
                 let init_started = std::time::Instant::now();
                 // For Backend::Fs, we need to open at the storage root level so that
                 // cloned databases can correctly resolve their relative parent SST paths.
@@ -632,9 +635,11 @@ impl ShardFactory {
 
     /// Close a specific shard and remove it from the factory.
     ///
-    /// The entry is marked closing before `shard.close()` runs, which takes the shard out of service for good: `close()` tears down the shard's runtime irreversibly, so a shard whose close has begun must never be served again. If the close fails or times out, the entry stays in the closing state and the error is returned; calling `close` again retries on the same shard object. The entry is removed once a close succeeds.
+    /// The entry is marked closing before `shard.close()` runs, which takes the shard out of service for good: `close()` tears down the shard's runtime irreversibly, so a shard whose close has begun must never be served again. If the close fails or times out, the entry stays in the closing state and the error is returned; calling `close` again makes another attempt on the same shard object. The entry is removed once an attempt reports the shard closed.
     ///
-    /// A timeout is applied because SlateDB's internal retrying_object_store retries indefinitely on transient errors, which would cause close to hang forever if the object store is unreachable.
+    /// SlateDB marks a database closed when its close begins, before it flushes. An attempt that follows one that timed out inside the database close therefore reports "already closed" at once and counts as complete: data acknowledged before that point is in the WAL, and the next writer to open the path fences this handle.
+    ///
+    /// The whole call runs under the close timeout, waiting for the entry included, because SlateDB's internal retrying_object_store retries indefinitely on transient errors: both a close and the `open` a close waits behind would otherwise hang forever if the object store is unreachable.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
         // Wall-clock timer for the whole close call, including the timeout-guarded
         // wait, so slow closes can be attributed without a profiler.
@@ -652,15 +657,25 @@ impl ShardFactory {
         };
 
         // Waits out an in-flight `open` initialization or an earlier `close`
-        // attempt on this entry.
-        let _lifecycle = entry.lifecycle.lock().await;
+        // attempt on this entry. `open` has no timeout of its own, so the wait
+        // shares this call's deadline; the entry stays closing, and the next
+        // attempt closes whatever the open produces.
+        let deadline = tokio::time::Instant::now() + self.close_timeout;
+        let Ok(_lifecycle) = tokio::time::timeout_at(deadline, entry.lifecycle.lock()).await else {
+            tracing::error!(
+                shard_id = %shard_id,
+                timeout_secs = self.close_timeout.as_secs(),
+                "factory.close: timed out waiting for an in-flight open or close of this shard, close pending"
+            );
+            return Err(self.close_timed_out());
+        };
         if !self.is_current_entry(shard_id, &entry) {
             tracing::trace!(shard_id = %shard_id, "factory.close: an earlier close removed the entry");
             return Ok(());
         }
 
         if let Some(shard) = entry.get() {
-            self.close_shard_with_timeout(shard_id, &shard).await?;
+            self.close_shard_by(deadline, shard_id, &shard).await?;
         } else {
             tracing::trace!(shard_id = %shard_id, "factory.close: shard not initialized");
         }
@@ -683,10 +698,18 @@ impl ShardFactory {
             .is_some_and(|current| Arc::ptr_eq(current.value(), entry))
     }
 
-    /// Run one `shard.close()` attempt under the close timeout. A database
-    /// that reports itself already closed counts as a successful close.
-    async fn close_shard_with_timeout(
+    fn close_timed_out(&self) -> JobStoreShardError {
+        JobStoreShardError::Codec(format!(
+            "shard close timed out after {}s",
+            self.close_timeout.as_secs()
+        ))
+    }
+
+    /// Run one `shard.close()` attempt that must finish by `deadline`. A
+    /// database that reports itself already closed counts as a completed close.
+    async fn close_shard_by(
         &self,
+        deadline: tokio::time::Instant,
         shard_id: &ShardId,
         shard: &JobStoreShard,
     ) -> Result<(), JobStoreShardError> {
@@ -699,7 +722,7 @@ impl ShardFactory {
 
         tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
         let close_started = std::time::Instant::now();
-        match tokio::time::timeout(self.close_timeout, shard.close()).await {
+        match tokio::time::timeout_at(deadline, shard.close()).await {
             Ok(Ok(())) => {
                 tracing::info!(
                     shard_id = %shard_id,
@@ -708,8 +731,8 @@ impl ShardFactory {
                 );
                 Ok(())
             }
-            // A timed-out close can complete internally, after which the DB
-            // reports itself closed. The shard is shut down.
+            // The database marks itself closed when its close begins, so this is
+            // what an attempt reports after an earlier one timed out inside it.
             Ok(Err(JobStoreShardError::Slate(ref slate_err)))
                 if matches!(slate_err.kind(), slatedb::ErrorKind::Closed(_)) =>
             {
@@ -726,10 +749,7 @@ impl ShardFactory {
                     timeout_secs = self.close_timeout.as_secs(),
                     "factory.close: shard.close() timed out (object store may be unreachable), close pending"
                 );
-                Err(JobStoreShardError::Codec(format!(
-                    "shard close timed out after {}s",
-                    self.close_timeout.as_secs()
-                )))
+                Err(self.close_timed_out())
             }
         }
     }

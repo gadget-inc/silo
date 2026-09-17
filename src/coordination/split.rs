@@ -424,7 +424,7 @@ impl ShardSplitter {
                 // Recover the parent shard: close the stale entry (with closed DB)
                 // from the factory, then reopen it with a fresh database.
                 if let Err(recover_err) = self.recover_parent_shard(&parent_shard_id).await {
-                    warn!(
+                    error!(
                         parent_shard_id = %parent_shard_id,
                         error = %recover_err,
                         "failed to recover parent shard after split failure"
@@ -782,6 +782,10 @@ impl ShardSplitter {
     /// the close succeeds, and reopens the shard with a fresh database so it can
     /// resume serving requests. It opens only after the close has completed and
     /// only while this node still owns the parent.
+    ///
+    /// An error leaves the parent unserved. When this node still owns it, the
+    /// parent stays that way until its guard releases it or the node restarts:
+    /// the guard is `Held` and nothing else reopens the shard.
     async fn recover_parent_shard(
         &self,
         parent_shard_id: &ShardId,
@@ -812,17 +816,37 @@ impl ShardSplitter {
             return Err(CoordinationError::NotShardOwner(*parent_shard_id));
         }
 
-        // Reopen the parent shard with a fresh database.
-        self.ctx
-            .factory
-            .open(parent_shard_id, &range)
-            .await
-            .map_err(|e| {
-                CoordinationError::BackendError(format!(
-                    "failed to reopen parent shard {} during recovery: {}",
-                    parent_shard_id, e
-                ))
-            })?;
+        // Reopen the parent shard with a fresh database. `open` has no timeout
+        // of its own and SlateDB retries indefinitely, so the reopen is bounded
+        // the way the guards bound theirs.
+        let reopen_timeout = self.ctx.factory.reopen_timeout();
+        tokio::time::timeout(
+            reopen_timeout,
+            self.ctx.factory.open(parent_shard_id, &range),
+        )
+        .await
+        .map_err(|_elapsed| {
+            CoordinationError::BackendError(format!(
+                "timed out after {}s reopening parent shard {} during recovery",
+                reopen_timeout.as_secs(),
+                parent_shard_id
+            ))
+        })?
+        .map_err(|e| {
+            CoordinationError::BackendError(format!(
+                "failed to reopen parent shard {} during recovery: {}",
+                parent_shard_id, e
+            ))
+        })?;
+
+        // The guard can also release the parent while the reopen is in flight.
+        // It drops the shard from the owned set before its release call goes
+        // out, so a second look catches that; the shard must not stay served
+        // without a lease.
+        if !self.ctx.owns_shard(parent_shard_id).await {
+            self.close_parent_until_done(parent_shard_id).await?;
+            return Err(CoordinationError::NotShardOwner(*parent_shard_id));
+        }
 
         info!(
             parent_shard_id = %parent_shard_id,

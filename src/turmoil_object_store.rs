@@ -66,7 +66,7 @@ pub fn stall_writes_under(prefix: impl Into<PathBuf>) {
     WRITE_STALLS
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(prefix.into());
 }
 
@@ -77,7 +77,7 @@ fn is_write_stalled(full_path: &std::path::Path) -> bool {
     WRITE_STALLS.get().is_some_and(|stalls| {
         stalls
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .any(|prefix| full_path.starts_with(prefix))
     })
@@ -95,7 +95,10 @@ async fn wait_while_write_stalled(full_path: &std::path::Path) {
 /// Release every armed write stall, letting the stalled writes complete.
 pub fn release_write_stalls() {
     if let Some(stalls) = WRITE_STALLS.get() {
-        stalls.lock().unwrap().clear();
+        stalls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -182,7 +185,9 @@ impl ObjectStore for TurmoilObjectStore {
         // The existence check and the insert share one lock acquisition, so a
         // `Create` is an atomic put-if-absent. SlateDB fences stale writers
         // through it: two writers racing on a manifest version must not both win.
-        let mut storage = get_shared_storage().lock().unwrap();
+        let mut storage = get_shared_storage()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if matches!(opts.mode, PutMode::Create) && storage.contains_key(&full_path) {
             return Err(ObjectStoreError::AlreadyExists {
                 path: location.to_string(),

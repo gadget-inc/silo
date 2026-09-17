@@ -2683,7 +2683,11 @@ mod splitter_unit_tests {
         let original = factory.get(&shard_id).unwrap();
         factory.inject_close_failures(shard_id, 1);
 
-        let result = execute_failing_split(&splitter, &shard_map, shard_id).await;
+        // Seeing the close pending proves recovery did not reopen around a
+        // failed close: `open` refuses the shard until the retry completes it.
+        let split_task =
+            spawn_split_and_wait_for_pending_close(&factory, &shard_map, &splitter, shard_id).await;
+        let result = split_task.await.expect("split task panicked");
         assert!(result.is_err(), "split should fail at shard map update");
 
         assert!(
@@ -2750,11 +2754,14 @@ mod splitter_unit_tests {
     async fn test_parent_recovery_does_not_reopen_after_losing_ownership() {
         let (factory, shard_map, owned, _mock, splitter, shard_id) =
             setup_failing_update_split("recover-lost-ownership").await;
-        factory.inject_close_failures(shard_id, 1);
+        // Recovery cannot get past its close until the fault is disarmed, so
+        // the ownership change below always lands inside the retry window.
+        factory.inject_close_failures(shard_id, u32::MAX);
 
         let split_task =
             spawn_split_and_wait_for_pending_close(&factory, &shard_map, &splitter, shard_id).await;
         owned.lock().await.remove(&shard_id);
+        factory.inject_close_failures(shard_id, 0);
 
         let result = split_task.await.expect("split task panicked");
         assert!(result.is_err(), "split should fail at shard map update");
@@ -2766,6 +2773,52 @@ mod splitter_unit_tests {
             factory.get(&shard_id).is_none(),
             "recovery should not reopen a parent this node no longer owns"
         );
+    }
+
+    /// The parent's guard can release the shard while recovery's reopen is in
+    /// flight, after recovery checked ownership. Recovery re-checks once the
+    /// open returns and closes the shard again rather than leave it served
+    /// without a lease.
+    #[silo::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parent_recovery_closes_a_parent_lost_during_its_reopen() {
+        let (factory, shard_map, owned, _mock, splitter, shard_id) =
+            setup_failing_update_split("recover-lost-during-reopen").await;
+        let parent_dir = std::env::temp_dir()
+            .join("silo-splitter-unit-recover-lost-during-reopen")
+            .join(shard_id.to_string());
+        factory.inject_close_failures(shard_id, 1);
+
+        let split_task =
+            spawn_split_and_wait_for_pending_close(&factory, &shard_map, &splitter, shard_id).await;
+
+        // With the parent's data unwritable, recovery's reopen blocks once its
+        // retried close has completed and its ownership check has passed.
+        crate::test_helpers::make_dir_tree_readonly(&parent_dir);
+        let close_completed = crate::test_helpers::poll_until(
+            || async { !factory.is_closing(&shard_id) },
+            |completed| *completed,
+            10_000,
+        )
+        .await;
+        // Recovery checks ownership right after its close completes, so by now
+        // that check has passed and the reopen is what it is blocked in.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let reopen_in_flight = !split_task.is_finished();
+        owned.lock().await.remove(&shard_id);
+        crate::test_helpers::restore_dir_tree_writable(&parent_dir);
+        assert!(close_completed, "recovery's retried close should complete");
+        assert!(
+            reopen_in_flight,
+            "recovery should be blocked in its reopen when ownership is lost"
+        );
+
+        let result = split_task.await.expect("split task panicked");
+        assert!(result.is_err(), "split should fail at shard map update");
+        assert!(
+            factory.get(&shard_id).is_none(),
+            "recovery should not leave a parent open that this node stopped owning mid-reopen"
+        );
+        assert!(!factory.is_closing(&shard_id));
     }
 
     /// Recovery's close-retry loop exits on coordinator shutdown and leaves

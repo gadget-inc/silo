@@ -28,6 +28,14 @@ jobs:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: Swatinem/rust-cache@v2
 
+      # The simulated object store and the invariant trackers are only built
+      # with the dst feature, so no other job runs their unit tests.
+      - name: Run simulation support unit tests
+        shell: bash
+        run: |
+          cargo test --features dst --test turmoil_object_store_tests
+          cargo test --features dst --test turmoil_runner shard_ownership_tracker_tests
+
       - name: Run simulation tests
         shell: bash
         run: |

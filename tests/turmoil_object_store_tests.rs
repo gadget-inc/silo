@@ -1,4 +1,4 @@
-//! Tests for `TurmoilObjectStore`'s arm-able write stall.
+//! Tests for `TurmoilObjectStore`'s arm-able write stall and put-if-absent.
 //!
 //! These live outside the `turmoil_runner` crate because that binary links
 //! mad-turmoil, which takes over the process clock: outside a simulation no

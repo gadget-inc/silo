@@ -465,6 +465,142 @@ async fn directly_closed_shard_is_not_served() {
     assert!(factory.get(&shard_id).is_some(), "fresh shard is served");
 }
 
+/// `open` has no timeout and SlateDB retries forever, so an open against
+/// unwritable storage can hold its entry indefinitely. A close of that entry
+/// still has to come back within the close timeout, leaving the close pending.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_returns_within_its_timeout_while_an_open_is_stuck() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory_with_close_timeout(&tmp);
+    let shard_id = ShardId::new();
+
+    // The shard's directory cannot be created, so the open keeps retrying.
+    make_dir_tree_readonly(tmp.path());
+    let stuck_open = {
+        let factory = Arc::clone(&factory);
+        tokio::spawn(async move { factory.open(&shard_id, &ShardRange::full()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!stuck_open.is_finished(), "the open should be stuck");
+
+    let closed = tokio::time::timeout(FAILING_CLOSE_TIMEOUT * 3, factory.close(&shard_id)).await;
+    restore_dir_tree_writable(tmp.path());
+    let closed = closed.expect("close should return within its timeout behind a stuck open");
+    assert!(closed.is_err(), "a close that could not run should fail");
+    assert!(
+        factory.is_closing(&shard_id),
+        "the close stays pending for a later attempt"
+    );
+
+    // With storage back, the open finishes; the pending close then closes the
+    // shard it produced.
+    let opened = stuck_open
+        .await
+        .expect("open task panicked")
+        .expect("open should finish once storage is writable");
+    assert!(
+        factory.get(&shard_id).is_none(),
+        "a closing entry is not served"
+    );
+    factory
+        .close(&shard_id)
+        .await
+        .expect("the pending close should complete");
+    assert!(
+        opened.is_closing(),
+        "the pending close closes the opened shard"
+    );
+    assert!(!factory.is_closing(&shard_id));
+}
+
+/// The retried close here runs a real `shard.close()`: the first attempt
+/// failed before it reached the shard, so nothing has marked the database
+/// closed. Data written before the failed close survives into the reopen.
+#[silo::test]
+async fn retried_close_runs_a_real_close_and_keeps_the_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory(&tmp);
+    let shard_id = ShardId::new();
+
+    let original = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+    enqueue_job(&original, "job-before-close").await;
+    factory.inject_close_failures(shard_id, 1);
+    factory
+        .close(&shard_id)
+        .await
+        .expect_err("the injected failure should fail the close");
+    assert!(factory.is_closing(&shard_id));
+    assert!(
+        !original.is_closing(),
+        "the injected failure leaves the shard object untouched"
+    );
+
+    factory
+        .close(&shard_id)
+        .await
+        .expect("the retried close should succeed");
+    assert!(original.is_closing(), "the retry closed the shard object");
+
+    let reopened = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open after completed close");
+    let job = reopened
+        .get_job("test-tenant", "job-before-close")
+        .await
+        .expect("get job");
+    assert!(
+        job.is_some(),
+        "a job enqueued before the close should survive"
+    );
+}
+
+/// `reset` on a shard whose pending close fails again reports the pending
+/// close and deletes nothing.
+#[silo::test]
+async fn reset_with_a_failing_pending_close_deletes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = make_fs_factory(&tmp);
+    let shard_id = ShardId::new();
+    let shard_dir = tmp.path().join(shard_id.to_string());
+
+    let shard = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+    enqueue_job(&shard, "job-before-close").await;
+    factory.inject_close_failures(shard_id, 2);
+    factory
+        .close(&shard_id)
+        .await
+        .expect_err("the injected failure should fail the close");
+
+    match factory.reset(&shard_id, &ShardRange::full()).await {
+        Err(silo::job_store_shard::JobStoreShardError::ClosePending(id)) => {
+            assert_eq!(id, shard_id)
+        }
+        Err(other) => {
+            panic!("reset with a failing pending close: expected ClosePending, got {other}")
+        }
+        Ok(_) => panic!("reset with a failing pending close: expected ClosePending, got a shard"),
+    }
+    assert!(factory.is_closing(&shard_id), "the close is still pending");
+    assert!(
+        shard_dir.exists(),
+        "reset must not delete data while the close is pending"
+    );
+
+    let fresh = factory
+        .reset(&shard_id, &ShardRange::full())
+        .await
+        .expect("reset should succeed once the close can complete");
+    assert_eq!(fresh.get_counters().await.expect("counters").total_jobs, 0);
+    assert!(!factory.is_closing(&shard_id));
+}
+
 // --- reset tests ---
 
 #[silo::test]

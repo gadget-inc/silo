@@ -1093,17 +1093,21 @@ impl EtcdShardGuard {
 
     /// Release ownership of a cleanly closed shard and return the guard to Idle.
     async fn release_ownership_to_idle(&self, owned_arc: &Mutex<HashSet<ShardId>>) {
+        // The owned set is what split parent recovery consults before it
+        // reopens a shard, so the shard leaves it before the release call goes
+        // out rather than after it returns.
+        owned_arc.lock().await.remove(&self.ctx.shard_id);
+
         if let Err(e) = self.release_ownership().await {
             tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to release shard ownership");
         }
         {
             let mut st = self.ctx.state.lock().await;
             st.ownership_token = None;
-            st.phase = ShardPhase::Idle;
-        }
-        {
-            let mut owned = owned_arc.lock().await;
-            owned.remove(&self.ctx.shard_id);
+            // A shutdown triggered during the release stays in charge.
+            if st.phase == ShardPhase::Releasing {
+                st.phase = ShardPhase::Idle;
+            }
         }
         dst_events::emit(DstEvent::ShardReleased {
             node_id: self.node_id.clone(),
@@ -1229,13 +1233,15 @@ impl EtcdShardGuard {
                         // A release can be cancelled only before its close begins. Once
                         // a close has begun the shard's runtime is torn down for good,
                         // so the close is driven to completion whatever `desired` does.
-                        let close_pending = factory.is_closing(&self.ctx.shard_id);
-                        if !close_pending {
+                        if !factory.is_closing(&self.ctx.shard_id) {
                             // The fixed delay precedes a release's first close attempt;
                             // retries wait out the close backoff instead.
                             debug!(shard_id = %self.ctx.shard_id, "shard: release start (delay)");
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
+                        // Read after the delay: another caller (split recovery,
+                        // reset) can begin a close of this shard during it.
+                        let close_pending = factory.is_closing(&self.ctx.shard_id);
 
                         let mut cancelled = false;
                         let was_held = {
@@ -1252,7 +1258,7 @@ impl EtcdShardGuard {
                         if cancelled {
                             return;
                         }
-                        if !was_held {
+                        if !was_held && !close_pending {
                             let mut st = self.ctx.state.lock().await;
                             st.phase = ShardPhase::Idle;
                             debug!(shard_id = %self.ctx.shard_id, "shard: release noop");
@@ -1331,6 +1337,13 @@ impl EtcdShardGuard {
                                     );
                                 }
                             }
+                        }
+
+                        // A shutdown that arrived during the reopen is the shutdown
+                        // arm's to finish: going Idle here with `desired` still true
+                        // would re-acquire the shard mid-shutdown.
+                        if self.ctx.state.lock().await.phase == ShardPhase::ShuttingDown {
+                            return;
                         }
 
                         // The shard is closed cleanly, so ownership can go. When this

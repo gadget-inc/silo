@@ -380,8 +380,9 @@ impl<T> ShardGuardContext<T> {
         }
     }
 
-    /// Wait out a close-retry backoff delay. Returns true when shutdown was
-    /// observed before the delay elapsed.
+    /// Wait out a close-retry backoff delay. Returns true when the wait ended
+    /// early for shutdown. Callers need not act on it: a guard re-reads its
+    /// phase and the shutdown channel at the top of its loop either way.
     ///
     /// Only shutdown ends the wait early. A coordinator shutting down reaches
     /// its guards as `trigger_shutdown` plus a notify, ahead of the shutdown

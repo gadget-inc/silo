@@ -1925,6 +1925,13 @@ impl<B: K8sBackend> K8sShardGuard<B> {
                         }
                     }
 
+                    // A shutdown that arrived during the reopen is the shutdown
+                    // arm's to finish: going Idle here with `desired` still true
+                    // would re-acquire the shard mid-shutdown.
+                    if self.ctx.state.lock().await.phase == ShardPhase::ShuttingDown {
+                        continue;
+                    }
+
                     // The shard is closed cleanly, so the lease can go. When this
                     // node is still desired, Idle -> Acquiring retries from scratch.
                     self.release_lease_to_idle(&lease_name, &owned_arc).await;
@@ -2054,6 +2061,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
 
     /// Release the lease of a cleanly closed shard and return the guard to Idle.
     async fn release_lease_to_idle(&self, lease_name: &str, owned_arc: &Mutex<HashSet<ShardId>>) {
+        // The owned set is what split parent recovery consults before it
+        // reopens a shard, so the shard leaves it before the release call goes
+        // out rather than up to a release timeout later.
+        owned_arc.lock().await.remove(&self.ctx.shard_id);
+
         // Release the lease by clearing holderIdentity with CAS
         let has_token = {
             let st = self.ctx.state.lock().await;
@@ -2084,10 +2096,11 @@ impl<B: K8sBackend> K8sShardGuard<B> {
         {
             let mut st = self.ctx.state.lock().await;
             st.ownership_token = None;
-            st.phase = ShardPhase::Idle;
+            // A shutdown triggered during the release stays in charge.
+            if st.phase == ShardPhase::Releasing {
+                st.phase = ShardPhase::Idle;
+            }
         }
-        let mut owned = owned_arc.lock().await;
-        owned.remove(&self.ctx.shard_id);
         dst_events::emit(DstEvent::ShardReleased {
             node_id: self.node_id.clone(),
             shard_id: self.ctx.shard_id.to_string(),

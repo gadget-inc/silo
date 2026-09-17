@@ -532,6 +532,61 @@ async fn close_backoff_wait_elapses_without_shutdown() {
     assert!(!shutdown_observed);
 }
 
+/// `desired` can flap many times during one backoff. The notifies must leave
+/// the deadline where it was: neither ending the wait nor restarting it.
+#[silo::test(flavor = "multi_thread")]
+async fn close_backoff_wait_keeps_its_deadline_across_notifies() {
+    use silo::coordination::ShardGuardContext;
+
+    const DELAY: Duration = Duration::from_secs(1);
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctx = Arc::new(ShardGuardContext::<()>::new(ShardId::new(), shutdown_rx));
+    let started = std::time::Instant::now();
+    let wait = spawn_close_backoff_wait(&ctx, DELAY);
+
+    // Notifies spread across most of the delay, the last at 900ms. A wait that
+    // restarted its timer on each one would run to at least 1.9s.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ctx.notify.notify_one();
+    }
+
+    let shutdown_observed = tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("the close backoff should elapse")
+        .expect("task panicked");
+    let elapsed = started.elapsed();
+    assert!(!shutdown_observed, "no shutdown was signalled");
+    assert!(
+        elapsed >= DELAY,
+        "notifies should not end the backoff early: elapsed {elapsed:?}, delay {DELAY:?}"
+    );
+    assert!(
+        elapsed < DELAY + Duration::from_millis(700),
+        "notifies should not restart the backoff: elapsed {elapsed:?}, delay {DELAY:?}"
+    );
+}
+
+/// A dropped shutdown sender means the coordinator is gone.
+#[silo::test(flavor = "multi_thread")]
+async fn close_backoff_wait_returns_when_the_shutdown_sender_is_dropped() {
+    use silo::coordination::ShardGuardContext;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctx = Arc::new(ShardGuardContext::<()>::new(ShardId::new(), shutdown_rx));
+    let wait = spawn_close_backoff_wait(&ctx, Duration::from_secs(30));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    drop(shutdown_tx);
+
+    let shutdown_observed = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("close backoff should end promptly once the shutdown sender is gone")
+        .expect("task panicked");
+    assert!(shutdown_observed);
+}
+
 #[silo::test]
 fn guard_state_exposes_failed_close_attempts() {
     let mut state: ShardGuardState<()> = ShardGuardState::new();

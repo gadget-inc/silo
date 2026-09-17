@@ -25,8 +25,13 @@
 //! - **jobCompleteness**: every job accepted before, during, and after the
 //!   stall reaches a terminal state once the stall is lifted. That includes the
 //!   backlog job, which can only be leased from the reopened shard
-//! - **noClosingShardServed**: no shard handed out by any node's factory has had
-//!   `close()` called on it
+//! - **noClosingShardServed**: while the close is pending, a request for the
+//!   shard is turned away by its node: `NOT_FOUND` with a redirect while the
+//!   joining node is the computed owner, a retryable `UNAVAILABLE` once this
+//!   node is again. No shard handed out by any node's factory has had `close()`
+//!   called on it
+//! - **closeFailedFirst**: the close is still pending after the first attempt's
+//!   deadline, so the run exercises a failed close and not just a slow one
 //! - **leaseHeldWhileClosing**: a node's lease on a shard is never released
 //!   while that node's factory reports the shard as closing
 //! - **noSplitBrain** / **closeBeforeRelease**: via DST events
@@ -90,9 +95,14 @@ const STALL_HOLD_AFTER_FLAP: Duration = Duration::from_secs(13);
 const BACKLOG_WINDOW: Duration = Duration::from_secs(1);
 
 /// How long client writes to the target shard are paused before the stall
-/// arms. Longer than the clients' 2s request timeout, so every request that
-/// was in flight has finished.
-const WRITE_DRAIN: Duration = Duration::from_millis(2500);
+/// arms. A client that passed the gate connects to the healthy stable node on
+/// its first attempt (2s timeout), a worker then sleeps up to 80ms, and the
+/// request takes at most 2s, so this covers every request that passed the gate.
+const WRITE_DRAIN: Duration = Duration::from_millis(4500);
+
+/// How long any single scenario step may take before the run fails with a
+/// message naming the step, rather than as a bare simulation timeout.
+const STEP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Gates client traffic to the target shard around the stall.
 #[derive(Default)]
@@ -441,8 +451,55 @@ async fn try_enqueue(
     }
 }
 
-/// Ask the job's shard owner whether the job has reached a terminal status.
-/// Any failure to find out counts as "not yet".
+/// Poll `condition` every 10ms of simulated time until it holds. Panics, naming
+/// `step`, when it has not held within [`STEP_DEADLINE`].
+async fn wait_for_step<F, Fut>(step: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = turmoil::sim_elapsed().unwrap_or_default() + STEP_DEADLINE;
+    while !condition().await {
+        assert!(
+            turmoil::sim_elapsed().unwrap_or_default() < deadline,
+            "scenario step did not happen within {}s: {step}",
+            STEP_DEADLINE.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Fetch a job's status from its shard's current lease holder.
+async fn get_job_status(
+    k8s_state: &MockK8sState,
+    client_config: &ClientConfig,
+    shard_id: ShardId,
+    tenant: String,
+    job_num: u32,
+) -> Result<i32, tonic::Status> {
+    let owner = k8s_state
+        .find_shard_owner(NAMESPACE, CLUSTER_PREFIX, &shard_id)
+        .await
+        .ok()
+        .flatten();
+    let target = owner_node_num(owner.as_ref())
+        .ok_or_else(|| tonic::Status::not_found("shard has no lease holder"))?;
+    let mut client = create_turmoil_client(&node_uri(target), client_config)
+        .await
+        .map_err(|e| tonic::Status::unknown(format!("connect failed: {e}")))?;
+    client
+        .get_job(tonic::Request::new(GetJobRequest {
+            shard: shard_id.to_string(),
+            id: job_id(job_num),
+            tenant: Some(tenant),
+            include_attempts: false,
+        }))
+        .await
+        .map(|resp| resp.into_inner().status)
+}
+
+/// Whether the job has reached a terminal status. Any failure to find out
+/// counts as "not yet".
 async fn job_is_terminal(
     k8s_state: &MockK8sState,
     client_config: &ClientConfig,
@@ -450,31 +507,13 @@ async fn job_is_terminal(
     tenant: String,
     job_num: u32,
 ) -> bool {
-    let owner = k8s_state
-        .find_shard_owner(NAMESPACE, CLUSTER_PREFIX, &shard_id)
+    get_job_status(k8s_state, client_config, shard_id, tenant, job_num)
         .await
-        .ok()
-        .flatten();
-    let Some(target) = owner_node_num(owner.as_ref()) else {
-        return false;
-    };
-    let Ok(mut client) = create_turmoil_client(&node_uri(target), client_config).await else {
-        return false;
-    };
-    let job = client
-        .get_job(tonic::Request::new(GetJobRequest {
-            shard: shard_id.to_string(),
-            id: job_id(job_num),
-            tenant: Some(tenant),
-            include_attempts: false,
-        }))
-        .await;
-    job.is_ok_and(|resp| {
-        let status = resp.into_inner().status;
-        status == JobStatus::Succeeded as i32
-            || status == JobStatus::Failed as i32
-            || status == JobStatus::Cancelled as i32
-    })
+        .is_ok_and(|status| {
+            status == JobStatus::Succeeded as i32
+                || status == JobStatus::Failed as i32
+                || status == JobStatus::Cancelled as i32
+        })
 }
 
 pub fn run() {
@@ -574,7 +613,7 @@ pub fn run() {
                 let gap = rng.random_range(enqueue_gap_ms.0..=enqueue_gap_ms.1);
                 tokio::time::sleep(Duration::from_millis(gap)).await;
 
-                let (shard_id, tenant) = shards[(i as usize) % shards.len()].clone();
+                let (shard_id, tenant) = job_route(&shards, None, num_jobs, i);
                 let job_id = job_id(i);
                 if producer_gate.writes_paused_for(&shard_id) {
                     pending.push_back(i);
@@ -729,17 +768,16 @@ pub fn run() {
             // the close failure: only the reopened shard can lease it.
             let shards = discover_shard_tenants(&controller_k8s_state).await;
             let (_, backlog_tenant) = job_route(&shards, Some(shard_id), num_jobs, num_jobs);
-            while !try_enqueue(
-                &controller_k8s_state,
-                &controller_config,
-                shard_id,
-                backlog_tenant.clone(),
-                num_jobs,
-            )
-            .await
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            wait_for_step("the target shard accepts the backlog job", || {
+                try_enqueue(
+                    &controller_k8s_state,
+                    &controller_config,
+                    shard_id,
+                    backlog_tenant.clone(),
+                    num_jobs,
+                )
+            })
+            .await;
             controller_accepted.lock().unwrap().insert(job_id(num_jobs));
             tracing::trace!(job_id = %job_id(num_jobs), shard = %shard_id, "backlog_planted");
 
@@ -754,29 +792,74 @@ pub fn run() {
             // The flapping node joins and takes the target shard from the
             // stable node, whose close then hangs on the stalled flush.
             let _ = controller_flapping_tx.send(NodeState::Active);
-            let stable_factory = loop {
-                let found = controller_registry
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(id, _)| *id == node_id(STABLE_NODE))
-                    .map(|(_, factory)| Arc::clone(factory));
-                match found {
-                    Some(factory) => break factory,
-                    None => tokio::time::sleep(Duration::from_millis(10)).await,
-                }
-            };
-            while !stable_factory.is_closing(&shard_id) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            let stable_factory = controller_registry
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| *id == node_id(STABLE_NODE))
+                .map(|(_, factory)| Arc::clone(factory))
+                .expect("the stable node registers its factory at startup");
+            wait_for_step(
+                "node-0 begins closing the target shard after node-1 joins",
+                || async { stable_factory.is_closing(&shard_id) },
+            )
+            .await;
             tracing::trace!(shard = %shard_id, "close_began");
+
+            // The stable node started releasing because the flapping node is
+            // now the shard's computed owner, so it redirects requests there.
+            let redirected = get_job_status(
+                &controller_k8s_state,
+                &controller_config,
+                shard_id,
+                backlog_tenant.clone(),
+                num_jobs,
+            )
+            .await;
+            let redirect = redirected.as_ref().err().map(|status| {
+                let owner = status
+                    .metadata()
+                    .get(silo::server::SHARD_OWNER_NODE_METADATA_KEY)
+                    .and_then(|node| node.to_str().ok())
+                    .map(str::to_string);
+                (status.code(), owner)
+            });
+            assert_eq!(
+                redirect,
+                Some((tonic::Code::NotFound, Some(node_id(FLAPPING_NODE)))),
+                "INVARIANT VIOLATION (noClosingShardServed): a request for shard {shard_id} while its close is pending and another node is its computed owner should get NOT_FOUND redirecting there, got {redirected:?}"
+            );
+            tracing::trace!(shard = %shard_id, "close_pending_probe_redirected");
 
             // It leaves again while that first close attempt is in flight, so
             // the stable node is re-selected with its close failing.
             let _ = controller_flapping_tx.send(NodeState::Shutdown);
             tracing::trace!(shard = %shard_id, "ownership_flapped_back");
 
-            tokio::time::sleep(STALL_HOLD_AFTER_FLAP).await;
+            // Just past the first attempt's deadline the guard is inside its
+            // first backoff: the close has failed and is still pending.
+            let past_first_attempt = CLOSE_TIMEOUT + Duration::from_millis(500);
+            tokio::time::sleep(past_first_attempt).await;
+            assert!(
+                stable_factory.is_closing(&shard_id),
+                "INVARIANT VIOLATION (closeFailedFirst): the close of shard {shard_id} is not pending after its first attempt's deadline"
+            );
+            let probe = get_job_status(
+                &controller_k8s_state,
+                &controller_config,
+                shard_id,
+                backlog_tenant.clone(),
+                num_jobs,
+            )
+            .await;
+            assert_eq!(
+                probe.as_ref().err().map(tonic::Status::code),
+                Some(tonic::Code::Unavailable),
+                "INVARIANT VIOLATION (noClosingShardServed): a request for shard {shard_id} while its close is pending should get a retryable UNAVAILABLE, got {probe:?}"
+            );
+            tracing::trace!(shard = %shard_id, "close_pending_probe_unavailable");
+
+            tokio::time::sleep(STALL_HOLD_AFTER_FLAP - past_first_attempt).await;
             release_write_stalls();
             controller_gate.writes_paused.store(false, Ordering::SeqCst);
             controller_gate.leasing_paused.store(false, Ordering::SeqCst);
@@ -791,14 +874,23 @@ pub fn run() {
         let checker_registry = Arc::clone(&registry);
         let checker_done_flag = Arc::clone(&scenario_done);
         sim.client("checker", async move {
+            let shard_ids: Vec<ShardId> = discover_shard_tenants(&checker_k8s_state)
+                .await
+                .into_iter()
+                .map(|(shard_id, _)| shard_id)
+                .collect();
+
             while !checker_done_flag.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                let factories: Vec<(String, Arc<ShardFactory>)> =
-                    checker_registry.lock().unwrap().clone();
+                // Holders are read before `is_closing`: an entry stays closing
+                // until its close completes, so a closing entry seen afterwards
+                // was closing, or still open, when the holders were read.
                 let holders = checker_k8s_state
                     .get_shard_holders(NAMESPACE, CLUSTER_PREFIX)
                     .await;
+                let factories: Vec<(String, Arc<ShardFactory>)> =
+                    checker_registry.lock().unwrap().clone();
                 for (node_id, factory) in &factories {
                     for (shard_id, shard) in factory.instances() {
                         assert!(
@@ -806,29 +898,14 @@ pub fn run() {
                             "INVARIANT VIOLATION (noClosingShardServed): {node_id} serves shard {shard_id} after close() was called on it"
                         );
                     }
-                    for shard_id in holders.keys() {
+                    for shard_id in &shard_ids {
                         if factory.is_closing(shard_id) {
                             assert_eq!(
                                 holders.get(shard_id),
                                 Some(node_id),
-                                "INVARIANT VIOLATION (leaseHeldWhileClosing): lease on shard {shard_id} left {node_id} while its close is pending"
+                                "INVARIANT VIOLATION (leaseHeldWhileClosing): the lease on shard {shard_id} is not with {node_id} while its close is pending"
                             );
                         }
-                    }
-                }
-                // A closing shard with no lease holder at all is the same violation.
-                let shard_ids = checker_k8s_state
-                    .get_shard_ids(NAMESPACE, CLUSTER_PREFIX)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                for (node_id, factory) in &factories {
-                    for shard_id in &shard_ids {
-                        assert!(
-                            !factory.is_closing(shard_id) || holders.contains_key(shard_id),
-                            "INVARIANT VIOLATION (leaseHeldWhileClosing): shard {shard_id} has no lease holder while {node_id}'s close is pending"
-                        );
                     }
                 }
             }
@@ -847,7 +924,15 @@ pub fn run() {
         let verifier_stable_tx = Arc::clone(&stable_tx);
         let verifier_flapping_tx = Arc::clone(&flapping_tx);
         sim.client("verifier", async move {
+            // The controller's whole sequence, from arming to lifting the stall,
+            // fits well inside this.
+            let stall_deadline = Duration::from_secs(90);
             while !verifier_stall_lifted.load(Ordering::SeqCst) {
+                assert!(
+                    turmoil::sim_elapsed().unwrap_or_default() < stall_deadline,
+                    "the controller never lifted the stall within {}s",
+                    stall_deadline.as_secs()
+                );
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
