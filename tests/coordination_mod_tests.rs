@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use silo::coordination::{
-    CoordinationError, CoordinatorBase, MemberInfo, ShardGuardState, ShardOwnerMap, ShardPhase,
+    CloseRetryBackoff, CoordinationError, CoordinatorBase, MemberInfo, ShardGuardState,
+    ShardOwnerMap, ShardPhase,
 };
 use silo::factory::ShardFactory;
 use silo::shard_range::{ShardId, ShardMap};
@@ -432,4 +433,167 @@ async fn compute_shard_owner_map_basic() {
         );
         assert_eq!(owner_map.get_node(&shard_id), Some(&"node-1".to_string()));
     }
+}
+
+// --- CloseRetryBackoff ---
+
+#[silo::test]
+fn close_retry_backoff_doubles_from_one_second_to_a_thirty_second_cap() {
+    let mut backoff = CloseRetryBackoff::new();
+
+    let delays: Vec<u64> = (0..7).map(|_| backoff.next_delay().as_secs()).collect();
+
+    assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30]);
+    assert_eq!(
+        backoff.attempts(),
+        7,
+        "each delay records one failed attempt"
+    );
+}
+
+#[silo::test]
+fn close_retry_backoff_returns_to_one_second_after_reset() {
+    let mut backoff = CloseRetryBackoff::new();
+    for _ in 0..6 {
+        backoff.next_delay();
+    }
+
+    backoff.reset();
+
+    assert_eq!(backoff.attempts(), 0);
+    assert_eq!(backoff.next_delay().as_secs(), 1);
+}
+
+// --- ShardGuardContext::wait_close_backoff ---
+
+fn spawn_close_backoff_wait(
+    ctx: &Arc<silo::coordination::ShardGuardContext<()>>,
+    delay: Duration,
+) -> tokio::task::JoinHandle<bool> {
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move { ctx.wait_close_backoff(delay).await })
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn close_backoff_wait_ignores_notify_and_returns_on_shutdown_signal() {
+    use silo::coordination::ShardGuardContext;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctx = Arc::new(ShardGuardContext::<()>::new(ShardId::new(), shutdown_rx));
+    let wait = spawn_close_backoff_wait(&ctx, Duration::from_secs(30));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // A `desired` flap notifies the guard; it must not shorten the backoff.
+    ctx.notify.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !wait.is_finished(),
+        "a notify alone should not end the close backoff"
+    );
+
+    shutdown_tx.send(true).expect("send shutdown");
+    let shutdown_observed = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("close backoff should end promptly once shutdown is signalled")
+        .expect("task panicked");
+    assert!(shutdown_observed);
+}
+
+/// Coordinator shutdown reaches a guard as `trigger_shutdown` plus a notify,
+/// before the shutdown channel fires.
+#[silo::test(flavor = "multi_thread")]
+async fn close_backoff_wait_returns_when_guard_shutdown_is_triggered() {
+    use silo::coordination::ShardGuardContext;
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctx = Arc::new(ShardGuardContext::<()>::new(ShardId::new(), shutdown_rx));
+    let wait = spawn_close_backoff_wait(&ctx, Duration::from_secs(30));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    ctx.trigger_shutdown().await;
+    ctx.notify.notify_one();
+
+    let shutdown_observed = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("close backoff should end promptly once the guard is shutting down")
+        .expect("task panicked");
+    assert!(shutdown_observed);
+}
+
+#[silo::test(flavor = "multi_thread")]
+async fn close_backoff_wait_elapses_without_shutdown() {
+    use silo::coordination::ShardGuardContext;
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctx = Arc::new(ShardGuardContext::<()>::new(ShardId::new(), shutdown_rx));
+
+    let shutdown_observed = ctx.wait_close_backoff(Duration::from_millis(20)).await;
+
+    assert!(!shutdown_observed);
+}
+
+/// `desired` can flap many times during one backoff. The notifies must leave
+/// the deadline where it was: neither ending the wait nor restarting it.
+#[silo::test(flavor = "multi_thread")]
+async fn close_backoff_wait_keeps_its_deadline_across_notifies() {
+    use silo::coordination::ShardGuardContext;
+
+    const DELAY: Duration = Duration::from_secs(1);
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctx = Arc::new(ShardGuardContext::<()>::new(ShardId::new(), shutdown_rx));
+    let started = std::time::Instant::now();
+    let wait = spawn_close_backoff_wait(&ctx, DELAY);
+
+    // Notifies spread across most of the delay, the last at 900ms. A wait that
+    // restarted its timer on each one would run to at least 1.9s.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ctx.notify.notify_one();
+    }
+
+    let shutdown_observed = tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("the close backoff should elapse")
+        .expect("task panicked");
+    let elapsed = started.elapsed();
+    assert!(!shutdown_observed, "no shutdown was signalled");
+    assert!(
+        elapsed >= DELAY,
+        "notifies should not end the backoff early: elapsed {elapsed:?}, delay {DELAY:?}"
+    );
+    assert!(
+        elapsed < DELAY + Duration::from_millis(700),
+        "notifies should not restart the backoff: elapsed {elapsed:?}, delay {DELAY:?}"
+    );
+}
+
+/// A dropped shutdown sender means the coordinator is gone.
+#[silo::test(flavor = "multi_thread")]
+async fn close_backoff_wait_returns_when_the_shutdown_sender_is_dropped() {
+    use silo::coordination::ShardGuardContext;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctx = Arc::new(ShardGuardContext::<()>::new(ShardId::new(), shutdown_rx));
+    let wait = spawn_close_backoff_wait(&ctx, Duration::from_secs(30));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    drop(shutdown_tx);
+
+    let shutdown_observed = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("close backoff should end promptly once the shutdown sender is gone")
+        .expect("task panicked");
+    assert!(shutdown_observed);
+}
+
+#[silo::test]
+fn guard_state_exposes_failed_close_attempts() {
+    let mut state: ShardGuardState<()> = ShardGuardState::new();
+    assert_eq!(state.failed_close_attempts(), 0);
+
+    state.close_backoff.next_delay();
+    state.close_backoff.next_delay();
+
+    assert_eq!(state.failed_close_attempts(), 2);
 }

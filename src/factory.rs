@@ -4,6 +4,7 @@ use slatedb::object_store::path::Path as ObjectPath;
 use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -17,21 +18,49 @@ use crate::settings::DatabaseTemplate;
 use crate::shard_range::{ShardId, ShardRange};
 use crate::storage::resolve_object_store;
 
-/// A shard entry that supports atomic initialization.
-/// Uses OnceCell to ensure only one caller opens each database even under concurrent access.
+/// A shard entry that supports atomic initialization and is either open or closing.
+/// The OnceCell holds the shard once it is opened; the lifecycle mutex is what
+/// lets only one caller open or close it at a time.
 struct ShardEntry {
     cell: OnceCell<Arc<JobStoreShard>>,
+    /// Set once a close has begun on this entry. A closing entry is never
+    /// served again: it leaves the map when its close succeeds.
+    closing: AtomicBool,
+    /// Serializes open-initialization and close attempts for this shard id, so
+    /// a close waits for an in-flight initialization and then closes the shard
+    /// it produced, and concurrent closes run one after another.
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ShardEntry {
     fn new() -> Self {
         Self {
             cell: OnceCell::new(),
+            closing: AtomicBool::new(false),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     fn get(&self) -> Option<Arc<JobStoreShard>> {
         self.cell.get().cloned()
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    fn mark_closing(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
+
+    /// The shard, when this entry is open. `None` while uninitialized or
+    /// closing, and `None` for a shard closed directly on the shard object
+    /// (the split cloning phase does this), whose entry is never marked.
+    fn serving(&self) -> Option<Arc<JobStoreShard>> {
+        if self.is_closing() {
+            return None;
+        }
+        self.get().filter(|shard| !shard.is_closing())
     }
 
     async fn get_or_try_init<F, Fut>(&self, f: F) -> Result<Arc<JobStoreShard>, JobStoreShardError>
@@ -43,17 +72,39 @@ impl ShardEntry {
     }
 }
 
+/// Why one close attempt on a factory entry failed.
+enum CloseAttemptError {
+    /// The attempt timed out waiting for the entry's lifecycle lock, behind an
+    /// in-flight open or an earlier close, and never reached the shard.
+    Blocked(JobStoreShardError),
+    /// `shard.close()` failed or timed out.
+    Shard(JobStoreShardError),
+}
+
+impl From<CloseAttemptError> for JobStoreShardError {
+    fn from(err: CloseAttemptError) -> Self {
+        match err {
+            CloseAttemptError::Blocked(e) | CloseAttemptError::Shard(e) => e,
+        }
+    }
+}
+
 /// Factory for opening and holding `Shard` instances by ShardId.
 ///
 /// Uses interior mutability (DashMap) so it can be shared across tasks
 /// and shards can be opened/closed dynamically as ownership changes.
-/// Per-shard OnceCell ensures that concurrent opens for the same shard
-/// are serialized while opens for different shards proceed in parallel.
+/// A per-shard lifecycle mutex serializes opens and closes of the same shard
+/// while different shards proceed in parallel.
 /// Default timeout for shard close operations (30 seconds).
 /// SlateDB's internal retrying_object_store retries indefinitely on transient errors,
 /// so we need a timeout to prevent close from hanging forever if the object store is
 /// unreachable or the filesystem is read-only.
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default timeout for reopening a shard after its close completed (30 seconds).
+/// `open` has no timeout of its own and SlateDB retries indefinitely, so callers
+/// that must not block on an unreachable object store bound the open with this.
+const DEFAULT_REOPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ShardFactory {
     instances: DashMap<ShardId, Arc<ShardEntry>>,
@@ -61,6 +112,7 @@ pub struct ShardFactory {
     rate_limiter: Arc<dyn RateLimitClient>,
     metrics: Option<Metrics>,
     close_timeout: Duration,
+    reopen_timeout: Duration,
     /// Test-only clone fault: when armed, the next `clone_closed_shard` skips
     /// cloning this child so it comes up empty. Debug builds only; inert
     /// unless a test arms it.
@@ -71,6 +123,31 @@ pub struct ShardFactory {
     /// inert unless a test arms it.
     #[cfg(debug_assertions)]
     init_fail_child: std::sync::Mutex<Option<ShardId>>,
+    /// Test-only close fault: the number of upcoming `close` attempts that
+    /// fail for each shard. Debug builds only; inert unless a test arms it.
+    #[cfg(debug_assertions)]
+    close_failures: std::sync::Mutex<HashMap<ShardId, u32>>,
+    /// Test-only reset pause: when armed, `reset` parks between its completed
+    /// close and its data delete. Debug builds only; inert unless a test arms it.
+    #[cfg(debug_assertions)]
+    reset_pauses: std::sync::Mutex<HashMap<ShardId, ArmedResetPause>>,
+}
+
+/// The factory's half of a [`ResetPause`].
+#[cfg(debug_assertions)]
+struct ArmedResetPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// The test's half of an armed reset pause: `reached` resolves once `reset`
+/// is parked between its close and its delete, and sending on (or dropping)
+/// `release` lets it continue.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub struct ResetPause {
+    pub reached: tokio::sync::oneshot::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
 }
 
 impl ShardFactory {
@@ -85,10 +162,15 @@ impl ShardFactory {
             rate_limiter,
             metrics,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            reopen_timeout: DEFAULT_REOPEN_TIMEOUT,
             #[cfg(debug_assertions)]
             clone_skip_child: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             init_fail_child: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            close_failures: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(debug_assertions)]
+            reset_pauses: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -112,10 +194,15 @@ impl ShardFactory {
             rate_limiter: NullGubernatorClient::new(),
             metrics: None,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            reopen_timeout: DEFAULT_REOPEN_TIMEOUT,
             #[cfg(debug_assertions)]
             clone_skip_child: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             init_fail_child: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            close_failures: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(debug_assertions)]
+            reset_pauses: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -185,6 +272,99 @@ impl ShardFactory {
         }
     }
 
+    /// Arm the test-only close fault: the next `attempts` close attempts on
+    /// `shard_id` fail after the entry is marked closing, without touching
+    /// the shard. Lets tests drive consecutive close failures and close
+    /// failures on an already-closed database, neither of which a storage
+    /// fault can produce. `pub` because integration tests compile as a
+    /// separate crate.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn inject_close_failures(&self, shard_id: ShardId, attempts: u32) {
+        let mut armed = self
+            .close_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if attempts == 0 {
+            armed.remove(&shard_id);
+        } else {
+            armed.insert(shard_id, attempts);
+        }
+    }
+
+    /// Consume one injected close failure for this shard, if any is armed.
+    /// Always `false` in release builds.
+    fn take_injected_close_failure(&self, shard_id: &ShardId) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            let mut armed = self
+                .close_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(remaining) = armed.get_mut(shard_id) else {
+                return false;
+            };
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                armed.remove(shard_id);
+            }
+            true
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = shard_id;
+            false
+        }
+    }
+
+    /// Arm the test-only reset pause: the next `reset` of `shard_id` parks
+    /// after its close completes and before it deletes any data, until the
+    /// returned handle releases it. Lets tests act inside that window, which
+    /// is otherwise too short to observe. `pub` because integration tests
+    /// compile as a separate crate.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn inject_reset_pause(&self, shard_id: ShardId) -> ResetPause {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.reset_pauses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                shard_id,
+                ArmedResetPause {
+                    reached: reached_tx,
+                    release: release_rx,
+                },
+            );
+        ResetPause {
+            reached: reached_rx,
+            release: release_tx,
+        }
+    }
+
+    /// Park at an armed reset pause for this shard, if any. A no-op in
+    /// release builds.
+    async fn wait_at_injected_reset_pause(&self, shard_id: &ShardId) {
+        #[cfg(debug_assertions)]
+        {
+            let armed = self
+                .reset_pauses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(shard_id);
+            if let Some(pause) = armed {
+                tracing::warn!(shard_id = %shard_id, "test fault injection: pausing reset before its delete");
+                let _ = pause.reached.send(());
+                let _ = pause.release.await;
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = shard_id;
+        }
+    }
+
     /// Set the timeout for shard close operations.
     /// SlateDB retries indefinitely on transient errors, so this timeout prevents
     /// close from hanging forever. Useful for tests that inject storage failures.
@@ -192,9 +372,21 @@ impl ShardFactory {
         self.close_timeout = timeout;
     }
 
-    /// Get a shard by its ID.
+    /// Set the timeout callers apply when reopening a shard whose close completed.
+    pub fn set_reopen_timeout(&mut self, timeout: Duration) {
+        self.reopen_timeout = timeout;
+    }
+
+    /// The timeout callers apply when reopening a shard whose close completed.
+    pub fn reopen_timeout(&self) -> Duration {
+        self.reopen_timeout
+    }
+
+    /// Get an open shard by its ID. A shard whose close has begun is never returned.
     pub fn get(&self, shard_id: &ShardId) -> Option<Arc<JobStoreShard>> {
-        self.instances.get(shard_id).and_then(|entry| entry.get())
+        self.instances
+            .get(shard_id)
+            .and_then(|entry| entry.serving())
     }
 
     /// Open a shard using the shared database template.
@@ -203,9 +395,11 @@ impl ShardFactory {
     /// specifies the tenant keyspace this shard is responsible for - this is immutable
     /// after opening.
     ///
-    /// Uses per-shard OnceCell to ensure atomic initialization: if two callers try to
-    /// open the same shard concurrently, only one will actually open the database and
-    /// the other will wait and receive the same instance.
+    /// Initialization is atomic per shard: if two callers try to open the same shard
+    /// concurrently, only one will actually open the database and the other will wait
+    /// and receive the same instance.
+    ///
+    /// Returns `ClosePending` when a close has begun on this shard and has not completed.
     ///
     /// **Note on path resolution:**
     /// For `Backend::Fs`, we resolve the object store at the storage root level (not
@@ -220,20 +414,37 @@ impl ShardFactory {
         let shard_id = *shard_id;
 
         // Wall-clock timer for this open call. Compared against the per-init
-        // timer below to expose time spent waiting on a concurrent opener
-        // (OnceCell contention) vs. time spent actually opening.
+        // timer below to expose time spent waiting on a concurrent opener or
+        // closer (lifecycle lock contention) vs. time spent actually opening.
         let call_started = std::time::Instant::now();
 
-        // Get or create the entry for this shard. The entry contains a OnceCell
-        // that ensures only one caller actually opens the database.
-        let entry = self
-            .instances
-            .entry(shard_id)
-            .or_insert_with(|| Arc::new(ShardEntry::new()))
-            .clone();
+        // Get or create the entry for this shard, then take its lifecycle lock so
+        // only one caller opens the database and no close runs meanwhile. The
+        // closing check runs under the map's per-key lock, the same lock `close` marks
+        // under, so a second database handle is never opened on a shard path
+        // whose close is pending.
+        let (entry, _lifecycle) = loop {
+            let entry = {
+                let entry = self
+                    .instances
+                    .entry(shard_id)
+                    .or_insert_with(|| Arc::new(ShardEntry::new()));
+                if entry.is_closing() {
+                    return Err(JobStoreShardError::ClosePending(shard_id));
+                }
+                Arc::clone(entry.value())
+            };
+            let lifecycle = Arc::clone(&entry.lifecycle).lock_owned().await;
+            // A close that ran while this call waited for the lifecycle lock
+            // either removed the entry (start over on a fresh one) or left it
+            // closing (refused by the check above on the next pass).
+            if self.is_current_entry(&shard_id, &entry) && !entry.is_closing() {
+                break (entry, lifecycle);
+            }
+        };
 
-        // OnceCell::get_or_try_init ensures only one caller opens the database,
-        // even if multiple callers reach this point concurrently.
+        // A caller that waited for the lifecycle lock behind another opener finds
+        // the cell filled and gets that instance.
         let name = shard_id.to_string();
         let range = range.clone();
         let template = &self.template;
@@ -242,8 +453,8 @@ impl ShardFactory {
 
         let result = entry
             .get_or_try_init(|| async {
-                // Timer for the actual open work (only the caller that wins the
-                // OnceCell runs this closure).
+                // Timer for the actual open work (only the caller that finds the
+                // cell empty runs this closure).
                 let init_started = std::time::Instant::now();
                 // For Backend::Fs, we need to open at the storage root level so that
                 // cloned databases can correctly resolve their relative parent SST paths.
@@ -514,63 +725,39 @@ impl ShardFactory {
 
     /// Close a specific shard and remove it from the factory.
     ///
-    /// If `shard.close()` fails or times out, the shard is re-inserted into instances so that close can be retried later. This prevents silent data loss where a failed close is followed by a lease release.
+    /// The entry is marked closing before `shard.close()` runs, which takes the shard out of service for good: `close()` tears down the shard's runtime irreversibly, so a shard whose close has begun must never be served again. If the close fails or times out, the entry stays in the closing state and the error is returned; calling `close` again makes another attempt on the same shard object. The entry is removed once an attempt reports the shard closed.
     ///
-    /// A timeout is applied because SlateDB's internal retrying_object_store retries indefinitely on transient errors, which would cause close to hang forever if the object store is unreachable.
+    /// SlateDB marks a database closed when its close begins, before it flushes, so an attempt that follows one that timed out inside the database close finds a handle that reports "already closed" and can no longer flush. What that means depends on where the WAL lives. With the WAL in object storage, data acknowledged before that point is already durable there, the next writer to open the path replays it and fences this handle, and the attempt counts as complete. With a local WAL, that data may exist only on this node's disk while the next owner can be another node, so the attempt completes the close through a fresh database handle that replays the local WAL into the main store; until that succeeds the close stays pending. A handle whose close ran to completion (the split cloning phase closes its parent directly) counts as complete either way.
+    ///
+    /// The whole call runs under the close timeout, waiting for the entry included, because SlateDB's internal retrying_object_store retries indefinitely on transient errors: both a close and the `open` a close waits behind would otherwise hang forever if the object store is unreachable.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
+        Ok(self.try_close(shard_id).await?)
+    }
+
+    async fn try_close(&self, shard_id: &ShardId) -> Result<(), CloseAttemptError> {
         // Wall-clock timer for the whole close call, including the timeout-guarded
         // wait, so slow closes can be attributed without a profiler.
         let call_started = std::time::Instant::now();
 
-        tracing::trace!(shard_id = %shard_id, "factory.close: removing from instances");
-        if let Some((id, entry)) = self.instances.remove(shard_id) {
-            if let Some(shard) = entry.get() {
-                tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
-                let close_started = std::time::Instant::now();
-                let close_result = tokio::time::timeout(self.close_timeout, shard.close()).await;
-                match close_result {
-                    Ok(Ok(())) => {
-                        tracing::info!(
-                            shard_id = %shard_id,
-                            close_ms = close_started.elapsed().as_millis() as u64,
-                            "closed shard"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        // If the DB is already closed (e.g. a previous timed-out close
-                        // actually completed internally), treat it as a successful close
-                        // rather than re-inserting. The shard is already shut down.
-                        if let JobStoreShardError::Slate(ref slate_err) = e
-                            && matches!(slate_err.kind(), slatedb::ErrorKind::Closed(_))
-                        {
-                            tracing::info!(shard_id = %shard_id, "factory.close: shard already closed, treating as success");
-                        } else {
-                            // Close returned an error - re-insert so close can be retried
-                            tracing::error!(shard_id = %shard_id, error = %e, "factory.close: shard.close() failed, re-inserting into instances");
-                            self.instances.insert(id, entry);
-                            return Err(e);
-                        }
-                    }
-                    Err(_elapsed) => {
-                        // Timeout - re-insert so close can be retried
-                        tracing::error!(
-                            shard_id = %shard_id,
-                            timeout_secs = self.close_timeout.as_secs(),
-                            "factory.close: shard.close() timed out (object store may be unreachable), re-inserting into instances"
-                        );
-                        self.instances.insert(id, entry);
-                        return Err(JobStoreShardError::Codec(format!(
-                            "shard close timed out after {}s",
-                            self.close_timeout.as_secs()
-                        )));
-                    }
-                }
-            } else {
-                tracing::trace!(shard_id = %shard_id, "factory.close: shard not initialized");
-            }
-        } else {
+        // Marking under the map's per-key lock orders this against `open`'s
+        // closing check, which runs under the same lock.
+        let entry = self.instances.get(shard_id).map(|entry| {
+            entry.mark_closing();
+            Arc::clone(entry.value())
+        });
+        let Some(entry) = entry else {
             tracing::trace!(shard_id = %shard_id, "factory.close: shard not found in instances");
+            return Ok(());
+        };
+
+        // The lifecycle lock is held until the entry is out of the map, so a
+        // caller queued on it (a `reset`, say) never adopts an entry that is
+        // about to be removed from under it.
+        let lifecycle = self.close_marked_entry(shard_id, &entry).await?;
+        if lifecycle.is_some() {
+            self.remove_entry(shard_id, &entry);
         }
+        drop(lifecycle);
 
         tracing::debug!(
             shard_id = %shard_id,
@@ -581,8 +768,195 @@ impl ShardFactory {
         Ok(())
     }
 
+    /// Run one close attempt, under the close timeout, on an entry already
+    /// marked closing. On success the entry is still in the map, closing, and
+    /// its lifecycle lock is returned held, so the caller decides when the
+    /// shard id opens up again. `None` means an earlier close completed and
+    /// removed the entry.
+    async fn close_marked_entry(
+        &self,
+        shard_id: &ShardId,
+        entry: &Arc<ShardEntry>,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, CloseAttemptError> {
+        // Waits out an in-flight `open` initialization or an earlier `close`
+        // attempt on this entry. `open` has no timeout of its own, so the wait
+        // shares this call's deadline; the entry stays closing, and the next
+        // attempt closes whatever the open produces.
+        let deadline = tokio::time::Instant::now() + self.close_timeout;
+        let Ok(lifecycle) =
+            tokio::time::timeout_at(deadline, Arc::clone(&entry.lifecycle).lock_owned()).await
+        else {
+            tracing::error!(
+                shard_id = %shard_id,
+                timeout_secs = self.close_timeout.as_secs(),
+                "factory.close: timed out waiting for an in-flight open or close of this shard, close pending"
+            );
+            return Err(CloseAttemptError::Blocked(self.close_timed_out()));
+        };
+        if !self.is_current_entry(shard_id, entry) {
+            tracing::trace!(shard_id = %shard_id, "factory.close: an earlier close removed the entry");
+            return Ok(None);
+        }
+
+        if let Some(shard) = entry.get() {
+            self.close_shard_by(deadline, shard_id, &shard)
+                .await
+                .map_err(CloseAttemptError::Shard)?;
+        } else {
+            tracing::trace!(shard_id = %shard_id, "factory.close: shard not initialized");
+        }
+        Ok(Some(lifecycle))
+    }
+
+    fn remove_entry(&self, shard_id: &ShardId, entry: &Arc<ShardEntry>) {
+        self.instances
+            .remove_if(shard_id, |_, current| Arc::ptr_eq(current, entry));
+    }
+
+    /// Whether `entry` is the entry the map holds for this shard id.
+    fn is_current_entry(&self, shard_id: &ShardId, entry: &Arc<ShardEntry>) -> bool {
+        self.instances
+            .get(shard_id)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), entry))
+    }
+
+    fn close_timed_out(&self) -> JobStoreShardError {
+        JobStoreShardError::Codec(format!(
+            "shard close timed out after {}s",
+            self.close_timeout.as_secs()
+        ))
+    }
+
+    /// Run one `shard.close()` attempt that must finish by `deadline`. A
+    /// database that reports itself already closed counts as a completed close.
+    async fn close_shard_by(
+        &self,
+        deadline: tokio::time::Instant,
+        shard_id: &ShardId,
+        shard: &JobStoreShard,
+    ) -> Result<(), JobStoreShardError> {
+        if self.take_injected_close_failure(shard_id) {
+            tracing::warn!(shard_id = %shard_id, "test fault injection: failing shard close");
+            return Err(JobStoreShardError::Codec(format!(
+                "injected close failure for shard {shard_id}"
+            )));
+        }
+
+        tracing::trace!(shard_id = %shard_id, "factory.close: calling shard.close()");
+        let close_started = std::time::Instant::now();
+        match tokio::time::timeout_at(deadline, shard.close()).await {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    shard_id = %shard_id,
+                    close_ms = close_started.elapsed().as_millis() as u64,
+                    "closed shard"
+                );
+                Ok(())
+            }
+            // The database marks itself closed when its close begins, so this is
+            // what an attempt reports after an earlier one timed out inside it,
+            // and also what it reports after a close that ran to completion
+            // (the split cloning phase closes the parent directly).
+            Ok(Err(JobStoreShardError::Slate(ref slate_err)))
+                if matches!(slate_err.kind(), slatedb::ErrorKind::Closed(_)) =>
+            {
+                if shard.close_completed() || !self.has_local_wal() {
+                    tracing::info!(shard_id = %shard_id, "factory.close: shard already closed, treating as success");
+                    return Ok(());
+                }
+                self.finish_abandoned_close(deadline, shard_id).await
+            }
+            Ok(Err(e)) => {
+                tracing::error!(shard_id = %shard_id, error = %e, "factory.close: shard.close() failed, close pending");
+                Err(e)
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    shard_id = %shard_id,
+                    timeout_secs = self.close_timeout.as_secs(),
+                    "factory.close: shard.close() timed out (object store may be unreachable), close pending"
+                );
+                Err(self.close_timed_out())
+            }
+        }
+    }
+
+    /// Whether shards keep their WAL on this node's local disk.
+    fn has_local_wal(&self) -> bool {
+        self.template
+            .wal
+            .as_ref()
+            .is_some_and(|wal| wal.is_local_storage())
+    }
+
+    /// Complete the close of a shard whose database handle was closed without
+    /// finishing: an earlier attempt timed out inside the database close,
+    /// which leaves the handle unusable while writes it acknowledged may exist
+    /// only in the local WAL. The next owner can be another node that never
+    /// sees that WAL, so a fresh handle on the same path replays it, flushes
+    /// it into the main store, and closes. Opening that handle fences the
+    /// abandoned one.
+    async fn finish_abandoned_close(
+        &self,
+        deadline: tokio::time::Instant,
+        shard_id: &ShardId,
+    ) -> Result<(), JobStoreShardError> {
+        tracing::warn!(shard_id = %shard_id, "factory.close: database handle was closed without finishing, replaying its local WAL through a fresh handle");
+        let started = std::time::Instant::now();
+        let name = shard_id.to_string();
+        let flushed = tokio::time::timeout_at(deadline, async {
+            let (resolved, db_path) =
+                Self::resolve_at_root(&self.template.backend, &self.template.path, &name)?;
+            let mut builder = slatedb::DbBuilder::new(db_path.as_str(), resolved.store)
+                .with_merge_operator(crate::job_store_shard::counter_merge_operator());
+            if let Some(wal_store) = self.resolve_wal_store(&name)? {
+                builder = builder.with_wal_object_store(wal_store);
+            }
+            let db = builder.build().await?;
+            db.flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await?;
+            db.close().await?;
+            Ok::<(), JobStoreShardError>(())
+        })
+        .await;
+        match flushed {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(shard_id = %shard_id, error = %e, "factory.close: failed to flush the local WAL of an abandoned close, close pending");
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    shard_id = %shard_id,
+                    timeout_secs = self.close_timeout.as_secs(),
+                    "factory.close: timed out flushing the local WAL of an abandoned close, close pending"
+                );
+                return Err(self.close_timed_out());
+            }
+        }
+
+        if self.template.apply_wal_on_close
+            && let Some(wal_cfg) = &self.template.wal
+        {
+            self.delete_wal_data(&name, wal_cfg).await?;
+        }
+        tracing::info!(
+            shard_id = %shard_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "closed shard through a fresh handle"
+        );
+        Ok(())
+    }
+
     /// Reset a specific shard: close it, delete all data, and reopen fresh.
+    /// A shard whose close is pending has that close retried first.
     /// This is intended for testing/development only.
+    ///
+    /// From the start of the close until the data is deleted, the shard id holds a closing entry, so a concurrent `open` returns `ClosePending`.
+    ///
+    /// `reset` makes one close attempt. When it returns an error from that attempt — the close failed or timed out, including a timeout spent waiting behind an in-flight `open` — nothing has been deleted and the entry stays closing with its shard possibly still live. The caller must retry `reset` (or call `close`) until it succeeds; nothing else finishes that close.
     pub async fn reset(
         &self,
         shard_id: &ShardId,
@@ -590,25 +964,53 @@ impl ShardFactory {
     ) -> Result<Arc<JobStoreShard>, JobStoreShardError> {
         let name = shard_id.to_string();
 
-        // 1. Close and remove the shard if it exists
-        if let Some((_, entry)) = self.instances.remove(shard_id)
-            && let Some(shard) = entry.get()
-        {
-            shard.close().await?;
-            tracing::info!(shard_id = %shard_id, "closed shard for reset");
-        }
+        // 1. Close the shard if it exists. No data is deleted until the close
+        // has completed: a close that is still pending keeps its database handle.
+        // The closing entry (created here when the shard was never opened) and
+        // its lifecycle lock are held until the delete is done, so a concurrent
+        // `open` gets `ClosePending` instead of a database on a path that is
+        // being deleted, and a concurrent `close` cannot free the shard id early.
+        let close_was_pending = self.is_closing(shard_id);
+        let (entry, lifecycle) = loop {
+            let entry = {
+                let entry = self
+                    .instances
+                    .entry(*shard_id)
+                    .or_insert_with(|| Arc::new(ShardEntry::new()));
+                entry.mark_closing();
+                Arc::clone(entry.value())
+            };
+            match self.close_marked_entry(shard_id, &entry).await {
+                Ok(Some(lifecycle)) => break (entry, lifecycle),
+                // A concurrent close removed the entry; hold a new one.
+                Ok(None) => continue,
+                Err(_) if close_was_pending => {
+                    return Err(JobStoreShardError::ClosePending(*shard_id));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        self.wait_at_injected_reset_pause(shard_id).await;
 
         // 2. Delete the data using the appropriate method for the backend
-        self.delete_shard_data(&name).await?;
-
-        // Delete WAL directory if configured separately
-        if let Some(wal_cfg) = &self.template.wal {
-            self.delete_wal_data(&name, wal_cfg).await?;
-        }
+        let deleted = self.delete_all_shard_data(&name).await;
+        self.remove_entry(shard_id, &entry);
+        drop(lifecycle);
+        deleted?;
 
         // 3. Reopen the shard fresh
         tracing::info!(shard_id = %shard_id, "reopening shard after reset");
         self.open(shard_id, range).await
+    }
+
+    /// Delete a shard's data and, when configured separately, its WAL.
+    async fn delete_all_shard_data(&self, shard_name: &str) -> Result<(), JobStoreShardError> {
+        self.delete_shard_data(shard_name).await?;
+        if let Some(wal_cfg) = &self.template.wal {
+            self.delete_wal_data(shard_name, wal_cfg).await?;
+        }
+        Ok(())
     }
 
     /// Delete all data for a shard from storage.
@@ -710,36 +1112,42 @@ impl ShardFactory {
     }
 
     /// Check if this factory owns a shard by its ID.
-    /// Returns true only if the shard entry exists AND the shard has been initialized.
+    /// Returns true only if the shard entry exists, has been initialized, and is open.
     pub fn owns_shard(&self, shard_id: &ShardId) -> bool {
+        self.get(shard_id).is_some()
+    }
+
+    /// Whether a close has begun on this shard and has not completed.
+    pub fn is_closing(&self, shard_id: &ShardId) -> bool {
         self.instances
             .get(shard_id)
-            .and_then(|entry| entry.get())
-            .is_some()
+            .is_some_and(|entry| entry.is_closing())
     }
 
     /// Get a snapshot of all currently open instances.
     pub fn instances(&self) -> HashMap<ShardId, Arc<JobStoreShard>> {
         self.instances
             .iter()
-            .filter_map(|entry| entry.value().get().map(|shard| (*entry.key(), shard)))
+            .filter_map(|entry| entry.value().serving().map(|shard| (*entry.key(), shard)))
             .collect()
     }
 
-    /// Close all shards gracefully. Returns all errors if any shards fail to close.
+    /// Close all shards gracefully, open or closing, each through [`Self::close`]:
+    /// under the close timeout, removed on success, left closing on failure.
+    /// Returns all errors if any shards fail to close.
+    ///
+    /// Nothing retries after this shutdown safety net, so an attempt that timed out waiting behind an in-flight `open` — and so never reached the shard — is followed by one more attempt, which closes whatever that open produced. A shard whose own close failed or timed out gets no second attempt: its database already reports itself closed, so a retry would only turn the failure into a reported success.
     pub async fn close_all(&self) -> Result<(), CloseAllError> {
         let mut errors: Vec<(ShardId, JobStoreShardError)> = Vec::new();
         // Collect and sort shard IDs for deterministic shutdown order
         let mut shard_ids: Vec<ShardId> = self.instances.iter().map(|e| *e.key()).collect();
         shard_ids.sort_unstable();
         for shard_id in shard_ids {
-            let Some(entry) = self.instances.get(&shard_id) else {
-                continue;
+            let closed = match self.try_close(&shard_id).await {
+                Err(CloseAttemptError::Blocked(_)) => self.close(&shard_id).await,
+                attempt => attempt.map_err(JobStoreShardError::from),
             };
-            let Some(shard) = entry.get() else {
-                continue;
-            };
-            if let Err(e) = shard.close().await {
+            if let Err(e) = closed {
                 errors.push((shard_id, e));
             }
         }

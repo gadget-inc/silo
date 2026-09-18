@@ -4,12 +4,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
-use crate::coordination::{CoordinationError, ShardOwnerMap};
+use crate::coordination::{CloseRetryBackoff, CoordinationError, ShardOwnerMap};
 
 /// Log markers for the split's pre-commit child verification. Operational
 /// tooling asserts on these exact strings in deployed logs -- do not reword.
@@ -424,7 +424,7 @@ impl ShardSplitter {
                 // Recover the parent shard: close the stale entry (with closed DB)
                 // from the factory, then reopen it with a fresh database.
                 if let Err(recover_err) = self.recover_parent_shard(&parent_shard_id).await {
-                    warn!(
+                    error!(
                         parent_shard_id = %parent_shard_id,
                         error = %recover_err,
                         "failed to recover parent shard after split failure"
@@ -778,8 +778,14 @@ impl ShardSplitter {
     /// During the SplitCloning phase, the parent shard's database is closed before
     /// cloning. If the split fails after this point but before the commit (shard map
     /// update), the parent shard is left in the factory with a closed database,
-    /// permanently unusable. This method removes the stale entry and reopens the
-    /// shard with a fresh database so it can resume serving requests.
+    /// permanently unusable. This method closes the stale entry, retrying until
+    /// the close succeeds, and reopens the shard with a fresh database so it can
+    /// resume serving requests. It opens only after the close has completed and
+    /// only while this node still owns the parent.
+    ///
+    /// An error leaves the parent unserved. When this node still owns it, the
+    /// parent stays that way until its guard releases it or the node restarts:
+    /// the guard is `Held` and nothing else reopens the shard.
     async fn recover_parent_shard(
         &self,
         parent_shard_id: &ShardId,
@@ -798,25 +804,49 @@ impl ShardSplitter {
         };
 
         // Close the stale factory entry (handles already-closed DB gracefully).
-        if let Err(e) = self.ctx.factory.close(parent_shard_id).await {
-            warn!(
-                parent_shard_id = %parent_shard_id,
-                error = %e,
-                "failed to close stale parent shard entry during recovery, continuing"
-            );
+        // The parent's guard is `Held` during a split, so no guard loop retries
+        // this close: recovery drives it to completion itself.
+        self.close_parent_until_done(parent_shard_id).await?;
+
+        // Recovery runs detached from the parent's guard, which can close the
+        // shard and release its lease while the close above is retrying.
+        // Reopening a parent this node stopped owning would put a second
+        // database handle beside the new owner's.
+        if !self.ctx.owns_shard(parent_shard_id).await {
+            return Err(CoordinationError::NotShardOwner(*parent_shard_id));
         }
 
-        // Reopen the parent shard with a fresh database.
-        self.ctx
-            .factory
-            .open(parent_shard_id, &range)
-            .await
-            .map_err(|e| {
-                CoordinationError::BackendError(format!(
-                    "failed to reopen parent shard {} during recovery: {}",
-                    parent_shard_id, e
-                ))
-            })?;
+        // Reopen the parent shard with a fresh database. `open` has no timeout
+        // of its own and SlateDB retries indefinitely, so the reopen is bounded
+        // the way the guards bound theirs.
+        let reopen_timeout = self.ctx.factory.reopen_timeout();
+        tokio::time::timeout(
+            reopen_timeout,
+            self.ctx.factory.open(parent_shard_id, &range),
+        )
+        .await
+        .map_err(|_elapsed| {
+            CoordinationError::BackendError(format!(
+                "timed out after {}s reopening parent shard {} during recovery",
+                reopen_timeout.as_secs(),
+                parent_shard_id
+            ))
+        })?
+        .map_err(|e| {
+            CoordinationError::BackendError(format!(
+                "failed to reopen parent shard {} during recovery: {}",
+                parent_shard_id, e
+            ))
+        })?;
+
+        // The guard can also release the parent while the reopen is in flight.
+        // It drops the shard from the owned set before its release call goes
+        // out, so a second look catches that; the shard must not stay served
+        // without a lease.
+        if !self.ctx.owns_shard(parent_shard_id).await {
+            self.close_parent_until_done(parent_shard_id).await?;
+            return Err(CoordinationError::NotShardOwner(*parent_shard_id));
+        }
 
         info!(
             parent_shard_id = %parent_shard_id,
@@ -824,6 +854,40 @@ impl ShardSplitter {
             "recovered parent shard after failed split"
         );
         Ok(())
+    }
+
+    /// Retry `factory.close` on the parent with capped exponential backoff
+    /// until it succeeds. Returns an error when the coordinator shuts down
+    /// first; the entry then stays closing for the shutdown path to close.
+    async fn close_parent_until_done(
+        &self,
+        parent_shard_id: &ShardId,
+    ) -> Result<(), CoordinationError> {
+        let mut backoff = CloseRetryBackoff::new();
+        let mut shutdown_rx = self.coordinator.base().shutdown_rx.clone();
+        loop {
+            let Err(e) = self.ctx.factory.close(parent_shard_id).await else {
+                return Ok(());
+            };
+            let delay = backoff.next_delay();
+            error!(
+                parent_shard_id = %parent_shard_id,
+                error = %e,
+                attempt = backoff.attempts(),
+                next_retry_ms = delay.as_millis() as u64,
+                "failed to close parent shard during recovery, retrying"
+            );
+
+            // A dropped shutdown sender means the coordinator is gone, which
+            // ends the retry loop the same way a shutdown signal does.
+            let shutdown_observed = tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                _ = shutdown_rx.wait_for(|shutdown| *shutdown) => true,
+            };
+            if shutdown_observed {
+                return Err(CoordinationError::ShuttingDown);
+            }
+        }
     }
 
     /// Re-hydrate the local paused-shards cache from persisted split records.

@@ -12,8 +12,9 @@ use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use crate::coordination::{
-    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardGuardContext,
-    ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend, get_hostname, keys,
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, OpenShardError, OwnershipCheck,
+    ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend,
+    get_hostname, keys,
 };
 
 /// etcd-based coordinator for distributed shard ownership.
@@ -1001,6 +1002,7 @@ impl EtcdShardGuard {
                     desired: true,
                     phase: ShardPhase::Held,
                     ownership_token: Some(()),
+                    ..ShardGuardState::new()
                 },
             ),
             client,
@@ -1070,6 +1072,94 @@ impl EtcdShardGuard {
         Ok(())
     }
 
+    /// Open this guard's shard from its shard map entry and start any pending
+    /// split cleanup (e.g., it's a split child or was re-acquired after a crash).
+    /// Shared by the post-acquisition open and the reopen after a completed close.
+    async fn open_shard(
+        &self,
+        factory: &ShardFactory,
+        shard_map: &Mutex<ShardMap>,
+    ) -> Result<(), OpenShardError> {
+        let (range, parent_shard_id) = {
+            let map = shard_map.lock().await;
+            let info = map
+                .get_shard(&self.ctx.shard_id)
+                .ok_or(OpenShardError::NotInShardMap)?;
+            (info.range.clone(), info.parent_shard_id)
+        };
+        let shard = factory.open(&self.ctx.shard_id, &range).await?;
+        drop(shard.maybe_spawn_background_cleanup(range, parent_shard_id));
+        Ok(())
+    }
+
+    /// Release ownership of a cleanly closed shard and return the guard to Idle.
+    async fn release_ownership_to_idle(&self, owned_arc: &Mutex<HashSet<ShardId>>) {
+        // The owned set is what split parent recovery consults before it
+        // reopens a shard, so the shard leaves it before the release call goes
+        // out rather than after it returns.
+        owned_arc.lock().await.remove(&self.ctx.shard_id);
+
+        if let Err(e) = self.release_ownership().await {
+            tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to release shard ownership");
+        }
+        self.finish_release_to_idle().await;
+    }
+
+    /// Give up a cleanly closed shard whose ownership another node has taken:
+    /// the same bookkeeping as a release, without a release call against an
+    /// owner key this node does not hold.
+    async fn abandon_lost_ownership_to_idle(&self, owned_arc: &Mutex<HashSet<ShardId>>) {
+        owned_arc.lock().await.remove(&self.ctx.shard_id);
+        self.finish_release_to_idle().await;
+    }
+
+    /// Drop the ownership token and return a releasing guard to Idle.
+    async fn finish_release_to_idle(&self) {
+        {
+            let mut st = self.ctx.state.lock().await;
+            st.ownership_token = None;
+            // A shutdown triggered during the release stays in charge.
+            if st.phase == ShardPhase::Releasing {
+                st.phase = ShardPhase::Idle;
+            }
+        }
+        dst_events::emit(DstEvent::ShardReleased {
+            node_id: self.node_id.clone(),
+            shard_id: self.ctx.shard_id.to_string(),
+        });
+    }
+
+    /// Whether the shard's owner key still names this node. A read that fails
+    /// or times out is `Unknown`: the caller neither reopens nor assumes
+    /// ownership is gone, and takes the ordinary release path, which compares
+    /// the owner itself.
+    async fn check_ownership(&self) -> OwnershipCheck {
+        let read_timeout = Duration::from_secs(5);
+        let owner_key = self.owner_key();
+        let mut kv = self.client.kv_client();
+        match tokio::time::timeout(read_timeout, kv.get(owner_key, None)).await {
+            Ok(Ok(resp)) => {
+                let is_ours = resp
+                    .kvs()
+                    .first()
+                    .is_some_and(|kv| kv.value() == self.node_id.as_bytes());
+                if is_ours {
+                    OwnershipCheck::Ours
+                } else {
+                    OwnershipCheck::Lost
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(shard_id = %self.ctx.shard_id, error = %e, "failed to read shard owner key before reopening");
+                OwnershipCheck::Unknown
+            }
+            Err(_) => {
+                warn!(shard_id = %self.ctx.shard_id, "timed out reading shard owner key before reopening");
+                OwnershipCheck::Unknown
+            }
+        }
+    }
+
     pub async fn run(
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
@@ -1123,22 +1213,15 @@ impl EtcdShardGuard {
                             // Try to acquire ownership via KV put-if-absent transaction
                             match self.try_acquire_ownership().await {
                                 Ok(true) => {
-                                    // Look up the shard's range and parent from the shard map
-                                    let (range, parent_shard_id) = {
-                                        let map = shard_map.lock().await;
-                                        match map.get_shard(&self.ctx.shard_id) {
-                                            Some(info) => (info.range.clone(), info.parent_shard_id),
-                                            None => {
-                                                tracing::error!(shard_id = %self.ctx.shard_id, "shard not found in shard map");
-                                                let _ = self.release_ownership().await;
-                                                continue;
-                                            }
-                                        }
-                                    };
                                     // Open the shard BEFORE marking as Held - if open fails, we should release ownership and not claim it.
-                                    let shard = match factory.open(&self.ctx.shard_id, &range).await {
-                                        Ok(shard) => shard,
-                                        Err(e) => {
+                                    match self.open_shard(&factory, &shard_map).await {
+                                        Ok(()) => {}
+                                        Err(OpenShardError::NotInShardMap) => {
+                                            tracing::error!(shard_id = %self.ctx.shard_id, "shard not found in shard map");
+                                            let _ = self.release_ownership().await;
+                                            continue;
+                                        }
+                                        Err(OpenShardError::Open(e)) => {
                                             tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to open shard, releasing ownership");
                                             let _ = self.release_ownership().await;
                                             // Exponential backoff before retry
@@ -1147,16 +1230,7 @@ impl EtcdShardGuard {
                                             attempt = attempt.wrapping_add(1);
                                             continue;
                                         }
-                                    };
-
-                                    // Spawn background cleanup if this shard has pending cleanup work
-                                    // (e.g., it's a split child or was re-acquired after a crash)
-                                    drop(
-                                        shard.maybe_spawn_background_cleanup(
-                                            range,
-                                            parent_shard_id,
-                                        ),
-                                    );
+                                    }
 
                                     {
                                         let mut st = self.ctx.state.lock().await;
@@ -1201,13 +1275,23 @@ impl EtcdShardGuard {
                     let owner_key = self.owner_key();
                     let span = info_span!("shard.release", shard_id = %self.ctx.shard_id, owner_key = %owner_key);
                     async {
-                        debug!(shard_id = %self.ctx.shard_id, "shard: release start (delay)");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // A release can be cancelled only before its close begins. Once
+                        // a close has begun the shard's runtime is torn down for good,
+                        // so the close is driven to completion whatever `desired` does.
+                        if !factory.is_closing(&self.ctx.shard_id) {
+                            // The fixed delay precedes a release's first close attempt;
+                            // retries wait out the close backoff instead.
+                            debug!(shard_id = %self.ctx.shard_id, "shard: release start (delay)");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        // Read after the delay: another caller (split recovery,
+                        // reset) can begin a close of this shard during it.
+                        let close_pending = factory.is_closing(&self.ctx.shard_id);
 
                         let mut cancelled = false;
                         let was_held = {
                             let mut st = self.ctx.state.lock().await;
-                            if st.phase == ShardPhase::ShuttingDown {
+                            if st.phase == ShardPhase::ShuttingDown || close_pending {
                                 // fall through
                             } else if st.desired {
                                 st.phase = ShardPhase::Held;
@@ -1219,48 +1303,116 @@ impl EtcdShardGuard {
                         if cancelled {
                             return;
                         }
-                        if was_held {
-                            // Close the shard before releasing ownership
-                            match factory.close(&self.ctx.shard_id).await {
-                                Ok(()) => {
-                                    dst_events::emit(DstEvent::ShardClosed {
-                                        node_id: self.node_id.clone(),
-                                        shard_id: self.ctx.shard_id.to_string(),
-                                    });
-                                    if let Err(e) = self.release_ownership().await {
-                                        tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to release shard ownership");
-                                    }
-                                    {
-                                        let mut st = self.ctx.state.lock().await;
-                                        st.ownership_token = None;
-                                        st.phase = ShardPhase::Idle;
-                                    }
-                                    {
-                                        let mut owned = owned_arc.lock().await;
-                                        owned.remove(&self.ctx.shard_id);
-                                    }
-                                    dst_events::emit(DstEvent::ShardReleased {
-                                        node_id: self.node_id.clone(),
-                                        shard_id: self.ctx.shard_id.to_string(),
-                                    });
-                                    debug!(shard_id = %self.ctx.shard_id, "shard: release done");
-                                }
-                                Err(e) => {
-                                    // Close failed - revert to Held so reconciliation retries
-                                    tracing::error!(
-                                        shard_id = %self.ctx.shard_id,
-                                        error = %e,
-                                        "failed to close shard, reverting to Held to prevent data loss"
-                                    );
-                                    let mut st = self.ctx.state.lock().await;
-                                    st.phase = ShardPhase::Held;
-                                }
-                            }
-                        } else {
+                        if !was_held && !close_pending {
                             let mut st = self.ctx.state.lock().await;
                             st.phase = ShardPhase::Idle;
                             debug!(shard_id = %self.ctx.shard_id, "shard: release noop");
+                            return;
                         }
+
+                        // Close the shard before releasing ownership
+                        if let Err(e) = factory.close(&self.ctx.shard_id).await {
+                            // Close pending: stay in Releasing and keep ownership. The
+                            // outer loop makes the next attempt after the backoff, or
+                            // moves to ShuttingDown if shutdown arrived meanwhile.
+                            let (attempt, backoff) = {
+                                let mut st = self.ctx.state.lock().await;
+                                let backoff = st.close_backoff.next_delay();
+                                (st.close_backoff.attempts(), backoff)
+                            };
+                            let jitter_ms =
+                                (self.ctx.shard_id.as_uuid().as_u64_pair().0.wrapping_mul(17)) % 20;
+                            let delay = backoff + Duration::from_millis(jitter_ms);
+                            tracing::error!(
+                                shard_id = %self.ctx.shard_id,
+                                error = %e,
+                                attempt,
+                                next_retry_ms = delay.as_millis() as u64,
+                                "failed to close shard, keeping ownership and retrying close"
+                            );
+                            self.ctx.wait_close_backoff(delay).await;
+                            return;
+                        }
+                        dst_events::emit(DstEvent::ShardClosed {
+                            node_id: self.node_id.clone(),
+                            shard_id: self.ctx.shard_id.to_string(),
+                        });
+
+                        let reopen = {
+                            let mut st = self.ctx.state.lock().await;
+                            st.close_backoff.reset();
+                            if st.phase == ShardPhase::ShuttingDown {
+                                // The shutdown arm releases ownership.
+                                return;
+                            }
+                            st.desired
+                        };
+
+                        // A close can stay pending for a long time, long enough for an
+                        // operator to force-release ownership and another node to take
+                        // it. The shard is reopened only under an owner key that still
+                        // names this node.
+                        let ownership_check = if reopen {
+                            self.check_ownership().await
+                        } else {
+                            OwnershipCheck::Ours
+                        };
+                        if ownership_check == OwnershipCheck::Lost {
+                            tracing::error!(
+                                shard_id = %self.ctx.shard_id,
+                                "shard owner key no longer names this node after a pending close, giving the shard up without reopening"
+                            );
+                            self.abandon_lost_ownership_to_idle(&owned_arc).await;
+                            return;
+                        }
+
+                        if reopen && ownership_check == OwnershipCheck::Ours {
+                            // This node is the desired owner again: keep ownership and
+                            // serve a fresh shard. `open` has no timeout of its own.
+                            let reopened = tokio::time::timeout(
+                                factory.reopen_timeout(),
+                                self.open_shard(&factory, &shard_map),
+                            )
+                            .await;
+                            match reopened {
+                                Ok(Ok(())) => {
+                                    {
+                                        let mut st = self.ctx.state.lock().await;
+                                        if st.phase == ShardPhase::Releasing {
+                                            st.phase = ShardPhase::Held;
+                                        }
+                                    }
+                                    dst_events::emit(DstEvent::ShardReopened {
+                                        node_id: self.node_id.clone(),
+                                        shard_id: self.ctx.shard_id.to_string(),
+                                    });
+                                    info!(shard_id = %self.ctx.shard_id, "shard: reopened after close, ownership kept");
+                                    return;
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::error!(shard_id = %self.ctx.shard_id, error = %e, "failed to reopen shard after close, releasing ownership");
+                                }
+                                Err(_elapsed) => {
+                                    tracing::error!(
+                                        shard_id = %self.ctx.shard_id,
+                                        timeout_ms = factory.reopen_timeout().as_millis() as u64,
+                                        "timed out reopening shard after close, releasing ownership"
+                                    );
+                                }
+                            }
+                        }
+
+                        // A shutdown that arrived during the reopen is the shutdown
+                        // arm's to finish: going Idle here with `desired` still true
+                        // would re-acquire the shard mid-shutdown.
+                        if self.ctx.state.lock().await.phase == ShardPhase::ShuttingDown {
+                            return;
+                        }
+
+                        // The shard is closed cleanly, so ownership can go. When this
+                        // node is still desired, Idle -> Acquiring retries from scratch.
+                        self.release_ownership_to_idle(&owned_arc).await;
+                        debug!(shard_id = %self.ctx.shard_id, "shard: release done");
                     }
                     .instrument(span)
                     .await;

@@ -183,6 +183,27 @@ pub enum CoordinationError {
     NotShardOwner(ShardId),
 }
 
+/// Why a shard guard could not open its shard.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenShardError {
+    #[error("shard not found in shard map")]
+    NotInShardMap,
+    #[error(transparent)]
+    Open(#[from] crate::job_store_shard::JobStoreShardError),
+}
+
+/// What the coordination backend records about a shard this guard holds a
+/// token for, read before the guard reopens the shard after a pending close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnershipCheck {
+    /// The backend still names this node as the shard's owner.
+    Ours,
+    /// The backend names another owner, or none.
+    Lost,
+    /// The backend could not be read.
+    Unknown,
+}
+
 /// Phase of a shard guard's lifecycle.
 ///
 /// Shared by all coordination backends (etcd, k8s).
@@ -215,6 +236,41 @@ impl std::fmt::Display for ShardPhase {
     }
 }
 
+/// Delay policy for retrying a failed shard close: 1s, doubling per failed
+/// attempt, capped at 30s. Callers add their own jitter.
+#[derive(Debug, Clone, Default)]
+pub struct CloseRetryBackoff {
+    attempts: u32,
+}
+
+impl CloseRetryBackoff {
+    const INITIAL_DELAY: Duration = Duration::from_secs(1);
+    const MAX_DELAY: Duration = Duration::from_secs(30);
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a failed close attempt and return the delay before the next one.
+    pub fn next_delay(&mut self) -> Duration {
+        let factor = 2u32.saturating_pow(self.attempts);
+        self.attempts = self.attempts.saturating_add(1);
+        Self::INITIAL_DELAY
+            .saturating_mul(factor)
+            .min(Self::MAX_DELAY)
+    }
+
+    /// Number of failed attempts recorded since the last reset.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// Clear the recorded attempts once a close succeeds.
+    pub fn reset(&mut self) {
+        self.attempts = 0;
+    }
+}
+
 /// Generic state for a shard guard.
 ///
 /// The ownership token type varies by backend:
@@ -224,6 +280,9 @@ pub struct ShardGuardState<T> {
     pub desired: bool,
     pub phase: ShardPhase,
     pub ownership_token: Option<T>,
+    /// Backoff for retrying a failed shard close. Its attempt count is the
+    /// number of consecutive failed closes; it resets when a close succeeds.
+    pub close_backoff: CloseRetryBackoff,
 }
 
 impl<T> ShardGuardState<T> {
@@ -233,7 +292,13 @@ impl<T> ShardGuardState<T> {
             desired: false,
             phase: ShardPhase::Idle,
             ownership_token: None,
+            close_backoff: CloseRetryBackoff::new(),
         }
+    }
+
+    /// Number of consecutive failed close attempts on this guard's shard.
+    pub fn failed_close_attempts(&self) -> u32 {
+        self.close_backoff.attempts()
     }
 
     /// Check if we have an ownership token (i.e., we believe we own the shard).
@@ -324,6 +389,38 @@ impl<T> ShardGuardContext<T> {
             biased;
             _ = self.notify.notified() => {}
             _ = shutdown_rx.changed() => {}
+        }
+    }
+
+    /// Wait out a close-retry backoff delay. Returns true when the wait ended
+    /// early for shutdown. Callers need not act on it: a guard re-reads its
+    /// phase and the shutdown channel at the top of its loop either way.
+    ///
+    /// Only shutdown ends the wait early. A coordinator shutting down reaches
+    /// its guards as `trigger_shutdown` plus a notify, ahead of the shutdown
+    /// channel, so a notify ends the wait when the phase shows shutdown. Any
+    /// other notify (a `desired` flap) leaves the deadline where it was.
+    pub async fn wait_close_backoff(&self, delay: Duration) -> bool {
+        let mut shutdown_rx = self.shutdown.clone();
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            let shutdown_signalled = tokio::select! {
+                _ = &mut sleep => return false,
+                result = shutdown_rx.wait_for(|shutdown| *shutdown) => {
+                    // A dropped sender means the coordinator is gone.
+                    drop(result);
+                    true
+                }
+                _ = self.notify.notified() => false,
+            };
+            if shutdown_signalled {
+                return true;
+            }
+            let st = self.state.lock().await;
+            if matches!(st.phase, ShardPhase::ShuttingDown | ShardPhase::ShutDown) {
+                return true;
+            }
         }
     }
 

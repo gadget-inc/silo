@@ -1878,11 +1878,13 @@ impl Silo for SiloService {
             let range = match self.factory.get(&shard_id) {
                 Some(shard) => shard.get_range(),
                 None => {
-                    // Shard is owned but not in the factory - this means it failed
-                    // to open during startup. Try to open it now.
+                    // Shard is owned but not served by the factory: either it never
+                    // opened, or its close is pending. `reset` opens the former and
+                    // retries the close of the latter.
                     tracing::warn!(
                         shard = %shard_id,
-                        "owned shard not found in factory during reset, attempting to open it"
+                        close_pending = self.factory.is_closing(&shard_id),
+                        "owned shard not served by factory during reset (never opened, or close pending), resetting from the shard map range"
                     );
                     shard_info.range.clone()
                 }

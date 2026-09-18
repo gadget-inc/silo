@@ -23,6 +23,7 @@ mod helpers;
 #[cfg(feature = "k8s")]
 mod mock_k8s;
 mod scenarios;
+mod shard_ownership_tracker;
 
 use helpers::{get_seed, is_fuzz_mode, is_subprocess, verify_determinism};
 
@@ -171,6 +172,16 @@ fn high_latency() {
         scenarios::high_latency::run();
     } else {
         verify_determinism("high_latency", get_seed());
+    }
+}
+
+#[test]
+#[cfg(feature = "k8s")]
+fn k8s_close_failure_recovery() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::k8s_close_failure_recovery::run();
+    } else {
+        verify_determinism("k8s_close_failure_recovery", get_seed());
     }
 }
 

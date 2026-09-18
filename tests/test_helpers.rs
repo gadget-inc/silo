@@ -815,3 +815,39 @@ pub async fn dequeue_refresh_tasks_until(
     }
     merged
 }
+
+/// Make a directory tree read-only so SlateDB writes fail, simulating a storage failure.
+pub fn make_dir_tree_readonly(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                make_dir_tree_readonly(&entry_path);
+            } else {
+                let _ =
+                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o444));
+            }
+        }
+    }
+    // Keep execute so the tree stays traversable.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555));
+}
+
+/// Restore a directory tree made read-only by [`make_dir_tree_readonly`].
+pub fn restore_dir_tree_writable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // Restore the directory before reading it so its entries are reachable.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                restore_dir_tree_writable(&entry_path);
+            } else {
+                let _ =
+                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+    }
+}
