@@ -23,6 +23,7 @@ mod helpers;
 #[cfg(feature = "k8s")]
 mod mock_k8s;
 mod scenarios;
+mod shard_ownership_tracker;
 
 use helpers::{get_seed, is_fuzz_mode, is_subprocess, verify_determinism};
 
