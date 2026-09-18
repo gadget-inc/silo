@@ -750,9 +750,14 @@ impl ShardFactory {
             return Ok(());
         };
 
-        if self.close_marked_entry(shard_id, &entry).await?.is_some() {
+        // The lifecycle lock is held until the entry is out of the map, so a
+        // caller queued on it (a `reset`, say) never adopts an entry that is
+        // about to be removed from under it.
+        let lifecycle = self.close_marked_entry(shard_id, &entry).await?;
+        if lifecycle.is_some() {
             self.remove_entry(shard_id, &entry);
         }
+        drop(lifecycle);
 
         tracing::debug!(
             shard_id = %shard_id,
