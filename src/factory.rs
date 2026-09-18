@@ -727,7 +727,7 @@ impl ShardFactory {
     ///
     /// The entry is marked closing before `shard.close()` runs, which takes the shard out of service for good: `close()` tears down the shard's runtime irreversibly, so a shard whose close has begun must never be served again. If the close fails or times out, the entry stays in the closing state and the error is returned; calling `close` again makes another attempt on the same shard object. The entry is removed once an attempt reports the shard closed.
     ///
-    /// SlateDB marks a database closed when its close begins, before it flushes. An attempt that follows one that timed out inside the database close therefore reports "already closed" at once and counts as complete: data acknowledged before that point is in the WAL, and the next writer to open the path fences this handle.
+    /// SlateDB marks a database closed when its close begins, before it flushes, so an attempt that follows one that timed out inside the database close finds a handle that reports "already closed" and can no longer flush. What that means depends on where the WAL lives. With the WAL in object storage, data acknowledged before that point is already durable there, the next writer to open the path replays it and fences this handle, and the attempt counts as complete. With a local WAL, that data may exist only on this node's disk while the next owner can be another node, so the attempt completes the close through a fresh database handle that replays the local WAL into the main store; until that succeeds the close stays pending. A handle whose close ran to completion (the split cloning phase closes its parent directly) counts as complete either way.
     ///
     /// The whole call runs under the close timeout, waiting for the entry included, because SlateDB's internal retrying_object_store retries indefinitely on transient errors: both a close and the `open` a close waits behind would otherwise hang forever if the object store is unreachable.
     pub async fn close(&self, shard_id: &ShardId) -> Result<(), JobStoreShardError> {
@@ -854,12 +854,17 @@ impl ShardFactory {
                 Ok(())
             }
             // The database marks itself closed when its close begins, so this is
-            // what an attempt reports after an earlier one timed out inside it.
+            // what an attempt reports after an earlier one timed out inside it,
+            // and also what it reports after a close that ran to completion
+            // (the split cloning phase closes the parent directly).
             Ok(Err(JobStoreShardError::Slate(ref slate_err)))
                 if matches!(slate_err.kind(), slatedb::ErrorKind::Closed(_)) =>
             {
-                tracing::info!(shard_id = %shard_id, "factory.close: shard already closed, treating as success");
-                Ok(())
+                if shard.close_completed() || !self.has_local_wal() {
+                    tracing::info!(shard_id = %shard_id, "factory.close: shard already closed, treating as success");
+                    return Ok(());
+                }
+                self.finish_abandoned_close(deadline, shard_id).await
             }
             Ok(Err(e)) => {
                 tracing::error!(shard_id = %shard_id, error = %e, "factory.close: shard.close() failed, close pending");
@@ -874,6 +879,75 @@ impl ShardFactory {
                 Err(self.close_timed_out())
             }
         }
+    }
+
+    /// Whether shards keep their WAL on this node's local disk.
+    fn has_local_wal(&self) -> bool {
+        self.template
+            .wal
+            .as_ref()
+            .is_some_and(|wal| wal.is_local_storage())
+    }
+
+    /// Complete the close of a shard whose database handle was closed without
+    /// finishing: an earlier attempt timed out inside the database close,
+    /// which leaves the handle unusable while writes it acknowledged may exist
+    /// only in the local WAL. The next owner can be another node that never
+    /// sees that WAL, so a fresh handle on the same path replays it, flushes
+    /// it into the main store, and closes. Opening that handle fences the
+    /// abandoned one.
+    async fn finish_abandoned_close(
+        &self,
+        deadline: tokio::time::Instant,
+        shard_id: &ShardId,
+    ) -> Result<(), JobStoreShardError> {
+        tracing::warn!(shard_id = %shard_id, "factory.close: database handle was closed without finishing, replaying its local WAL through a fresh handle");
+        let started = std::time::Instant::now();
+        let name = shard_id.to_string();
+        let flushed = tokio::time::timeout_at(deadline, async {
+            let (resolved, db_path) =
+                Self::resolve_at_root(&self.template.backend, &self.template.path, &name)?;
+            let mut builder = slatedb::DbBuilder::new(db_path.as_str(), resolved.store)
+                .with_merge_operator(crate::job_store_shard::counter_merge_operator());
+            if let Some(wal_store) = self.resolve_wal_store(&name)? {
+                builder = builder.with_wal_object_store(wal_store);
+            }
+            let db = builder.build().await?;
+            db.flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await?;
+            db.close().await?;
+            Ok::<(), JobStoreShardError>(())
+        })
+        .await;
+        match flushed {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(shard_id = %shard_id, error = %e, "factory.close: failed to flush the local WAL of an abandoned close, close pending");
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    shard_id = %shard_id,
+                    timeout_secs = self.close_timeout.as_secs(),
+                    "factory.close: timed out flushing the local WAL of an abandoned close, close pending"
+                );
+                return Err(self.close_timed_out());
+            }
+        }
+
+        if self.template.apply_wal_on_close
+            && let Some(wal_cfg) = &self.template.wal
+        {
+            self.delete_wal_data(&name, wal_cfg).await?;
+        }
+        tracing::info!(
+            shard_id = %shard_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "closed shard through a fresh handle"
+        );
+        Ok(())
     }
 
     /// Reset a specific shard: close it, delete all data, and reopen fresh.

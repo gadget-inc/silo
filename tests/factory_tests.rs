@@ -643,6 +643,80 @@ async fn retried_close_runs_a_real_close_and_keeps_the_data() {
     );
 }
 
+/// With a local WAL, a close that timed out inside the database close leaves
+/// acknowledged writes only in that WAL, and the database handle reports
+/// itself closed from then on. The retried close must still get those writes
+/// into the main store before it reports success, because the next owner may
+/// be another node that cannot see this node's WAL directory.
+///
+/// `apply_wal_on_close` is off so the read-only fault lands in the database
+/// close itself; with it on, the fault lands in the flush that precedes it,
+/// which leaves the handle open and the retry is an ordinary close.
+#[silo::test]
+async fn retried_close_with_local_wal_makes_acknowledged_writes_durable() {
+    let data_tmp = tempfile::tempdir().unwrap();
+    let wal_tmp = tempfile::tempdir().unwrap();
+    let template = DatabaseTemplate {
+        backend: Backend::Fs,
+        path: data_tmp
+            .path()
+            .join("%shard%")
+            .to_string_lossy()
+            .to_string(),
+        wal: Some(WalConfig {
+            backend: Backend::Fs,
+            path: wal_tmp.path().join("%shard%").to_string_lossy().to_string(),
+        }),
+        apply_wal_on_close: false,
+        ..Default::default()
+    };
+    let mut factory = ShardFactory::new(template, MockGubernatorClient::new_arc(), None);
+    factory.set_close_timeout(FAILING_CLOSE_TIMEOUT);
+    let shard_id = ShardId::new();
+
+    let shard = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open shard");
+    enqueue_job(&shard, "job-before-close").await;
+    drop(shard);
+
+    let fault = ReadOnlyShardDir::arm(&data_tmp, &shard_id);
+    factory
+        .close(&shard_id)
+        .await
+        .expect_err("close should fail while the data dir is read-only");
+    // The handle now reports itself closed, but nothing has reached the main
+    // store, so a retry against broken storage is still a failed close.
+    factory
+        .close(&shard_id)
+        .await
+        .expect_err("a retry cannot succeed while the main store is unwritable");
+    assert!(factory.is_closing(&shard_id), "the close stays pending");
+    fault.restore();
+    factory
+        .close(&shard_id)
+        .await
+        .expect("the retried close should succeed once storage is writable");
+    assert!(!factory.is_closing(&shard_id));
+
+    // The next owner is another node: it has the main store, not this WAL.
+    std::fs::remove_dir_all(wal_tmp.path().join(shard_id.to_string()))
+        .expect("remove the local WAL directory");
+    let reopened = factory
+        .open(&shard_id, &ShardRange::full())
+        .await
+        .expect("open after completed close");
+    let job = reopened
+        .get_job("test-tenant", "job-before-close")
+        .await
+        .expect("get job");
+    assert!(
+        job.is_some(),
+        "a job acknowledged before the close should be in the main store once close reports success"
+    );
+}
+
 /// `reset` on a shard whose pending close fails again reports the pending
 /// close and deletes nothing.
 #[silo::test]
