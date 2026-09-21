@@ -225,6 +225,9 @@ pub struct JobStoreShard {
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
+    /// Set once `close()` has closed the database. A close that failed or was
+    /// abandoned partway leaves this unset.
+    close_completed: std::sync::atomic::AtomicBool,
     /// Object store for the shard's SlateDB instance (needed for Admin API).
     store: Arc<dyn slatedb::object_store::ObjectStore>,
     /// Database path relative to the object store root (needed for Admin API).
@@ -303,6 +306,8 @@ pub enum JobStoreShardError {
     JobNotLeaseable(#[from] JobNotLeaseableError),
     #[error("transaction conflict during {0}, exceeded max retries")]
     TransactionConflict(String),
+    #[error("shard {0} has a close pending")]
+    ClosePending(crate::shard_range::ShardId),
 }
 
 /// Information about the LSM tree state of a shard's SlateDB instance.
@@ -615,6 +620,7 @@ impl JobStoreShard {
             concurrency_reconcile_scan_slice,
             holder_drift_scan_slice,
             cancellation: CancellationToken::new(),
+            close_completed: std::sync::atomic::AtomicBool::new(false),
             store,
             db_path: db_path.to_string(),
             range: range.clone(),
@@ -775,6 +781,8 @@ impl JobStoreShard {
         tracing::trace!(shard = %self.name, "shard.close: calling db.close()");
         let db_close_started = std::time::Instant::now();
         self.db.close().await.map_err(JobStoreShardError::from)?;
+        self.close_completed
+            .store(true, std::sync::atomic::Ordering::Release);
         tracing::debug!(
             shard = %self.name,
             elapsed_ms = db_close_started.elapsed().as_millis() as u64,
@@ -820,6 +828,21 @@ impl JobStoreShard {
         );
 
         Ok(())
+    }
+
+    /// Whether a `close()` on this shard object got as far as closing the
+    /// database, which is the point at which its data is in the main store.
+    /// False after a close that failed or was abandoned partway (a caller's
+    /// timeout, say), even though the database then reports itself closed.
+    pub fn close_completed(&self) -> bool {
+        self.close_completed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether `close()` has been called on this shard object. A closing
+    /// shard's brokers and grant scanner are stopped for good.
+    pub fn is_closing(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
 
     /// Returns the WAL close configuration, if any.

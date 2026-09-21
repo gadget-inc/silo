@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod etcd_test_helpers;
+mod test_helpers;
 
 use etcd_test_helpers::EtcdConnection;
 use silo::coordination::etcd::{EtcdCoordinator, EtcdShardGuard};
@@ -11,6 +12,7 @@ use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{Backend, DatabaseTemplate};
 use silo::shard_range::{ShardId, ShardMap};
+use test_helpers::{make_dir_tree_readonly, restore_dir_tree_writable};
 
 // Atomic counter for truly unique prefixes even within the same nanosecond
 static PREFIX_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3689,45 +3691,11 @@ async fn make_guard_with_factory(
     (guard, owned, tx, handle)
 }
 
-/// Make a directory tree read-only so SlateDB writes fail, simulating a storage failure.
-fn make_dir_tree_readonly(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                make_dir_tree_readonly(&entry_path);
-            } else {
-                let _ =
-                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o444));
-            }
-        }
-    }
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555));
-}
-
-/// Restore a directory tree to writable after a test.
-fn restore_dir_tree_writable(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                restore_dir_tree_writable(&entry_path);
-            } else {
-                let _ =
-                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644));
-            }
-        }
-    }
-}
-
 /// If factory.close() fails during a normal release, the guard should keep retrying
 /// and the ownership key should persist in etcd until close succeeds.
 ///
 /// With slatedb's current close semantics, a timed-out close internally marks the DB
-/// as closed. On the guard's next retry cycle, factory.close() detects the
+/// as closed. On the guard's next attempt, after its backoff, factory.close() detects the
 /// "already closed" state and treats it as a successful close. The shard is then
 /// released normally. This verifies the graceful recovery path.
 #[silo::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3779,7 +3747,7 @@ async fn etcd_shard_close_failure_keeps_ownership() {
 
     // The first close attempt will time out (3s) because the directory is read-only
     // and slatedb's retrying_object_store retries indefinitely. After the timeout,
-    // the guard reverts to Held and retries. On the second attempt, slatedb reports
+    // the guard backs off and retries. On the second attempt, slatedb reports
     // the DB as already closed (it internally closed during the timeout), and
     // factory.close() treats this as success.
     //
@@ -3892,4 +3860,582 @@ async fn etcd_shard_close_failure_during_shutdown_keeps_ownership() {
     restore_dir_tree_writable(&shard_data_path);
     handle.abort();
     let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+// --- Close-failure recovery: a failed close is driven to completion ---
+
+/// Close timeout for the recovery scenarios. The read-only-directory fault
+/// fails exactly one close attempt: SlateDB retries for the whole timeout, and
+/// afterwards reports the database closed, so the next attempt succeeds.
+const RECOVERY_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One node in a close-recovery scenario: a guard with a filesystem factory
+/// rooted at a directory the test controls.
+struct RecoveryNode {
+    node_id: String,
+    shard_id: ShardId,
+    guard: Arc<EtcdShardGuard>,
+    owned: Arc<tokio::sync::Mutex<HashSet<ShardId>>>,
+    factory: Arc<ShardFactory>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl RecoveryNode {
+    async fn start(
+        coord: &EtcdConnection,
+        prefix: &str,
+        shard_id: ShardId,
+        data_root: &std::path::Path,
+        reopen_timeout: Duration,
+    ) -> Self {
+        let node_id = next_node_id();
+        let mut factory = ShardFactory::new(
+            DatabaseTemplate {
+                backend: Backend::Fs,
+                path: data_root.join("%shard%").to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            MockGubernatorClient::new_arc(),
+            None,
+        );
+        factory.set_close_timeout(RECOVERY_CLOSE_TIMEOUT);
+        factory.set_reopen_timeout(reopen_timeout);
+        let factory = Arc::new(factory);
+        let (guard, owned, shutdown_tx, handle) =
+            make_guard_with_factory(coord, prefix, shard_id, node_id.clone(), factory.clone())
+                .await;
+        Self {
+            node_id,
+            shard_id,
+            guard,
+            owned,
+            factory,
+            shutdown_tx,
+            handle,
+        }
+    }
+
+    async fn phase(&self) -> ShardPhase {
+        self.guard.ctx.state.lock().await.phase
+    }
+
+    async fn holds_shard(&self) -> bool {
+        let st = self.guard.ctx.state.lock().await;
+        st.phase == ShardPhase::Held
+            && st.has_token()
+            && self.owned.lock().await.contains(&self.shard_id)
+    }
+
+    async fn acquire(&self) -> Arc<silo::job_store_shard::JobStoreShard> {
+        self.guard.ctx.set_desired(true).await;
+        let acquired = wait_until(Duration::from_secs(30), || self.holds_shard()).await;
+        assert!(acquired, "{} should acquire the shard", self.node_id);
+        self.factory
+            .get(&self.shard_id)
+            .expect("an acquired shard should be served by the factory")
+    }
+
+    /// Revoke write access to the shard's data and start a release, returning
+    /// once the factory reports the close as begun.
+    async fn begin_failing_release(&self, data_root: &std::path::Path) -> ReadOnlyShardDir {
+        let fault = ReadOnlyShardDir::revoke(data_root.join(self.shard_id.to_string()));
+        self.guard.ctx.set_desired(false).await;
+        let closing = wait_until(Duration::from_secs(10), || async {
+            self.factory.is_closing(&self.shard_id)
+        })
+        .await;
+        assert!(closing, "the release should begin closing the shard");
+        fault
+    }
+
+    /// Wait until the guard has recorded a failed close attempt, which proves
+    /// the close-pending path ran.
+    async fn wait_for_failed_close(&self) {
+        let failed = wait_until(Duration::from_secs(15), || async {
+            self.guard.ctx.state.lock().await.failed_close_attempts() >= 1
+        })
+        .await;
+        assert!(failed, "the guard should record a failed close attempt");
+    }
+}
+
+/// A shard data directory with write access revoked. Restores access on drop,
+/// so a failed assertion cannot leave an undeletable tree behind.
+struct ReadOnlyShardDir(std::path::PathBuf);
+
+impl ReadOnlyShardDir {
+    fn revoke(shard_dir: std::path::PathBuf) -> Self {
+        make_dir_tree_readonly(&shard_dir);
+        Self(shard_dir)
+    }
+
+    fn restore(&self) {
+        restore_dir_tree_writable(&self.0);
+    }
+}
+
+impl Drop for ReadOnlyShardDir {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// The node recorded as the shard's owner in etcd.
+async fn shard_owner(coord: &EtcdConnection, prefix: &str, shard_id: &ShardId) -> Option<String> {
+    let owner_key = silo::coordination::keys::shard_owner_key(prefix, shard_id);
+    let resp = coord
+        .client()
+        .get(owner_key.as_bytes(), None)
+        .await
+        .expect("etcd get owner key");
+    resp.kvs()
+        .first()
+        .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
+}
+
+async fn connect_for_recovery() -> EtcdConnection {
+    let cfg = silo::settings::AppConfig::load(None).expect("load default config");
+    EtcdConnection::connect(&cfg.coordination)
+        .await
+        .expect("connect etcd")
+}
+
+fn recovery_data_root(scenario: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("silo-etcd-close-recovery-{scenario}"));
+    if root.exists() {
+        restore_dir_tree_writable(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    root
+}
+
+async fn assert_shard_leases_a_job(shard: &silo::job_store_shard::JobStoreShard, job_id: &str) {
+    shard
+        .enqueue(
+            "close-recovery-tenant",
+            Some(job_id.to_string()),
+            5,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"k": "v"})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    let leased = test_helpers::dequeue_task_ids_until(shard, "worker-1", "default", 1).await;
+    assert_eq!(leased.len(), 1, "the shard should lease the enqueued job");
+}
+
+/// The node is re-selected as owner while its close is failing: the guard
+/// keeps ownership, finishes the close, and ends up `Held` on a fresh shard.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_close_failure_recovers_when_desired_flips_back() {
+    let prefix = unique_prefix();
+    let coord = connect_for_recovery().await;
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("flips-back");
+    let node = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    let original = node.acquire().await;
+
+    let fault = node.begin_failing_release(&data_root).await;
+    node.guard.ctx.set_desired(true).await;
+
+    // While the close is pending the shard is out of service, the guard stays
+    // in Releasing, and ownership stays with this node. Each dependent value
+    // is read before `is_closing`: the entry stays closing until the close
+    // completes, so still seeing it afterwards dates the earlier read.
+    let mut saw_failed_close = false;
+    let mut recovered = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !recovered && Instant::now() < deadline {
+        assert_eq!(
+            shard_owner(&coord, &prefix, &shard_id).await.as_deref(),
+            Some(node.node_id.as_str()),
+            "ownership must stay with this node throughout recovery"
+        );
+        let phase = node.phase().await;
+        let served = node.factory.get(&shard_id).is_some();
+        if node.factory.is_closing(&shard_id) {
+            assert!(
+                !served,
+                "a closing shard must not be served (phase={phase:?})"
+            );
+            assert_eq!(
+                phase,
+                ShardPhase::Releasing,
+                "the guard must stay in Releasing while its close is pending"
+            );
+        }
+        if !saw_failed_close && node.guard.ctx.state.lock().await.failed_close_attempts() >= 1 {
+            saw_failed_close = true;
+            fault.restore();
+        }
+        recovered = saw_failed_close
+            && node.holds_shard().await
+            && node
+                .factory
+                .get(&shard_id)
+                .is_some_and(|shard| !Arc::ptr_eq(&shard, &original));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fault.restore();
+    assert!(saw_failed_close, "the close-pending path should have run");
+    assert!(recovered, "the guard should end up Held on a fresh shard");
+
+    let fresh = node.factory.get(&shard_id).unwrap();
+    assert_shard_leases_a_job(&fresh, "job-after-recovery").await;
+
+    node.handle.abort();
+    let _ = node.shutdown_tx.send(true);
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// The node stays undesired while its close is failing: ownership is held
+/// until the retried close succeeds, then released, and another node can
+/// acquire the shard and lease work from it.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_close_failure_releases_once_close_succeeds() {
+    let prefix = unique_prefix();
+    let coord = connect_for_recovery().await;
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("stays-undesired");
+    let first = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    first.acquire().await;
+
+    let fault = first.begin_failing_release(&data_root).await;
+
+    // Until the close completes, ownership stays with the first node and the
+    // guard never claims Held on the torn-down shard. The owner is read before
+    // `is_closing`, so a release landing between the two reads cannot fail a
+    // correct run.
+    let mut saw_failed_close = false;
+    let mut released = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !released && Instant::now() < deadline {
+        let phase = first.phase().await;
+        assert_ne!(
+            phase,
+            ShardPhase::Held,
+            "an undesired guard must not return to Held"
+        );
+        let owner = shard_owner(&coord, &prefix, &shard_id).await;
+        let served = first.factory.get(&shard_id).is_some();
+        if first.factory.is_closing(&shard_id) {
+            assert_eq!(
+                owner.as_deref(),
+                Some(first.node_id.as_str()),
+                "ownership must not be released while the close is pending"
+            );
+            assert!(
+                !served,
+                "a closing shard must not be served (phase={phase:?})"
+            );
+        }
+        saw_failed_close |= first.guard.ctx.state.lock().await.failed_close_attempts() >= 1;
+        released = phase == ShardPhase::Idle
+            && !first.guard.ctx.state.lock().await.has_token()
+            && !first.owned.lock().await.contains(&shard_id);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fault.restore();
+    assert!(saw_failed_close, "the close-pending path should have run");
+    assert!(
+        released,
+        "ownership should be released once the retried close succeeds"
+    );
+    assert!(!first.factory.is_closing(&shard_id));
+
+    let second = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    let shard = second.acquire().await;
+    assert_eq!(
+        shard_owner(&coord, &prefix, &shard_id).await.as_deref(),
+        Some(second.node_id.as_str())
+    );
+    assert_shard_leases_a_job(&shard, "job-on-second-node").await;
+
+    first.handle.abort();
+    second.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// Shutdown arrives while a close is pending: the guard leaves its backoff
+/// without waiting it out, and the shutdown arm makes its single close attempt
+/// on the closing entry. Three injected failures put the guard in a 4s backoff;
+/// the shutdown close is then a real close, so ownership is released. The
+/// keep-ownership outcome, where the shutdown close itself fails, is
+/// `etcd_shard_close_failure_during_shutdown_keeps_ownership`.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_shutdown_during_pending_close_reaches_shut_down() {
+    const FAILED_ATTEMPTS: u32 = 3;
+    /// Well under the 4s backoff that follows the third failed attempt.
+    const SHUTDOWN_BUDGET: Duration = Duration::from_millis(2500);
+
+    let prefix = unique_prefix();
+    let coord = connect_for_recovery().await;
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("shutdown-pending");
+    let node = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    node.acquire().await;
+
+    node.factory
+        .inject_close_failures(shard_id, FAILED_ATTEMPTS);
+    node.guard.ctx.set_desired(false).await;
+    let backing_off = wait_until(Duration::from_secs(20), || async {
+        node.guard.ctx.state.lock().await.failed_close_attempts() >= FAILED_ATTEMPTS
+    })
+    .await;
+    assert!(
+        backing_off,
+        "the guard should fail {FAILED_ATTEMPTS} close attempts in a row"
+    );
+    assert_eq!(
+        shard_owner(&coord, &prefix, &shard_id).await.as_deref(),
+        Some(node.node_id.as_str()),
+        "ownership stays held across consecutive failed closes"
+    );
+
+    let _ = node.shutdown_tx.send(true);
+    let shut_down = wait_until(SHUTDOWN_BUDGET, || async {
+        node.phase().await == ShardPhase::ShutDown
+    })
+    .await;
+    assert!(
+        shut_down,
+        "the guard should leave its backoff for shutdown instead of waiting it out"
+    );
+
+    assert!(
+        !node.factory.is_closing(&shard_id),
+        "the shutdown close attempt should complete the pending close"
+    );
+    assert!(!node.guard.ctx.state.lock().await.has_token());
+    assert_eq!(shard_owner(&coord, &prefix, &shard_id).await, None);
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// Ownership moves to another node while this node's close is pending and the
+/// node is desired again: once the close completes the guard must not reopen
+/// the shard under an owner key that names someone else, and must leave that
+/// key alone.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_lost_ownership_during_pending_close_is_not_reopened() {
+    const FAILED_ATTEMPTS: u32 = 2;
+    const OTHER_OWNER: &str = "recover-lost-other";
+    /// How long the guard is watched after its close completes.
+    const SETTLE_WINDOW: Duration = Duration::from_millis(1500);
+
+    let prefix = unique_prefix();
+    let coord = connect_for_recovery().await;
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("lost-ownership");
+    let node = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(30),
+    )
+    .await;
+    node.acquire().await;
+
+    node.factory
+        .inject_close_failures(shard_id, FAILED_ATTEMPTS);
+    node.guard.ctx.set_desired(false).await;
+    node.wait_for_failed_close().await;
+    // An operator force-release followed by an acquisition on another node.
+    let owner_key = silo::coordination::keys::shard_owner_key(&prefix, &shard_id);
+    coord
+        .client()
+        .put(owner_key.as_bytes(), OTHER_OWNER, None)
+        .await
+        .expect("rewrite the owner key");
+    node.guard.ctx.set_desired(true).await;
+
+    let close_completed = wait_until(Duration::from_secs(30), || async {
+        !node.factory.is_closing(&shard_id)
+    })
+    .await;
+    assert!(close_completed, "the pending close should complete");
+
+    let settled_at = Instant::now();
+    while settled_at.elapsed() < SETTLE_WINDOW {
+        assert!(
+            node.factory.get(&shard_id).is_none(),
+            "the shard must not be reopened under ownership this node lost"
+        );
+        assert_eq!(
+            shard_owner(&coord, &prefix, &shard_id).await.as_deref(),
+            Some(OTHER_OWNER),
+            "the other node's owner key must be left untouched"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The still-desired guard keeps trying to acquire, so its resting state is
+    // Idle or Acquiring; either way it holds nothing.
+    let phase = node.phase().await;
+    assert!(
+        matches!(phase, ShardPhase::Idle | ShardPhase::Acquiring),
+        "the guard should give the shard up, got {phase:?}"
+    );
+    assert!(!node.guard.ctx.state.lock().await.has_token());
+    assert!(!node.owned.lock().await.contains(&shard_id));
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// The reopen after a completed close cannot finish (storage still
+/// unwritable): the guard gives up after the reopen timeout, releases
+/// ownership, and re-acquires from scratch once storage is back.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_failed_reopen_releases_then_reacquires() {
+    let prefix = unique_prefix();
+    let coord = connect_for_recovery().await;
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("reopen-fails");
+    let node = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(1),
+    )
+    .await;
+    let original = node.acquire().await;
+
+    let fault = node.begin_failing_release(&data_root).await;
+    node.guard.ctx.set_desired(true).await;
+    node.wait_for_failed_close().await;
+
+    // Write access stays revoked, so the reopen times out and the guard gives
+    // the shard up. It is still desired, so it re-takes ownership at once and
+    // then blocks in the acquisition's open: the release shows as a guard that
+    // is acquiring from scratch, without an ownership token.
+    let released = wait_until(Duration::from_secs(20), || async {
+        let st = node.guard.ctx.state.lock().await;
+        matches!(st.phase, ShardPhase::Idle | ShardPhase::Acquiring)
+            && !st.has_token()
+            && !node.owned.lock().await.contains(&shard_id)
+    })
+    .await;
+    assert!(released, "a failed reopen should release ownership");
+    assert!(
+        !node.factory.is_closing(&shard_id),
+        "ownership is released only after the close completed"
+    );
+
+    fault.restore();
+    let reacquired = wait_until(Duration::from_secs(60), || async {
+        node.holds_shard().await
+            && node
+                .factory
+                .get(&shard_id)
+                .is_some_and(|shard| !Arc::ptr_eq(&shard, &original))
+    })
+    .await;
+    assert!(
+        reacquired,
+        "the guard should re-acquire once storage is writable"
+    );
+    assert_eq!(
+        shard_owner(&coord, &prefix, &shard_id).await.as_deref(),
+        Some(node.node_id.as_str())
+    );
+    let fresh = node.factory.get(&shard_id).unwrap();
+    assert_shard_leases_a_job(&fresh, "job-after-reacquire").await;
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// Coordinator shutdown reaches the guard while its reopen is blocked on
+/// unwritable storage, and the reopen then times out. The guard must hand the
+/// cleanly closed shard to the shutdown arm; releasing to Idle with `desired`
+/// still true would have it re-take ownership and reopen the shard mid-shutdown.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn etcd_shutdown_during_blocked_reopen_reaches_shut_down() {
+    let prefix = unique_prefix();
+    let coord = connect_for_recovery().await;
+    let shard_id = ShardId::new();
+    let data_root = recovery_data_root("shutdown-during-reopen");
+    let node = RecoveryNode::start(
+        &coord,
+        &prefix,
+        shard_id,
+        &data_root,
+        Duration::from_secs(2),
+    )
+    .await;
+    node.acquire().await;
+
+    let fault = node.begin_failing_release(&data_root).await;
+    node.guard.ctx.set_desired(true).await;
+    let reopening = wait_until(Duration::from_secs(20), || async {
+        !node.factory.is_closing(&shard_id) && node.phase().await == ShardPhase::Releasing
+    })
+    .await;
+    assert!(
+        reopening,
+        "the guard should be reopening after its close completed"
+    );
+
+    // The way a coordinator shuts its guards down: phase plus a notify, ahead
+    // of the shutdown channel.
+    node.guard.ctx.trigger_shutdown().await;
+    node.guard.ctx.notify.notify_one();
+
+    let shut_down = wait_until(Duration::from_secs(15), || async {
+        node.phase().await == ShardPhase::ShutDown
+    })
+    .await;
+    fault.restore();
+    assert!(
+        shut_down,
+        "the guard should shut down after its reopen failed, not re-acquire (phase={:?})",
+        node.phase().await
+    );
+    assert!(!node.guard.ctx.state.lock().await.has_token());
+    assert_eq!(
+        shard_owner(&coord, &prefix, &shard_id).await,
+        None,
+        "ownership of the cleanly closed shard should be released at shutdown"
+    );
+    assert!(node.factory.get(&shard_id).is_none());
+
+    node.handle.abort();
+    let _ = std::fs::remove_dir_all(&data_root);
 }

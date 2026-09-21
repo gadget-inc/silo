@@ -61,6 +61,12 @@ jobs:
         env:
           SILO_DEBUG_LOG_FILE: test-debug.log
         run: cargo test -- --skip k8s_ --skip etcd_ --skip coordination_split_tests --skip cluster_two_nodes
+      - name: Run simulated object store unit tests
+        shell: bash
+        # The simulated object store only builds with the dst feature, so plain
+        # `cargo test` above skips its unit tests. The scenarios themselves run
+        # in the simulation testing workflow.
+        run: cargo test --features dst --test turmoil_object_store_tests
       - name: Run silo-compactor tests
         shell: bash
         # Plain `cargo test` above only covers the workspace's root package, so

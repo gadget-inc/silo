@@ -15,6 +15,8 @@ pub mod grpc_end_to_end;
 pub mod high_latency;
 pub mod high_message_loss;
 #[cfg(feature = "k8s")]
+pub mod k8s_close_failure_recovery;
+#[cfg(feature = "k8s")]
 pub mod k8s_coordination;
 #[cfg(feature = "k8s")]
 pub mod k8s_permanent_leases;
