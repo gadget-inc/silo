@@ -8,10 +8,11 @@ mod test_helpers;
 use silo::codec::{decode_lease, decode_task, encode_holder, encode_lease, encode_task};
 use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, JobStatusKind, Limit};
 use silo::job_attempt::AttemptOutcome;
-use silo::job_store_shard::JobStoreShardError;
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
-use silo::keys::{concurrency_holder_key, job_info_key, task_key};
+use silo::job_store_shard::{JobStoreShard, JobStoreShardError};
+use silo::keys::{ParsedConcurrencyHolderKey, concurrency_holder_key, job_info_key, task_key};
 use silo::retry::RetryPolicy;
+use silo::shard_range::{ShardRange, hash_tenant};
 use silo::task::{GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 use test_helpers::*;
@@ -20,6 +21,16 @@ fn conc_limit(queue: &str, max: u32) -> Limit {
     Limit::Concurrency(ConcurrencyLimit {
         key: queue.to_string(),
         max_concurrency: max,
+    })
+}
+
+/// Encoded holder granted just now that carries no owning job. Planted
+/// fixtures use it so they read as young owner-unknown holders.
+fn holder_without_owner() -> Vec<u8> {
+    encode_holder(&HolderRecord {
+        granted_at_ms: now_ms(),
+        job_id: None,
+        attempt_number: None,
     })
 }
 
@@ -316,6 +327,8 @@ async fn check_rate_limit_max_retries_releases_held_queues() {
     let task_id = format!("crl-orphan-{}", uuid::Uuid::new_v4());
     let holder = encode_holder(&HolderRecord {
         granted_at_ms: now_ms(),
+        job_id: Some(job_id.clone()),
+        attempt_number: Some(1),
     });
     shard
         .db()
@@ -415,9 +428,7 @@ async fn check_rate_limit_missing_job_info_releases_held_queues() {
     let task_id = format!("crl-orphan-{}", uuid::Uuid::new_v4());
 
     // Plant the held concurrency holder we'll prove gets released.
-    let holder = encode_holder(&HolderRecord {
-        granted_at_ms: now_ms(),
-    });
+    let holder = holder_without_owner();
     shard
         .db()
         .put(&concurrency_holder_key(tenant, queue, &task_id), &holder)
@@ -507,9 +518,7 @@ async fn purge_orphaned_holders_for_task_removes_stranded_holders() {
     let other_task_id = "other-task-id";
 
     // Manually plant orphaned holders (no lease, no task).
-    let holder_val = encode_holder(&HolderRecord {
-        granted_at_ms: now_ms(),
-    });
+    let holder_val = holder_without_owner();
     shard
         .db()
         .put(
@@ -593,9 +602,7 @@ async fn late_report_outcome_followed_by_purge_clears_holder() {
         .db()
         .put(
             &concurrency_holder_key(tenant, stale_queue, &task_id),
-            &encode_holder(&HolderRecord {
-                granted_at_ms: now_ms(),
-            }),
+            &holder_without_owner(),
         )
         .await
         .expect("plant stale");
@@ -1755,7 +1762,7 @@ async fn reconcile_pending_holders_four_quadrants() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "hydrate-seed"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("seed write");
         shard.db().flush().await.expect("flush seed");
@@ -1766,7 +1773,7 @@ async fn reconcile_pending_holders_four_quadrants() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "task-both"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
@@ -1781,7 +1788,7 @@ async fn reconcile_pending_holders_four_quadrants() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "task-durable-only"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable-only write");
         shard.db().flush().await.expect("flush");
@@ -1851,7 +1858,7 @@ async fn reconcile_pending_holders_kicks_grant_per_release() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "hydrate-seed"),
-            &encode_holder(&silo::task::HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("seed write");
         shard.db().flush().await.expect("flush seed");
@@ -1911,7 +1918,7 @@ async fn report_holder_drift_self_heals_ghost() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "keep"),
-            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
@@ -1972,7 +1979,7 @@ async fn report_holder_drift_skips_unconfirmed_inflight_reservation() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "keep"),
-            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
@@ -2001,7 +2008,7 @@ async fn report_holder_drift_skips_unconfirmed_inflight_reservation() {
         let mut batch = slatedb::WriteBatch::new();
         batch.put(
             &concurrency_holder_key(tenant, queue, "inflight"),
-            &encode_holder(&HolderRecord { granted_at_ms: 0 }),
+            &holder_without_owner(),
         );
         shard.db().write(batch).await.expect("durable write");
         shard.db().flush().await.expect("flush");
@@ -2088,4 +2095,697 @@ async fn reconcile_pending_requests_uses_requester_counters() {
         1,
         "reconcile_pending_requests read the requester counter (=1) and kicked exactly one grant"
     );
+}
+
+/// `has_unexpired_lease` reports a lease only while its `expiry_ms` is in the
+/// future; an expired row still awaiting the reaper counts as absent.
+#[silo::test]
+async fn has_unexpired_lease_ignores_expired_rows() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        "lease-live",
+        "-",
+        "lease-job",
+        "default",
+        now + 60_000,
+        now,
+    )
+    .await;
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        "lease-expired",
+        "-",
+        "lease-job",
+        "default",
+        now - 1,
+        now - 10_000,
+    )
+    .await;
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        "lease-at-now",
+        "-",
+        "lease-job",
+        "default",
+        now,
+        now - 10_000,
+    )
+    .await;
+
+    assert!(
+        shard
+            .has_unexpired_lease("lease-live", now)
+            .await
+            .expect("read live lease"),
+        "unexpired lease row must count as present"
+    );
+    assert!(
+        !shard
+            .has_unexpired_lease("lease-expired", now)
+            .await
+            .expect("read expired lease"),
+        "expired lease row must count as absent"
+    );
+    assert!(
+        !shard
+            .has_unexpired_lease("lease-at-now", now)
+            .await
+            .expect("read lease expiring now"),
+        "a lease whose expiry equals now must count as absent"
+    );
+    assert!(
+        !shard
+            .has_unexpired_lease("lease-none", now)
+            .await
+            .expect("read missing lease"),
+        "missing lease row must count as absent"
+    );
+}
+
+fn holder_key_parts(tenant: &str, queue: &str, task_id: &str) -> ParsedConcurrencyHolderKey {
+    ParsedConcurrencyHolderKey {
+        tenant: tenant.to_string(),
+        queue: queue.to_string(),
+        task_id: task_id.to_string(),
+    }
+}
+
+/// Purging an orphan holder on a cap-1 queue frees the slot for a real
+/// requester parked behind it: the requester is granted and its task becomes
+/// dequeueable.
+#[silo::test]
+async fn purge_orphan_holders_admits_parked_requester() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "purge-prim-q";
+    let orphan_task = "purge-prim-orphan";
+
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, orphan_task),
+            &holder_without_owner(),
+        )
+        .await
+        .expect("plant orphan holder");
+    shard.db().flush().await.expect("flush");
+
+    // The enqueue hydrates the queue, sees the orphan at cap, and parks.
+    shard
+        .enqueue(
+            tenant,
+            Some("purge-prim-job".to_string()),
+            10,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![conc_limit(queue, 1)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+
+    let purged = shard
+        .purge_orphan_holders(vec![holder_key_parts(tenant, queue, orphan_task)])
+        .await
+        .expect("purge");
+    assert_eq!(purged.len(), 1);
+    assert!(!shard.concurrency_contains_holder(tenant, queue, orphan_task));
+
+    let tasks = poll_until(
+        || async {
+            shard
+                .dequeue("w1", "default", 1)
+                .await
+                .expect("dequeue")
+                .tasks
+        },
+        |tasks| !tasks.is_empty(),
+        10_000,
+    )
+    .await;
+    assert_eq!(tasks.len(), 1, "requester should be granted and dequeued");
+    assert_eq!(tasks[0].attempt().job_id(), "purge-prim-job");
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+}
+
+/// The purge hydrates a queue it has never touched before releasing, so the
+/// surviving holder is present in memory and the purged one is not.
+#[silo::test]
+async fn purge_orphan_holders_hydrates_the_queue() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "purge-hydrate-q";
+
+    for task_id in ["purge-hydrate-keep", "purge-hydrate-gone"] {
+        shard
+            .db()
+            .put(
+                &concurrency_holder_key(tenant, queue, task_id),
+                &holder_without_owner(),
+            )
+            .await
+            .expect("plant holder");
+    }
+    shard.db().flush().await.expect("flush");
+    assert_eq!(
+        shard.concurrency_holder_count(tenant, queue),
+        0,
+        "queue must not be hydrated before the purge"
+    );
+
+    let purged = shard
+        .purge_orphan_holders(vec![holder_key_parts(tenant, queue, "purge-hydrate-gone")])
+        .await
+        .expect("purge");
+    assert_eq!(purged.len(), 1);
+
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+    assert!(shard.concurrency_contains_holder(tenant, queue, "purge-hydrate-keep"));
+    assert!(
+        !shard.concurrency_contains_holder(tenant, queue, "purge-hydrate-gone"),
+        "purged task id must not survive as an in-memory ghost"
+    );
+}
+
+/// Holders whose rows are already absent are skipped: they are not counted,
+/// not released in memory, and a repeat call purges nothing.
+#[silo::test]
+async fn purge_orphan_holders_skips_absent_rows() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "purge-idem-q";
+
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, "purge-idem-present"),
+            &holder_without_owner(),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    let requested = vec![
+        holder_key_parts(tenant, queue, "purge-idem-present"),
+        holder_key_parts(tenant, queue, "purge-idem-absent"),
+    ];
+    let purged = shard
+        .purge_orphan_holders(requested.clone())
+        .await
+        .expect("purge");
+    assert_eq!(
+        purged,
+        vec![holder_key_parts(tenant, queue, "purge-idem-present")]
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 0);
+
+    let purged_again = shard
+        .purge_orphan_holders(requested)
+        .await
+        .expect("purge again");
+    assert!(purged_again.is_empty());
+}
+
+/// Drive the orphan sweep hook until it reports a completed pass, returning
+/// the number of holders purged during that pass.
+async fn run_orphan_sweep_pass(
+    shard: &silo::job_store_shard::JobStoreShard,
+    slice: usize,
+) -> usize {
+    let mut purged = 0;
+    for _ in 0..10_000 {
+        let (n, pass_completed) = shard.sweep_orphan_holders_for_test(slice).await;
+        purged += n;
+        if pass_completed {
+            return purged;
+        }
+    }
+    panic!("orphan sweep never completed a pass");
+}
+
+/// Encoded holder with no owner whose grant time is well past the stale
+/// threshold.
+fn stale_holder_without_owner() -> Vec<u8> {
+    encode_holder(&HolderRecord {
+        granted_at_ms: now_ms() - 2 * silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS as i64,
+        job_id: None,
+        attempt_number: None,
+    })
+}
+
+/// Production reproduction: a cap-5 queue wedged by six owner-less holders
+/// older than the stale threshold admits a real requester once the periodic
+/// sweep has confirmed them across two passes.
+#[silo::test]
+async fn orphan_sweep_recovers_queue_wedged_by_stale_holders() {
+    let (_tmp, shard) = open_temp_shard_with_orphan_sweep(
+        silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
+        silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
+        silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
+        2_000,
+        None,
+        ShardRange::full(),
+    )
+    .await;
+    let tenant = "-";
+    let queue = "wedged-q";
+
+    for i in 0..6 {
+        shard
+            .db()
+            .put(
+                &concurrency_holder_key(tenant, queue, &format!("leaked-{i}")),
+                &stale_holder_without_owner(),
+            )
+            .await
+            .expect("plant leaked holder");
+    }
+    shard.db().flush().await.expect("flush");
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        6,
+        "leaked holders must still be durable when the requester arrives"
+    );
+
+    shard
+        .enqueue(
+            tenant,
+            Some("wedged-job".to_string()),
+            10,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![conc_limit(queue, 5)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        1,
+        "requester must park behind the leaked holders"
+    );
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 6);
+
+    let tasks = poll_until(
+        || async {
+            shard
+                .dequeue("w1", "default", 1)
+                .await
+                .expect("dequeue")
+                .tasks
+        },
+        |tasks| !tasks.is_empty(),
+        20_000,
+    )
+    .await;
+    assert_eq!(
+        tasks.len(),
+        1,
+        "requester should be granted once the sweep purges the leak"
+    );
+    assert_eq!(tasks[0].attempt().job_id(), "wedged-job");
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+}
+
+/// Full-range variant of `open_temp_shard_for_sweep_hook_in_range`.
+async fn open_temp_shard_for_sweep_hook() -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    open_temp_shard_for_sweep_hook_in_range(ShardRange::full()).await
+}
+
+/// Open a shard whose periodic reconcile tick never fires during a test, so
+/// the sweep hook is the only thing advancing sweep state.
+async fn open_temp_shard_for_sweep_hook_in_range(
+    range: ShardRange,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    open_temp_shard_with_orphan_sweep(
+        silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
+        silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
+        silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
+        3_600_000,
+        None,
+        range,
+    )
+    .await
+}
+
+/// Encoded holder owned by `job_id` attempt 1, granted well past the grace
+/// window but within the stale threshold.
+fn owned_holder_past_grace(job_id: &str) -> Vec<u8> {
+    encode_holder(&HolderRecord {
+        granted_at_ms: now_ms() - 2 * silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS as i64,
+        job_id: Some(job_id.to_string()),
+        attempt_number: Some(1),
+    })
+}
+
+/// Run a job to completion so its status row is terminal, returning its id.
+async fn run_job_to_success(shard: &JobStoreShard, job_id: &str) {
+    shard
+        .enqueue(
+            "-",
+            Some(job_id.to_string()),
+            10,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    let tasks = shard
+        .dequeue("w1", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report success");
+}
+
+/// A holder whose job is terminal survives the first full pass and is purged
+/// by the second.
+#[silo::test]
+async fn orphan_sweep_purges_terminal_job_holder_on_second_pass() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "term-q";
+    run_job_to_success(&shard, "term-job").await;
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, "term-task"),
+            &owned_holder_past_grace("term-job"),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(run_orphan_sweep_pass(&shard, 1).await, 0);
+    assert_eq!(
+        count_concurrency_holders(shard.db()).await,
+        1,
+        "first pass only records the candidate"
+    );
+
+    assert_eq!(run_orphan_sweep_pass(&shard, 1).await, 1);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 0);
+}
+
+/// A holder whose job is `Scheduled` for the holder's own attempt is a chain
+/// parked between steps and is left alone within the stale threshold.
+#[silo::test]
+async fn orphan_sweep_keeps_holder_for_chain_parked_on_same_attempt() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "parked-q";
+    shard
+        .enqueue(
+            tenant,
+            Some("parked-job".to_string()),
+            10,
+            now_ms() + 3_600_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue future job");
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, "parked-task"),
+            &owned_holder_past_grace("parked-job"),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    for _ in 0..3 {
+        assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 0);
+    }
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+}
+
+/// A holder younger than the grace window is never classified, even when
+/// its job row is missing.
+#[silo::test]
+async fn orphan_sweep_skips_holder_within_grace_window() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "grace-q";
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, "young-task"),
+            &encode_holder(&HolderRecord {
+                granted_at_ms: now_ms(),
+                job_id: Some("no-such-job".to_string()),
+                attempt_number: Some(1),
+            }),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    for _ in 0..3 {
+        assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 0);
+    }
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+}
+
+/// A holder whose task holds an unexpired lease is never purged, however old
+/// its grant is.
+#[silo::test]
+async fn orphan_sweep_keeps_holder_with_live_lease() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "leased-q";
+    let now = now_ms();
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        "leased-task",
+        tenant,
+        "leased-job",
+        "default",
+        now + 60_000,
+        now,
+    )
+    .await;
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, "leased-task"),
+            &stale_holder_without_owner(),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    for _ in 0..3 {
+        assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 0);
+    }
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+}
+
+/// Holders for tenants outside the shard's range are skipped while an
+/// identical holder inside the range is purged.
+#[silo::test]
+async fn orphan_sweep_skips_tenants_outside_shard_range() {
+    let (lo_tenant, hi_tenant) = {
+        let mut lo: Option<String> = None;
+        let mut hi: Option<String> = None;
+        for i in 0..512u32 {
+            let name = format!("tenant-{i}");
+            let h = hash_tenant(&name);
+            if h.as_str() < "8" && lo.is_none() {
+                lo = Some(name);
+            } else if h.as_str() >= "8" && hi.is_none() {
+                hi = Some(name);
+            }
+            if lo.is_some() && hi.is_some() {
+                break;
+            }
+        }
+        (lo.expect("lo tenant"), hi.expect("hi tenant"))
+    };
+    let half_range = ShardRange::new("", "8");
+    assert!(half_range.contains_tenant(&lo_tenant));
+    assert!(!half_range.contains_tenant(&hi_tenant));
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook_in_range(half_range).await;
+
+    for tenant in [&lo_tenant, &hi_tenant] {
+        shard
+            .db()
+            .put(
+                &concurrency_holder_key(tenant, "range-q", "range-task"),
+                &stale_holder_without_owner(),
+            )
+            .await
+            .expect("plant holder");
+    }
+    shard.db().flush().await.expect("flush");
+
+    run_orphan_sweep_pass(&shard, 1).await;
+    run_orphan_sweep_pass(&shard, 1).await;
+
+    assert_eq!(
+        count_concurrency_holders_for_tenant(shard.db(), &lo_tenant).await,
+        0,
+        "in-range stale holder must be purged"
+    );
+    assert_eq!(
+        count_concurrency_holders_for_tenant(shard.db(), &hi_tenant).await,
+        1,
+        "out-of-range holder must be left alone"
+    );
+}
+
+fn scrape_metrics(metrics: &silo::metrics::Metrics) -> String {
+    use prometheus::{Encoder, TextEncoder};
+    let mut buf = Vec::new();
+    TextEncoder::new()
+        .encode(&metrics.registry().gather(), &mut buf)
+        .expect("encode metrics");
+    String::from_utf8(buf).expect("utf8 metrics")
+}
+
+/// The purge counter increments once per purged holder, labelled by reason.
+#[silo::test]
+async fn orphan_sweep_counts_purged_holders_by_reason() {
+    let metrics = silo::metrics::init().expect("init metrics");
+    let (_tmp, shard) = open_temp_shard_with_orphan_sweep(
+        silo::settings::DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE,
+        silo::settings::DEFAULT_ORPHAN_HOLDER_GRACE_MS,
+        silo::settings::DEFAULT_ORPHAN_HOLDER_STALE_MS,
+        200,
+        Some(metrics.clone()),
+        ShardRange::full(),
+    )
+    .await;
+    run_job_to_success(&shard, "metric-job").await;
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key("-", "metric-q", "metric-task"),
+            &owned_holder_past_grace("metric-job"),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    let body = poll_until(
+        || async { scrape_metrics(&metrics) },
+        |body| body.contains("silo_concurrency_orphan_holders_purged_total"),
+        20_000,
+    )
+    .await;
+    assert!(
+        body.contains(
+            "silo_concurrency_orphan_holders_purged_total{reason=\"job_terminal\",shard=\"test\"} 1"
+        ),
+        "expected one job_terminal purge in scrape:\n{body}"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+}
+
+/// A candidate that classifies live on the next pass drops out of the
+/// candidate set and needs two fresh consecutive orphan passes again.
+#[silo::test]
+async fn orphan_sweep_drops_candidate_that_turns_live() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "dropout-q";
+    let task_id = "dropout-task";
+    shard
+        .db()
+        .put(
+            &concurrency_holder_key(tenant, queue, task_id),
+            &stale_holder_without_owner(),
+        )
+        .await
+        .expect("plant holder");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 0, "pass 1 flags");
+
+    let now = now_ms();
+    write_run_attempt_lease(
+        &shard,
+        "w1",
+        task_id,
+        tenant,
+        "dropout-job",
+        "default",
+        now + 60_000,
+        now,
+    )
+    .await;
+    assert_eq!(
+        run_orphan_sweep_pass(&shard, 2).await,
+        0,
+        "pass 2 sees a live lease and drops the candidate"
+    );
+
+    let mut batch = slatedb::WriteBatch::new();
+    batch.delete(silo::keys::leased_task_key(task_id));
+    shard.db().write(batch).await.expect("delete lease");
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(
+        run_orphan_sweep_pass(&shard, 2).await,
+        0,
+        "pass 3 flags afresh rather than purging"
+    );
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 1, "pass 4 purges");
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
+}
+
+/// A slice smaller than the holder count still covers every row over a pass.
+#[silo::test]
+async fn orphan_sweep_covers_every_row_with_small_slice() {
+    let (_tmp, shard) = open_temp_shard_for_sweep_hook().await;
+    let tenant = "-";
+    let queue = "slice-q";
+    for i in 0..5 {
+        shard
+            .db()
+            .put(
+                &concurrency_holder_key(tenant, queue, &format!("small-slice-{i}")),
+                &stale_holder_without_owner(),
+            )
+            .await
+            .expect("plant holder");
+    }
+    shard.db().flush().await.expect("flush");
+
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 0);
+    assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 5);
+    assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }

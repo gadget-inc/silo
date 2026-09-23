@@ -245,6 +245,10 @@ table JobStatus {
 
 table HolderRecord {
   granted_at_ms: int64;
+  // Owning job and its total attempt number. Absent on records written
+  // without owner information.
+  job_id: string;
+  attempt_number: uint32;
 }
 
 // ============================================================

@@ -13,6 +13,7 @@ pub mod import;
 mod lease;
 mod lease_task;
 pub(crate) mod limit_chain;
+mod orphan_sweep;
 mod rate_limit;
 mod restart;
 pub(crate) mod scan;
@@ -117,6 +118,16 @@ pub struct OpenShardOptions {
     /// Max hydrated queues the periodic holder-drift report scans per tick.
     /// Populated from `holder_drift_scan_slice` in the database config.
     pub holder_drift_scan_slice: usize,
+    /// Max durable holder rows the periodic orphan holder sweep walks per
+    /// tick. Populated from `orphan_holder_sweep_slice` in the database config.
+    pub orphan_holder_sweep_slice: usize,
+    /// Minimum holder age (ms) before the orphan sweep classifies it.
+    /// Populated from `orphan_holder_grace_ms` in the database config.
+    pub orphan_holder_grace_ms: u64,
+    /// Holder age (ms) past which the orphan sweep purges a lease-less holder
+    /// regardless of owner status; zero disables the rule. Populated from
+    /// `orphan_holder_stale_ms` in the database config.
+    pub orphan_holder_stale_ms: u64,
     /// When set, jobs that reach Succeeded have their associated KV records
     /// re-put with a SlateDB row TTL of this many seconds. `None` disables
     /// the feature for successful jobs.
@@ -222,6 +233,15 @@ pub struct JobStoreShard {
     concurrency_reconcile_scan_slice: usize,
     /// Max hydrated queues scanned per periodic holder-drift tick.
     holder_drift_scan_slice: usize,
+    /// Max durable holder rows walked per periodic orphan sweep tick.
+    orphan_holder_sweep_slice: usize,
+    /// Minimum holder age (ms) before the orphan sweep classifies it.
+    orphan_holder_grace_ms: i64,
+    /// Holder age (ms) past which the orphan sweep purges a lease-less
+    /// holder; zero disables the rule.
+    orphan_holder_stale_ms: i64,
+    /// Cursor and candidate state the orphan sweep carries between ticks.
+    orphan_sweep: std::sync::Mutex<orphan_sweep::OrphanSweepPass>,
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
@@ -456,6 +476,9 @@ impl JobStoreShard {
                 },
                 concurrency_reconcile_scan_slice: cfg.concurrency_reconcile_scan_slice,
                 holder_drift_scan_slice: cfg.holder_drift_scan_slice,
+                orphan_holder_sweep_slice: cfg.orphan_holder_sweep_slice,
+                orphan_holder_grace_ms: cfg.orphan_holder_grace_ms,
+                orphan_holder_stale_ms: cfg.orphan_holder_stale_ms,
                 completed_job_expire_s: cfg.completed_job_expire_s,
                 terminal_job_expire_s: cfg.terminal_job_expire_s,
                 count_from_status_counters: cfg.count_from_status_counters,
@@ -504,6 +527,9 @@ impl JobStoreShard {
             grant_scanner,
             concurrency_reconcile_scan_slice,
             holder_drift_scan_slice,
+            orphan_holder_sweep_slice,
+            orphan_holder_grace_ms,
+            orphan_holder_stale_ms,
             completed_job_expire_s,
             terminal_job_expire_s,
             count_from_status_counters,
@@ -619,6 +645,11 @@ impl JobStoreShard {
             concurrency_reconcile_interval,
             concurrency_reconcile_scan_slice,
             holder_drift_scan_slice,
+            orphan_holder_sweep_slice,
+            // Epoch-ms arithmetic needs an i64; a value past i64::MAX saturates.
+            orphan_holder_grace_ms: i64::try_from(orphan_holder_grace_ms).unwrap_or(i64::MAX),
+            orphan_holder_stale_ms: i64::try_from(orphan_holder_stale_ms).unwrap_or(i64::MAX),
+            orphan_sweep: std::sync::Mutex::new(orphan_sweep::OrphanSweepPass::default()),
             cancellation: CancellationToken::new(),
             close_completed: std::sync::atomic::AtomicBool::new(false),
             store,
@@ -1091,6 +1122,11 @@ impl JobStoreShard {
                             .concurrency
                             .report_holder_drift(&shard.db, &range, shard.holder_drift_scan_slice)
                             .await;
+                        // Then advance the sliced orphan holder sweep, which
+                        // releases durable holders whose task is gone.
+                        shard
+                            .sweep_orphan_holders(shard.orphan_holder_sweep_slice)
+                            .await;
                     }
                     _ = cancellation.cancelled() => {
                         tracing::debug!(
@@ -1335,6 +1371,16 @@ impl JobStoreShard {
             .report_holder_drift(&self.db, &range, slice)
             .await
     }
+
+    /// Test-only: advance the orphan holder sweep by at most `slice` holder
+    /// rows, exactly as one periodic tick does. Returns the number of holders
+    /// purged by this call and whether it completed a full pass over the
+    /// holder keyspace.
+    #[doc(hidden)]
+    pub async fn sweep_orphan_holders_for_test(&self, slice: usize) -> (usize, bool) {
+        self.sweep_orphan_holders(slice).await
+    }
+
     /// Get the SlateDB metrics registry for this shard.
     /// Use this to collect storage-level statistics for observability.
     pub fn slatedb_metrics_recorder(&self) -> &Arc<DefaultMetricsRecorder> {

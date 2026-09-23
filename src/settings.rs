@@ -237,6 +237,32 @@ fn default_holder_drift_scan_slice() -> usize {
     DEFAULT_HOLDER_DRIFT_SCAN_SLICE
 }
 
+/// Default for `orphan_holder_sweep_slice`: max durable holder rows the
+/// periodic orphan holder sweep walks per tick before saving a cursor and
+/// yielding.
+pub const DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE: usize = DEFAULT_HOLDER_DRIFT_SCAN_SLICE;
+
+fn default_orphan_holder_sweep_slice() -> usize {
+    DEFAULT_ORPHAN_HOLDER_SWEEP_SLICE
+}
+
+/// Default for `orphan_holder_grace_ms`: age a holder must reach before the
+/// orphan sweep classifies it. Well beyond the lease TTL and the
+/// grant-to-lease window, so an in-flight grant is never inspected.
+pub const DEFAULT_ORPHAN_HOLDER_GRACE_MS: u64 = 60_000;
+
+fn default_orphan_holder_grace_ms() -> u64 {
+    DEFAULT_ORPHAN_HOLDER_GRACE_MS
+}
+
+/// Default for `orphan_holder_stale_ms`: age past which a holder with no
+/// unexpired lease is purged regardless of its owner's status (24 hours).
+pub const DEFAULT_ORPHAN_HOLDER_STALE_MS: u64 = 86_400_000;
+
+fn default_orphan_holder_stale_ms() -> u64 {
+    DEFAULT_ORPHAN_HOLDER_STALE_MS
+}
+
 /// Default for `grant_scanner_next_hop_skip_min_backlog`: minimum requester
 /// backlog on a candidate's next concurrency hop before the scanner defers
 /// granting the candidate while that hop is saturated. 0 disables the skip.
@@ -378,6 +404,26 @@ pub struct DatabaseTemplate {
     /// below 1 are treated as 1.
     #[serde(default = "default_holder_drift_scan_slice")]
     pub holder_drift_scan_slice: usize,
+    /// Max durable concurrency holder rows the periodic orphan holder sweep
+    /// walks per reconcile tick. The sweep resumes from a cursor on the next
+    /// tick, so a full pass over the shard's holders spans multiple ticks; a
+    /// holder is purged only after it is classified orphan on two consecutive
+    /// full passes. Defaults to 5000. Values below 1 are treated as 1.
+    #[serde(default = "default_orphan_holder_sweep_slice")]
+    pub orphan_holder_sweep_slice: usize,
+    /// Age in milliseconds a concurrency holder must reach before the orphan
+    /// sweep classifies it, so a freshly granted holder whose lease or task
+    /// write is still landing is never inspected. Defaults to 60000.
+    #[serde(default = "default_orphan_holder_grace_ms")]
+    pub orphan_holder_grace_ms: u64,
+    /// Age in milliseconds past which a concurrency holder with no unexpired
+    /// lease is purged regardless of its owner's status. This recovers
+    /// holders whose record carries no owner and chains parked for longer
+    /// than any legitimate wait, at the cost of a single over-admit on that
+    /// queue. Zero disables this age-only rule. Defaults to 86400000 (24
+    /// hours).
+    #[serde(default = "default_orphan_holder_stale_ms")]
+    pub orphan_holder_stale_ms: u64,
     /// Minimum requester backlog on a candidate's next concurrency hop before
     /// the grant scanner defers granting the candidate while that hop is
     /// saturated (avoids parking holders behind a deeply backlogged
@@ -484,6 +530,9 @@ impl Default for DatabaseTemplate {
             grant_scanner_cold_batch_size: default_grant_scanner_cold_batch_size(),
             concurrency_reconcile_scan_slice: default_concurrency_reconcile_scan_slice(),
             holder_drift_scan_slice: default_holder_drift_scan_slice(),
+            orphan_holder_sweep_slice: default_orphan_holder_sweep_slice(),
+            orphan_holder_grace_ms: default_orphan_holder_grace_ms(),
+            orphan_holder_stale_ms: default_orphan_holder_stale_ms(),
             grant_scanner_next_hop_skip_min_backlog:
                 default_grant_scanner_next_hop_skip_min_backlog(),
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
@@ -837,6 +886,19 @@ pub struct DatabaseConfig {
     /// `DatabaseTemplate::holder_drift_scan_slice` for details. Defaults to 5000.
     #[serde(default = "default_holder_drift_scan_slice")]
     pub holder_drift_scan_slice: usize,
+    /// Max durable holder rows walked per orphan sweep tick. See
+    /// `DatabaseTemplate::orphan_holder_sweep_slice` for details. Defaults to 5000.
+    #[serde(default = "default_orphan_holder_sweep_slice")]
+    pub orphan_holder_sweep_slice: usize,
+    /// Minimum holder age before the orphan sweep classifies it. See
+    /// `DatabaseTemplate::orphan_holder_grace_ms` for details. Defaults to 60000.
+    #[serde(default = "default_orphan_holder_grace_ms")]
+    pub orphan_holder_grace_ms: u64,
+    /// Holder age past which the orphan sweep purges a lease-less holder. See
+    /// `DatabaseTemplate::orphan_holder_stale_ms` for details. Defaults to
+    /// 86400000; zero disables the rule.
+    #[serde(default = "default_orphan_holder_stale_ms")]
+    pub orphan_holder_stale_ms: u64,
     /// Minimum next-hop backlog before the scanner defers a candidate. See
     /// `DatabaseTemplate::grant_scanner_next_hop_skip_min_backlog` for details.
     /// Defaults to 1024; 0 disables.
@@ -914,6 +976,9 @@ impl Default for DatabaseConfig {
             grant_scanner_cold_batch_size: default_grant_scanner_cold_batch_size(),
             concurrency_reconcile_scan_slice: default_concurrency_reconcile_scan_slice(),
             holder_drift_scan_slice: default_holder_drift_scan_slice(),
+            orphan_holder_sweep_slice: default_orphan_holder_sweep_slice(),
+            orphan_holder_grace_ms: default_orphan_holder_grace_ms(),
+            orphan_holder_stale_ms: default_orphan_holder_stale_ms(),
             grant_scanner_next_hop_skip_min_backlog:
                 default_grant_scanner_next_hop_skip_min_backlog(),
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
