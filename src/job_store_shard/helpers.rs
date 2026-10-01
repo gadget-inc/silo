@@ -404,9 +404,7 @@ where
     for attempt in 0..MAX_RETRIES {
         match f().await {
             Ok(val) => return Ok(val),
-            Err(JobStoreShardError::Slate(ref e))
-                if e.kind() == slatedb::ErrorKind::Transaction || is_clock_tick_error(e) =>
-            {
+            Err(ref e) if is_txn_conflict(e) => {
                 if attempt + 1 < MAX_RETRIES {
                     let delay_ms = 10 * (1 << attempt); // 10ms, 20ms, 40ms, 80ms
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -425,6 +423,17 @@ where
     Err(JobStoreShardError::TransactionConflict(
         operation_name.to_string(),
     ))
+}
+
+/// Whether an error is a transient transaction failure worth retrying: a
+/// serializable-snapshot conflict or SlateDB's `InvalidClockTick` race.
+pub(crate) fn is_txn_conflict(e: &JobStoreShardError) -> bool {
+    match e {
+        JobStoreShardError::Slate(e) => {
+            e.kind() == slatedb::ErrorKind::Transaction || is_clock_tick_error(e)
+        }
+        _ => false,
+    }
 }
 
 /// Check if a SlateDB error is an InvalidClockTick error.

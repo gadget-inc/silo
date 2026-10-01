@@ -21,8 +21,9 @@ use crate::job_store_shard::{
 };
 use crate::keys::{
     ParsedConcurrencyHolderKey, attempt_key, attempt_prefix, concurrency_holder_key,
-    concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key, idx_metadata_key,
-    job_cancelled_key, job_info_key, leased_task_key, parse_concurrency_holder_key,
+    concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key, idx_enqueue_time_key,
+    idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key,
+    parse_concurrency_holder_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
@@ -842,6 +843,7 @@ impl JobStoreShard {
     /// Records covered:
     ///   - `JOB_INFO`            (read existing bytes, re-put with TTL)
     ///   - `IDX_METADATA`        (one entry per metadata pair on the job)
+    ///   - `IDX_ENQUEUE_TIME`    (the job's listing entry, keyed by its enqueue time)
     ///   - `ATTEMPT`             (scan all attempt rows for the job, re-put each)
     ///   - `JOB_CANCELLED`       (re-put with TTL if present)
     ///
@@ -869,18 +871,15 @@ impl JobStoreShard {
         expire_ts: i64,
     ) -> Result<(), JobStoreShardError> {
         let info_key = job_info_key(tenant, job_id);
-        let metadata_pairs = if let Some(info_raw) = writer.get(&info_key).await? {
+        if let Some(info_raw) = writer.get(&info_key).await? {
             let view = JobView::new(info_raw.clone())?;
-            let pairs = view.metadata();
             writer.put_with_expire(&info_key, info_raw, expire_ts)?;
-            pairs
-        } else {
-            Vec::new()
-        };
-
-        for (mk, mv) in &metadata_pairs {
-            let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-            writer.put_with_expire(&mkey, [], expire_ts)?;
+            for (mk, mv) in &view.metadata() {
+                let mkey = idx_metadata_key(tenant, mk, mv, job_id);
+                writer.put_with_expire(&mkey, [], expire_ts)?;
+            }
+            let entry_key = idx_enqueue_time_key(tenant, view.enqueue_time_ms(), job_id);
+            writer.put_with_expire(&entry_key, [], expire_ts)?;
         }
 
         let attempt_start = attempt_prefix(tenant, job_id);
@@ -895,5 +894,44 @@ impl JobStoreShard {
         }
 
         Ok(())
+    }
+
+    /// Counterpart to [`Self::expire_terminal_job_records`] for a job leaving
+    /// a terminal status: re-put `JOB_INFO`, its `IDX_METADATA` rows, its
+    /// `ATTEMPT` rows, and its `IDX_ENQUEUE_TIME` entry with no row TTL, so a
+    /// job that is live again does not lose its metadata, attempt history, or
+    /// listing entry when the old terminal retention elapses.
+    ///
+    /// `JOB_CANCELLED` is deliberately not revived: the caller deletes it in
+    /// the same transaction, and the write set is last-write-wins per key.
+    ///
+    /// Returns the job's decoded `JOB_INFO`, or `JobNotFound` when absent.
+    pub(crate) async fn revive_terminal_job_records<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+    ) -> Result<JobView, JobStoreShardError> {
+        let info_key = job_info_key(tenant, job_id);
+        let Some(info_raw) = writer.get(&info_key).await? else {
+            return Err(JobStoreShardError::JobNotFound(job_id.to_string()));
+        };
+        let view = JobView::new(info_raw.clone())?;
+        writer.put(&info_key, info_raw)?;
+        for (mk, mv) in &view.metadata() {
+            writer.put(idx_metadata_key(tenant, mk, mv, job_id), [])?;
+        }
+        writer.put(
+            idx_enqueue_time_key(tenant, view.enqueue_time_ms(), job_id),
+            [],
+        )?;
+
+        let attempt_start = attempt_prefix(tenant, job_id);
+        let mut iter = writer.scan_prefix(&attempt_start).await?;
+        while let Some(kv) = iter.next().await? {
+            writer.put(&kv.key, &kv.value)?;
+        }
+
+        Ok(view)
     }
 }

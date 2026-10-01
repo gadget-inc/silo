@@ -1068,3 +1068,38 @@ orphan_holder_stale_ms = 0
     assert_eq!(explicit.database.orphan_holder_grace_ms, 5_000);
     assert_eq!(explicit.database.orphan_holder_stale_ms, 0);
 }
+
+#[silo::test]
+fn parse_toml_enqueue_time_index_backfill_defaults_off() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    let backfill = &cfg.database.enqueue_time_index_backfill;
+    assert!(!backfill.enabled, "the backfill sweep is off by default");
+    assert_eq!(backfill.batch_size, 256);
+    assert_eq!(backfill.pause_ms, 10);
+}
+
+#[silo::test]
+fn parse_toml_enqueue_time_index_backfill_opt_in() {
+    let toml_str = r#"
+[database]
+backend = "fs"
+path = "/tmp/silo-%shard%"
+
+[database.enqueue_time_index_backfill]
+enabled = true
+batch_size = 64
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    let backfill = &cfg.database.enqueue_time_index_backfill;
+    assert!(backfill.enabled);
+    assert_eq!(backfill.batch_size, 64);
+    assert_eq!(
+        backfill.pause_ms, 10,
+        "unspecified fields keep their defaults"
+    );
+}
