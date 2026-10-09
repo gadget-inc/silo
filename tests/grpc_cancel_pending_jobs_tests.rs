@@ -178,6 +178,62 @@ async fn batch_cancel_validates_the_whole_request_before_mutating() -> anyhow::R
 }
 
 #[silo::test(flavor = "multi_thread")]
+async fn batch_cancel_racing_worker_dequeue_never_dispatches_cancelled_jobs() -> anyhow::Result<()>
+{
+    let (factory, _tmp) = create_test_factory().await?;
+    let (mut client, shutdown_tx, server, _) = setup_test_server(factory, test_config()?).await?;
+    let mut worker = client.clone();
+    for i in 0..10 {
+        let task_group = format!("worker-race-{i}");
+        let ids: Vec<String> = (0..30).map(|j| format!("worker-race-{i}-{j}")).collect();
+        for id in &ids {
+            let mut request = enqueue(id, "tenant");
+            request.task_group = task_group.clone();
+            client.enqueue(request).await?;
+        }
+        let request = CancelPendingJobsRequest {
+            shard: TEST_SHARD_ID.into(),
+            ids,
+            tenant: Some("tenant".into()),
+        };
+        let (cancelled, leased) = tokio::join!(
+            client.cancel_pending_jobs(request),
+            worker.lease_tasks(LeaseTasksRequest {
+                shard: Some(TEST_SHARD_ID.into()),
+                worker_id: "worker".into(),
+                max_tasks: 30,
+                task_group,
+            }),
+        );
+        let results = cancelled?.into_inner().results;
+        for task in leased?.into_inner().tasks {
+            assert_eq!(
+                results
+                    .iter()
+                    .find(|result| result.id == task.job_id)
+                    .unwrap()
+                    .status(),
+                CancelPendingJobStatus::Running,
+                "a production worker must never receive a job cancelled by the pending-only RPC"
+            );
+            assert!(
+                !worker
+                    .heartbeat(HeartbeatRequest {
+                        shard: TEST_SHARD_ID.into(),
+                        worker_id: "worker".into(),
+                        task_id: task.id,
+                        tenant_id: Some("tenant".into()),
+                    })
+                    .await?
+                    .into_inner()
+                    .cancelled
+            );
+        }
+    }
+    shutdown_server(shutdown_tx, server).await
+}
+
+#[silo::test(flavor = "multi_thread")]
 async fn batch_cancel_racing_a_lease_never_cancels_a_running_attempt() -> anyhow::Result<()> {
     let (factory, _tmp) = create_test_factory().await?;
     let (mut client, shutdown_tx, server, _) = setup_test_server(factory, test_config()?).await?;

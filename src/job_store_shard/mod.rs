@@ -241,6 +241,11 @@ pub struct JobStoreShard {
     pub(crate) name: String,
     pub(crate) db: Arc<InstrumentedDb>,
     pub(crate) brokers: Arc<TaskBrokerRegistry>,
+    /// Dequeue holds shared guards from reading a job through persisting its batch;
+    /// pending-only cancellation holds an exclusive guard through commit and eviction.
+    /// Fixed stripes bound memory while keeping dequeuers concurrent. Owned guards
+    /// can stay with an in-flight write after the requesting RPC is dropped.
+    pub(crate) pending_cancel_locks: Vec<Arc<tokio::sync::RwLock<()>>>,
     pub(crate) concurrency: Arc<ConcurrencyManager>,
     #[cfg(feature = "server")]
     query_engine: OnceLock<ShardQueryEngine>,
@@ -367,6 +372,8 @@ pub enum JobStoreShardError {
     JobNotLeaseable(#[from] JobNotLeaseableError),
     #[error("transaction conflict during {0}, exceeded max retries")]
     TransactionConflict(String),
+    #[error("background mutation task failed: {0}")]
+    MutationTask(#[from] tokio::task::JoinError),
     #[error("shard {0} has a close pending")]
     ClosePending(crate::shard_range::ShardId),
 }
@@ -679,6 +686,9 @@ impl JobStoreShard {
             name,
             db,
             brokers,
+            pending_cancel_locks: (0..4096)
+                .map(|_| Arc::new(tokio::sync::RwLock::new(())))
+                .collect(),
             concurrency,
             #[cfg(feature = "server")]
             query_engine: OnceLock::new(),

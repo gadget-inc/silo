@@ -1,6 +1,9 @@
 //! Job cancellation operations.
 
 use slatedb::IsolationLevel;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
@@ -23,6 +26,12 @@ enum CancellationMode {
 }
 
 impl JobStoreShard {
+    pub(crate) fn pending_cancel_lock_index(&self, tenant: &str, id: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        (tenant, id).hash(&mut hasher);
+        hasher.finish() as usize % self.pending_cancel_locks.len()
+    }
+
     /// Cancel a job by id. Prevents further execution and signals running workers to stop.
     ///
     /// Cancellation semantics:
@@ -48,10 +57,32 @@ impl JobStoreShard {
     /// every transaction attempt, so racing leases cannot turn this into an abort.
     #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn cancel_pending_job(
+        self: &Arc<Self>,
+        tenant: &str,
+        id: &str,
+    ) -> Result<CancelPendingJobOutcome, JobStoreShardError> {
+        // Keep the exclusion guard until the storage operation finishes even if
+        // the caller disconnects while a transaction is being committed.
+        let shard = Arc::clone(self);
+        let tenant = tenant.to_string();
+        let id = id.to_string();
+        tokio::spawn(
+            async move { shard.cancel_pending_job_guarded(&tenant, &id).await }.in_current_span(),
+        )
+        .await?
+    }
+
+    async fn cancel_pending_job_guarded(
         &self,
         tenant: &str,
         id: &str,
     ) -> Result<CancelPendingJobOutcome, JobStoreShardError> {
+        // Production dequeue uses unconditional write batches, so transaction
+        // conflict detection alone cannot stop a lease staged before this cancel
+        // from being committed afterwards. Serialize with that job's dequeue.
+        let _guard = self.pending_cancel_locks[self.pending_cancel_lock_index(tenant, id)]
+            .write()
+            .await;
         match retry_on_txn_conflict("cancel_pending_job", || {
             self.cancel_job_inner(tenant, id, CancellationMode::PendingOnly)
         })
