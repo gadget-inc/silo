@@ -202,9 +202,17 @@ pub struct JobStatus {
     /// Present when a task exists in the task queue (Scheduled status), absent when the job is running (task became a lease) or terminal.
     /// Used for O(1) task key reconstruction in expedite operations.
     pub current_attempt: Option<u32>,
+    /// The job's enqueue time, copied from `JobInfo` when the record is
+    /// written. Absent on records stored without it.
+    pub enqueue_time_ms: Option<i64>,
+    /// The job's priority, copied from `JobInfo` when the record is written.
+    /// Absent on records stored without it.
+    pub priority: Option<u8>,
 }
 
 impl JobStatus {
+    /// A status with the job-derived fields absent; the status-writing
+    /// helper fills them when the record is stored.
     pub fn new(
         kind: JobStatusKind,
         changed_at_ms: i64,
@@ -216,7 +224,14 @@ impl JobStatus {
             changed_at_ms,
             next_attempt_starts_after_ms,
             current_attempt,
+            enqueue_time_ms: None,
+            priority: None,
         }
+    }
+
+    /// Whether both job-derived fields are present.
+    pub fn has_job_fields(&self) -> bool {
+        self.enqueue_time_ms.is_some() && self.priority.is_some()
     }
 
     /// Create a Scheduled status with the next attempt start time and attempt number.

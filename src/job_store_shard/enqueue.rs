@@ -471,7 +471,9 @@ impl JobStoreShard {
         };
 
         // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time
-        let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
+        let mut job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
+        job_status.enqueue_time_ms = Some(job.enqueue_time_ms);
+        job_status.priority = Some(job.priority);
         let job_status_kind = job_status.kind;
 
         writer.put(job_info_key(tenant, job_id), &job_value)?;
@@ -900,12 +902,16 @@ impl JobStoreShard {
     /// the lookup is on the hot path for callers like dequeue and
     /// `report_attempt_outcome`. Callers without a `JobView` in scope pass
     /// `None` and the helper falls back to reading `JOB_INFO` itself.
+    ///
+    /// The new record carries the job's enqueue time and priority: from the
+    /// previous status record when it has them, else from `job_metric_info`,
+    /// else from the same single `JOB_INFO` read.
     pub(crate) async fn set_job_status_with_index_opts<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
         job_id: &str,
-        new_status: JobStatus,
+        mut new_status: JobStatus,
         expire_ts: Option<i64>,
         job_metric_info: Option<&JobView>,
     ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
@@ -929,20 +935,33 @@ impl JobStoreShard {
         let new_kind = new_status.kind;
         let needs_background_action_counters =
             background_action_queue_counter_transition_is_relevant(old_kind, new_kind);
+        let job_fields_from_old = old_status
+            .as_ref()
+            .filter(|old| old.has_job_fields())
+            .map(|old| (old.enqueue_time_ms, old.priority));
+        let loaded_view = if job_metric_info.is_none()
+            && (needs_background_action_counters || job_fields_from_old.is_none())
+        {
+            writer
+                .get(&job_info_key(tenant, job_id))
+                .await?
+                .map(|raw| JobView::new(raw).map_err(|e| JobStoreShardError::Codec(e.to_string())))
+                .transpose()?
+        } else {
+            None
+        };
+        let job_view = job_metric_info.or(loaded_view.as_ref());
+
+        (new_status.enqueue_time_ms, new_status.priority) =
+            job_fields_from_old.unwrap_or_else(|| {
+                job_view.map_or((None, None), |view| {
+                    (Some(view.enqueue_time_ms()), Some(view.priority()))
+                })
+            });
+
         let derived_metric_info: Option<(String, Vec<(String, String)>)> =
             if needs_background_action_counters {
-                match job_metric_info {
-                    Some(view) => Some((view.task_group().to_string(), view.metadata())),
-                    None => writer
-                        .get(&job_info_key(tenant, job_id))
-                        .await?
-                        .map(|raw| {
-                            JobView::new(raw)
-                                .map(|view| (view.task_group().to_string(), view.metadata()))
-                                .map_err(|e| JobStoreShardError::Codec(e.to_string()))
-                        })
-                        .transpose()?,
-                }
+                job_view.map(|view| (view.task_group().to_string(), view.metadata()))
             } else {
                 None
             };
