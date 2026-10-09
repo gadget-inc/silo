@@ -1,13 +1,159 @@
+use silo::job::ListingSegment;
 use silo::keys::{
-    attempt_key, attempt_prefix, concurrency_holder_key, concurrency_request_job_prefix,
-    concurrency_request_key, end_bound, floating_limit_state_key, idx_enqueue_time_key,
-    idx_enqueue_time_tenant_prefix, idx_metadata_key, idx_status_time_key, idx_status_time_prefix,
+    StatusEnqueueTimeIndexValue, attempt_key, attempt_prefix, concurrency_holder_key,
+    concurrency_request_job_prefix, concurrency_request_key, end_bound, floating_limit_state_key,
+    idx_enqueue_time_key, idx_enqueue_time_tenant_prefix, idx_metadata_key,
+    idx_status_enqueue_time_candidate_keys, idx_status_enqueue_time_key,
+    idx_status_enqueue_time_priority_prefix, idx_status_enqueue_time_segment_prefix,
+    idx_status_enqueue_time_tenant_prefix, idx_status_time_key, idx_status_time_prefix,
     job_cancelled_key, job_info_key, job_info_prefix, job_status_key, leased_task_key,
     parse_attempt_key, parse_concurrency_holder_key, parse_concurrency_request_key,
     parse_enqueue_time_index_key, parse_floating_limit_key, parse_job_cancelled_key,
     parse_job_info_key, parse_job_status_key, parse_lease_key, parse_metadata_index_key,
-    parse_status_time_index_key, parse_task_key, task_group_prefix, task_key,
+    parse_status_enqueue_time_index_key, parse_status_time_index_key, parse_task_key,
+    task_group_prefix, task_key,
 };
+
+#[test]
+fn status_enqueue_time_index_key_roundtrips_every_component() {
+    for segment in ListingSegment::ALL {
+        for priority in [0u8, 1, 2, 50, 99] {
+            for enqueue_time_ms in [i64::MIN, -2_000, -1, 0, 1, 1_700_000_000_000, i64::MAX] {
+                let key =
+                    idx_status_enqueue_time_key("tenant1", segment, priority, enqueue_time_ms, "j");
+                let parsed = parse_status_enqueue_time_index_key(&key).unwrap_or_else(|| {
+                    panic!("key for {segment:?}/{priority}/{enqueue_time_ms} should parse")
+                });
+                assert_eq!(parsed.tenant, "tenant1");
+                assert_eq!(parsed.segment, segment);
+                assert_eq!(parsed.priority, priority);
+                assert_eq!(parsed.enqueue_time_ms(), enqueue_time_ms);
+                assert_eq!(parsed.job_id, "j");
+            }
+        }
+    }
+    assert!(
+        parse_status_enqueue_time_index_key(&idx_enqueue_time_key("tenant1", 1, "j")).is_none(),
+        "an enqueue-time index key must not parse as a status-segmented key"
+    );
+}
+
+#[test]
+fn status_enqueue_time_index_orders_by_segment_priority_then_time_desc_id_asc() {
+    // Within one (tenant, segment, priority) prefix: enqueue_time_ms DESC,
+    // id ASC, across the sign boundary. Prefixes sort by segment then
+    // priority ascending so a scan of one arm never crosses into another.
+    type Row = (ListingSegment, u8, i64, &'static str);
+    let expected: Vec<Row> = vec![
+        (ListingSegment::ScheduledFirst, 0, 5_000, "a"),
+        (ListingSegment::ScheduledFirst, 0, -1, "a"),
+        (ListingSegment::ScheduledFirst, 1, i64::MAX, "a"),
+        (ListingSegment::ScheduledFirst, 1, 5_000, "a"),
+        (ListingSegment::ScheduledFirst, 1, 5_000, "b"),
+        (ListingSegment::ScheduledFirst, 1, 1, "z"),
+        (ListingSegment::ScheduledFirst, 1, 0, "a"),
+        (ListingSegment::ScheduledFirst, 1, 0, "b"),
+        (ListingSegment::ScheduledFirst, 1, -1, "a"),
+        (ListingSegment::ScheduledFirst, 1, -2_000, "a"),
+        (ListingSegment::ScheduledFirst, 1, i64::MIN, "a"),
+        (ListingSegment::ScheduledFirst, 2, 5_000, "a"),
+        (ListingSegment::ScheduledFirst, 99, i64::MIN, "a"),
+        (ListingSegment::ScheduledRetry, 0, 5_000, "a"),
+        (ListingSegment::Running, 0, 5_000, "a"),
+        (ListingSegment::Succeeded, 0, 5_000, "a"),
+        (ListingSegment::Failed, 0, 5_000, "a"),
+        (ListingSegment::Cancelled, 0, 5_000, "a"),
+    ];
+    let mut keys: Vec<(Vec<u8>, Row)> = expected
+        .iter()
+        .map(|&(s, p, t, id)| (idx_status_enqueue_time_key("t", s, p, t, id), (s, p, t, id)))
+        .collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    let sorted: Vec<Row> = keys.into_iter().map(|(_, e)| e).collect();
+    assert_eq!(
+        sorted, expected,
+        "key order must equal segment, priority, enqueue_time_ms DESC, id ASC"
+    );
+}
+
+#[test]
+fn status_enqueue_time_index_prefixes_nest_and_scope_scans() {
+    let key = idx_status_enqueue_time_key("tenant1", ListingSegment::Failed, 7, 1_000, "job1");
+    let in_range =
+        |prefix: &[u8]| key.as_slice() >= prefix && key.as_slice() < end_bound(prefix).as_slice();
+
+    assert!(in_range(&idx_status_enqueue_time_tenant_prefix("tenant1")));
+    assert!(in_range(&idx_status_enqueue_time_segment_prefix(
+        "tenant1",
+        ListingSegment::Failed
+    )));
+    assert!(in_range(&idx_status_enqueue_time_priority_prefix(
+        "tenant1",
+        ListingSegment::Failed,
+        7
+    )));
+
+    assert!(!in_range(&idx_status_enqueue_time_tenant_prefix(
+        "tenant10"
+    )));
+    assert!(!in_range(&idx_status_enqueue_time_segment_prefix(
+        "tenant1",
+        ListingSegment::Running
+    )));
+    assert!(!in_range(&idx_status_enqueue_time_priority_prefix(
+        "tenant1",
+        ListingSegment::Failed,
+        8
+    )));
+    assert!(!in_range(&idx_enqueue_time_tenant_prefix("tenant1")));
+}
+
+#[test]
+fn status_enqueue_time_index_candidate_keys_cover_every_segment() {
+    let candidates = idx_status_enqueue_time_candidate_keys("t", 3, 42, "job");
+    let segments: Vec<ListingSegment> = candidates
+        .iter()
+        .map(|k| {
+            parse_status_enqueue_time_index_key(k)
+                .expect("candidate parses")
+                .segment
+        })
+        .collect();
+    assert_eq!(segments, ListingSegment::ALL.to_vec());
+    for key in &candidates {
+        let parsed = parse_status_enqueue_time_index_key(key).expect("candidate parses");
+        assert_eq!(
+            (
+                parsed.priority,
+                parsed.enqueue_time_ms(),
+                parsed.job_id.as_str()
+            ),
+            (3, 42, "job")
+        );
+    }
+}
+
+#[test]
+fn status_enqueue_time_index_value_roundtrips_optional_next_attempt() {
+    for next in [
+        None,
+        Some(0),
+        Some(-5),
+        Some(1_700_000_000_000),
+        Some(i64::MIN),
+    ] {
+        let value = StatusEnqueueTimeIndexValue {
+            next_attempt_starts_after_ms: next,
+        };
+        let decoded = StatusEnqueueTimeIndexValue::decode(&value.encode())
+            .unwrap_or_else(|| panic!("value for {next:?} should decode"));
+        assert_eq!(decoded, value);
+    }
+    assert!(
+        StatusEnqueueTimeIndexValue::decode(&[1, 2, 3]).is_none(),
+        "a malformed value must not decode"
+    );
+}
 
 #[test]
 fn enqueue_time_index_key_roundtrip_across_sign() {

@@ -229,9 +229,10 @@ impl JobStatus {
         }
     }
 
-    /// Whether both job-derived fields are present.
-    pub fn has_job_fields(&self) -> bool {
-        self.enqueue_time_ms.is_some() && self.priority.is_some()
+    /// The job-derived `(enqueue_time_ms, priority)` pair when both are
+    /// present.
+    pub fn job_fields(&self) -> Option<(i64, u8)> {
+        self.enqueue_time_ms.zip(self.priority)
     }
 
     /// Create a Scheduled status with the next attempt start time and attempt number.
@@ -269,6 +270,57 @@ impl JobStatus {
             self.kind,
             JobStatusKind::Succeeded | JobStatusKind::Failed | JobStatusKind::Cancelled
         )
+    }
+}
+
+/// The arm of the status-segmented enqueue-time index a job's entry lives in.
+///
+/// The stored Scheduled kind splits on `current_attempt` so first attempts
+/// and retries list separately; every other kind maps one-to-one. A job's
+/// entry sits in exactly one segment at a time, and because enqueue time and
+/// priority never change, a job has at most six candidate keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListingSegment {
+    ScheduledFirst = 0,
+    ScheduledRetry = 1,
+    Running = 2,
+    Succeeded = 3,
+    Failed = 4,
+    Cancelled = 5,
+}
+
+impl ListingSegment {
+    /// Every segment, in key order.
+    pub const ALL: [ListingSegment; 6] = [
+        ListingSegment::ScheduledFirst,
+        ListingSegment::ScheduledRetry,
+        ListingSegment::Running,
+        ListingSegment::Succeeded,
+        ListingSegment::Failed,
+        ListingSegment::Cancelled,
+    ];
+
+    /// The segment a job with this stored status lists under.
+    pub fn from_status(status: &JobStatus) -> Self {
+        match status.kind {
+            JobStatusKind::Scheduled => match status.current_attempt {
+                Some(attempt) if attempt > 1 => Self::ScheduledRetry,
+                _ => Self::ScheduledFirst,
+            },
+            JobStatusKind::Running => Self::Running,
+            JobStatusKind::Succeeded => Self::Succeeded,
+            JobStatusKind::Failed => Self::Failed,
+            JobStatusKind::Cancelled => Self::Cancelled,
+        }
+    }
+
+    /// The key-order discriminant.
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(value)).copied()
     }
 }
 

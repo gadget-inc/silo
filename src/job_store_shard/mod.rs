@@ -1789,7 +1789,11 @@ impl JobStoreShard {
     ///
     /// Returns an error if the job is currently running (has active leases/holders) or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
     pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        use crate::keys::{idx_enqueue_time_key, idx_metadata_key};
+        use crate::job::ListingSegment;
+        use crate::keys::{
+            idx_enqueue_time_key, idx_metadata_key, idx_status_enqueue_time_candidate_keys,
+            idx_status_enqueue_time_key,
+        };
         use slatedb::WriteBatch;
 
         // Check if job is running or has pending state
@@ -1821,6 +1825,7 @@ impl JobStoreShard {
         }
         // Clean up metadata and enqueue-time index entries (load job info to
         // enumerate metadata and recover the enqueue time)
+        let mut job_fields = status.as_ref().and_then(JobStatus::job_fields);
         let job_metric_info = if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
             let view = JobView::new(raw)?;
             for (mk, mv) in view.metadata().into_iter() {
@@ -1828,10 +1833,34 @@ impl JobStoreShard {
                 batch.delete(&mkey);
             }
             batch.delete(idx_enqueue_time_key(tenant, view.enqueue_time_ms(), id));
+            job_fields.get_or_insert((view.enqueue_time_ms(), view.priority()));
             Some((view.task_group().to_string(), view.metadata()))
         } else {
             None
         };
+        // The status-segmented entry sits under the stored status; without a
+        // status record it could be in any segment, so every candidate goes.
+        if let Some((enqueue_time_ms, priority)) = job_fields {
+            match status.as_ref() {
+                Some(status) => batch.delete(idx_status_enqueue_time_key(
+                    tenant,
+                    ListingSegment::from_status(status),
+                    priority,
+                    enqueue_time_ms,
+                    id,
+                )),
+                None => {
+                    for key in idx_status_enqueue_time_candidate_keys(
+                        tenant,
+                        priority,
+                        enqueue_time_ms,
+                        id,
+                    ) {
+                        batch.delete(key);
+                    }
+                }
+            }
+        }
         batch.delete(&job_info_key_bytes);
         batch.delete(&job_status_key_bytes);
         // Also delete cancellation record if present

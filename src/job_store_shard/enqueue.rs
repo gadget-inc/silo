@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::codec::{encode_job_info, encode_job_status};
 use crate::concurrency::RequestTicketOutcome;
 use crate::dst_events::{self, DstEvent};
-use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
+use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit, ListingSegment};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::counters::{
@@ -20,7 +20,8 @@ use crate::job_store_shard::helpers::{
     retry_on_txn_conflict,
 };
 use crate::keys::{
-    idx_enqueue_time_key, idx_metadata_key, idx_status_time_key, job_info_key, job_status_key,
+    StatusEnqueueTimeIndexValue, idx_enqueue_time_key, idx_metadata_key,
+    idx_status_enqueue_time_key, idx_status_time_key, job_info_key, job_status_key,
     status_index_timestamp, tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
@@ -935,10 +936,7 @@ impl JobStoreShard {
         let new_kind = new_status.kind;
         let needs_background_action_counters =
             background_action_queue_counter_transition_is_relevant(old_kind, new_kind);
-        let job_fields_from_old = old_status
-            .as_ref()
-            .filter(|old| old.has_job_fields())
-            .map(|old| (old.enqueue_time_ms, old.priority));
+        let job_fields_from_old = old_status.as_ref().and_then(JobStatus::job_fields);
         let loaded_view = if job_metric_info.is_none()
             && (needs_background_action_counters || job_fields_from_old.is_none())
         {
@@ -952,12 +950,22 @@ impl JobStoreShard {
         };
         let job_view = job_metric_info.or(loaded_view.as_ref());
 
-        (new_status.enqueue_time_ms, new_status.priority) =
-            job_fields_from_old.unwrap_or_else(|| {
-                job_view.map_or((None, None), |view| {
-                    (Some(view.enqueue_time_ms()), Some(view.priority()))
-                })
-            });
+        let job_fields = job_fields_from_old
+            .or_else(|| job_view.map(|view| (view.enqueue_time_ms(), view.priority())));
+        (new_status.enqueue_time_ms, new_status.priority) = job_fields.unzip();
+
+        // The entry under the previous status leaves before the new one is
+        // put, so a transition that keeps the same key (Scheduled to
+        // Scheduled) ends with the put winning within the batch.
+        if let (Some(old), Some((enqueue_time_ms, priority))) = (old_status.as_ref(), job_fields) {
+            writer.delete(idx_status_enqueue_time_key(
+                tenant,
+                ListingSegment::from_status(old),
+                priority,
+                enqueue_time_ms,
+                job_id,
+            ))?;
+        }
 
         let derived_metric_info: Option<(String, Vec<(String, String)>)> =
             if needs_background_action_counters {
@@ -1030,6 +1038,23 @@ impl JobStoreShard {
         match expire_ts {
             Some(ets) => writer.put_with_expire(&timek, [], ets)?,
             None => writer.put(&timek, [])?,
+        }
+
+        // The status-segmented enqueue-time entry needs the job fields the
+        // status record carries; a record without them lists nothing.
+        if let Some((enqueue_time_ms, priority)) = new_status.job_fields() {
+            let entry_key = idx_status_enqueue_time_key(
+                tenant,
+                ListingSegment::from_status(&new_status),
+                priority,
+                enqueue_time_ms,
+                job_id,
+            );
+            let entry_value = StatusEnqueueTimeIndexValue::for_status(&new_status).encode();
+            match expire_ts {
+                Some(ets) => writer.put_with_expire(&entry_key, &entry_value, ets)?,
+                None => writer.put(&entry_key, &entry_value)?,
+            }
         }
 
         // Increment tenant status counter for the new status
