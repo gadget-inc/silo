@@ -78,3 +78,5 @@ export {
 export { JobHandle } from "./JobHandle";
 export { WorkerMetrics } from "./metrics";
 export type { RetryPolicy, Failure } from "./pb/silo";
+export { CancelPendingJobStatus } from "./pb/silo";
+export type { CancelPendingJobResult } from "./pb/silo";

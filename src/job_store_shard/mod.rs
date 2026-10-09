@@ -317,6 +317,16 @@ pub struct JobStoreShard {
         tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Result of an atomic pending-only cancellation. Expected state races are not errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelPendingJobOutcome {
+    Cancelled,
+    AlreadyCancelled,
+    Running,
+    Terminal,
+    NotFound,
+}
+
 #[derive(Debug, Error)]
 pub enum JobStoreShardError {
     #[error(transparent)]

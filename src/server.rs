@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -30,7 +30,7 @@ use crate::coordination::{Coordinator, ShardSplitter, member_in_ring};
 use crate::factory::ShardFactory;
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{CancelPendingJobOutcome, JobStoreShard, JobStoreShardError};
 use crate::metrics::Metrics;
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
@@ -1225,6 +1225,83 @@ impl Silo for SiloService {
             .await?;
         shard.cancel_job(&tenant, &r.id).await.map_err(map_err)?;
         Ok(Response::new(CancelJobResponse {}))
+    }
+
+    async fn cancel_pending_jobs(
+        &self,
+        req: Request<CancelPendingJobsRequest>,
+    ) -> Result<Response<CancelPendingJobsResponse>, Status> {
+        let r = req.into_inner();
+        if r.ids.is_empty() || r.ids.len() > 1000 {
+            return Err(Status::invalid_argument(
+                "expected between 1 and 1000 job IDs",
+            ));
+        }
+        let mut unique_ids = HashSet::with_capacity(r.ids.len());
+        if r.ids
+            .iter()
+            .any(|id| id.is_empty() || !unique_ids.insert(id))
+        {
+            return Err(Status::invalid_argument(
+                "job IDs must be nonempty and unique",
+            ));
+        }
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+
+        // Keep storage concurrency bounded and preserve request order. Each job
+        // uses the same transactional cleanup as CancelJob, including ticket release.
+        let mut indexed_results: Vec<_> =
+            futures::stream::iter(r.ids.into_iter().enumerate().map(|(index, id)| {
+                let shard = Arc::clone(&shard);
+                let tenant = tenant.clone();
+                async move {
+                    let (status, error) = match shard.cancel_pending_job(&tenant, &id).await {
+                        Ok(outcome) => (
+                            match outcome {
+                                CancelPendingJobOutcome::Cancelled => {
+                                    CancelPendingJobStatus::Cancelled
+                                }
+                                CancelPendingJobOutcome::AlreadyCancelled => {
+                                    CancelPendingJobStatus::AlreadyCancelled
+                                }
+                                CancelPendingJobOutcome::Running => CancelPendingJobStatus::Running,
+                                CancelPendingJobOutcome::Terminal => {
+                                    CancelPendingJobStatus::Terminal
+                                }
+                                CancelPendingJobOutcome::NotFound => {
+                                    CancelPendingJobStatus::NotFound
+                                }
+                            },
+                            None,
+                        ),
+                        Err(error) => (
+                            CancelPendingJobStatus::Failed,
+                            Some(map_err(error).message().to_string()),
+                        ),
+                    };
+                    (
+                        index,
+                        CancelPendingJobResult {
+                            id,
+                            status: status.into(),
+                            error,
+                        },
+                    )
+                }
+            }))
+            .buffer_unordered(30)
+            .collect()
+            .await;
+
+        indexed_results.sort_unstable_by_key(|(index, _)| *index);
+        let results = indexed_results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect();
+
+        Ok(Response::new(CancelPendingJobsResponse { results }))
     }
 
     async fn drop_tenant_holders(

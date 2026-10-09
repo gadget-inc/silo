@@ -42,6 +42,36 @@ If you're using tenancy, include the tenant:
 await client.cancelJob("job-123", "customer-456");
 ```
 
+### Cancelling a batch of pending jobs
+
+Use `cancelPendingJobs` to clear a backlog without fetching every job first. The
+request accepts up to 1,000 unique IDs in one tenant and returns a result for each
+ID in the same order:
+
+```typescript
+import { CancelPendingJobStatus } from "@silo/client";
+
+const results = await client.cancelPendingJobs(["job-123", "job-456"], "customer-456");
+for (const result of results) {
+  if (result.status === CancelPendingJobStatus.FAILED) {
+    console.error(result.id, result.error);
+  }
+}
+```
+
+Silo checks the current state inside each job's cancellation transaction. A job
+that starts running before cancellation commits is left running and receives no
+cancellation signal. Pending jobs receive the same task and concurrency cleanup
+as `cancelJob`.
+
+Results distinguish `CANCELLED`, `ALREADY_CANCELLED`, `RUNNING`, `TERMINAL`,
+`NOT_FOUND`, and `FAILED`. Individual failures do not stop the rest of the batch.
+Each job commits independently; the whole batch is not atomic. Retrying after a
+lost response is safe: jobs already cancelled return `ALREADY_CANCELLED`.
+The server processes at most 30 jobs concurrently per request. The TypeScript
+client treats an empty list as a no-op; duplicate IDs, empty IDs, and batches
+over 1,000 IDs are rejected.
+
 ### Using Job Handles
 
 Job handles provide a convenient `cancel()` method:
