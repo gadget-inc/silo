@@ -154,24 +154,52 @@ pub trait K8sBackend: Send + Sync + Clone + 'static {
 }
 
 /// Real Kubernetes backend using kube-rs client.
+///
+/// One-shot calls (get, list, create, replace, patch, delete) go through
+/// `client`. Each watch stream gets a `kube::Client` of its own, built from
+/// `config`, and so a connection pool of its own.
+///
+/// The separation matters because kube-rs talks HTTP/1.1, where a connection
+/// carries one response at a time and a watch holds its connection for the
+/// whole watch (290s by default). A race in hyper's connection dispatch can
+/// leave a connection marked ready while a response is still streaming on it,
+/// and the pool then hands that connection to the next request, which is only
+/// written once the stream ends. With one shared pool that next request can
+/// be a membership renewal queued behind a watch. With a pool per watch
+/// stream, nothing else can be queued behind a watch.
 #[derive(Clone)]
 pub struct KubeBackend {
     client: kube::Client,
+    config: kube::Config,
 }
 
 impl KubeBackend {
-    /// Create a new KubeBackend from a kube::Client.
-    pub fn new(client: kube::Client) -> Self {
-        Self { client }
+    /// Create a new KubeBackend that connects with the given configuration.
+    pub fn new(config: kube::Config) -> Result<Self, CoordinationError> {
+        let client = Self::build_client(&config)?;
+        Ok(Self { client, config })
     }
 
     /// Create a new KubeBackend using the default in-cluster or kubeconfig configuration.
     pub async fn try_default() -> Result<Self, CoordinationError> {
-        let client = kube::Client::try_default()
+        let config = kube::Config::infer()
             .await
             .map_err(|e| CoordinationError::ConnectionFailed(e.to_string()))?;
-        Ok(Self::new(client))
+        Self::new(config)
     }
+
+    fn build_client(config: &kube::Config) -> Result<kube::Client, CoordinationError> {
+        kube::Client::try_from(config.clone())
+            .map_err(|e| CoordinationError::ConnectionFailed(e.to_string()))
+    }
+}
+
+/// A watch stream that reports `error` and ends, for a watch that could not
+/// be started.
+fn failed_watch<T: Send + 'static>(
+    error: CoordinationError,
+) -> Pin<Box<dyn Stream<Item = Result<T, CoordinationError>> + Send>> {
+    Box::pin(tokio_stream::once(Err(error)))
 }
 
 #[async_trait]
@@ -264,7 +292,11 @@ impl K8sBackend for KubeBackend {
         use futures::StreamExt;
         use kube::runtime::watcher::{Config as WatcherConfig, Event, watcher};
 
-        let leases: kube::Api<Lease> = kube::Api::namespaced(self.client.clone(), namespace);
+        let client = match Self::build_client(&self.config) {
+            Ok(client) => client,
+            Err(e) => return failed_watch(e),
+        };
+        let leases: kube::Api<Lease> = kube::Api::namespaced(client, namespace);
         let watcher_config = WatcherConfig::default().labels(label_selector);
         let watch_stream = watcher(leases, watcher_config);
 
@@ -382,8 +414,11 @@ impl K8sBackend for KubeBackend {
         use futures::StreamExt;
         use kube::runtime::watcher::{Config as WatcherConfig, Event, watcher};
 
-        let configmaps: kube::Api<ConfigMap> =
-            kube::Api::namespaced(self.client.clone(), namespace);
+        let client = match Self::build_client(&self.config) {
+            Ok(client) => client,
+            Err(e) => return failed_watch(e),
+        };
+        let configmaps: kube::Api<ConfigMap> = kube::Api::namespaced(client, namespace);
         // Use field selector to watch only the specific ConfigMap by name
         let watcher_config = WatcherConfig::default().fields(&format!("metadata.name={}", name));
         let watch_stream = watcher(configmaps, watcher_config);
