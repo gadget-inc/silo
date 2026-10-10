@@ -8,8 +8,8 @@ import {
 import xxhashInit from "xxhash-wasm";
 import type { ClientOptions } from "@grpc/grpc-js";
 import { ChannelCredentials, credentials, Metadata } from "@grpc/grpc-js";
-import { GrpcTransport } from "@protobuf-ts/grpc-transport";
-import type { RpcInterceptor, RpcOptions } from "@protobuf-ts/runtime-rpc";
+import { GrpcTransport, type GrpcOptions } from "@protobuf-ts/grpc-transport";
+import type { MethodInfo, RpcInterceptor, RpcOptions, UnaryCall } from "@protobuf-ts/runtime-rpc";
 import { RpcError } from "@protobuf-ts/runtime-rpc";
 import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
@@ -1277,6 +1277,48 @@ function injectTraceContext(rpcOptions: RpcOptions): void {
   });
 }
 
+/** RPCs that renew or settle a task's lease */
+const LEASE_METHODS = new Set(["Heartbeat", "ReportOutcome", "ReportRefreshOutcome"]);
+
+/**
+ * A transport that sends the calls in LEASE_METHODS over a second channel.
+ *
+ * Those calls race a task's lease, and the caller can't move that deadline.
+ * grpc-js puts every channel with the same target and options on one TCP
+ * connection, and a connection carries calls in the order they were made, so
+ * a burst of enqueues from the same process would otherwise stand in front of
+ * a heartbeat. A channel-local subchannel pool gives the second channel a
+ * connection nothing else uses. It connects on its first call, so a process
+ * that never holds a lease never opens it.
+ */
+class LeaseSplitTransport extends GrpcTransport {
+  private readonly _leaseTransport: GrpcTransport;
+
+  public constructor(options: GrpcOptions) {
+    super(options);
+    this._leaseTransport = new GrpcTransport({
+      ...options,
+      clientOptions: { ...options.clientOptions, "grpc.use_local_subchannel_pool": 1 },
+    });
+  }
+
+  public override unary<I extends object, O extends object>(
+    method: MethodInfo<I, O>,
+    input: I,
+    options: RpcOptions,
+  ): UnaryCall<I, O> {
+    if (LEASE_METHODS.has(method.name)) {
+      return this._leaseTransport.unary(method, input, options);
+    }
+    return super.unary(method, input, options);
+  }
+
+  public override close(): void {
+    super.close();
+    this._leaseTransport.close();
+  }
+}
+
 /** Connection to a single server */
 interface ServerConnection {
   address: string;
@@ -1539,7 +1581,7 @@ export class SiloGRPCClient {
       if (this._authInterceptor) {
         interceptors.push(this._authInterceptor);
       }
-      const transport = new GrpcTransport({
+      const transport = new LeaseSplitTransport({
         host: address,
         channelCredentials: this._channelCredentials,
         clientOptions: this._grpcClientOptions,
