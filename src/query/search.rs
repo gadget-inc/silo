@@ -16,9 +16,9 @@ use crate::job::{JobStatus, JobStatusKind};
 use crate::job_store_shard::JobStoreShard;
 use crate::keys;
 use crate::query::{
-    JobsScanStrategy, OrderingColumn, QueryStatusFilter, Scan, ScanDecision, analyze_projection,
-    build_job_pairs_batch, exec_err, extract_metadata_key_from_expr, fetch_batch_data,
-    parse_eq_filter,
+    JobsScanStrategy, OrderingColumn, QueryStatusFilter, Scan, ScanDecision, StringComparisonOp,
+    analyze_projection, build_job_pairs_batch, exec_err, extract_metadata_key_from_expr,
+    fetch_batch_data, parse_eq_filter, parse_string_comparison_filter,
 };
 
 /// Fixed-size candidate filter: broad prefixes cannot allocate one String per job.
@@ -126,6 +126,9 @@ async fn next_value(
     start: Vec<u8>,
     end: Vec<u8>,
 ) -> DfResult<Option<String>> {
+    if start >= end {
+        return Ok(None);
+    }
     let mut cursor = shard
         .open_range_cursor(start, end, &crate::scan_options())
         .await
@@ -135,6 +138,33 @@ async fn next_value(
         .first()
         .and_then(|kv| keys::parse_metadata_index_key(&kv.key))
         .map(|p| p.value))
+}
+
+/// Restrict discovery to the requested value range before reading any statuses.
+/// In particular, a keyset page must not rescan every preceding queue's history.
+fn metadata_value_range(tenant: &str, key: &str, filters: &[Expr]) -> (Vec<u8>, Vec<u8>) {
+    let mut start = keys::idx_metadata_key_only_prefix(tenant, key);
+    let mut end = keys::end_bound(&start);
+    for filter in filters {
+        let Some((column, op, value)) = parse_string_comparison_filter(filter) else {
+            continue;
+        };
+        if column != "value" {
+            continue;
+        }
+        let prefix = keys::idx_metadata_prefix(tenant, key, &value);
+        match op {
+            StringComparisonOp::Eq => {
+                end = end.min(keys::end_bound(&prefix));
+                start = start.max(prefix);
+            }
+            StringComparisonOp::Gt => start = start.max(keys::end_bound(&prefix)),
+            StringComparisonOp::GtEq => start = start.max(prefix),
+            StringComparisonOp::Lt => end = end.min(prefix),
+            StringComparisonOp::LtEq => end = end.min(keys::end_bound(&prefix)),
+        }
+    }
+    (start, end)
 }
 
 pub(crate) fn search_index_stream(
@@ -327,6 +357,7 @@ impl Scan for PendingMetadataScanner {
         };
         let tenant = equality("tenant");
         let key = equality("key");
+        let filters = filters.to_vec();
         let stream = async_stream::try_stream! {
             let (Some(tenant), Some(key)) = (tenant, key) else {
                 Err(DataFusionError::Plan(
@@ -342,8 +373,10 @@ impl Scan for PendingMetadataScanner {
             // avoiding an O(pending jobs) scan before the first queue is returned.
             let mut pending: Option<CandidateIds> = None;
             let mut unsuccessful_probes = 0;
-            let mut start = keys::idx_metadata_key_only_prefix(&tenant, &key);
-            let end = keys::end_bound(&start);
+            let (mut start, end) = metadata_value_range(&tenant, &key, &filters);
+            if start >= end {
+                return;
+            }
             let mut sent = 0;
             while let Some(value) = next_value(&shard, start, end.clone()).await? {
                 let value_start = keys::idx_metadata_prefix(&tenant, &key, &value);

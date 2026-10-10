@@ -1,3 +1,4 @@
+mod grpc_integration_helpers;
 mod test_helpers;
 
 use std::sync::Arc;
@@ -339,6 +340,175 @@ async fn pending_names_include_later_queues_and_exclude_cancelled_and_other_tena
         .await
         .is_empty()
     );
+    shard.close().await.expect("close");
+}
+
+#[silo::test]
+async fn pending_names_seek_past_previous_pages_before_reading_statuses() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let future = now_ms() + 60_000;
+    for i in 0..200 {
+        enqueue(
+            &shard,
+            "a",
+            &format!("job-{i}"),
+            &format!("queue-{i:04}"),
+            "noop",
+            future,
+        )
+        .await;
+    }
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let before = metrics.query_point_lookups_value(shard.name());
+    assert_eq!(strings(&engine, "SELECT value FROM pending_metadata WHERE tenant = 'a' AND key = 'queue' AND value > 'queue-0197' ORDER BY value LIMIT 2").await, ["queue-0198", "queue-0199"]);
+    assert_eq!(
+        metrics.query_point_lookups_value(shard.name()) - before,
+        2.0,
+        "a later page must not recheck the pending status of earlier names"
+    );
+    let before = metrics.query_point_lookups_value(shard.name());
+    assert!(strings(&engine, "SELECT value FROM pending_metadata WHERE tenant = 'a' AND key = 'queue' AND value > 'queue-0199' ORDER BY value LIMIT 2").await.is_empty());
+    assert_eq!(
+        metrics.query_point_lookups_value(shard.name()) - before,
+        0.0
+    );
+    shard.close().await.expect("close");
+}
+
+#[silo::test]
+async fn pending_names_preserve_string_range_boundaries() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let values = ["", " ", "A", "a", "a\0", "aa", "b", "é", "😀"];
+    for (i, value) in values.iter().enumerate() {
+        enqueue(
+            &shard,
+            "a",
+            &format!("job-{i}"),
+            value,
+            "noop",
+            now_ms() + 60_000,
+        )
+        .await;
+    }
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    for (condition, expected) in [
+        ("value = 'a'", vec!["a"]),
+        ("value > 'a' AND value < 'b'", vec!["a\0", "aa"]),
+        ("value >= 'a' AND value <= 'b'", vec!["a", "a\0", "aa", "b"]),
+        ("'a' < value AND 'é' >= value", vec!["a\0", "aa", "b", "é"]),
+        ("value > 'b' AND value < 'a'", vec![]),
+        ("value >= 'a' AND value < 'a'", vec![]),
+        ("value > 'a' AND value > 'b'", vec!["é", "😀"]),
+        ("value = 'missing'", vec![]),
+    ] {
+        let sql = format!(
+            "SELECT value FROM pending_metadata WHERE tenant = 'a' AND key = 'queue' AND {condition} ORDER BY value"
+        );
+        assert_eq!(strings(&engine, &sql).await, expected, "{sql}");
+    }
+    shard.close().await.expect("close");
+}
+
+#[silo::test]
+async fn pending_names_work_through_cluster_and_grpc_query_engines() {
+    use grpc_integration_helpers::{
+        TEST_SHARD_ID, create_test_factory, setup_test_server, shutdown_server,
+    };
+    use silo::cluster_query::ClusterQueryEngine;
+    use silo::pb::{
+        QueryArrowRequest, QueryParameter, QueryRequest, query_parameter, serialized_bytes,
+    };
+    use silo::settings::AppConfig;
+    use silo::shard_range::ShardId;
+
+    let (factory, _tmp) = create_test_factory().await.expect("factory");
+    let shard = factory
+        .get(&ShardId::parse(TEST_SHARD_ID).expect("shard ID"))
+        .expect("shard");
+    for (tenant, id, queue) in [
+        ("a", "a", "first"),
+        ("a", "b", "second"),
+        ("a", "c", "second"),
+        ("b", "d", "foreign"),
+    ] {
+        enqueue(&shard, tenant, id, queue, "noop", now_ms() + 60_000).await;
+    }
+    let engine = ClusterQueryEngine::new(Arc::clone(&factory), None)
+        .await
+        .expect("cluster engine");
+    let sql = "SELECT value AS queue_name FROM pending_metadata WHERE tenant = 'a' AND key = 'queue' AND value > 'first' ORDER BY value LIMIT 101";
+    let batches = engine
+        .sql(sql)
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("cluster query");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("names")
+            .value(0),
+        "second"
+    );
+
+    let (mut client, shutdown, server, _) =
+        setup_test_server(Arc::clone(&factory), AppConfig::load(None).expect("config"))
+            .await
+            .expect("server");
+    let parameters = ["a", "queue", "first"]
+        .into_iter()
+        .map(|value| QueryParameter {
+            value: Some(query_parameter::Value::StringValue(value.into())),
+        })
+        .collect();
+    let result = client.query(QueryRequest {
+        shard: TEST_SHARD_ID.into(),
+        tenant: Some("a".into()),
+        sql: "SELECT value AS queue_name FROM pending_metadata WHERE tenant = $1 AND key = $2 AND value > $3 ORDER BY value LIMIT 101".into(),
+        parameters,
+    }).await.expect("bound query").into_inner();
+    assert_eq!(result.row_count, 1);
+    let Some(serialized_bytes::Encoding::Msgpack(bytes)) = &result.rows[0].encoding else {
+        panic!("msgpack row")
+    };
+    let row: serde_json::Value = rmp_serde::from_slice(bytes).expect("decode");
+    assert_eq!(row["queue_name"], "second");
+
+    // The cluster's remote path uses Arrow with the tenant in SQL, not the RPC.
+    let mut stream = client
+        .query_arrow(QueryArrowRequest {
+            shard: TEST_SHARD_ID.into(),
+            tenant: None,
+            sql: sql.into(),
+            parameters: vec![],
+        })
+        .await
+        .expect("arrow query")
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend(chunk.expect("arrow chunk").ipc_data);
+    }
+    let batches: Vec<_> =
+        datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .expect("arrow reader")
+            .collect::<Result<_, _>>()
+            .expect("arrow batches");
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("names")
+            .value(0),
+        "second"
+    );
+    shutdown_server(shutdown, server).await.expect("shutdown");
     shard.close().await.expect("close");
 }
 

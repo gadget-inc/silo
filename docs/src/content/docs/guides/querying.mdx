@@ -94,7 +94,7 @@ ORDER BY value
 LIMIT 101
 ```
 
-The columns are `tenant`, `key`, and `value` (strings). Page names with `value > 'last-name'`. Results reflect live queue state, so concurrent enqueues or cancellations can change subsequent pages.
+The columns are `tenant`, `key`, and `value` (strings). Page names with `value > 'last-name'`; the scan seeks directly past that value without rechecking earlier queues. Equality and upper/lower bounds on `value` also restrict the index range. Names retain their exact case and whitespace and use UTF-8 byte ordering. Results reflect live queue state, so concurrent enqueues or cancellations can change subsequent pages.
 
 ### Case-insensitive prefix search
 
