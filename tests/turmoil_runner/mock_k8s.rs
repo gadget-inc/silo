@@ -981,16 +981,99 @@ fn match_configmap_labels(configmap: &StoredConfigMap, selector: Option<&str>) -
     true
 }
 
+/// A Kubernetes call that a test can make hang on one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StalledCall {
+    GetLease,
+    ListLeases,
+}
+
+/// A planted hang: matching calls sleep until the stall's window ends and then
+/// run normally, like a request that is stuck and later answered.
+struct CallStall {
+    call: StalledCall,
+    /// Substring the lease name (get) or label selector (list) must contain.
+    target: String,
+    duration: Duration,
+    /// How many more calls may join the stall. `None` is every matching call
+    /// that starts inside the window.
+    remaining_calls: Option<u32>,
+    /// When the stalled calls return. Set by the first call that stalls, on
+    /// that caller's clock, so the window starts when the fault first bites.
+    release_at: Option<tokio::time::Instant>,
+}
+
 /// Wrapper around Arc<MockK8sState> that implements K8sBackend trait.
 /// This allows using the mock state as a backend for the real K8sCoordinator.
+///
+/// The state is the API server and is shared by every node. A backend is one
+/// node's client, so a hang planted with [`MockK8sBackend::stall_calls`] hits
+/// only the node (and its clones) the backend was handed to.
 #[derive(Clone)]
 pub struct MockK8sBackend {
     pub state: Arc<MockK8sState>,
+    stalls: Arc<std::sync::Mutex<Vec<CallStall>>>,
+    stalled_calls: Arc<AtomicU64>,
 }
 
 impl MockK8sBackend {
     pub fn new(state: Arc<MockK8sState>, _namespace: impl Into<String>) -> Self {
-        Self { state }
+        Self {
+            state,
+            stalls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            stalled_calls: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Make this backend's next matching calls hang for `duration`, measured
+    /// from the first call that stalls. `target` is a substring of the lease
+    /// name for [`StalledCall::GetLease`] and of the label selector for
+    /// [`StalledCall::ListLeases`]. `max_calls` bounds how many calls stall;
+    /// `None` stalls every matching call that starts inside the window.
+    pub fn stall_calls(
+        &self,
+        call: StalledCall,
+        target: impl Into<String>,
+        duration: Duration,
+        max_calls: Option<u32>,
+    ) {
+        self.stalls.lock().unwrap().push(CallStall {
+            call,
+            target: target.into(),
+            duration,
+            remaining_calls: max_calls,
+            release_at: None,
+        });
+    }
+
+    /// How many calls on this backend have stalled so far. A test reads this
+    /// to learn when a planted stall took effect, and that it did at all.
+    pub fn stalled_call_count(&self) -> u64 {
+        self.stalled_calls.load(Ordering::SeqCst)
+    }
+
+    /// Sleep through a planted stall that matches this call, if there is one.
+    async fn stall_if_planted(&self, call: StalledCall, target: &str) {
+        let release_at = {
+            let mut stalls = self.stalls.lock().unwrap();
+            let now = tokio::time::Instant::now();
+            stalls.retain(|stall| stall.release_at.is_none_or(|at| at > now));
+            let Some(stall) = stalls.iter_mut().find(|stall| {
+                stall.call == call
+                    && target.contains(&stall.target)
+                    && stall.remaining_calls != Some(0)
+            }) else {
+                return;
+            };
+            if let Some(remaining) = stall.remaining_calls.as_mut() {
+                *remaining -= 1;
+            }
+            *stall.release_at.get_or_insert(now + stall.duration)
+        };
+        self.stalled_calls.fetch_add(1, Ordering::SeqCst);
+        trace!(?call, target, "mock: call stalled");
+        tokio::time::sleep_until(release_at).await;
+        trace!(?call, target, "mock: stalled call released");
     }
 }
 
@@ -1001,6 +1084,7 @@ impl K8sBackend for MockK8sBackend {
         namespace: &str,
         name: &str,
     ) -> Result<Option<Lease>, CoordinationError> {
+        self.stall_if_planted(StalledCall::GetLease, name).await;
         let result = self.state.get_lease(namespace, name).await?;
         Ok(result.map(|stored| stored.lease))
     }
@@ -1032,6 +1116,8 @@ impl K8sBackend for MockK8sBackend {
         namespace: &str,
         label_selector: &str,
     ) -> Result<Vec<Lease>, CoordinationError> {
+        self.stall_if_planted(StalledCall::ListLeases, label_selector)
+            .await;
         let selector = if label_selector.is_empty() {
             None
         } else {
