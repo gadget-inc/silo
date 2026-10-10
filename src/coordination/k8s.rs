@@ -19,14 +19,48 @@ use crate::coordination::k8s_backend::{
     ConfigMapWatchEvent, K8sBackend, KubeBackend, LeaseWatchEvent,
 };
 use crate::coordination::{
-    CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo, OpenShardError,
-    OwnershipCheck, ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase,
+    AbortOnDrop, CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo,
+    OpenShardError, OwnershipCheck, ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase,
     SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
 fn format_microtime(dt: chrono::DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+/// Longest any Kubernetes call made on a timer or from a watch handler may
+/// take. The same bound the shard guards put on their lease calls.
+const K8S_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the membership lease is renewed: a third of its TTL, and at least
+/// once a second.
+fn membership_renew_interval(lease_duration_secs: i32) -> Duration {
+    Duration::from_secs((lease_duration_secs / 3).max(1) as u64)
+}
+
+/// Longest one Kubernetes call of a membership renewal may take: one renew
+/// interval, so that a hung call is abandoned in time for later ticks to renew
+/// before the lease expires.
+fn membership_call_timeout(renew_interval: Duration) -> Duration {
+    renew_interval.min(K8S_CALL_TIMEOUT)
+}
+
+/// Bound a Kubernetes call. One that outlives `limit` is abandoned and
+/// reported as an error naming it, so a request that never returns costs its
+/// caller one attempt instead of stalling it.
+async fn with_k8s_timeout<T>(
+    limit: Duration,
+    call: &'static str,
+    fut: impl Future<Output = Result<T, CoordinationError>>,
+) -> Result<T, CoordinationError> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(CoordinationError::BackendError(format!(
+            "{call} timed out after {}ms",
+            limit.as_millis()
+        ))),
+    }
 }
 
 /// Configuration for starting a K8sCoordinator
@@ -158,6 +192,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         backend
             .patch_lease_apply(&namespace, &member_lease_name, lease_spec)
             .await?;
+        base.record_membership_renewal();
 
         let members_cache = Arc::new(Mutex::new(Vec::new()));
         let membership_changed = Arc::new(Notify::new());
@@ -186,6 +221,18 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let nid = node_id.clone();
 
         let handle = tokio::spawn(async move {
+            // Start the membership renewal task. It runs apart from the
+            // coordination loop so that nothing the loop waits on can keep
+            // this node from renewing. The guard stops it with this task, so
+            // a coordinator whose handle is aborted stops renewing.
+            let membership_renewal_me = me_bg.clone();
+            let membership_renewal_shutdown = me_bg.base.shutdown_rx.clone();
+            let _membership_renewal = AbortOnDrop(tokio::spawn(async move {
+                membership_renewal_me
+                    .run_membership_renewal(membership_renewal_shutdown)
+                    .await;
+            }));
+
             // Start the membership watcher task
             let membership_watcher_me = me_bg.clone();
             let membership_watcher_shutdown = me_bg.base.shutdown_rx.clone();
@@ -468,6 +515,15 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         self.membership_notify_count.load(Ordering::Relaxed)
     }
 
+    /// The phase of this node's guard for a shard, or `None` if the node has
+    /// never been asked to own it. Used in tests to tell a shard this node is
+    /// still waiting to acquire from one it holds.
+    pub async fn shard_phase(&self, shard_id: &ShardId) -> Option<ShardPhase> {
+        let guard = self.shard_guards.lock().await.get(shard_id).cloned()?;
+        let phase = guard.ctx.state.lock().await.phase;
+        Some(phase)
+    }
+
     /// Get or create a notifier for when a specific shard lease becomes available.
     /// Guards waiting to acquire a shard can await on this notifier instead of blind retrying.
     pub async fn get_shard_available_notifier(&self, shard_id: ShardId) -> Arc<Notify> {
@@ -571,14 +627,77 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         }
     }
 
-    /// Main coordination loop - renews membership and reconciles shards.
+    /// Renew the membership lease on a timer, on a task of its own.
+    ///
+    /// Other nodes drop this one from membership once its lease goes a full
+    /// TTL without a renewal, and shard leases are permanent, so the shards a
+    /// dropped node holds are unavailable until it renews again. Renewal
+    /// therefore shares nothing with reconciliation: a slow reconcile cannot
+    /// delay it, and each Kubernetes call it makes is bounded well under the
+    /// TTL, so a call that never returns costs one attempt and the next tick
+    /// tries again.
+    async fn run_membership_renewal(&self, mut shutdown_rx: watch::Receiver<bool>) {
+        let renew_interval = membership_renew_interval(self.lease_duration_secs);
+        let call_timeout = membership_call_timeout(renew_interval);
+        let slow_renewal = (renew_interval / 2).min(Duration::from_secs(1));
+        let mut renew_timer = tokio::time::interval(renew_interval);
+        // After an attempt that overran, renew once and carry on from there
+        // rather than firing a tick for every one that was missed.
+        renew_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_renewed = std::time::Instant::now();
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        debug!(node_id = %self.base.node_id, "membership renewal shutting down");
+                        break;
+                    }
+                }
+                _ = renew_timer.tick() => {
+                    let started = std::time::Instant::now();
+                    let result = self.renew_membership_lease(call_timeout).await;
+                    let elapsed = started.elapsed();
+                    match result {
+                        Ok(()) => {
+                            last_renewed = std::time::Instant::now();
+                            self.base.record_membership_renewal();
+                            if elapsed >= slow_renewal {
+                                warn!(
+                                    node_id = %self.base.node_id,
+                                    elapsed_ms = elapsed.as_millis() as u64,
+                                    lease_ttl_secs = self.lease_duration_secs,
+                                    "slow membership lease renewal"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // Shutdown deletes the lease, so an attempt it
+                            // overtakes fails by design.
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                            warn!(
+                                node_id = %self.base.node_id,
+                                error = %e,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                since_last_renewal_ms = last_renewed.elapsed().as_millis() as u64,
+                                lease_ttl_secs = self.lease_duration_secs,
+                                "failed to renew membership lease"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Main coordination loop - reconciles shards.
     ///
     /// Reconciliation is primarily reactive (triggered by the membership watcher), but we also do periodic reconciliation as a safety net in case watches miss events due to network issues.
     async fn run_coordination_loop(&self, mut shutdown_rx: watch::Receiver<bool>) {
-        // Renew membership lease periodically (at 1/3 of lease duration)
-        let renew_interval = Duration::from_secs((self.lease_duration_secs / 3).max(1) as u64);
-        let mut renew_timer = tokio::time::interval(renew_interval);
-
         // Periodic reconciliation as a safety net to catch any missed watch events due to network issues
         let safety_reconcile_interval = Duration::from_secs(5);
         let mut safety_reconcile_timer = tokio::time::interval(safety_reconcile_interval);
@@ -612,12 +731,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                     info!(node_id = %self.base.node_id, "shard map changed, reconciling shards");
                     if let Err(e) = self.reconcile_shards().await {
                         warn!(node_id = %self.base.node_id, error = %e, "reconcile after shard map change failed");
-                    }
-                }
-                // Periodic membership lease renewal
-                _ = renew_timer.tick() => {
-                    if let Err(e) = self.renew_membership_lease().await {
-                        warn!(node_id = %self.base.node_id, error = %e, "failed to renew membership lease");
                     }
                 }
                 // Safety net: periodic reconciliation in case watches missed events
@@ -674,10 +787,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             self.cluster_prefix
         );
 
-        let lease_list = self
-            .backend
-            .list_leases(&self.namespace, &label_selector)
-            .await?;
+        let lease_list = with_k8s_timeout(
+            K8S_CALL_TIMEOUT,
+            "list member leases",
+            self.backend.list_leases(&self.namespace, &label_selector),
+        )
+        .await?;
 
         let now = Utc::now();
         let mut members = Vec::new();
@@ -719,18 +834,23 @@ impl<B: K8sBackend> K8sCoordinator<B> {
     /// Renew the membership lease.
     ///
     /// We verify that we're still the holder before updating, and use CAS to ensure we don't accidentally renew someone else's lease if ours expired.
-    async fn renew_membership_lease(&self) -> Result<(), CoordinationError> {
+    ///
+    /// Each of the two Kubernetes calls is given `call_timeout`.
+    async fn renew_membership_lease(
+        &self,
+        call_timeout: Duration,
+    ) -> Result<(), CoordinationError> {
         let member_lease_name =
             keys::k8s_member_lease_name(&self.cluster_prefix, &self.base.node_id);
 
         // Get current lease to verify we still own it
-        let existing = self
-            .backend
-            .get_lease(&self.namespace, &member_lease_name)
-            .await?
-            .ok_or_else(|| {
-                CoordinationError::BackendError("membership lease was deleted".into())
-            })?;
+        let existing = with_k8s_timeout(
+            call_timeout,
+            "get membership lease",
+            self.backend.get_lease(&self.namespace, &member_lease_name),
+        )
+        .await?
+        .ok_or_else(|| CoordinationError::BackendError("membership lease was deleted".into()))?;
 
         // Verify we're still the holder
         let holder = existing
@@ -780,9 +900,13 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             }),
         };
 
-        self.backend
-            .replace_lease(&self.namespace, &member_lease_name, &updated_lease)
-            .await?;
+        with_k8s_timeout(
+            call_timeout,
+            "replace membership lease",
+            self.backend
+                .replace_lease(&self.namespace, &member_lease_name, &updated_lease),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1031,10 +1155,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             self.cluster_prefix
         );
 
-        let lease_list = self
-            .backend
-            .list_leases(&self.namespace, &label_selector)
-            .await?;
+        let lease_list = with_k8s_timeout(
+            K8S_CALL_TIMEOUT,
+            "list shard leases",
+            self.backend.list_leases(&self.namespace, &label_selector),
+        )
+        .await?;
 
         let mut reclaimed = Vec::new();
         for lease in lease_list {

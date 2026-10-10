@@ -35,6 +35,7 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, watch};
 use tracing::debug;
@@ -479,6 +480,21 @@ pub struct K8sOwnershipToken {
     pub lease_uid: Option<String>,
 }
 
+/// Aborts a spawned task when dropped.
+///
+/// A coordinator's background work hangs off the task whose `JoinHandle` its
+/// `start` returns, and aborting that handle is how a caller stops the
+/// coordinator dead, as a crash would. A task spawned from inside it would
+/// carry on regardless. Holding the spawned task through this guard ties its
+/// life to the future that owns the guard.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Shared state and helpers for coordinator implementations.
 /// Contains all the common state that all coordinators need, and is presented at coordinator.base()
 #[derive(Clone)]
@@ -502,6 +518,10 @@ pub struct CoordinatorBase {
     /// Read by `is_shard_paused` on the hot request path to avoid k8s API calls.
     /// Uses std::sync::RwLock (not tokio) because the critical section is tiny.
     paused_shards: Arc<std::sync::RwLock<HashSet<ShardId>>>,
+    /// Unix timestamp in milliseconds of this node's last successful
+    /// membership renewal, 0 until the backend records one. Written by the
+    /// backend's renewal path and read by the placement metrics sampler.
+    last_membership_renewal_ms: Arc<AtomicI64>,
 }
 
 impl CoordinatorBase {
@@ -529,6 +549,7 @@ impl CoordinatorBase {
             startup_time_ms,
             placement_rings,
             paused_shards: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            last_membership_renewal_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -554,6 +575,7 @@ impl CoordinatorBase {
             startup_time_ms: None,
             placement_rings: Vec::new(),
             paused_shards: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            last_membership_renewal_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -594,6 +616,25 @@ impl CoordinatorBase {
             .read()
             .expect("paused_shards lock poisoned")
             .contains(shard_id)
+    }
+
+    /// Note that this node's membership was renewed just now.
+    pub fn record_membership_renewal(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.last_membership_renewal_ms
+            .store(now_ms, Ordering::Relaxed);
+    }
+
+    /// When this node's membership was last renewed, as a Unix timestamp in
+    /// milliseconds. `None` if the backend has not recorded a renewal.
+    pub fn last_membership_renewal_ms(&self) -> Option<i64> {
+        match self.last_membership_renewal_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     /// Get owned shards sorted (shared by both backends).
