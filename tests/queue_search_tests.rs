@@ -178,6 +178,84 @@ async fn search_preserves_case_insensitive_or_semantics_filters_and_pagination()
 }
 
 #[silo::test]
+async fn search_empty_status_ranges_do_not_hydrate_the_backlog() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    for i in 0..300 {
+        enqueue(
+            &shard,
+            "a",
+            &format!("job-{i}"),
+            "mixed",
+            "noop",
+            now_ms() + 60_000,
+        )
+        .await;
+    }
+    enqueue(&shard, "b", "foreign", "mixed", "noop", now_ms() + 60_000).await;
+    shard.cancel_job("b", "foreign").await.expect("cancel");
+    shard
+        .set_enqueue_time_index_complete(true)
+        .await
+        .expect("index");
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let before = metrics.query_point_lookups_value(shard.name());
+    for status in [
+        "status_kind = 'Failed'",
+        "status_kind IN ('Failed', 'Cancelled')",
+    ] {
+        let sql = format!(
+            "SELECT id FROM jobs WHERE tenant = 'a' AND {status} AND {} ORDER BY enqueue_time_ms DESC, id ASC LIMIT 101",
+            predicate("mixed")
+        );
+        assert!(strings(&engine, &sql).await.is_empty());
+    }
+    assert_eq!(
+        metrics.query_point_lookups_value(shard.name()) - before,
+        0.0
+    );
+    shard.close().await.expect("close");
+}
+
+#[silo::test]
+async fn search_keeps_order_when_switching_from_dense_batches_to_metadata_candidates() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let future = now_ms() + 60_000;
+    let mut expected = Vec::new();
+    for i in 0..900 {
+        let id = format!("job-{i:04}");
+        let matching = !(300..600).contains(&i);
+        if matching {
+            expected.push(id.clone());
+        }
+        enqueue(
+            &shard,
+            "a",
+            &id,
+            if matching { "mixed" } else { "other" },
+            "noop",
+            future,
+        )
+        .await;
+    }
+    shard
+        .set_enqueue_time_index_complete(true)
+        .await
+        .expect("index");
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let sql = format!(
+        "SELECT id FROM jobs WHERE tenant = 'a' AND status_kind = 'Scheduled' AND {} ORDER BY enqueue_time_ms DESC, id ASC LIMIT 300 OFFSET 256",
+        predicate("mixed")
+    );
+    assert_eq!(strings(&engine, &sql).await, expected[256..556]);
+    shard
+        .set_enqueue_time_index_complete(false)
+        .await
+        .expect("disable index");
+    assert_eq!(strings(&engine, &sql).await, expected[256..556]);
+    shard.close().await.expect("close");
+}
+
+#[silo::test]
 async fn search_page_limit_is_applied_after_residual_filters() {
     let (_tmp, shard) = open_temp_shard().await;
     for (id, priority) in [("a-rejected", 1), ("b-rejected", 1), ("c-match", 10)] {
@@ -571,5 +649,26 @@ async fn large_queue_search_bounds_job_record_hydration() {
         metrics.query_point_lookups_value(shard.name()) - before_discovery,
         3.0
     );
+    let broad_sql = sql.replace(&predicate("queue-test-2"), &predicate("queue"));
+    let start = Instant::now();
+    let rows = tokio::time::timeout(Duration::from_secs(5), strings(&engine, &broad_sql))
+        .await
+        .expect("broad prefixes under statement deadline");
+    eprintln!("{} jobs: broad prefix {:?}", per_queue * 3, start.elapsed());
+    assert_eq!(rows.len(), 101);
+    let start = Instant::now();
+    let next_page = tokio::time::timeout(
+        Duration::from_secs(5),
+        strings(&engine, &format!("{broad_sql} OFFSET 512")),
+    )
+    .await
+    .expect("later broad-prefix pages under statement deadline");
+    eprintln!(
+        "{} jobs: later broad page {:?}",
+        per_queue * 3,
+        start.elapsed()
+    );
+    assert_eq!(next_page.len(), 101);
+    assert!(next_page.iter().all(|id| !rows.contains(id)));
     shard.close().await.expect("close");
 }

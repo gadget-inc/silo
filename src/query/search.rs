@@ -167,6 +167,72 @@ fn metadata_value_range(tenant: &str, key: &str, filters: &[Expr]) -> (Vec<u8>, 
     (start, end)
 }
 
+async fn metadata_candidates(
+    shard: &JobStoreShard,
+    tenant: &str,
+    searches: &[PrefixSearch],
+) -> DfResult<CandidateIds> {
+    let mut candidates = CandidateIds::new();
+    for search in searches {
+        let SearchField::Metadata(key) = &search.field else {
+            continue;
+        };
+        let mut start = keys::idx_metadata_key_only_prefix(tenant, key);
+        let end = keys::end_bound(&start);
+        while let Some(value) = next_value(shard, start, end.clone()).await? {
+            let value_start = keys::idx_metadata_prefix(tenant, key, &value);
+            start = keys::end_bound(&value_start);
+            if !value.to_lowercase().starts_with(&search.prefix) {
+                continue;
+            }
+            let mut cursor = shard
+                .open_range_cursor(value_start, start.clone(), &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
+            loop {
+                let rows = cursor.next_kv_chunk(1024).await.map_err(exec_err)?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    if let Some(p) = keys::parse_metadata_index_key(&row.key) {
+                        candidates.insert(&p.job_id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+async fn has_status_candidates(
+    shard: &JobStoreShard,
+    tenant: &str,
+    statuses: &[QueryStatusFilter],
+) -> DfResult<bool> {
+    for status in statuses {
+        let kind = match status {
+            QueryStatusFilter::Stored(kind) => *kind,
+            QueryStatusFilter::Waiting | QueryStatusFilter::FutureScheduled => {
+                JobStatusKind::Scheduled
+            }
+        };
+        let start = keys::idx_status_time_prefix(tenant, &format!("{kind:?}"));
+        let mut cursor = shard
+            .open_range_cursor(
+                start.clone(),
+                keys::end_bound(&start),
+                &crate::scan_options(),
+            )
+            .await
+            .map_err(exec_err)?;
+        if !cursor.next_kv_chunk(1).await.map_err(exec_err)?.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn search_index_stream(
     shard: Arc<JobStoreShard>,
     projection: SchemaRef,
@@ -177,36 +243,14 @@ pub(crate) fn search_index_stream(
     limit: Option<usize>,
 ) -> impl Stream<Item = DfResult<RecordBatch>> {
     async_stream::try_stream! {
-        let mut candidates = CandidateIds::new();
-        for search in &searches {
-            let SearchField::Metadata(key) = &search.field else {
-                continue;
-            };
-            let mut start = keys::idx_metadata_key_only_prefix(&tenant, key);
-            let end = keys::end_bound(&start);
-            while let Some(value) = next_value(&shard, start, end.clone()).await? {
-                let value_start = keys::idx_metadata_prefix(&tenant, key, &value);
-                start = keys::end_bound(&value_start);
-                if !value.to_lowercase().starts_with(&search.prefix) {
-                    continue;
-                }
-                let mut cursor = shard
-                    .open_range_cursor(value_start, start.clone(), &crate::scan_options())
-                    .await
-                    .map_err(exec_err)?;
-                loop {
-                    let rows = cursor.next_kv_chunk(1024).await.map_err(exec_err)?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    for row in rows {
-                        if let Some(p) = keys::parse_metadata_index_key(&row.key) {
-                            candidates.insert(&p.job_id);
-                        }
-                    }
-                }
-            }
-        }
+        // Let a broad prefix satisfy pages from ordered batches immediately.
+        // Building candidates for every matching job first can exceed the statement
+        // deadline even when the very first jobs already fill the requested page.
+        let mut candidates = None;
+        // If a batch is sparse, switch once to the metadata candidate filter.
+        // This bounds unrelated hydration while avoiding an eager scan of every
+        // matching metadata key for broad prefixes, including on later pages.
+        let mut scan_direct = true;
         let start = keys::idx_enqueue_time_tenant_prefix(&tenant);
         let mut cursor = shard
             .open_range_cursor(
@@ -225,12 +269,22 @@ pub(crate) fn search_index_stream(
             JobsScanStrategy::StatusUnion { statuses, .. } => statuses.clone(),
             _ => Vec::new(),
         };
+        // Preserve the cheap empty-status result of the original status scan.
+        // For example, searching Failed must not hydrate a scheduled backlog
+        // when this tenant has no failed jobs at all.
+        if !statuses_to_match.is_empty()
+            && !has_status_candidates(&shard, &tenant, &statuses_to_match).await? {
+            return;
+        }
         needs.need_status_point_lookup |= !statuses_to_match.is_empty();
         let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
         let mut sent = 0;
         loop {
             if limit.is_some_and(|l| sent >= l) {
                 break;
+            }
+            if !scan_direct && candidates.is_none() {
+                candidates = Some(metadata_candidates(&shard, &tenant, &searches).await?);
             }
             let rows = cursor
                 .next_kv_chunk(batch_size.clamp(1, 256))
@@ -244,7 +298,7 @@ pub(crate) fn search_index_stream(
                 let Some(p) = keys::parse_enqueue_time_index_key(&row.key) else {
                     continue;
                 };
-                if candidates.contains(&p.job_id)
+                if scan_direct || candidates.as_ref().is_some_and(|ids| ids.contains(&p.job_id))
                     || searches.iter().any(|s| {
                         matches!(s.field, SearchField::Id)
                             && p.job_id.to_lowercase().starts_with(&s.prefix)
@@ -269,6 +323,20 @@ pub(crate) fn search_index_stream(
                             }))
                 })
                 .collect();
+            if scan_direct {
+                let matching = existing.iter().filter(|pair| {
+                    let metadata = jobs.get(*pair).map(|job| job.metadata()).unwrap_or_default();
+                    searches.iter().any(|search| match &search.field {
+                        SearchField::Id => pair.1.to_lowercase().starts_with(&search.prefix),
+                        SearchField::Metadata(key) => metadata.iter().any(|(k, value)| {
+                            k == key && value.to_lowercase().starts_with(&search.prefix)
+                        }),
+                    })
+                }).count();
+                // Continue only while at least half the batch matches the
+                // candidate predicate. SQL still enforces every exact predicate.
+                scan_direct = matching * 2 >= pairs.len();
+            }
             if let Some(l) = limit {
                 existing.truncate(l - sent);
             }

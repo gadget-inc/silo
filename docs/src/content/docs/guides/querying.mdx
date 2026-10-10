@@ -111,7 +111,7 @@ ORDER BY enqueue_time_ms DESC, id ASC
 LIMIT 101
 ```
 
-Use the index's `id ASC` tiebreak and a flat page limit. Sorting an intermediate sample or using another ordering forces extra work before returning the first page. State, attempt and priority predicates remain SQL filters, and search results are deduplicated by job ID. `EXPLAIN` reports `SearchEnqueueTimeIndex` for this path. It uses a fixed-size candidate filter and rechecks the original SQL predicates, keeping candidate memory bounded without changing matching semantics. Shards whose enqueue-time index is not ready keep the existing scan path.
+Use the index's `id ASC` tiebreak and a flat page limit. Sorting an intermediate sample or using another ordering forces extra work before returning the first page. State, attempt and priority predicates remain SQL filters, and search results are deduplicated by job ID. `EXPLAIN` reports `SearchEnqueueTimeIndex` for this path. It starts with bounded ordered batches so broad searches can return immediately. When a batch has few matches, it switches to a fixed-size metadata candidate filter to skip unrelated records. It always rechecks the original SQL predicates, keeping candidate memory bounded without changing matching semantics. Shards whose enqueue-time index is not ready keep the existing scan path.
 
 ### `jobs` Table
 
