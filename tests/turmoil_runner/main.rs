@@ -197,6 +197,16 @@ fn k8s_coordination() {
 
 #[test]
 #[cfg(feature = "k8s")]
+fn k8s_membership_stall() {
+    if is_subprocess() || is_fuzz_mode() {
+        scenarios::k8s_membership_stall::run();
+    } else {
+        verify_determinism("k8s_membership_stall", get_seed());
+    }
+}
+
+#[test]
+#[cfg(feature = "k8s")]
 fn k8s_permanent_lease_reclaim() {
     if is_subprocess() || is_fuzz_mode() {
         scenarios::k8s_permanent_leases::run_reclaim();

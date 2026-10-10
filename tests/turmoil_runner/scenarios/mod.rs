@@ -19,6 +19,8 @@ pub mod k8s_close_failure_recovery;
 #[cfg(feature = "k8s")]
 pub mod k8s_coordination;
 #[cfg(feature = "k8s")]
+pub mod k8s_membership_stall;
+#[cfg(feature = "k8s")]
 pub mod k8s_permanent_leases;
 #[cfg(feature = "k8s")]
 pub mod k8s_shard_splits;
