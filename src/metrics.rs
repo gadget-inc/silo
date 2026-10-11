@@ -147,6 +147,10 @@ pub struct Metrics {
     // gRPC metrics
     grpc_requests: CounterVec,
     grpc_request_duration: HistogramVec,
+    /// gRPC calls a handler has started and not yet finished, per method.
+    /// The counter and histogram above only see a call when it ends, so a
+    /// call that hangs is invisible to them until it returns.
+    grpc_requests_in_flight: GaugeVec,
 
     // Query (SQL statement) metrics
     /// Number of SQL statements currently executing, per shard. Bounded by the
@@ -424,6 +428,14 @@ impl Metrics {
         self.grpc_request_duration
             .with_label_values(&[method])
             .observe(duration_secs);
+    }
+
+    /// Count a gRPC call as in flight for `method` until the returned guard is
+    /// dropped.
+    pub fn grpc_in_flight(&self, method: &str) -> GrpcInFlightGuard {
+        let gauge = self.grpc_requests_in_flight.with_label_values(&[method]);
+        gauge.inc();
+        GrpcInFlightGuard { gauge }
     }
 
     /// Increment the in-flight statement gauge for a shard.
@@ -2059,6 +2071,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let grpc_requests_in_flight = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_grpc_requests_in_flight",
+                "Number of gRPC requests currently being handled",
+            ),
+            &["method"],
+        )?,
+    );
+
     // Query (SQL statement) metrics
     let query_inflight = register(
         &registry,
@@ -2631,6 +2654,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         background_actions_running_state: Arc::new(Mutex::new(HashMap::new())),
         grpc_requests,
         grpc_request_duration,
+        grpc_requests_in_flight,
         query_inflight,
         query_rejected,
         query_cancelled,
@@ -2768,8 +2792,26 @@ fn grpc_code_label(code: tonic::Code) -> &'static str {
     }
 }
 
+/// RAII guard holding one call in `silo_grpc_requests_in_flight`. Created by
+/// [`Metrics::grpc_in_flight`], which bumps the gauge; `Drop` takes it back
+/// down. The decrement lives in `Drop` because a client that cancels a call
+/// makes the server drop the handler future before it completes, so code
+/// placed after the `.await` would never run and the gauge would leak upward.
+#[must_use = "the call stops being counted as soon as the guard is dropped"]
+pub struct GrpcInFlightGuard {
+    gauge: Gauge,
+}
+
+impl Drop for GrpcInFlightGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 /// Tower layer that records `silo_grpc_requests_total` and
-/// `silo_grpc_request_duration_seconds` for every gRPC request.
+/// `silo_grpc_request_duration_seconds` for every gRPC request that finishes,
+/// and holds `silo_grpc_requests_in_flight` up while a request is being
+/// handled.
 ///
 /// When metrics are `None` the layer is a no-op passthrough.
 #[derive(Clone)]
@@ -2841,9 +2883,12 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
             let start = std::time::Instant::now();
+            let method = method.as_deref().unwrap_or("unknown");
+            // Held across the await: released when the call returns, and also
+            // when the client cancels it and this future is dropped mid-flight.
+            let _in_flight = metrics.as_ref().map(|m| m.grpc_in_flight(method));
             let result = inner.call(req).await;
             if let Some(ref m) = metrics {
-                let method = method.as_deref().unwrap_or("unknown");
                 let duration = start.elapsed().as_secs_f64();
                 let code = match &result {
                     Ok(resp) => tonic::Status::from_header_map(resp.headers())
