@@ -1639,12 +1639,21 @@ export class SiloGRPCClient {
     if (this._topologyReady) {
       return;
     }
-    if (this._pendingTopologyRefresh) {
-      return this._pendingTopologyRefresh;
+    return this._refreshTopologyShared();
+  }
+
+  /**
+   * Refresh topology, joining the refresh already in flight if there is one.
+   * When a connection drops, every call on it fails at once; this keeps them
+   * from each sending their own GetClusterInfo.
+   * @internal
+   */
+  private _refreshTopologyShared(): Promise<void> {
+    if (!this._pendingTopologyRefresh) {
+      this._pendingTopologyRefresh = this.refreshTopology().finally(() => {
+        this._pendingTopologyRefresh = null;
+      });
     }
-    this._pendingTopologyRefresh = this.refreshTopology().finally(() => {
-      this._pendingTopologyRefresh = null;
-    });
     return this._pendingTopologyRefresh;
   }
 
@@ -1686,7 +1695,7 @@ export class SiloGRPCClient {
           } else {
             // Connectivity error or wrong shard without redirect — refresh
             // topology so the retry can reach a different server
-            await this.refreshTopology();
+            await this._refreshTopologyShared();
             ({ client, shard } = resolveClient());
           }
 
