@@ -94,10 +94,12 @@ These metrics track distributed shard ownership across the cluster.
 |--------|------|--------|-------------|
 | `silo_shards_owned` | Gauge | - | Number of shards owned by this node (from coordinator) |
 | `silo_coordination_shards_open` | Gauge | - | Number of shards currently open in this process |
+| `silo_coordination_membership_last_renewal_timestamp_seconds` | Gauge | - | Unix time of this node's last successful membership lease renewal (0 until one is recorded) |
 
 **Key insights:**
 - `silo_shards_owned` should match `silo_coordination_shards_open` after convergence
 - Discrepancies indicate shard acquisition/release in progress
+- Other nodes drop a member whose lease goes a full TTL without a renewal, and its shards stay unavailable until it renews. Alert when `time() - silo_coordination_membership_last_renewal_timestamp_seconds` nears the lease TTL (ignore series still at 0)
 - Use for capacity planning: total shards / nodes = shards per node
 
 ### Concurrency Metrics

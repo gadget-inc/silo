@@ -12,10 +12,13 @@ use crate::factory::ShardFactory;
 use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use crate::coordination::{
-    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, OpenShardError, OwnershipCheck,
-    ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase, SplitStorageBackend,
-    get_hostname, keys,
+    AbortOnDrop, CoordinationError, Coordinator, CoordinatorBase, MemberInfo, OpenShardError,
+    OwnershipCheck, ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase,
+    SplitStorageBackend, get_hostname, keys,
 };
+
+/// Longest the coordination loop waits for etcd to list the members.
+const MEMBERS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// etcd-based coordinator for distributed shard ownership.
 ///
@@ -143,6 +146,56 @@ impl EtcdCoordinator {
                 error!(node_id = %nid, error = %e, "failed to send initial membership keepalive");
             }
 
+            // Keep the membership lease alive on a task of its own, so that
+            // nothing the coordination loop below waits on (a slow reconcile,
+            // an etcd read that never returns) can let the lease expire. An
+            // expired lease takes this node's member key with it. The guard
+            // stops it with this task, so a coordinator whose handle is
+            // aborted stops sending keepalives.
+            // Keepalives go out at 1/3 of the TTL.
+            let keepalive_interval_secs = (ttl_secs / 3).max(1) as u64;
+            let _keepalive = AbortOnDrop(tokio::spawn({
+                let nid = nid.clone();
+                let base = me_bg.base.clone();
+                let mut shutdown_rx = shutdown_rx.clone();
+                async move {
+                    let mut keepalive_timer =
+                        tokio::time::interval(Duration::from_secs(keepalive_interval_secs));
+                    debug!(node_id = %nid, interval_secs = keepalive_interval_secs, "starting keepalive timer");
+                    let mut responses_open = true;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() { break; }
+                            }
+                            _ = keepalive_timer.tick() => {
+                                if let Err(e) = memb_keeper.keep_alive().await {
+                                    error!(node_id = %nid, error = %e, "failed to send membership keepalive");
+                                }
+                            }
+                            resp = memb_stream.message(), if responses_open => {
+                                match resp {
+                                    Ok(Some(ka_resp)) => {
+                                        debug!(node_id = %nid, ttl = ka_resp.ttl(), "membership keepalive response received");
+                                        if ka_resp.ttl() > 0 {
+                                            base.record_membership_renewal();
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        error!(node_id = %nid, "membership lease keepalive stream closed! Lease will expire.");
+                                        responses_open = false;
+                                    }
+                                    Err(e) => {
+                                        error!(node_id = %nid, error = %e, "membership lease keepalive error");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+
             // Establish member watch with retries
             let members_prefix = keys::members_prefix(&cprefix);
             debug!(node_id = %nid, "starting coordinator background tasks");
@@ -199,24 +252,12 @@ impl EtcdCoordinator {
                 warn!(node_id = %nid, error = %err, "initial reconcile failed");
             }
 
-            // Main loop: reconcile on membership events, periodic resync, and send keepalives
+            // Main loop: reconcile on membership events and periodic resync
             let mut resync = tokio::time::interval(Duration::from_secs(1));
-            // Send keepalives at 1/3 of TTL to ensure lease doesn't expire
-            let keepalive_interval_secs = (ttl_secs / 3).max(1) as u64;
-            let mut keepalive_timer =
-                tokio::time::interval(Duration::from_secs(keepalive_interval_secs));
-            debug!(node_id = %nid, interval_secs = keepalive_interval_secs, "starting keepalive timer");
 
             loop {
                 tokio::select! {
                     biased;
-                    _ = keepalive_timer.tick() => {
-                        if *shutdown_rx.borrow() { break; }
-                        // Send keepalive for membership lease
-                        if let Err(e) = memb_keeper.keep_alive().await {
-                            error!(node_id = %nid, error = %e, "failed to send membership keepalive");
-                        }
-                    }
                     _ = resync.tick() => {
                         if *shutdown_rx.borrow() { break; }
                         if let Err(err) = me_bg.reconcile_shards().await {
@@ -260,20 +301,6 @@ impl EtcdCoordinator {
                             }
                             Err(e) => {
                                 warn!(node_id = %nid, error = %e, "shard map watch error");
-                            }
-                        }
-                    }
-                    resp = memb_stream.message() => {
-                        if *shutdown_rx.borrow() { break; }
-                        match resp {
-                            Ok(Some(ka_resp)) => {
-                                debug!(node_id = %nid, ttl = ka_resp.ttl(), "membership keepalive response received");
-                            }
-                            Ok(None) => {
-                                error!(node_id = %nid, "membership lease keepalive stream closed! Lease will expire.");
-                            }
-                            Err(e) => {
-                                error!(node_id = %nid, error = %e, "membership lease keepalive error");
                             }
                         }
                     }
@@ -444,7 +471,16 @@ impl EtcdCoordinator {
     }
 
     async fn reconcile_shards(&self) -> Result<(), CoordinationError> {
-        let members = self.get_members().await?;
+        // Bounded so that an etcd read that never returns costs one
+        // reconcile pass instead of stalling the coordination loop.
+        let members = tokio::time::timeout(MEMBERS_READ_TIMEOUT, self.get_members())
+            .await
+            .map_err(|_| {
+                CoordinationError::BackendError(format!(
+                    "list members timed out after {}ms",
+                    MEMBERS_READ_TIMEOUT.as_millis()
+                ))
+            })??;
 
         let guard_shard_ids: HashSet<ShardId> = {
             let guards = self.shard_guards.lock().await;

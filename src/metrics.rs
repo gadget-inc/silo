@@ -173,6 +173,9 @@ pub struct Metrics {
     /// Driven by the placement metrics sampler.
     shards_unassigned: GaugeVec,
     coordination_shards_open: Gauge,
+    /// When this node last renewed its membership. Driven by the placement
+    /// metrics sampler.
+    membership_last_renewal_timestamp: Gauge,
     broker_buffer_size: GaugeVec,
     broker_inflight_size: GaugeVec,
     broker_scan_duration: HistogramVec,
@@ -504,6 +507,13 @@ impl Metrics {
     /// Update the number of shards currently open in this process.
     pub fn set_coordination_shards_open(&self, count: u64) {
         self.coordination_shards_open.set(count as f64);
+    }
+
+    /// Record when this node last renewed its membership, given as a Unix
+    /// timestamp in milliseconds.
+    pub fn set_membership_last_renewal_timestamp(&self, unix_ms: i64) {
+        self.membership_last_renewal_timestamp
+            .set(unix_ms as f64 / 1000.0);
     }
 
     /// Update broker buffer size for a shard and task group.
@@ -2150,6 +2160,21 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let membership_last_renewal_timestamp = register(
+        &registry,
+        Gauge::new(
+            "silo_coordination_membership_last_renewal_timestamp_seconds",
+            format!(
+                "Unix time of this node's last successful membership lease renewal, 0 until \
+                 one is recorded (never, with no coordination backend). Other nodes drop \
+                 a member whose lease goes a full TTL without a renewal, so \
+                 `time()` minus this value approaching the lease TTL means the node is \
+                 about to lose its membership; sampled every {}s, which bounds staleness",
+                PLACEMENT_SAMPLE_INTERVAL.as_secs()
+            ),
+        )?,
+    );
+
     let broker_buffer_size = register(
         &registry,
         GaugeVec::new(
@@ -2639,6 +2664,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         shards_owned,
         shards_unassigned,
         coordination_shards_open,
+        membership_last_renewal_timestamp,
         broker_buffer_size,
         broker_inflight_size,
         broker_scan_duration,

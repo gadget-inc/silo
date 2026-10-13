@@ -79,6 +79,9 @@ datafusion = { version = "50", features = [
 ], optional = true }
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["full"] }
+# Not used directly. Holds h2 below 0.4.16, which closes a gRPC connection when
+# many small DATA frames sit unread (tests/grpc_small_call_burst_tests.rs).
+h2 = "=0.4.14"
 http-body-util = "0.1"
 axum = "0.7"
 askama = "0.12"

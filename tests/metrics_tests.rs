@@ -254,6 +254,9 @@ async fn test_metrics_all_recording_methods() {
     // set_coordination_shards_open
     metrics.set_coordination_shards_open(5);
 
+    // set_membership_last_renewal_timestamp
+    metrics.set_membership_last_renewal_timestamp(1_760_000_000_500);
+
     let request = Request::builder()
         .method("GET")
         .uri("/metrics")
@@ -378,6 +381,13 @@ async fn test_metrics_all_recording_methods() {
     assert!(
         body_str.contains("silo_coordination_shards_open 5"),
         "coordination shards open should be 5"
+    );
+
+    // Verify the membership renewal timestamp is exported in seconds
+    assert!(
+        body_str
+            .contains("silo_coordination_membership_last_renewal_timestamp_seconds 1760000000.5"),
+        "membership last renewal timestamp should be 1760000000.5"
     );
 }
 
