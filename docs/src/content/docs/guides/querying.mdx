@@ -103,6 +103,8 @@ The primary table containing all job data.
 
 Each tenant's jobs are also indexed by `enqueue_time_ms`, newest first. A tenant-scoped query that projects only `shard_id`, `tenant`, `id`, and `enqueue_time_ms` is served from that index once the shard's index backfill has completed (`enqueue_time_index_backfill.enabled = true` in the database config starts the backfill), and its rows arrive in `enqueue_time_ms DESC, id ASC` order. Silo declares that ordering to the query planner, so an `ORDER BY enqueue_time_ms DESC, id ASC` on such a query runs without a sort, and a `LIMIT` reads only `OFFSET + LIMIT` index keys rather than the whole tenant. See [Listing Jobs](#listing-jobs) and [Scan strategy priority](#scan-strategy-priority).
 
+A second index segments each tenant's jobs by status and priority before enqueue time (the status-segmented enqueue-time index). A tenant-scoped query with a `status_kind` predicate, a `priority = n` pin, or both, that projects only `shard_id`, `tenant`, `id`, `enqueue_time_ms`, `status_kind`, and `priority`, is served from that index on a shard whose listing index is at version 2 (`enqueue_time_index_backfill.status_index = true` beside `enabled = true` drives the backfill there), with the same declared ordering and the same `OFFSET + LIMIT` key cost. See [Listing Jobs by Status](#listing-jobs-by-status).
+
 ### `tasks` Table
 
 Exposes the internal task execution queue for **debugging purposes**. Tasks are the ephemeral work items that drive job execution — they are created when jobs are enqueued and deleted when workers lease them.
@@ -239,7 +241,62 @@ WHERE tenant = 'customer-123' AND task_group = 'emails'
 ORDER BY enqueue_time_ms DESC
 ```
 
+### Listing Jobs by Status
+
+A status-filtered listing, with or without a priority filter, is a key-only walk of the status-segmented enqueue-time index on a shard whose listing index is at version 2. The shape is the newest-first listing above plus the predicate; every value may be a bound parameter, which is how the Gadget IDE sends them. These are the IDE's tabs:
+
+```sql
+-- Scheduled tab: first attempts due in the future ($2 = 'Scheduled')
+SELECT id FROM jobs
+WHERE tenant = $1 AND status_kind = $2 AND current_attempt = 1
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 100 OFFSET 0
+
+-- Retrying tab: retries due in the future ($2 = 'Scheduled')
+SELECT id FROM jobs
+WHERE tenant = $1 AND status_kind = $2 AND current_attempt > 1
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 100 OFFSET 0
+
+-- Waiting tab: first attempts and retries whose start time has passed ($2 = 'Waiting')
+-- Running, Failed, Cancelled, and Completed tabs: the same shape with
+-- $2 = 'Running', 'Failed', 'Cancelled', or 'Succeeded'
+SELECT id FROM jobs
+WHERE tenant = $1 AND status_kind = $2
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 100 OFFSET 0
+
+-- Several statuses at once, merged into one newest-first stream
+SELECT id FROM jobs
+WHERE tenant = $1 AND status_kind IN ($2, $3, $4)
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 100 OFFSET 0
+
+-- Any tab narrowed to one priority ($3 = 50)
+SELECT id FROM jobs
+WHERE tenant = $1 AND status_kind = $2 AND priority = $3
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 100 OFFSET 0
+
+-- The All tab narrowed to one priority ($2 = 50)
+SELECT id FROM jobs
+WHERE tenant = $1 AND priority = $2
+ORDER BY enqueue_time_ms DESC, id ASC
+LIMIT 100 OFFSET 0
+```
+
+The index serves the query when all of the following hold:
+
+- The query filters on `tenant`, and the only other indexed predicates are a status predicate (a single `status_kind = ...` equality or an `IN` list), a `priority = n` pin, or both. An `id` or metadata filter takes precedence and routes elsewhere, and an `OR` of status conjunctions carrying other predicates is not a status predicate.
+- The projection stays within `shard_id`, `tenant`, `id`, `enqueue_time_ms`, `status_kind`, and `priority`. Any other column moves the query to a path that reads each matching job's record, still filtered by the index but without the declared ordering.
+- A `current_attempt = 1` or `current_attempt > 1` pin appears only beside a status predicate made up solely of `Waiting` and `Scheduled`; it selects the first-attempt or retry segment. Beside any other status, or without one, it is an ordinary post-filter.
+- The tiebreak is `id ASC`.
+
+`Waiting` and `Scheduled` rows live in the same segments and are split by each entry's next-attempt time against one `now` snapshot taken when the query starts, so a listing of either reads its `OFFSET + LIMIT` keys plus the keys the split rejects along the way. The stored statuses read exactly `OFFSET + LIMIT` keys plus a bounded per-arm overhead; one arm is opened per status segment and per priority present in it, and the arms are merged in enqueue order.
+
 ### Filtering by Status
+
+The examples below project job-record columns, so each reads the matching jobs' records after the index selects them; see [Listing Jobs by Status](#listing-jobs-by-status) for the key-only form.
 
 ```sql
 -- All currently running jobs
@@ -297,6 +354,21 @@ FROM jobs
 WHERE tenant = 'customer-123'
 GROUP BY task_group
 ```
+
+A tenant-scoped `COUNT(*)` with a status predicate is answered from the per-tenant status counters, with no index walk, when the status list names only stored statuses (`Running`, `Succeeded`, `Failed`, `Cancelled`) or contains both `Waiting` and `Scheduled` (together they are the stored Scheduled status), the query has no `LIMIT`, no subquery, and no `current_attempt` or `priority` pin, and `count_from_status_counters` is enabled. `EXPLAIN` shows `path=CountFromCounters` for these:
+
+```sql
+-- One stored status ($2 = 'Failed')
+SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND status_kind = $2
+
+-- The open statuses ($2, $3, $4 = 'Waiting', 'Scheduled', 'Running')
+SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND status_kind IN ($2, $3, $4)
+
+-- The terminal statuses ($2, $3, $4 = 'Succeeded', 'Failed', 'Cancelled')
+SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND status_kind IN ($2, $3, $4)
+```
+
+A count of `Waiting` alone, of `Scheduled` alone, or with an attempt or priority pin splits a counter by time or by key, which no counter answers; on a shard whose listing index is at version 2 it is a key-only walk of the status-segmented index with no sort and no job-record reads (`path=StatusEnqueueTimeIndex`).
 
 ```sql
 -- Fast per-tenant status counts using the pre-computed sparse counter table
@@ -429,12 +501,17 @@ Silo picks the best scan strategy from your filters in this priority order:
 1. **Exact ID lookup** — `WHERE id = '...'` — direct key lookup, fastest
 2. **Metadata exact match** — `WHERE array_contains(element_at(metadata, 'key'), 'value')` — uses the metadata index
 3. **Metadata prefix** — `WHERE starts_with(array_any_value(element_at(metadata, 'key')), 'prefix')` — uses the metadata index with prefix scan
-4. **Status filter** — `WHERE status_kind = '...'` — uses the status/time index
-5. **Full scan** — no indexed filter — scans all jobs for the tenant
+4. **Listing index** — `WHERE tenant = '...'` with a status predicate, a `priority = n` pin, or both — walks the status-segmented enqueue-time index; chosen only on a shard whose listing index is at version 2
+5. **Status filter** — `WHERE status_kind = '...'` — uses the status/time index
+6. **Full scan** — no indexed filter — scans all jobs for the tenant
 
 Only one index-backed filter is used per query. If you combine filters (e.g., status + metadata), the highest-priority one drives the scan and the rest are applied as post-filters.
 
 A full scan is not always a walk over job records. When the query has a `tenant` filter, no other indexed filter, and a projection limited to `shard_id`, `tenant`, `id`, and `enqueue_time_ms`, Silo walks the tenant's enqueue-time index instead, newest first, on any shard whose index backfill has completed. `EXPLAIN` names the path on the `SiloExecutionPlan` line (`path=EnqueueTimeIndex`); the same shape on a shard still being backfilled shows `path=StatusIndex` or `path=FullScanJoin` and returns the same rows.
+
+The listing-index strategy takes the place of the status filter and the full scan when the shard's listing index is at version 2 and the filters are a tenant, a pure status predicate (an equality or an `IN` list, not an `OR` of conjunctions carrying other predicates), a `priority = n` pin, or both of the last two. It opens one arm of the status-segmented enqueue-time index per status segment and per priority present in it (the pinned priority only, when pinned) and merges the arms newest first. The `EXPLAIN` line reads `ListingIndex(tenant=..., statuses=[...], segments=[...], priority=..., attempt=..., split=...)`, and the path is `path=StatusEnqueueTimeIndex` when the projection stays within `shard_id`, `tenant`, `id`, `enqueue_time_ms`, `status_kind`, and `priority` (key-only, ordering declared, limit pushed to the index walk) or `path=JobPairs` otherwise (the index selects the ids and each job record is read by point lookup, with no declared ordering). The same query on a shard below version 2 shows the status/time index path or `path=FullScanJoin` and returns the same rows. The tenant-only shape with no status predicate and no pin stays a full scan, so the All tab keeps the enqueue-time index.
+
+Two kinds of pin are recognized: `priority = n` (an integer literal or a bound parameter, in either operand order; a value outside `0..=99` matches nothing), and `current_attempt = 1` or `current_attempt > 1` (also written `current_attempt >= 2`). A pin is applied inside the scan, and marked exact so no post-filter sits between the limit and the index walk, only under the listing-index strategy, which requires a version-2 shard; under every other strategy a pin is a post-filter. An attempt pin selects a segment only beside a status predicate made up solely of `Waiting` and `Scheduled`; beside any other status, or without one, it stays a post-filter even on a version-2 shard.
 
 ```sql
 -- Uses ExactId scan (priority 1), even though status filter is also present
