@@ -531,6 +531,57 @@ export interface CancelJobRequest {
 export interface CancelJobResponse {
 }
 /**
+ * Cancel up to 1000 unique jobs in one tenant, only while they are still pending.
+ * Each job is checked and cancelled in its own transaction. Jobs that have started
+ * running are left untouched, including when they start after the caller's query.
+ *
+ * @generated from protobuf message silo.v1.CancelPendingJobsRequest
+ */
+export interface CancelPendingJobsRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string;
+    /**
+     * @generated from protobuf field: repeated string ids = 2
+     */
+    ids: string[];
+    /**
+     * @generated from protobuf field: optional string tenant = 3
+     */
+    tenant?: string;
+}
+/**
+ * @generated from protobuf message silo.v1.CancelPendingJobResult
+ */
+export interface CancelPendingJobResult {
+    /**
+     * @generated from protobuf field: string id = 1
+     */
+    id: string;
+    /**
+     * @generated from protobuf field: silo.v1.CancelPendingJobStatus status = 2
+     */
+    status: CancelPendingJobStatus;
+    /**
+     * @generated from protobuf field: optional string error = 3
+     */
+    error?: string; // Present for FAILED results.
+}
+/**
+ * One result per requested ID, in request order. A failure for one job does not
+ * prevent the other jobs from being processed. Retrying a request is safe;
+ * previously cancelled jobs return ALREADY_CANCELLED.
+ *
+ * @generated from protobuf message silo.v1.CancelPendingJobsResponse
+ */
+export interface CancelPendingJobsResponse {
+    /**
+     * @generated from protobuf field: repeated silo.v1.CancelPendingJobResult results = 1
+     */
+    results: CancelPendingJobResult[];
+}
+/**
  * Forcibly drop all concurrency holders for a tenant on a single shard, freeing
  * held slots so stuck jobs can be re-granted. Emergency admin/operator action;
  * in-flight run attempts are left running (and may briefly double-run).
@@ -1887,6 +1938,39 @@ export enum AttemptStatus {
      * @generated from protobuf enum value: ATTEMPT_STATUS_CANCELLED = 3;
      */
     CANCELLED = 3
+}
+/**
+ * @generated from protobuf enum silo.v1.CancelPendingJobStatus
+ */
+export enum CancelPendingJobStatus {
+    /**
+     * @generated from protobuf enum value: CANCEL_PENDING_JOB_STATUS_UNSPECIFIED = 0;
+     */
+    UNSPECIFIED = 0,
+    /**
+     * @generated from protobuf enum value: CANCEL_PENDING_JOB_STATUS_CANCELLED = 1;
+     */
+    CANCELLED = 1,
+    /**
+     * @generated from protobuf enum value: CANCEL_PENDING_JOB_STATUS_ALREADY_CANCELLED = 2;
+     */
+    ALREADY_CANCELLED = 2,
+    /**
+     * @generated from protobuf enum value: CANCEL_PENDING_JOB_STATUS_RUNNING = 3;
+     */
+    RUNNING = 3,
+    /**
+     * @generated from protobuf enum value: CANCEL_PENDING_JOB_STATUS_TERMINAL = 4;
+     */
+    TERMINAL = 4,
+    /**
+     * @generated from protobuf enum value: CANCEL_PENDING_JOB_STATUS_NOT_FOUND = 5;
+     */
+    NOT_FOUND = 5,
+    /**
+     * @generated from protobuf enum value: CANCEL_PENDING_JOB_STATUS_FAILED = 6;
+     */
+    FAILED = 6
 }
 // @generated message type with reflection information, may provide speed optimized methods
 class SerializedBytes$Type extends MessageType<SerializedBytes> {
@@ -3370,6 +3454,177 @@ class CancelJobResponse$Type extends MessageType<CancelJobResponse> {
  * @generated MessageType for protobuf message silo.v1.CancelJobResponse
  */
 export const CancelJobResponse = new CancelJobResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class CancelPendingJobsRequest$Type extends MessageType<CancelPendingJobsRequest> {
+    constructor() {
+        super("silo.v1.CancelPendingJobsRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "ids", kind: "scalar", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ },
+            { no: 3, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<CancelPendingJobsRequest>): CancelPendingJobsRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        message.ids = [];
+        if (value !== undefined)
+            reflectionMergePartial<CancelPendingJobsRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: CancelPendingJobsRequest): CancelPendingJobsRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* repeated string ids */ 2:
+                    message.ids.push(reader.string());
+                    break;
+                case /* optional string tenant */ 3:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: CancelPendingJobsRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* repeated string ids = 2; */
+        for (let i = 0; i < message.ids.length; i++)
+            writer.tag(2, WireType.LengthDelimited).string(message.ids[i]);
+        /* optional string tenant = 3; */
+        if (message.tenant !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.CancelPendingJobsRequest
+ */
+export const CancelPendingJobsRequest = new CancelPendingJobsRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class CancelPendingJobResult$Type extends MessageType<CancelPendingJobResult> {
+    constructor() {
+        super("silo.v1.CancelPendingJobResult", [
+            { no: 1, name: "id", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "status", kind: "enum", T: () => ["silo.v1.CancelPendingJobStatus", CancelPendingJobStatus, "CANCEL_PENDING_JOB_STATUS_"] },
+            { no: 3, name: "error", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<CancelPendingJobResult>): CancelPendingJobResult {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.id = "";
+        message.status = 0;
+        if (value !== undefined)
+            reflectionMergePartial<CancelPendingJobResult>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: CancelPendingJobResult): CancelPendingJobResult {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string id */ 1:
+                    message.id = reader.string();
+                    break;
+                case /* silo.v1.CancelPendingJobStatus status */ 2:
+                    message.status = reader.int32();
+                    break;
+                case /* optional string error */ 3:
+                    message.error = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: CancelPendingJobResult, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string id = 1; */
+        if (message.id !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.id);
+        /* silo.v1.CancelPendingJobStatus status = 2; */
+        if (message.status !== 0)
+            writer.tag(2, WireType.Varint).int32(message.status);
+        /* optional string error = 3; */
+        if (message.error !== undefined)
+            writer.tag(3, WireType.LengthDelimited).string(message.error);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.CancelPendingJobResult
+ */
+export const CancelPendingJobResult = new CancelPendingJobResult$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class CancelPendingJobsResponse$Type extends MessageType<CancelPendingJobsResponse> {
+    constructor() {
+        super("silo.v1.CancelPendingJobsResponse", [
+            { no: 1, name: "results", kind: "message", repeat: 2 /*RepeatType.UNPACKED*/, T: () => CancelPendingJobResult }
+        ]);
+    }
+    create(value?: PartialMessage<CancelPendingJobsResponse>): CancelPendingJobsResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.results = [];
+        if (value !== undefined)
+            reflectionMergePartial<CancelPendingJobsResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: CancelPendingJobsResponse): CancelPendingJobsResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* repeated silo.v1.CancelPendingJobResult results */ 1:
+                    message.results.push(CancelPendingJobResult.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: CancelPendingJobsResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* repeated silo.v1.CancelPendingJobResult results = 1; */
+        for (let i = 0; i < message.results.length; i++)
+            CancelPendingJobResult.internalBinaryWrite(message.results[i], writer.tag(1, WireType.LengthDelimited).fork(), options).join();
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.CancelPendingJobsResponse
+ */
+export const CancelPendingJobsResponse = new CancelPendingJobsResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class DropTenantHoldersRequest$Type extends MessageType<DropTenantHoldersRequest> {
     constructor() {
@@ -7332,6 +7587,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "GetJobResult", options: {}, I: GetJobResultRequest, O: GetJobResultResponse },
     { name: "DeleteJob", options: {}, I: DeleteJobRequest, O: DeleteJobResponse },
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
+    { name: "CancelPendingJobs", options: {}, I: CancelPendingJobsRequest, O: CancelPendingJobsResponse },
     { name: "DropTenantHolders", options: {}, I: DropTenantHoldersRequest, O: DropTenantHoldersResponse },
     { name: "RestartJob", options: {}, I: RestartJobRequest, O: RestartJobResponse },
     { name: "ExpediteJob", options: {}, I: ExpediteJobRequest, O: ExpediteJobResponse },

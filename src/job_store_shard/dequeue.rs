@@ -1,6 +1,7 @@
 //! Task dequeue and processing operations.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
@@ -307,6 +308,30 @@ impl JobStoreShard {
             // from the broker's in-flight set instead of leaking them there.
             let mut inflight_guard = ClaimedInflightGuard::new(&self.brokers, claimed);
 
+            // Pending cancellation must not commit between these reads and this
+            // iteration's unconditional write batch. Sort/deduplicate stripes so
+            // each shared lock is acquired once (including when a writer waits).
+            let mut lock_indices: Vec<_> = inflight_guard
+                .tasks()
+                .iter()
+                .filter(|entry| {
+                    entry.decoded.variant_type() != fb::TaskVariant::RefreshFloatingLimit
+                })
+                .map(|entry| {
+                    self.pending_cancel_lock_index(entry.decoded.tenant(), entry.decoded.job_id())
+                })
+                .collect();
+            lock_indices.sort_unstable();
+            lock_indices.dedup();
+            let mut cancel_guards = Vec::with_capacity(lock_indices.len());
+            for index in lock_indices {
+                cancel_guards.push(
+                    Arc::clone(&self.pending_cancel_locks[index])
+                        .read_owned()
+                        .await,
+                );
+            }
+
             // Get the shard range for split-aware filtering
             let shard_range = self.get_range();
 
@@ -433,10 +458,16 @@ impl JobStoreShard {
 
             // Commit durable state — write_with_options with await_durable:true blocks
             // until the WAL is flushed to object storage, so no separate flush is needed.
-            if !state.batch.is_empty()
-                && let Err(e) = self
-                    .db
-                    .write_with_options(
+            // A dropped RPC can leave an already-submitted storage write in flight.
+            // Keep its guards with the write, not with the caller, so a pending
+            // cancel cannot pass it and then be overwritten by that delayed lease.
+            let commit_result = if state.batch.is_empty() {
+                Ok(())
+            } else {
+                let db = Arc::clone(&self.db);
+                tokio::spawn(async move {
+                    let _cancel_guards = cancel_guards;
+                    db.write_with_options(
                         state.batch,
                         &WriteOptions {
                             await_durable: true,
@@ -444,7 +475,13 @@ impl JobStoreShard {
                         },
                     )
                     .await
-            {
+                    .map(|_| ())
+                })
+                .await
+                .map_err(JobStoreShardError::from)
+                .and_then(|result| result.map_err(JobStoreShardError::from))
+            };
+            if let Err(e) = commit_result {
                 dst_events::cancel_write(write_op);
                 // Commit failed: known not-durable. Roll back all grants and
                 // discard pending holder releases (paired durable deletes
@@ -460,7 +497,7 @@ impl JobStoreShard {
                 let _ = holder_guard.disarm();
                 // Put back all claimed entries since we didn't lease them durably
                 self.brokers.requeue(inflight_guard.disarm());
-                return Err(JobStoreShardError::from(e));
+                return Err(e);
             }
             dst_events::confirm_write(write_op);
             self.mark_refresh_pending_groups(state.scheduled_refreshes.task_groups());
@@ -1369,9 +1406,26 @@ impl JobStoreShard {
         let attempt_number = ra.attempt_number();
         let relative_attempt_number = ra.relative_attempt_number();
 
-        // [SILO-DEQ-2] Look up job info; if missing, delete the task and skip
+        // A broker entry may have been claimed before cancellation evicted it.
+        // Check terminal state under the shared cancellation guard before using
+        // that stale entry; otherwise the batch would resurrect a cancelled job.
+        let terminal = self
+            .db
+            .get(&job_status_key(tenant, job_id))
+            .await?
+            .map(|raw| decode_job_status_owned(&raw))
+            .transpose()?
+            .is_some_and(|status| {
+                status.kind.is_final() || status.kind == JobStatusKind::Cancelled
+            });
+
+        // [SILO-DEQ-2] Missing or terminal jobs cannot be dispatched.
         let job_key = job_info_key(tenant, job_id);
-        let maybe_job = self.db.get(&job_key).await?;
+        let maybe_job = if terminal {
+            None
+        } else {
+            self.db.get(&job_key).await?
+        };
         let Some(job_bytes) = maybe_job else {
             // Job missing — drop the task and release any concurrency holders
             // it acquired at enqueue time. Without this, a stranded holder
@@ -1389,18 +1443,23 @@ impl JobStoreShard {
                         .push((tenant.to_string(), queue, task_id.to_string()));
                 }
             }
-            tracing::warn!(
-                tenant = %tenant,
-                job_id = %job_id,
-                task_id = %task_id,
-                "dropped RunAttempt for missing job_info; released held concurrency queues",
-            );
+            if terminal {
+                tracing::debug!(
+                    tenant,
+                    job_id,
+                    task_id,
+                    "dropped RunAttempt for terminal job"
+                );
+            } else {
+                tracing::warn!(
+                    tenant,
+                    job_id,
+                    task_id,
+                    "dropped RunAttempt for missing job_info; released held concurrency queues",
+                );
+            }
             return Ok(());
         };
-
-        // Note: No cancelled check here. Cancelled jobs' tasks are eagerly removed
-        // by cancel_job. If a stale task appears (e.g., retry after cancel), it will
-        // be leased normally and the worker discovers cancellation via heartbeat.
 
         let view = JobView::new(job_bytes)?;
 

@@ -214,6 +214,38 @@ message CancelJobRequest {
 // Response confirming cancellation was requested.
 message CancelJobResponse {}
 
+// Cancel up to 1000 unique jobs in one tenant, only while they are still pending.
+// Each job is checked and cancelled in its own transaction. Jobs that have started
+// running are left untouched, including when they start after the caller's query.
+message CancelPendingJobsRequest {
+  string shard = 1;
+  repeated string ids = 2;
+  optional string tenant = 3;
+}
+
+enum CancelPendingJobStatus {
+  CANCEL_PENDING_JOB_STATUS_UNSPECIFIED = 0;
+  CANCEL_PENDING_JOB_STATUS_CANCELLED = 1;
+  CANCEL_PENDING_JOB_STATUS_ALREADY_CANCELLED = 2;
+  CANCEL_PENDING_JOB_STATUS_RUNNING = 3;
+  CANCEL_PENDING_JOB_STATUS_TERMINAL = 4;
+  CANCEL_PENDING_JOB_STATUS_NOT_FOUND = 5;
+  CANCEL_PENDING_JOB_STATUS_FAILED = 6;
+}
+
+message CancelPendingJobResult {
+  string id = 1;
+  CancelPendingJobStatus status = 2;
+  optional string error = 3; // Present for FAILED results.
+}
+
+// One result per requested ID, in request order. A failure for one job does not
+// prevent the other jobs from being processed. Retrying a request is safe;
+// previously cancelled jobs return ALREADY_CANCELLED.
+message CancelPendingJobsResponse {
+  repeated CancelPendingJobResult results = 1;
+}
+
 // Forcibly drop all concurrency holders for a tenant on a single shard, freeing
 // held slots so stuck jobs can be re-granted. Emergency admin/operator action;
 // in-flight run attempts are left running (and may briefly double-run).
@@ -689,6 +721,9 @@ service Silo {
   // Cancel a job. Running jobs will be notified via heartbeat.
   // Jobs in any state can be cancelled.
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+
+  // Cancel a bounded batch without interrupting running jobs.
+  rpc CancelPendingJobs(CancelPendingJobsRequest) returns (CancelPendingJobsResponse);
 
   // Forcibly drop all concurrency holders and in-flight run attempts for a
   // tenant on this shard. Admin action to clear stuck concurrency state.

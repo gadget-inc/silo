@@ -908,6 +908,15 @@ impl DecodedTask {
         )
     }
 
+    /// Job identity for scheduling tasks. Refresh tasks are queue-scoped and have none.
+    pub fn job_id(&self) -> &str {
+        task_str_field!(self, job_id,
+            RunAttempt => variant_as_run_attempt,
+            RequestTicket => variant_as_request_ticket,
+            CheckRateLimit => variant_as_check_rate_limit,
+        )
+    }
+
     pub fn task_group(&self) -> &str {
         task_str_field!(self, task_group,
             RunAttempt => variant_as_run_attempt,
