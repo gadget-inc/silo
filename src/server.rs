@@ -2611,6 +2611,13 @@ where
         // can bottleneck when many streams are active simultaneously.
         .initial_connection_window_size(Some(4 * 1024 * 1024)) // 4 MiB
         .initial_stream_window_size(Some(2 * 1024 * 1024)) // 2 MiB
+        // Cap the calls one connection may have in flight; clients queue the
+        // rest on their side. Without a cap, a burst of small unary calls can
+        // use up the budget h2 0.4.16+ keeps for unread small DATA frames
+        // (half the connection window above, so 8,355 five-byte requests),
+        // and h2 then closes the whole connection with
+        // GOAWAY(ENHANCE_YOUR_CALM). 1,000 unread requests use 12% of it.
+        .max_concurrent_streams(Some(1000))
         // Increase the number of reset streams the h2 layer remembers.
         // When a stream is reset (e.g. due to "shard not ready" errors),
         // h2 tracks it to correctly handle late-arriving frames. The
