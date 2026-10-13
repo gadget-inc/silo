@@ -29,7 +29,7 @@ use datafusion::prelude::DataFrame;
 use futures::{Stream, StreamExt};
 use slatedb::KeyValue;
 
-use crate::job::{JobStatus, JobView};
+use crate::job::{JobStatus, JobStatusKind, JobView, ListingSegment};
 use crate::job_store_shard::{JobStoreShard, TenantStatusCounterScanRange};
 
 /// Error surfaced when a statement exceeds its configured deadline. It travels
@@ -625,13 +625,82 @@ pub enum JobsScanStrategy {
         tenant: String,
         statuses: Vec<QueryStatusFilter>,
     },
+    /// Walk the status-segmented enqueue-time index: one arm per listed
+    /// segment (and per priority within it), merged into enqueue order. Chosen
+    /// only on a shard whose listing index is at version 2, for a
+    /// tenant-scoped filter set with a pure status predicate, a priority pin,
+    /// or both.
+    ListingIndex {
+        tenant: String,
+        /// The parsed status predicate, in predicate order; empty when the
+        /// filter set has none. Classification matches the original predicate
+        /// against this list.
+        statuses: Vec<QueryStatusFilter>,
+        /// The segments the status list resolves to; every segment when
+        /// there is no status predicate.
+        segments: Vec<ListingSegment>,
+        /// The `priority = <value>` pin, when present. A value outside the
+        /// priority domain yields no arms.
+        priority: Option<i64>,
+        /// Which Scheduled-segment rows the virtual status keeps.
+        split: ClockSplit,
+    },
     /// Full scan (no index-backed filter)
     FullScan { tenant: Option<String> },
+}
+
+/// Which rows of the two Scheduled segments a listing keeps, decided per
+/// entry from its next-attempt time against the query's clock snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockSplit {
+    /// Every row of every listed segment.
+    None,
+    /// Scheduled rows whose next attempt is at or before the snapshot.
+    Waiting,
+    /// Scheduled rows whose next attempt is after the snapshot.
+    Future,
+}
+
+impl std::fmt::Display for ClockSplit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClockSplit::None => write!(f, "none"),
+            ClockSplit::Waiting => write!(f, "waiting"),
+            ClockSplit::Future => write!(f, "future"),
+        }
+    }
 }
 
 impl std::fmt::Display for JobsScanStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            JobsScanStrategy::ListingIndex {
+                tenant,
+                statuses,
+                segments,
+                priority,
+                split,
+            } => {
+                let statuses = statuses
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let segments = segments
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write!(
+                    f,
+                    "ListingIndex(tenant={:?}, statuses=[{}], segments=[{}], priority={}, split={})",
+                    tenant,
+                    statuses,
+                    segments,
+                    priority.map_or_else(|| "none".to_string(), |p| p.to_string()),
+                    split
+                )
+            }
             JobsScanStrategy::ExactId { tenant, id } => {
                 write!(f, "ExactId(tenant={:?}, id={:?})", tenant, id)
             }
@@ -675,15 +744,25 @@ impl std::fmt::Display for JobsScanStrategy {
     }
 }
 
-/// Parse DataFusion filter expressions into a scan strategy.
-/// This determines which index-backed scan path will be used.
-/// Classify jobs table filters for use by both ShardQueryEngine and ClusterQueryEngine.
+/// Classify jobs table filters without a shard in hand, as the cluster query
+/// engine does: the listing-index strategy is never chosen, so pins stay
+/// Inexact.
 pub fn classify_jobs_filters(filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+    classify_jobs_filters_with(filters, false)
+}
+
+/// Classify jobs table filters against the strategy they parse to.
+/// `listing_index` says whether the shard's listing index is at version 2,
+/// which admits the `ListingIndex` strategy and makes its pins Exact.
+pub fn classify_jobs_filters_with(
+    filters: &[&Expr],
+    listing_index: bool,
+) -> Vec<TableProviderFilterPushDown> {
     // Strip table qualifiers from filter expressions before parsing the strategy,
     // because supports_filters_pushdown receives qualified names (e.g. "jobs.tenant")
     // while parse_jobs_scan_strategy expects unqualified names ("tenant").
     let unqualified_filters: Vec<Expr> = filters.iter().map(|f| unqualify_expr(f)).collect();
-    let strategy = parse_jobs_scan_strategy(&unqualified_filters);
+    let strategy = parse_jobs_scan_strategy_with(&unqualified_filters, listing_index);
 
     unqualified_filters
         .iter()
@@ -725,6 +804,17 @@ fn classify_filter_pushdown(
     strategy: &JobsScanStrategy,
 ) -> TableProviderFilterPushDown {
     use TableProviderFilterPushDown::{Exact, Inexact};
+    // A pin is Exact only under the listing-index strategy that carries its
+    // value: every path that strategy can take applies it inside the scan.
+    if let Some(value) = parse_priority_pin(expr) {
+        return match strategy {
+            JobsScanStrategy::ListingIndex {
+                priority: Some(pinned),
+                ..
+            } if *pinned == value => Exact,
+            _ => Inexact,
+        };
+    }
     if let Some((col, val)) = parse_eq_filter(expr) {
         let col_name = col.rsplit('.').next().unwrap_or(&col);
         return match (col_name, strategy) {
@@ -747,12 +837,20 @@ fn classify_filter_pushdown(
             {
                 Exact
             }
+            ("status_kind", JobsScanStrategy::ListingIndex { statuses, .. })
+                if statuses.len() == 1 && parse_status_kind(&val) == Some(statuses[0]) =>
+            {
+                Exact
+            }
             _ => Inexact,
         };
     }
     if let Some(statuses) = parse_multi_status_predicate(expr) {
         return match strategy {
             JobsScanStrategy::StatusUnion {
+                statuses: chosen, ..
+            }
+            | JobsScanStrategy::ListingIndex {
                 statuses: chosen, ..
             } if *chosen == statuses => Exact,
             // A one-element predicate collapses to the single-status strategy.
@@ -767,6 +865,12 @@ fn classify_filter_pushdown(
     Inexact
 }
 
+/// Whether any filter is a priority pin. Paths that cannot apply a pin
+/// inside their scan refuse filter sets containing one.
+fn filters_contain_pin(filters: &[Expr]) -> bool {
+    filters.iter().any(|f| parse_priority_pin(f).is_some())
+}
+
 /// The tenant a strategy's scan is actually scoped to, if any.
 fn strategy_tenant(strategy: &JobsScanStrategy) -> Option<&str> {
     match strategy {
@@ -775,11 +879,24 @@ fn strategy_tenant(strategy: &JobsScanStrategy) -> Option<&str> {
         | JobsScanStrategy::MetadataPrefix { tenant, .. }
         | JobsScanStrategy::Status { tenant, .. }
         | JobsScanStrategy::FullScan { tenant } => tenant.as_deref(),
-        JobsScanStrategy::StatusUnion { tenant, .. } => Some(tenant),
+        JobsScanStrategy::StatusUnion { tenant, .. }
+        | JobsScanStrategy::ListingIndex { tenant, .. } => Some(tenant),
     }
 }
 
+/// Parse filters into a strategy without a shard in hand: the listing-index
+/// strategy is never chosen.
 pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
+    parse_jobs_scan_strategy_with(filters, false)
+}
+
+/// Parse DataFusion filter expressions into a scan strategy. `listing_index`
+/// says whether the shard's listing index is at version 2; when it is, a
+/// tenant-scoped filter set with a pure status predicate, a priority pin, or
+/// both parses to `ListingIndex` instead of the status strategies or a full
+/// scan. Id and metadata filters rank ahead of it, as they rank ahead of the
+/// status strategies.
+pub fn parse_jobs_scan_strategy_with(filters: &[Expr], listing_index: bool) -> JobsScanStrategy {
     let mut tenant_filter: Option<String> = None;
     let mut status_filter: Option<QueryStatusFilter> = None;
     let mut multi_status_filter: Option<Vec<QueryStatusFilter>> = None;
@@ -787,9 +904,12 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
     let mut id_filter: Option<String> = None;
     let mut metadata_filter: Option<(String, String)> = None;
     let mut metadata_prefix_filter: Option<(String, String)> = None;
+    let mut priority_pin: Option<i64> = None;
 
     for f in filters {
-        if let Some((col, val)) = parse_eq_filter(f) {
+        if let Some(value) = parse_priority_pin(f) {
+            priority_pin = Some(value);
+        } else if let Some((col, val)) = parse_eq_filter(f) {
             match col.as_str() {
                 "tenant" => tenant_filter = Some(val),
                 "status_kind" => status_filter = parse_status_kind(&val),
@@ -828,6 +948,19 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
             key,
             prefix,
         }
+    } else if let Some(listing) = listing_index
+        .then(|| {
+            listing_index_strategy(
+                tenant_filter.as_deref(),
+                status_filter,
+                multi_status_filter.as_deref(),
+                state_shape_filter.is_some(),
+                priority_pin,
+            )
+        })
+        .flatten()
+    {
+        listing
     } else if let Some(status) = status_filter {
         // When a single-status equality is ANDed with a multi-status predicate,
         // the equality drives the scan (its range is a subset of any union) and
@@ -859,6 +992,60 @@ pub fn parse_jobs_scan_strategy(filters: &[Expr]) -> JobsScanStrategy {
         JobsScanStrategy::FullScan {
             tenant: tenant_filter,
         }
+    }
+}
+
+/// The `ListingIndex` strategy for a tenant-scoped filter set on a version-2
+/// shard, or `None` when the filter set keeps today's strategies: no tenant,
+/// neither a pure status predicate nor a priority pin, a state shape with
+/// residue standing in for the status predicate, or a status predicate the
+/// index does not serve yet.
+///
+/// A single equality drives the segment set ahead of an IN-list, as it drives
+/// the status strategies, so the status list a flagless parse would mark
+/// Exact is the one the arms enforce.
+fn listing_index_strategy(
+    tenant: Option<&str>,
+    status: Option<QueryStatusFilter>,
+    multi_status: Option<&[QueryStatusFilter]>,
+    has_state_shape: bool,
+    priority_pin: Option<i64>,
+) -> Option<JobsScanStrategy> {
+    let tenant = tenant?;
+    let statuses: Vec<QueryStatusFilter> = match (status, multi_status) {
+        (Some(status), _) => vec![status],
+        (None, Some(statuses)) => statuses.to_vec(),
+        (None, None) if has_state_shape || priority_pin.is_none() => return None,
+        (None, None) => Vec::new(),
+    };
+    let mut segments = Vec::new();
+    for status in &statuses {
+        match status {
+            QueryStatusFilter::Stored(kind) => segments.push(stored_kind_segment(*kind)),
+            QueryStatusFilter::Waiting | QueryStatusFilter::FutureScheduled => return None,
+        }
+    }
+    if statuses.is_empty() {
+        segments.extend(ListingSegment::ALL);
+    }
+    Some(JobsScanStrategy::ListingIndex {
+        tenant: tenant.to_string(),
+        statuses,
+        segments,
+        priority: priority_pin,
+        split: ClockSplit::None,
+    })
+}
+
+/// The segment a stored, non-Scheduled kind lists under. The Scheduled kind
+/// is reached only through the virtual statuses, which split it.
+fn stored_kind_segment(kind: JobStatusKind) -> ListingSegment {
+    match kind {
+        JobStatusKind::Scheduled => ListingSegment::ScheduledFirst,
+        JobStatusKind::Running => ListingSegment::Running,
+        JobStatusKind::Succeeded => ListingSegment::Succeeded,
+        JobStatusKind::Failed => ListingSegment::Failed,
+        JobStatusKind::Cancelled => ListingSegment::Cancelled,
     }
 }
 
@@ -1130,6 +1317,12 @@ pub enum JobsScanPath {
     /// enqueue-time index key, on a shard whose index backfill has completed.
     /// Walks the tenant's index range newest-first with no point lookups.
     EnqueueTimeIndex,
+    /// Listing-index strategy whose projection needs only columns carried by
+    /// the status-segmented enqueue-time index key (or nothing, for a count).
+    /// Walks one arm per segment and priority key-only, merged into
+    /// `enqueue_time_ms DESC, id ASC`, with the pins and the clock split
+    /// applied inside the scan.
+    StatusEnqueueTimeIndex,
     /// Scan the status/time index directly, no point lookups: the projection
     /// needs only tenant, id, status_kind, or status_changed_at_ms.
     StatusIndex,
@@ -1166,6 +1359,17 @@ fn projection_served_by_enqueue_time_index(projection: &SchemaRef) -> bool {
         })
 }
 
+/// Whether every projected column is carried by the status-segmented
+/// enqueue-time index key, or the projection is empty (a count).
+fn projection_served_by_status_enqueue_time_index(projection: &SchemaRef) -> bool {
+    projection.fields().iter().all(|f| {
+        matches!(
+            f.name().as_str(),
+            "shard_id" | "tenant" | "id" | "enqueue_time_ms" | "status_kind" | "priority"
+        )
+    })
+}
+
 impl JobsScanner {
     fn resolve_jobs(
         &self,
@@ -1173,21 +1377,34 @@ impl JobsScanner {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> JobsScanDecision {
-        let strategy = parse_jobs_scan_strategy(filters);
+        let strategy =
+            parse_jobs_scan_strategy_with(filters, self.shard.status_enqueue_time_index_complete());
         let needs = analyze_projection(projection, &strategy);
         let tenant_full_scan = matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) });
-        let path = if projection.fields().is_empty()
+        // Pins are Exact only under the listing-index strategy, whose paths
+        // apply them inside the scan; no other key-only path may serve a
+        // filter set that carries one.
+        let pinned = filters_contain_pin(filters);
+        let path = if matches!(strategy, JobsScanStrategy::ListingIndex { .. }) {
+            if projection_served_by_status_enqueue_time_index(projection) {
+                JobsScanPath::StatusEnqueueTimeIndex
+            } else {
+                JobsScanPath::JobPairs
+            }
+        } else if projection.fields().is_empty()
             && limit.is_none()
             && self.shard.count_from_status_counters
             && tenant_full_scan
+            && !pinned
         {
             JobsScanPath::CountFromCounters
         } else if tenant_full_scan
             && projection_served_by_enqueue_time_index(projection)
             && self.shard.enqueue_time_index_complete()
+            && !pinned
         {
             JobsScanPath::EnqueueTimeIndex
-        } else if needs.use_status_index_path {
+        } else if needs.use_status_index_path && !pinned {
             JobsScanPath::StatusIndex
         } else if needs.need_job_info && matches!(strategy, JobsScanStrategy::FullScan { .. }) {
             JobsScanPath::FullScanJoin
@@ -1210,17 +1427,19 @@ impl Scan for JobsScanner {
         let decision = ScanDecision::new(jobs);
         match path {
             // The index range is walked in key order, which is exactly
-            // `enqueue_time_ms DESC, id ASC`, and the stream stops at its limit.
-            JobsScanPath::EnqueueTimeIndex => decision.ordered_with_fetch(vec![
-                OrderingColumn {
-                    name: "enqueue_time_ms".to_string(),
-                    descending: true,
-                },
-                OrderingColumn {
-                    name: "id".to_string(),
-                    descending: false,
-                },
-            ]),
+            // `enqueue_time_ms DESC, id ASC`, and the stream stops at its
+            // limit; the listing path merges its arms into that same order.
+            JobsScanPath::EnqueueTimeIndex | JobsScanPath::StatusEnqueueTimeIndex => decision
+                .ordered_with_fetch(vec![
+                    OrderingColumn {
+                        name: "enqueue_time_ms".to_string(),
+                        descending: true,
+                    },
+                    OrderingColumn {
+                        name: "id".to_string(),
+                        descending: false,
+                    },
+                ]),
             _ => decision,
         }
     }
@@ -1234,7 +1453,7 @@ impl Scan for JobsScanner {
     }
 
     fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
-        classify_jobs_filters(filters)
+        classify_jobs_filters_with(filters, self.shard.status_enqueue_time_index_complete())
     }
 
     fn scan(
@@ -1260,6 +1479,13 @@ impl Scan for JobsScanner {
                 strategy,
             )),
             JobsScanPath::EnqueueTimeIndex => Box::pin(enqueue_time_index_stream(
+                shard,
+                projection.clone(),
+                strategy,
+                batch_size,
+                limit,
+            )),
+            JobsScanPath::StatusEnqueueTimeIndex => Box::pin(status_enqueue_time_index_stream(
                 shard,
                 projection.clone(),
                 strategy,
@@ -1384,6 +1610,276 @@ fn build_enqueue_time_index_batch(
             )),
             "enqueue_time_ms" => Arc::new(Int64Array::from(
                 rows.iter().map(|(_, _, t)| *t).collect::<Vec<_>>(),
+            )),
+            _ => new_null_array(f.data_type(), n),
+        };
+        cols.push(col);
+    }
+    RecordBatch::try_new(Arc::clone(projection), cols)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// One decoded status-segmented enqueue-time index entry.
+struct ListingRow {
+    inverted_enqueue_time: u64,
+    tenant: String,
+    job_id: String,
+    segment: ListingSegment,
+    priority: u8,
+    enqueue_time_ms: i64,
+    next_attempt_starts_after_ms: Option<i64>,
+}
+
+/// Rows the first chunk of an arm pulls; later chunks double up to the
+/// batch size, so a small limit reads few keys per arm and a long listing
+/// amortizes its cursor calls.
+const LISTING_ARM_INITIAL_CHUNK: usize = 16;
+
+/// One `(segment, priority)` range of the status-segmented index, pulled in
+/// growing chunks. Every key the cursor pulls counts toward the scanned-keys
+/// metric.
+struct ListingArm {
+    cursor: crate::job_store_shard::scan::RangeScanCursor,
+    buffer: VecDeque<ListingRow>,
+    chunk: usize,
+    exhausted: bool,
+}
+
+impl ListingArm {
+    /// Pull the next chunk into the buffer, never more keys than `remaining`
+    /// (the rows the limit still needs) or the batch size.
+    async fn refill(&mut self, batch_size: usize, remaining: Option<usize>) -> DfResult<()> {
+        if self.exhausted {
+            return Ok(());
+        }
+        let want = self
+            .chunk
+            .min(batch_size)
+            .min(remaining.unwrap_or(usize::MAX))
+            .max(1);
+        let chunk = self.cursor.next_kv_chunk(want).await.map_err(exec_err)?;
+        if chunk.is_empty() {
+            self.exhausted = true;
+            return Ok(());
+        }
+        for kv in &chunk {
+            let Some(key) = crate::keys::parse_status_enqueue_time_index_key(&kv.key)
+                .filter(|p| !p.job_id.is_empty())
+            else {
+                continue;
+            };
+            let Some(value) = crate::keys::StatusEnqueueTimeIndexValue::decode(&kv.value) else {
+                continue;
+            };
+            self.buffer.push_back(ListingRow {
+                inverted_enqueue_time: key.inverted_enqueue_time,
+                enqueue_time_ms: key.enqueue_time_ms(),
+                tenant: key.tenant,
+                job_id: key.job_id,
+                segment: key.segment,
+                priority: key.priority,
+                next_attempt_starts_after_ms: value.next_attempt_starts_after_ms,
+            });
+        }
+        self.chunk = (self.chunk * 2).min(batch_size.max(1));
+        Ok(())
+    }
+}
+
+/// Silo's priority domain; a pin outside it matches no job.
+const PRIORITY_RANGE: std::ops::RangeInclusive<i64> = 0..=99;
+
+/// The pinned priority as a key component, or `None` when the pin is
+/// outside the domain and so selects no arm.
+fn pinned_priority(value: i64) -> Option<u8> {
+    PRIORITY_RANGE.contains(&value).then_some(value as u8)
+}
+
+/// The `(segment, priority)` arms a listing-index strategy walks: every
+/// listed segment at the pinned priority, or, without a pin, every priority
+/// present in each segment, found by a skip scan that reads one key per
+/// distinct priority.
+async fn resolve_listing_arms(
+    shard: &JobStoreShard,
+    tenant: &str,
+    segments: &[ListingSegment],
+    priority: Option<i64>,
+) -> DfResult<Vec<(ListingSegment, u8)>> {
+    use crate::keys;
+    let mut arms = Vec::new();
+    if let Some(priority) = priority {
+        if let Some(priority) = pinned_priority(priority) {
+            arms.extend(segments.iter().map(|segment| (*segment, priority)));
+        }
+        return Ok(arms);
+    }
+    for segment in segments {
+        let segment_end = keys::end_bound(&keys::idx_status_enqueue_time_segment_prefix(
+            tenant, *segment,
+        ));
+        let mut start = keys::idx_status_enqueue_time_segment_prefix(tenant, *segment);
+        loop {
+            let mut cursor = shard
+                .open_range_cursor(start, segment_end.clone(), &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
+            let chunk = cursor.next_kv_chunk(1).await.map_err(exec_err)?;
+            let Some(found) = chunk
+                .first()
+                .and_then(|kv| keys::parse_status_enqueue_time_index_key(&kv.key))
+            else {
+                break;
+            };
+            arms.push((*segment, found.priority));
+            start = keys::end_bound(&keys::idx_status_enqueue_time_priority_prefix(
+                tenant,
+                *segment,
+                found.priority,
+            ));
+        }
+    }
+    Ok(arms)
+}
+
+/// Streams a tenant's status-segmented enqueue-time index key-only: one arm
+/// per `(segment, priority)`, merged on `(inverted enqueue time, id)` so the
+/// output is `enqueue_time_ms DESC, id ASC` across arms, with the pins and
+/// the clock split applied from the keys and values against one `now`
+/// snapshot that also labels `status_kind`. No arm pulls more keys than the
+/// limit still needs, and dropping the stream drops every cursor.
+fn status_enqueue_time_index_stream(
+    shard: Arc<JobStoreShard>,
+    projection: SchemaRef,
+    strategy: JobsScanStrategy,
+    batch_size: usize,
+    limit: Option<usize>,
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    async_stream::try_stream! {
+        let JobsScanStrategy::ListingIndex { tenant, segments, priority, split, .. } = strategy else {
+            return; // guarded by the resolver; nothing to emit otherwise
+        };
+        let shard_id = shard.name().to_string();
+        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+        let batch_size = batch_size.max(1);
+
+        let arm_keys = resolve_listing_arms(&shard, &tenant, &segments, priority).await?;
+        if let Some(metrics) = &shard.metrics {
+            metrics.record_query_listing_index_arms(shard.name(), arm_keys.len() as u64);
+        }
+        let mut arms: Vec<ListingArm> = Vec::with_capacity(arm_keys.len());
+        for (segment, priority) in arm_keys {
+            let start = crate::keys::idx_status_enqueue_time_priority_prefix(&tenant, segment, priority);
+            let end = crate::keys::end_bound(&start);
+            let cursor = shard
+                .open_range_cursor(start, end, &crate::scan_options())
+                .await
+                .map_err(exec_err)?;
+            arms.push(ListingArm {
+                cursor,
+                buffer: VecDeque::new(),
+                chunk: LISTING_ARM_INITIAL_CHUNK,
+                exhausted: false,
+            });
+        }
+
+        let mut sent = 0usize;
+        let remaining = |sent: usize, pending: usize| limit.map(|l| l.saturating_sub(sent + pending));
+        for arm in arms.iter_mut() {
+            arm.refill(batch_size, remaining(sent, 0)).await?;
+        }
+        let mut out: Vec<ListingRow> = Vec::with_capacity(batch_size);
+        loop {
+            if limit.is_some_and(|l| sent + out.len() >= l) {
+                break;
+            }
+            // The arm whose head sorts first; heads are the smallest row of
+            // each arm, and arms never overlap in key space.
+            let next = arms
+                .iter()
+                .enumerate()
+                .filter_map(|(i, arm)| arm.buffer.front().map(|row| ((row.inverted_enqueue_time, row.job_id.as_str()), i)))
+                .min()
+                .map(|(_, i)| i);
+            let Some(i) = next else {
+                break;
+            };
+            let Some(row) = arms[i].buffer.pop_front() else {
+                break;
+            };
+            if arms[i].buffer.is_empty() {
+                arms[i].refill(batch_size, remaining(sent, out.len() + 1)).await?;
+            }
+            let keep = match split {
+                ClockSplit::None => true,
+                ClockSplit::Waiting => row.next_attempt_starts_after_ms.is_none_or(|t| t <= now_ms),
+                ClockSplit::Future => row.next_attempt_starts_after_ms.is_some_and(|t| t > now_ms),
+            };
+            if keep {
+                out.push(row);
+            }
+            if out.len() >= batch_size {
+                let batch = build_listing_index_batch(&projection, &shard_id, &out, now_ms)?;
+                sent += batch.num_rows();
+                out.clear();
+                yield batch;
+            }
+        }
+        if !out.is_empty() {
+            let batch = build_listing_index_batch(&projection, &shard_id, &out, now_ms)?;
+            yield batch;
+        }
+    }
+}
+
+/// The `status_kind` label of a listing-index row: the segment's kind, with
+/// the two Scheduled segments split into Waiting and Scheduled by the entry's
+/// next-attempt time against the query's snapshot.
+fn listing_row_status_label(row: &ListingRow, now_ms: i64) -> &'static str {
+    match row.segment {
+        ListingSegment::ScheduledFirst | ListingSegment::ScheduledRetry => {
+            if row.next_attempt_starts_after_ms.is_none_or(|t| t <= now_ms) {
+                "Waiting"
+            } else {
+                "Scheduled"
+            }
+        }
+        ListingSegment::Running => "Running",
+        ListingSegment::Succeeded => "Succeeded",
+        ListingSegment::Failed => "Failed",
+        ListingSegment::Cancelled => "Cancelled",
+    }
+}
+
+fn build_listing_index_batch(
+    projection: &SchemaRef,
+    shard_id: &str,
+    rows: &[ListingRow],
+    now_ms: i64,
+) -> DfResult<RecordBatch> {
+    let n = rows.len();
+    if projection.fields().is_empty() {
+        return make_empty_projection_batch(projection, n);
+    }
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(projection.fields().len());
+    for f in projection.fields() {
+        let col: ArrayRef = match f.name().as_str() {
+            "shard_id" => Arc::new(StringArray::from(vec![shard_id; n])),
+            "tenant" => Arc::new(StringArray::from(
+                rows.iter().map(|r| r.tenant.as_str()).collect::<Vec<_>>(),
+            )),
+            "id" => Arc::new(StringArray::from(
+                rows.iter().map(|r| r.job_id.as_str()).collect::<Vec<_>>(),
+            )),
+            "enqueue_time_ms" => Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.enqueue_time_ms).collect::<Vec<_>>(),
+            )),
+            "status_kind" => Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| Some(listing_row_status_label(r, now_ms)))
+                    .collect::<Vec<_>>(),
+            )),
+            "priority" => Arc::new(UInt8Array::from(
+                rows.iter().map(|r| r.priority).collect::<Vec<_>>(),
             )),
             _ => new_null_array(f.data_type(), n),
         };
@@ -1604,6 +2100,8 @@ fn fullscan_join_stream(
             return; // guarded by the caller
         };
         let shard_id = shard.name().to_string();
+        // One clock snapshot per query labels every window's `status_kind`.
+        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
 
         let (info_start, info_end) = match &tenant {
             Some(t) => {
@@ -1692,8 +2190,14 @@ fn fullscan_join_stream(
                 .map(|(t, id, view)| ((t, id), view))
                 .collect();
             let pair_refs: Vec<&(String, String)> = pairs.iter().collect();
-            let batch =
-                build_job_pairs_batch(&projection, &shard_id, &pair_refs, &jobs_map, &status_map)?;
+            let batch = build_job_pairs_batch(
+                &projection,
+                &shard_id,
+                &pair_refs,
+                &jobs_map,
+                &status_map,
+                now_ms,
+            )?;
             sent += batch.num_rows();
             yield batch;
         }
@@ -1790,6 +2294,12 @@ fn job_pairs_stream(
         let shard_id = shard.name().to_string();
         let fetch_batch = batch_size.clamp(1, POINT_LOOKUP_BATCH);
 
+        // One clock snapshot per query: it plans every range, decides the
+        // clock split, and labels `status_kind`, so a job crossing its
+        // scheduled-start time mid-scan cannot fall into two arms' ranges or
+        // carry a label inconsistent with the arm that produced it.
+        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+
         // ExactId with a tenant: synthesize the single pair, no scan required.
         if let JobsScanStrategy::ExactId { tenant: Some(tenant), id } = &strategy {
             let pairs = vec![(tenant.clone(), id.clone())];
@@ -1800,15 +2310,107 @@ fn job_pairs_stream(
                 pairs.iter().collect()
             };
             if !existing.is_empty() {
-                yield build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map)?;
+                yield build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map, now_ms)?;
+            }
+            return;
+        }
+
+        // A listing-index strategy hydrating job-record columns: walk one
+        // range per listed segment (per segment and priority when pinned),
+        // applying the pins and the clock split from the keys and values. No
+        // ordering is declared, so there is no priority discovery or merge.
+        if let JobsScanStrategy::ListingIndex { tenant, segments, priority, split, .. } = &strategy {
+            let ranges: Vec<(Vec<u8>, Vec<u8>)> = match priority {
+                Some(p) => match pinned_priority(*p) {
+                    Some(p) => segments
+                        .iter()
+                        .map(|s| {
+                            let start = crate::keys::idx_status_enqueue_time_priority_prefix(tenant, *s, p);
+                            let end = crate::keys::end_bound(&start);
+                            (start, end)
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                },
+                None => segments
+                    .iter()
+                    .map(|s| {
+                        let start = crate::keys::idx_status_enqueue_time_segment_prefix(tenant, *s);
+                        let end = crate::keys::end_bound(&start);
+                        (start, end)
+                    })
+                    .collect(),
+            };
+            let mut sent = 0usize;
+            'ranges: for (start, end) in ranges {
+                let mut cursor = shard
+                    .open_range_cursor(start, end, &crate::scan_options())
+                    .await
+                    .map_err(exec_err)?;
+                let mut pending: Vec<(String, String)> = Vec::new();
+                let mut done = false;
+                loop {
+                    if limit.is_some_and(|l| sent >= l) {
+                        break 'ranges;
+                    }
+                    let want = limit.map_or(fetch_batch, |l| fetch_batch.min(l - sent));
+                    while pending.len() < want && !done {
+                        let chunk = cursor
+                            .next_kv_chunk(want - pending.len())
+                            .await
+                            .map_err(exec_err)?;
+                        if chunk.is_empty() {
+                            done = true;
+                            break;
+                        }
+                        for kv in &chunk {
+                            let Some(key) = crate::keys::parse_status_enqueue_time_index_key(&kv.key)
+                                .filter(|p| !p.job_id.is_empty())
+                            else {
+                                continue;
+                            };
+                            let Some(value) = crate::keys::StatusEnqueueTimeIndexValue::decode(&kv.value) else {
+                                continue;
+                            };
+                            let keep = match split {
+                                ClockSplit::None => true,
+                                ClockSplit::Waiting => value.next_attempt_starts_after_ms.is_none_or(|t| t <= now_ms),
+                                ClockSplit::Future => value.next_attempt_starts_after_ms.is_some_and(|t| t > now_ms),
+                            };
+                            if keep {
+                                pending.push((key.tenant, key.job_id));
+                            }
+                        }
+                    }
+                    if pending.is_empty() {
+                        break;
+                    }
+                    if let Some(l) = limit {
+                        pending.truncate(l - sent);
+                    }
+                    let (jobs_map, status_map) = fetch_batch_data(&shard, &pending, &needs).await?;
+                    let existing: Vec<&(String, String)> = if needs.need_job_info || needs.needs_existence_check {
+                        pending.iter().filter(|pair| jobs_map.contains_key(*pair)).collect()
+                    } else {
+                        pending.iter().collect()
+                    };
+                    if !existing.is_empty() {
+                        let batch =
+                            build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map, now_ms)?;
+                        sent += batch.num_rows();
+                        yield batch;
+                    }
+                    pending.clear();
+                    if done {
+                        break;
+                    }
+                }
             }
             return;
         }
 
         // All plans (one per union arm; a single plan otherwise) are computed from
-        // one clock snapshot, so a job crossing its scheduled-start time mid-scan
-        // cannot fall into two arms' ranges even on a quiescent shard.
-        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+        // the snapshot.
         let plans = pairs_scan_plans(&strategy, now_ms);
 
         let mut sent = 0usize;
@@ -1867,7 +2469,7 @@ fn job_pairs_stream(
                 };
                 if !existing.is_empty() {
                     let batch =
-                        build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map)?;
+                        build_job_pairs_batch(&projection, &shard_id, &existing, &jobs_map, &status_map, now_ms)?;
                     sent += batch.num_rows();
                     yield batch;
                 }
@@ -1985,6 +2587,11 @@ fn single_pairs_scan_plan(
         // correctness bug, not a perf bug — so fail loudly instead.
         JobsScanStrategy::StatusUnion { .. } => {
             unreachable!("StatusUnion is expanded by pairs_scan_plans")
+        }
+        // The listing-index strategy walks its own ranges in `job_pairs_stream`
+        // before any plan is computed, for the same reason.
+        JobsScanStrategy::ListingIndex { .. } => {
+            unreachable!("ListingIndex is walked by job_pairs_stream")
         }
     }
 }
@@ -2148,13 +2755,16 @@ async fn fetch_batch_data(
     Ok((jobs_map, status_map))
 }
 
-/// Build a RecordBatch for the standard path, reading columns from jobs_map and status_map.
+/// Build a RecordBatch for the standard path, reading columns from jobs_map
+/// and status_map. `now_ms` is the query's clock snapshot for the virtual
+/// Waiting/Scheduled label.
 fn build_job_pairs_batch(
     projection: &SchemaRef,
     shard_id: &str,
     pairs: &[&(String, String)],
     jobs_map: &HashMap<(String, String), JobView>,
     status_map: &HashMap<(String, String), JobStatus>,
+    now_ms: i64,
 ) -> DfResult<RecordBatch> {
     let n = pairs.len();
     if projection.fields().is_empty() {
@@ -2205,7 +2815,7 @@ fn build_job_pairs_batch(
             "status_kind" => Arc::new(StringArray::from(
                 pairs
                     .iter()
-                    .map(|p| status_map.get(*p).map(display_status_kind))
+                    .map(|p| status_map.get(*p).map(|s| display_status_kind(s, now_ms)))
                     .collect::<Vec<Option<String>>>(),
             )),
             "status_changed_at_ms" => Arc::new(Int64Array::from(
@@ -3672,6 +4282,39 @@ fn parse_i64_comparison_filter(expr: &Expr) -> Option<(String, I64ComparisonOp, 
     }
 }
 
+/// The expression under any cast DataFusion inserted for type coercion.
+fn strip_cast(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Cast(cast) => strip_cast(&cast.expr),
+        other => other,
+    }
+}
+
+/// An integer comparison between a column and a literal, with either
+/// operand on either side and a cast allowed around each: the shape a
+/// `column <op> <literal or bound value>` predicate takes after coercion.
+fn parse_int_comparison(expr: &Expr) -> Option<(String, I64ComparisonOp, i64)> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return None;
+    };
+    match (strip_cast(left), strip_cast(right)) {
+        (Expr::Column(c), Expr::Literal(s, _)) => i64_comparison_op(op)
+            .zip(literal_to_i64(s))
+            .map(|(cmp, value)| (c.name.clone(), cmp, value)),
+        (Expr::Literal(s, _), Expr::Column(c)) => inverted_i64_comparison_op(op)
+            .zip(literal_to_i64(s))
+            .map(|(cmp, value)| (c.name.clone(), cmp, value)),
+        _ => None,
+    }
+}
+
+/// The value of a `priority = <value>` pin.
+fn parse_priority_pin(expr: &Expr) -> Option<i64> {
+    parse_int_comparison(expr)
+        .filter(|(col, op, _)| col == "priority" && *op == I64ComparisonOp::Eq)
+        .map(|(_, _, value)| value)
+}
+
 fn i64_comparison_op(op: &Operator) -> Option<I64ComparisonOp> {
     match op {
         Operator::Eq => Some(I64ComparisonOp::Eq),
@@ -4054,17 +4697,16 @@ fn parse_status_kind(s: &str) -> Option<QueryStatusFilter> {
     }
 }
 
-/// Compute the display status kind string for a job status.
-/// Scheduled jobs with start_time <= now display as "Waiting".
-fn display_status_kind(status: &crate::job::JobStatus) -> String {
-    if status.kind == crate::job::JobStatusKind::Scheduled {
-        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
-        if status
+/// Compute the display status kind string for a job status against the
+/// query's clock snapshot: Scheduled jobs with start_time <= `now_ms`
+/// display as "Waiting".
+fn display_status_kind(status: &crate::job::JobStatus, now_ms: i64) -> String {
+    if status.kind == crate::job::JobStatusKind::Scheduled
+        && status
             .next_attempt_starts_after_ms
             .is_none_or(|t| t <= now_ms)
-        {
-            return "Waiting".to_string();
-        }
+    {
+        return "Waiting".to_string();
     }
     format!("{:?}", status.kind)
 }

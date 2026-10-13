@@ -166,6 +166,10 @@ pub struct Metrics {
     /// shard. Stays flat for index-only scans — the signal that an aggregate
     /// shape rode the index-only path instead of per-row hydration.
     query_point_lookups: CounterVec,
+    /// `(segment, priority)` arms opened by status-segmented listing scans,
+    /// per shard. Grows by the number of distinct priorities a scan found
+    /// (or one per segment when the priority is pinned).
+    query_listing_index_arms: CounterVec,
 
     // Shard/broker metrics
     shards_owned: Gauge,
@@ -476,6 +480,23 @@ impl Metrics {
         self.query_point_lookups
             .with_label_values(&[shard])
             .inc_by(n as f64);
+    }
+
+    /// Add `n` to the per-shard counter of `(segment, priority)` arms a
+    /// status-segmented listing scan opened. Called once per scan after the
+    /// arms are resolved, so a test can check priority discovery against the
+    /// priorities present.
+    pub fn record_query_listing_index_arms(&self, shard: &str, n: u64) {
+        self.query_listing_index_arms
+            .with_label_values(&[shard])
+            .inc_by(n as f64);
+    }
+
+    /// Read the current listing-index arms counter for a shard.
+    pub fn query_listing_index_arms_value(&self, shard: &str) -> f64 {
+        self.query_listing_index_arms
+            .with_label_values(&[shard])
+            .get()
     }
 
     /// Read the current query point-lookup counter for a shard. Exposed for
@@ -2100,6 +2121,16 @@ pub fn init() -> anyhow::Result<Metrics> {
             &["shard", "reason"],
         )?,
     );
+    let query_listing_index_arms = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_query_listing_index_arms_total",
+                "Segment/priority arms opened by status-segmented listing scans per shard",
+            ),
+            &["shard"],
+        )?,
+    );
     let query_scanned_keys = register(
         &registry,
         CounterVec::new(
@@ -2661,6 +2692,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         query_cancelled,
         query_scanned_keys,
         query_point_lookups,
+        query_listing_index_arms,
         shards_owned,
         shards_unassigned,
         coordination_shards_open,
