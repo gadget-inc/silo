@@ -1,3 +1,5 @@
+pub mod search;
+
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
@@ -150,6 +152,14 @@ impl ShardQueryEngine {
         });
         let jobs_provider = Arc::new(SiloTableProvider::new(jobs_schema, jobs_scanner));
         ctx.register_table(table_name, jobs_provider)?;
+
+        ctx.register_table(
+            "pending_metadata",
+            Arc::new(SiloTableProvider::new(
+                search::PendingMetadataScanner::base_schema(),
+                Arc::new(search::PendingMetadataScanner::new(Arc::clone(&shard))),
+            )),
+        )?;
 
         // Register queues table for concurrency queue data
         let queues_schema = QueuesScanner::base_schema();
@@ -1130,6 +1140,8 @@ pub enum JobsScanPath {
     /// enqueue-time index key, on a shard whose index backfill has completed.
     /// Walks the tenant's index range newest-first with no point lookups.
     EnqueueTimeIndex,
+    /// Candidate IDs from metadata indexes, hydrated in enqueue-time order.
+    SearchEnqueueTimeIndex,
     /// Scan the status/time index directly, no point lookups: the projection
     /// needs only tenant, id, status_kind, or status_changed_at_ms.
     StatusIndex,
@@ -1176,7 +1188,13 @@ impl JobsScanner {
         let strategy = parse_jobs_scan_strategy(filters);
         let needs = analyze_projection(projection, &strategy);
         let tenant_full_scan = matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) });
-        let path = if projection.fields().is_empty()
+        let path = if strategy_tenant(&strategy).is_some()
+            && !matches!(strategy, JobsScanStrategy::ExactId { .. })
+            && search::search_filter(filters).is_some()
+            && self.shard.enqueue_time_index_complete()
+        {
+            JobsScanPath::SearchEnqueueTimeIndex
+        } else if projection.fields().is_empty()
             && limit.is_none()
             && self.shard.count_from_status_counters
             && tenant_full_scan
@@ -1211,16 +1229,17 @@ impl Scan for JobsScanner {
         match path {
             // The index range is walked in key order, which is exactly
             // `enqueue_time_ms DESC, id ASC`, and the stream stops at its limit.
-            JobsScanPath::EnqueueTimeIndex => decision.ordered_with_fetch(vec![
-                OrderingColumn {
-                    name: "enqueue_time_ms".to_string(),
-                    descending: true,
-                },
-                OrderingColumn {
-                    name: "id".to_string(),
-                    descending: false,
-                },
-            ]),
+            JobsScanPath::EnqueueTimeIndex | JobsScanPath::SearchEnqueueTimeIndex => decision
+                .ordered_with_fetch(vec![
+                    OrderingColumn {
+                        name: "enqueue_time_ms".to_string(),
+                        descending: true,
+                    },
+                    OrderingColumn {
+                        name: "id".to_string(),
+                        descending: false,
+                    },
+                ]),
             _ => decision,
         }
     }
@@ -1241,7 +1260,7 @@ impl Scan for JobsScanner {
         &self,
         decision: &ScanDecision,
         projection: SchemaRef,
-        _filters: &[Expr],
+        filters: &[Expr],
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
@@ -1266,6 +1285,22 @@ impl Scan for JobsScanner {
                 batch_size,
                 limit,
             )),
+            JobsScanPath::SearchEnqueueTimeIndex => {
+                match (strategy_tenant(&strategy), search::search_filter(filters)) {
+                    (Some(tenant), Some(searches)) => Box::pin(search::search_index_stream(
+                        shard,
+                        projection.clone(),
+                        tenant.to_string(),
+                        strategy,
+                        searches,
+                        batch_size,
+                        limit,
+                    )),
+                    _ => Box::pin(futures::stream::once(async {
+                        Err(exec_err("invalid search index scan decision"))
+                    })),
+                }
+            }
             JobsScanPath::StatusIndex => Box::pin(status_index_stream(
                 shard,
                 projection.clone(),

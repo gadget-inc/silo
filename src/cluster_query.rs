@@ -38,6 +38,7 @@ use crate::factory::ShardFactory;
 use crate::job_store_shard::JobStoreShard;
 use crate::pb::QueryArrowRequest;
 use crate::pb::silo_client::SiloClient;
+use crate::query::search::PendingMetadataScanner;
 use crate::query::{
     FloatingRefreshTasksScanner, JobsScanner, QueueCountsScanner, QueuesScanner, ScannerRef,
     TasksScanner, TenantCountsScanner, classify_floating_refresh_tasks_filters,
@@ -98,6 +99,17 @@ impl ClusterQueryEngine {
             auth_token.clone(),
         ));
         ctx.register_table("jobs", jobs_provider)?;
+
+        ctx.register_table(
+            "pending_metadata",
+            Arc::new(ClusterTableProvider::new(
+                PendingMetadataScanner::base_schema(),
+                factory.clone(),
+                coordinator.clone(),
+                TableKind::PendingMetadata,
+                auth_token.clone(),
+            )),
+        )?;
 
         // Register cluster-wide queues table (shard_id is included in the scanner's schema)
         let queues_schema = QueuesScanner::base_schema();
@@ -234,6 +246,7 @@ impl ClusterQueryEngine {
 /// Which table type this provider is for
 #[derive(Debug, Clone, Copy)]
 enum TableKind {
+    PendingMetadata,
     Jobs,
     Queues,
     TenantCounts,
@@ -348,6 +361,9 @@ impl TableProvider for ClusterTableProvider {
         match self.table_kind {
             TableKind::Jobs => Ok(classify_jobs_filters(filters)),
             TableKind::Tasks => Ok(classify_tasks_filters(filters)),
+            TableKind::PendingMetadata => {
+                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+            }
             TableKind::FloatingRefreshTasks => Ok(classify_floating_refresh_tasks_filters(filters)),
             TableKind::Queues | TableKind::TenantCounts | TableKind::QueueCounts => {
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
@@ -511,6 +527,9 @@ impl ExecutionPlan for ClusterExecutionPlan {
                             Arc::new(QueueCountsScanner::new(Arc::clone(&shard)))
                         }
                         TableKind::Tasks => Arc::new(TasksScanner::new(Arc::clone(&shard))),
+                        TableKind::PendingMetadata => {
+                            Arc::new(PendingMetadataScanner::new(Arc::clone(&shard)))
+                        }
                         TableKind::FloatingRefreshTasks => {
                             Arc::new(FloatingRefreshTasksScanner::new(Arc::clone(&shard)))
                         }
@@ -628,6 +647,7 @@ async fn query_remote_shard_batches(
         TableKind::QueueCounts => "queue_counts",
         TableKind::Tasks => "tasks",
         TableKind::FloatingRefreshTasks => "floating_refresh_tasks",
+        TableKind::PendingMetadata => "pending_metadata",
     };
 
     let sql = build_sql_query(table_name, filters, limit);
