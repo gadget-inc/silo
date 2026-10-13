@@ -1238,3 +1238,160 @@ async fn clock_split_scan_reads_within_the_rejected_key_budget() {
         "scanned {keys} keys, budget {budget} with {arms} arms"
     );
 }
+
+/// The counted value of a `SELECT COUNT(*)` query.
+async fn count_of(engine: &ShardQueryEngine, query: &str, params: &[ScalarValue]) -> i64 {
+    collect(engine, query, params)
+        .await
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("count")
+                .values()
+                .to_vec()
+        })
+        .sum()
+}
+
+fn counter_count_shapes() -> Vec<(&'static str, Vec<ScalarValue>)> {
+    vec![
+        ("status_kind = $2", vec![utf8("-"), utf8("Failed")]),
+        ("status_kind = $2", vec![utf8("-"), utf8("Running")]),
+        ("status_kind = $2", vec![utf8("-"), utf8("Succeeded")]),
+        ("status_kind = $2", vec![utf8("-"), utf8("Cancelled")]),
+        (
+            "status_kind IN ($2, $3, $4)",
+            vec![
+                utf8("-"),
+                utf8("Waiting"),
+                utf8("Scheduled"),
+                utf8("Running"),
+            ],
+        ),
+        (
+            "status_kind IN ($2, $3, $4)",
+            vec![
+                utf8("-"),
+                utf8("Succeeded"),
+                utf8("Failed"),
+                utf8("Cancelled"),
+            ],
+        ),
+    ]
+}
+
+#[silo::test]
+async fn stored_kind_and_open_set_counts_come_from_counters_on_both_versions() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 60).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    for (predicate, params) in counter_count_shapes() {
+        let count = format!("SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND {predicate}");
+        let listing = format!("SELECT id FROM jobs WHERE tenant = $1 AND {predicate}");
+        for version in [
+            ENQUEUE_TIME_INDEX_VERSION,
+            STATUS_ENQUEUE_TIME_INDEX_VERSION,
+        ] {
+            set_version(&shard, version).await;
+            let walked = ids(&engine, &listing, &params).await.len() as i64;
+            assert!(walked > 0, "{listing}");
+            let line = plan_line(&engine, &count, &params).await;
+            assert!(
+                line.contains("path=CountFromCounters"),
+                "v{version} {count}: {line}"
+            );
+            assert_eq!(
+                count_of(&engine, &count, &params).await,
+                walked,
+                "v{version} {count}"
+            );
+        }
+    }
+}
+
+#[silo::test]
+async fn split_and_pinned_counts_are_not_served_from_counters() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 40).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let shapes = [
+        ("status_kind = $2", vec![utf8("-"), utf8("Waiting")]),
+        ("status_kind = $2", vec![utf8("-"), utf8("Scheduled")]),
+        (
+            "status_kind = $2 AND current_attempt = 1",
+            vec![utf8("-"), utf8("Scheduled")],
+        ),
+        (
+            "status_kind = $2 AND current_attempt > 1",
+            vec![utf8("-"), utf8("Scheduled")],
+        ),
+        (
+            "status_kind = $2 AND priority = $3",
+            vec![utf8("-"), utf8("Failed"), int(5)],
+        ),
+        ("priority = $2", vec![utf8("-"), int(5)]),
+        (
+            "status_kind IN ($2, $3)",
+            vec![utf8("-"), utf8("Waiting"), utf8("Running")],
+        ),
+    ];
+    for (predicate, params) in shapes {
+        let count = format!("SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND {predicate}");
+        let listing = format!("SELECT id FROM jobs WHERE tenant = $1 AND {predicate}");
+        for version in [
+            ENQUEUE_TIME_INDEX_VERSION,
+            STATUS_ENQUEUE_TIME_INDEX_VERSION,
+        ] {
+            set_version(&shard, version).await;
+            let line = plan_line(&engine, &count, &params).await;
+            assert!(
+                !line.contains("path=CountFromCounters"),
+                "v{version} {count}: {line}"
+            );
+            let walked = ids(&engine, &listing, &params).await.len() as i64;
+            assert_eq!(
+                count_of(&engine, &count, &params).await,
+                walked,
+                "v{version} {count}"
+            );
+        }
+    }
+}
+
+#[silo::test]
+async fn counter_counts_need_counters_enabled_and_no_limit() {
+    let (_tmp, shard, _metrics) =
+        open_temp_shard_with_metrics_and_config(|cfg| cfg.count_from_status_counters = false).await;
+    seed(&shard, 20).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    for version in [
+        ENQUEUE_TIME_INDEX_VERSION,
+        STATUS_ENQUEUE_TIME_INDEX_VERSION,
+    ] {
+        set_version(&shard, version).await;
+        for (predicate, params) in counter_count_shapes() {
+            let count = format!("SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND {predicate}");
+            let line = plan_line(&engine, &count, &params).await;
+            assert!(
+                !line.contains("path=CountFromCounters"),
+                "v{version} {count}: {line}"
+            );
+        }
+    }
+
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 20).await;
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let limited =
+        "SELECT COUNT(*) FROM (SELECT id FROM jobs WHERE tenant = $1 AND status_kind = $2 LIMIT 3)";
+    let params = [utf8("-"), utf8("Failed")];
+    let line = plan_line(&engine, limited, &params).await;
+    assert!(!line.contains("path=CountFromCounters"), "{line}");
+    assert_eq!(count_of(&engine, limited, &params).await, 3);
+}

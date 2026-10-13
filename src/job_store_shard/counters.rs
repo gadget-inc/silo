@@ -519,6 +519,30 @@ impl JobStoreShard {
         Ok(total)
     }
 
+    /// The tenant's live job count across `kinds`, summed from the per-status
+    /// counters: one point read per kind, no index walk. A counter driven
+    /// below zero by reconciliation lag counts as zero, as in
+    /// [`Self::count_tenant_live_jobs`].
+    pub async fn count_tenant_jobs_in_kinds(
+        &self,
+        tenant: &str,
+        kinds: &[JobStatusKind],
+    ) -> Result<i64, JobStoreShardError> {
+        use crate::keys::tenant_status_counter_key;
+
+        let mut total: i64 = 0;
+        for kind in kinds {
+            if let Some(raw) = self
+                .db
+                .get(&tenant_status_counter_key(tenant, kind.as_str()))
+                .await?
+            {
+                total += decode_counter(&raw).max(0);
+            }
+        }
+        Ok(total)
+    }
+
     /// Get the current concurrency requester count for a specific tenant/queue.
     pub async fn get_concurrency_requester_count(
         &self,

@@ -1490,19 +1490,19 @@ impl JobsScanner {
         // apply them inside the scan; no other key-only path may serve a
         // filter set that carries one.
         let pinned = filters_contain_pin(filters);
-        let path = if matches!(strategy, JobsScanStrategy::ListingIndex { .. }) {
+        let counter_served = projection.fields().is_empty()
+            && limit.is_none()
+            && self.shard.count_from_status_counters
+            && !pinned
+            && counter_tally(&strategy).is_some();
+        let path = if counter_served {
+            JobsScanPath::CountFromCounters
+        } else if matches!(strategy, JobsScanStrategy::ListingIndex { .. }) {
             if projection_served_by_status_enqueue_time_index(projection) {
                 JobsScanPath::StatusEnqueueTimeIndex
             } else {
                 JobsScanPath::JobPairs
             }
-        } else if projection.fields().is_empty()
-            && limit.is_none()
-            && self.shard.count_from_status_counters
-            && tenant_full_scan
-            && !pinned
-        {
-            JobsScanPath::CountFromCounters
         } else if tenant_full_scan
             && projection_served_by_enqueue_time_index(projection)
             && self.shard.enqueue_time_index_complete()
@@ -1989,22 +1989,74 @@ fn build_listing_index_batch(
         .map_err(|e| DataFusionError::Execution(e.to_string()))
 }
 
-/// COUNT(*)-over-a-tenant fast path: sum the transactionally-maintained
-/// per-status counters instead of walking the status index. Emits a single
-/// zero-column batch whose row count is the tenant's live job total.
+/// What a tenant-scoped count sums from the per-status counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CounterTally {
+    /// Every status counter: the tenant's live job total.
+    All,
+    /// The counters of these stored kinds.
+    Kinds(Vec<JobStatusKind>),
+}
+
+/// The counters a strategy's row tally can be read from, or `None` when it
+/// cannot: the strategy must be tenant-scoped, carry no pin, and its status
+/// list must name only stored kinds or hold both Waiting and Scheduled
+/// (which together are the stored Scheduled kind). A list with only one of
+/// the virtual statuses splits a counter by time, which no counter answers.
+fn counter_tally(strategy: &JobsScanStrategy) -> Option<CounterTally> {
+    let statuses: &[QueryStatusFilter] = match strategy {
+        JobsScanStrategy::FullScan { tenant: Some(_) } => return Some(CounterTally::All),
+        JobsScanStrategy::Status {
+            tenant: Some(_),
+            status,
+        } => std::slice::from_ref(status),
+        JobsScanStrategy::StatusUnion { statuses, .. } => statuses,
+        JobsScanStrategy::ListingIndex {
+            statuses,
+            priority: None,
+            attempt: None,
+            ..
+        } if !statuses.is_empty() => statuses,
+        _ => return None,
+    };
+    let has_waiting = statuses.contains(&QueryStatusFilter::Waiting);
+    let has_future = statuses.contains(&QueryStatusFilter::FutureScheduled);
+    if has_waiting != has_future {
+        return None;
+    }
+    let mut kinds: Vec<JobStatusKind> = Vec::new();
+    for status in statuses {
+        let kind = match status {
+            QueryStatusFilter::Stored(kind) => *kind,
+            QueryStatusFilter::Waiting | QueryStatusFilter::FutureScheduled => {
+                JobStatusKind::Scheduled
+            }
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    Some(CounterTally::Kinds(kinds))
+}
+
+/// COUNT(*) fast path: sum the transactionally-maintained per-status
+/// counters instead of walking an index. Emits a single zero-column batch
+/// whose row count is the tenant's live job total, or its total across the
+/// stored kinds the status predicate names.
 fn count_from_counters_stream(
     shard: Arc<JobStoreShard>,
     projection: SchemaRef,
     strategy: JobsScanStrategy,
 ) -> impl Stream<Item = DfResult<RecordBatch>> {
     async_stream::try_stream! {
-        let JobsScanStrategy::FullScan { tenant: Some(tenant) } = strategy else {
-            return; // guarded by the caller; nothing to emit otherwise
+        let (Some(tenant), Some(tally)) = (strategy_tenant(&strategy), counter_tally(&strategy)) else {
+            return; // guarded by the resolver; nothing to emit otherwise
         };
-        let total = shard
-            .count_tenant_live_jobs(&tenant)
-            .await
-            .map_err(exec_err)?;
+        let total = match tally {
+            CounterTally::All => shard.count_tenant_live_jobs(tenant).await,
+            CounterTally::Kinds(kinds) => shard.count_tenant_jobs_in_kinds(tenant, &kinds).await,
+        }
+        .map_err(exec_err)?;
         yield make_empty_projection_batch(&projection, total.max(0) as usize)?;
     }
 }
