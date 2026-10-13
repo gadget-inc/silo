@@ -316,6 +316,35 @@ fn make_coordinator_base(node_id: &str, num_shards: u32) -> CoordinatorBase {
     )
 }
 
+/// Milliseconds since the Unix epoch, the unit `last_membership_renewal_ms` reports.
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the epoch")
+        .as_millis() as i64
+}
+
+#[silo::test]
+fn last_membership_renewal_is_none_until_one_is_recorded() {
+    let base = make_coordinator_base("node-1", 2);
+    assert_eq!(base.last_membership_renewal_ms(), None);
+
+    let before_ms = unix_ms_now();
+    base.record_membership_renewal();
+    let after_ms = unix_ms_now();
+
+    let recorded_ms = base
+        .last_membership_renewal_ms()
+        .expect("a recorded renewal is reported");
+    assert!(
+        (before_ms..=after_ms).contains(&recorded_ms),
+        "recorded {recorded_ms}, expected a time between {before_ms} and {after_ms}"
+    );
+
+    // The placement metrics sampler reads through a clone of the base.
+    assert_eq!(base.clone().last_membership_renewal_ms(), Some(recorded_ms));
+}
+
 #[silo::test]
 async fn wait_converged_timeout() {
     let base = make_coordinator_base("node-1", 2);

@@ -797,6 +797,43 @@ async fn k8s_coordinator_metadata() {
     handle.abort();
 }
 
+/// The coordinator records each successful membership renewal. That recorded
+/// time is what `silo_coordination_membership_last_renewal_timestamp_seconds`
+/// exports, so a gauge that stops moving means renewals stopped.
+#[silo::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k8s_membership_renewal_is_recorded() {
+    let prefix = unique_prefix();
+    let namespace = get_namespace();
+    let node_id = "renewal-test-node";
+
+    // A 3s TTL renews every second, so the recorded time moves within the test.
+    let config =
+        make_coordinator_config(&namespace, &prefix, node_id, "http://127.0.0.1:7450", 8, 3);
+    let (coord, handle) = K8sCoordinator::start(config, make_test_factory(node_id))
+        .await
+        .expect("Failed to connect to K8s cluster - ensure cluster is accessible");
+
+    let at_start_ms = coord
+        .base()
+        .last_membership_renewal_ms()
+        .expect("creating the membership lease counts as a renewal");
+
+    let renewed_again = wait_until(Duration::from_secs(30), || async {
+        coord
+            .base()
+            .last_membership_renewal_ms()
+            .is_some_and(|ms| ms > at_start_ms)
+    })
+    .await;
+    assert!(
+        renewed_again,
+        "a renewal tick should move the recorded time past {at_start_ms}"
+    );
+
+    coord.shutdown().await.unwrap();
+    handle.abort();
+}
+
 /// Helper to create a K8sShardGuard for testing
 async fn make_k8s_guard(
     namespace: &str,
