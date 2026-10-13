@@ -5481,6 +5481,7 @@ dependencies = [
  "flatbuffers",
  "flate2",
  "futures",
+ "h2 0.4.14",
  "hex",
  "hostname",
  "http-body-util",
