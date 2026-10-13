@@ -2,6 +2,9 @@
 mod bench_helpers;
 
 use bench_helpers::*;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::scalar::ScalarValue;
+use silo::job_store_shard::{ENQUEUE_TIME_INDEX_VERSION, STATUS_ENQUEUE_TIME_INDEX_VERSION};
 use silo::query::ShardQueryEngine;
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,20 +12,49 @@ use std::time::Instant;
 const WARMUP_ITERS: usize = 1;
 const MEASURED_ITERS: usize = 5;
 
+/// Rows per IDE page.
+const PAGE: usize = 100;
+/// Offset of the deep page each tab shape is also measured at.
+const DEEP_OFFSET: usize = 2000;
+/// The priority the pinned shapes select; one of the golden priorities.
+const PINNED_PRIORITY: i64 = 50;
+
 /// Run a query multiple times and collect timing stats.
 async fn bench_query(engine: &ShardQueryEngine, label: &str, query: &str) -> BenchResult {
-    // Warmup
+    bench_bound_query(engine, label, query, &[]).await
+}
+
+/// Execute a query with its placeholders bound, the way the IDE sends every
+/// value, and collect the batches.
+async fn run_bound_query(
+    engine: &ShardQueryEngine,
+    query: &str,
+    params: &[ScalarValue],
+) -> Vec<RecordBatch> {
+    let df = engine.sql(query).await.expect("sql");
+    let df = if params.is_empty() {
+        df
+    } else {
+        df.with_param_values(params.to_vec()).expect("bind params")
+    };
+    df.collect().await.expect("collect")
+}
+
+/// Run a bound query multiple times and collect timing stats.
+async fn bench_bound_query(
+    engine: &ShardQueryEngine,
+    label: &str,
+    query: &str,
+    params: &[ScalarValue],
+) -> BenchResult {
     for _ in 0..WARMUP_ITERS {
-        let df = engine.sql(query).await.expect("sql");
-        let _batches = df.collect().await.expect("collect");
+        run_bound_query(engine, query, params).await;
     }
 
-    // Measured
     let mut durations = Vec::with_capacity(MEASURED_ITERS);
     for _ in 0..MEASURED_ITERS {
         let start = Instant::now();
-        let df = engine.sql(query).await.expect("sql");
-        let _batches = df.collect().await.expect("collect");
+        run_bound_query(engine, query, params).await;
         durations.push(start.elapsed());
     }
 
@@ -313,6 +345,49 @@ fn first_column_strings(batches: &[datafusion::arrow::record_batch::RecordBatch]
         .collect()
 }
 
+/// The first value of an `Int64` single-column result.
+fn first_i64(batches: &[RecordBatch]) -> i64 {
+    batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("int64 column")
+                .value(0)
+        })
+        .expect("a row")
+}
+
+/// What one execution of a query cost, read from the clone's query counters
+/// around it, with the batches it returned.
+struct ScanCost {
+    batches: Vec<RecordBatch>,
+    scanned_keys: u64,
+    point_lookups: u64,
+    arms: u64,
+}
+
+async fn measure_scan(
+    engine: &ShardQueryEngine,
+    metrics: &silo::metrics::Metrics,
+    shard_name: &str,
+    query: &str,
+    params: &[ScalarValue],
+) -> ScanCost {
+    let keys = metrics.query_scanned_keys_value(shard_name);
+    let lookups = metrics.query_point_lookups_value(shard_name);
+    let arms = metrics.query_listing_index_arms_value(shard_name);
+    let batches = run_bound_query(engine, query, params).await;
+    ScanCost {
+        batches,
+        scanned_keys: (metrics.query_scanned_keys_value(shard_name) - keys) as u64,
+        point_lookups: (metrics.query_point_lookups_value(shard_name) - lookups) as u64,
+        arms: (metrics.query_listing_index_arms_value(shard_name) - arms) as u64,
+    }
+}
+
 /// Run `bench_query` and also report the index keys one execution scans, read
 /// from the clone's scanned-keys counter. Returns that execution's first
 /// column so callers can check the states return the same rows.
@@ -323,22 +398,323 @@ async fn bench_query_with_keys(
     label: &str,
     query: &str,
 ) -> Vec<String> {
-    let before = metrics.query_scanned_keys_value(shard_name);
-    let df = engine.sql(query).await.expect("sql");
-    let batches = df.collect().await.expect("collect");
-    let scanned = metrics.query_scanned_keys_value(shard_name) - before;
-    let rows: Vec<String> = first_column_strings(&batches);
+    let cost = measure_scan(engine, metrics, shard_name, query, &[]).await;
+    let rows: Vec<String> = first_column_strings(&cost.batches);
     let r = bench_query(engine, label, query).await;
     r.print();
-    println!("  {:<30} rows={} scanned_keys={}", "", rows.len(), scanned);
+    println!(
+        "  {:<30} rows={} scanned_keys={} lookups={}",
+        "",
+        rows.len(),
+        cost.scanned_keys,
+        cost.point_lookups
+    );
     rows
+}
+
+fn utf8(value: &str) -> ScalarValue {
+    ScalarValue::Utf8(Some(value.to_string()))
+}
+
+/// One IDE tab shape: the predicates after `tenant = $1`, the values bound
+/// after the tenant, whether the shape pins a priority, and, for the
+/// clock-split tabs, the predicate selecting the rows the split rejects
+/// inside the segments the tab walks.
+struct TabShape {
+    name: &'static str,
+    predicate: &'static str,
+    params: Vec<ScalarValue>,
+    pinned: bool,
+    rejected: Option<(&'static str, Vec<ScalarValue>)>,
+}
+
+/// The seven state tabs, All with a priority pin, and one state tab with a
+/// priority pin.
+fn tab_shapes() -> Vec<TabShape> {
+    let stored = |name: &'static str, kind: &str| TabShape {
+        name,
+        predicate: "status_kind = $2",
+        params: vec![utf8(kind)],
+        pinned: false,
+        rejected: None,
+    };
+    vec![
+        TabShape {
+            name: "scheduled",
+            predicate: "status_kind = $2 AND current_attempt = 1",
+            params: vec![utf8("Scheduled")],
+            pinned: false,
+            rejected: Some((
+                "status_kind = $2 AND current_attempt = 1",
+                vec![utf8("Waiting")],
+            )),
+        },
+        TabShape {
+            name: "retrying",
+            predicate: "status_kind = $2 AND current_attempt > 1",
+            params: vec![utf8("Scheduled")],
+            pinned: false,
+            rejected: Some((
+                "status_kind = $2 AND current_attempt > 1",
+                vec![utf8("Waiting")],
+            )),
+        },
+        TabShape {
+            name: "waiting",
+            predicate: "status_kind = $2",
+            params: vec![utf8("Waiting")],
+            pinned: false,
+            rejected: Some(("status_kind = $2", vec![utf8("Scheduled")])),
+        },
+        stored("running", "Running"),
+        stored("failed", "Failed"),
+        stored("cancelled", "Cancelled"),
+        stored("completed", "Succeeded"),
+        TabShape {
+            name: "all_priority",
+            predicate: "priority = $2",
+            params: vec![ScalarValue::Int64(Some(PINNED_PRIORITY))],
+            pinned: true,
+            rejected: None,
+        },
+        TabShape {
+            name: "failed_priority",
+            predicate: "status_kind = $2 AND priority = $3",
+            params: vec![utf8("Failed"), ScalarValue::Int64(Some(PINNED_PRIORITY))],
+            pinned: true,
+            rejected: None,
+        },
+    ]
+}
+
+/// A tab count: the predicates after `tenant = $1`, the bound values, and
+/// whether the per-tenant status counters answer it.
+struct CountShape {
+    name: &'static str,
+    predicate: &'static str,
+    params: Vec<ScalarValue>,
+    counter_served: bool,
+}
+
+fn count_shapes() -> Vec<CountShape> {
+    vec![
+        CountShape {
+            name: "failed_counter",
+            predicate: "status_kind = $2",
+            params: vec![utf8("Failed")],
+            counter_served: true,
+        },
+        CountShape {
+            name: "open_counter",
+            predicate: "status_kind IN ($2, $3, $4)",
+            params: vec![utf8("Waiting"), utf8("Scheduled"), utf8("Running")],
+            counter_served: true,
+        },
+        CountShape {
+            name: "waiting_index",
+            predicate: "status_kind = $2",
+            params: vec![utf8("Waiting")],
+            counter_served: false,
+        },
+        CountShape {
+            name: "scheduled_index",
+            predicate: "status_kind = $2 AND current_attempt = 1",
+            params: vec![utf8("Scheduled")],
+            counter_served: false,
+        },
+        CountShape {
+            name: "retrying_index",
+            predicate: "status_kind = $2 AND current_attempt > 1",
+            params: vec![utf8("Scheduled")],
+            counter_served: false,
+        },
+        CountShape {
+            name: "failed_priority_index",
+            predicate: "status_kind = $2 AND priority = $3",
+            params: vec![utf8("Failed"), ScalarValue::Int64(Some(PINNED_PRIORITY))],
+            counter_served: false,
+        },
+    ]
+}
+
+/// The IDE's tab page: newest first, `id ASC` tiebreak, one page at `offset`.
+fn tab_listing_query(predicate: &str, offset: usize) -> String {
+    format!(
+        "SELECT id FROM jobs WHERE tenant = $1 AND {predicate} ORDER BY enqueue_time_ms DESC, id ASC LIMIT {PAGE} OFFSET {offset}"
+    )
+}
+
+/// The IDE's tab count: no subquery, no limit.
+fn tab_count_query(predicate: &str) -> String {
+    format!("SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND {predicate}")
+}
+
+fn bound_params(tenant: &str, params: &[ScalarValue]) -> Vec<ScalarValue> {
+    let mut all = Vec::with_capacity(params.len() + 1);
+    all.push(utf8(tenant));
+    all.extend(params.iter().cloned());
+    all
+}
+
+/// The keys a listing-index walk may read: the pushed-down fetch, one final
+/// chunk per arm capped by the fetch, one discovery seek per arm when the
+/// priority is not pinned, and, for a clock-split shape, the rejected rows
+/// interleaved before the last emitted row.
+fn listing_key_budget(fetch: usize, arms: u64, pinned: bool, rejected: u64) -> u64 {
+    let fetch = fetch as u64;
+    let discovery = if pinned { 0 } else { arms };
+    fetch + arms * fetch + discovery + rejected
+}
+
+/// An upper bound on the rows a clock split rejected before the listing's
+/// last row: the rejected-side rows of the walked segments enqueued at or
+/// after that row.
+async fn rejected_rows_through(
+    engine: &ShardQueryEngine,
+    tenant: &str,
+    predicate: &str,
+    params: &[ScalarValue],
+    last_id: &str,
+) -> u64 {
+    let last_enqueue = first_i64(
+        &run_bound_query(
+            engine,
+            "SELECT enqueue_time_ms FROM jobs WHERE tenant = $1 AND id = $2",
+            &[utf8(tenant), utf8(last_id)],
+        )
+        .await,
+    );
+    let query = format!(
+        "SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND {predicate} AND enqueue_time_ms >= ${}",
+        params.len() + 2
+    );
+    let mut all = bound_params(tenant, params);
+    all.push(ScalarValue::Int64(Some(last_enqueue)));
+    first_i64(&run_bound_query(engine, &query, &all).await) as u64
+}
+
+/// Measure one tab shape at one offset under the marker version the clone
+/// currently holds: timing, rows, and scan cost. On version 2 the scan is
+/// checked against the key budget and must read no job records. Returns the
+/// ids the page listed.
+async fn bench_tab_listing(
+    engine: &ShardQueryEngine,
+    metrics: &silo::metrics::Metrics,
+    shard_name: &str,
+    tenant: &str,
+    shape: &TabShape,
+    offset: usize,
+    version: u8,
+) -> Vec<String> {
+    let query = tab_listing_query(shape.predicate, offset);
+    let params = bound_params(tenant, &shape.params);
+    let page = if offset == 0 { "p1" } else { "deep" };
+    let label = format!("tab_{}_{page}_v{version}", shape.name);
+    let cost = measure_scan(engine, metrics, shard_name, &query, &params).await;
+    let rows = first_column_strings(&cost.batches);
+    bench_bound_query(engine, &label, &query, &params)
+        .await
+        .print();
+    let mut detail = format!(
+        "rows={} scanned_keys={} lookups={} arms={}",
+        rows.len(),
+        cost.scanned_keys,
+        cost.point_lookups,
+        cost.arms
+    );
+    if version == STATUS_ENQUEUE_TIME_INDEX_VERSION {
+        let rejected = match (&shape.rejected, rows.last()) {
+            (Some((predicate, params)), Some(last_id)) => {
+                rejected_rows_through(engine, tenant, predicate, params, last_id).await
+            }
+            _ => 0,
+        };
+        let budget = listing_key_budget(offset + PAGE, cost.arms, shape.pinned, rejected);
+        detail.push_str(&format!(" rejected<={rejected} budget={budget}"));
+        assert!(
+            cost.scanned_keys <= budget,
+            "{label}: scanned {} keys against a budget of {budget}",
+            cost.scanned_keys
+        );
+        assert_eq!(
+            cost.point_lookups, 0,
+            "{label}: the index path must read no job records"
+        );
+    }
+    println!("  {:<30} {detail}", "");
+    rows
+}
+
+/// Measure one tab count under the marker version the clone currently
+/// holds. On version 2 a counter-served count must walk no keys and every
+/// count must read no job records. Returns the count.
+async fn bench_tab_count(
+    engine: &ShardQueryEngine,
+    metrics: &silo::metrics::Metrics,
+    shard_name: &str,
+    tenant: &str,
+    shape: &CountShape,
+    version: u8,
+) -> i64 {
+    let query = tab_count_query(shape.predicate);
+    let params = bound_params(tenant, &shape.params);
+    let label = format!("count_{}_v{version}", shape.name);
+    let cost = measure_scan(engine, metrics, shard_name, &query, &params).await;
+    let count = first_i64(&cost.batches);
+    bench_bound_query(engine, &label, &query, &params)
+        .await
+        .print();
+    println!(
+        "  {:<30} count={count} scanned_keys={} lookups={}",
+        "", cost.scanned_keys, cost.point_lookups
+    );
+    if version == STATUS_ENQUEUE_TIME_INDEX_VERSION {
+        if shape.counter_served {
+            assert_eq!(
+                cost.scanned_keys, 0,
+                "{label}: a counter-served count must walk no keys"
+            );
+        }
+        assert_eq!(
+            cost.point_lookups, 0,
+            "{label}: a count must read no job records"
+        );
+    }
+    count
+}
+
+/// Every tab shape at page one and at the deep offset, then every count
+/// shape, under the clone's current marker version. Returns the listed ids
+/// per shape and offset, and the counts, for comparison across versions.
+async fn run_tab_benchmarks(
+    engine: &ShardQueryEngine,
+    metrics: &silo::metrics::Metrics,
+    shard_name: &str,
+    tenant: &str,
+    version: u8,
+) -> (Vec<Vec<String>>, Vec<i64>) {
+    let mut rows = Vec::new();
+    for shape in &tab_shapes() {
+        for offset in [0, DEEP_OFFSET] {
+            rows.push(
+                bench_tab_listing(engine, metrics, shard_name, tenant, shape, offset, version)
+                    .await,
+            );
+        }
+    }
+    let mut counts = Vec::new();
+    for shape in &count_shapes() {
+        counts.push(bench_tab_count(engine, metrics, shard_name, tenant, shape, version).await);
+    }
+    (rows, counts)
 }
 
 /// Measure the listing shapes on a clone of the golden shard opened with
 /// metrics: after the backfill sweep runs to completion on the clone (the
-/// index path) and with the completion marker cleared (the job-record path),
-/// including the Gadget subquery shape with its `id DESC` tiebreak. Also
-/// reports the sweep's own cost on the clone.
+/// index paths), with the marker held at version 1 (the baseline for every
+/// tab shape), and with the marker cleared (the job-record path for the All
+/// tab), including the Gadget subquery shape with its `id DESC` tiebreak.
+/// Also reports the sweep's own cost on the clone.
 async fn run_listing_benchmarks(metadata: &GoldenShardMetadata, tenant: &str) {
     let metrics = silo::metrics::init().expect("init metrics");
     let (_guard, shard) =
@@ -397,6 +773,38 @@ async fn run_listing_benchmarks(metadata: &GoldenShardMetadata, tenant: &str) {
         .await;
         index_rows.push(rows);
     }
+
+    println!("--- IDE Tab Shapes ({}, marker at version 2) ---", tenant);
+    let (tab_rows, tab_counts) = run_tab_benchmarks(
+        &engine,
+        &metrics,
+        &shard_name,
+        tenant,
+        STATUS_ENQUEUE_TIME_INDEX_VERSION,
+    )
+    .await;
+
+    println!("--- IDE Tab Shapes ({}, marker at version 1) ---", tenant);
+    shard
+        .set_listing_index_version(ENQUEUE_TIME_INDEX_VERSION)
+        .await
+        .expect("hold marker at version 1");
+    let (baseline_rows, baseline_counts) = run_tab_benchmarks(
+        &engine,
+        &metrics,
+        &shard_name,
+        tenant,
+        ENQUEUE_TIME_INDEX_VERSION,
+    )
+    .await;
+    assert_eq!(
+        tab_rows, baseline_rows,
+        "every tab shape must list the same ids on both marker versions"
+    );
+    assert_eq!(
+        tab_counts, baseline_counts,
+        "every count shape must agree on both marker versions"
+    );
 
     shard
         .set_listing_index_version(0)
