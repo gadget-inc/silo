@@ -10,7 +10,7 @@ use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use silo::job::{ConcurrencyLimit, Limit};
-use silo::job_store_shard::JobStoreShard;
+use silo::job_store_shard::{JobStoreShard, STATUS_ENQUEUE_TIME_INDEX_VERSION};
 use silo::query::ShardQueryEngine;
 use test_helpers::*;
 
@@ -43,9 +43,14 @@ async fn seed(shard: &JobStoreShard, count: usize) {
     }
 }
 
+/// Set the marker to version 2 (both listing indexes complete) or clear it.
 async fn mark_complete(shard: &JobStoreShard, complete: bool) {
     shard
-        .set_enqueue_time_index_complete(complete)
+        .set_listing_index_version(if complete {
+            STATUS_ENQUEUE_TIME_INDEX_VERSION
+        } else {
+            0
+        })
         .await
         .expect("set marker");
 }
@@ -344,7 +349,7 @@ async fn limit_on_other_tables_is_unchanged() {
     }
     shard.dequeue("w", "default", 3).await.expect("dequeue");
     shard
-        .set_enqueue_time_index_complete(true)
+        .set_listing_index_version(STATUS_ENQUEUE_TIME_INDEX_VERSION)
         .await
         .expect("marker");
     let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");

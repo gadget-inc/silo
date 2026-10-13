@@ -353,7 +353,11 @@ async fn run_listing_benchmarks(metadata: &GoldenShardMetadata, tenant: &str) {
     );
     let sweep_started = Instant::now();
     let sweep = shard
-        .backfill_enqueue_time_index(256, std::time::Duration::ZERO)
+        .backfill_listing_index(
+            silo::job_store_shard::STATUS_ENQUEUE_TIME_INDEX_VERSION,
+            256,
+            std::time::Duration::ZERO,
+        )
         .await
         .expect("backfill sweep");
     println!(
@@ -395,7 +399,7 @@ async fn run_listing_benchmarks(metadata: &GoldenShardMetadata, tenant: &str) {
     }
 
     shard
-        .set_enqueue_time_index_complete(false)
+        .set_listing_index_version(0)
         .await
         .expect("clear marker");
     for ((name, query), expected) in shapes.iter().zip(&index_rows) {
