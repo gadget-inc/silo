@@ -671,7 +671,7 @@ async fn shapes_outside_the_listing_strategy_keep_their_strategies_on_version_2(
     let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
     set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
 
-    let keeps: [(&str, &str); 9] = [
+    let keeps: [(&str, &str); 6] = [
         (
             "SELECT id FROM jobs WHERE status_kind = 'Failed'",
             "Status(",
@@ -691,18 +691,6 @@ async fn shapes_outside_the_listing_strategy_keep_their_strategies_on_version_2(
         (
             "SELECT id FROM jobs WHERE tenant = '-' AND starts_with(array_any_value(element_at(metadata, 'env')), 'pr') AND status_kind = 'Waiting'",
             "MetadataPrefix(",
-        ),
-        (
-            "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting'",
-            "Status(",
-        ),
-        (
-            "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Scheduled' AND priority = 5",
-            "Status(",
-        ),
-        (
-            "SELECT id FROM jobs WHERE tenant = '-' AND status_kind IN ('Waiting', 'Running')",
-            "StatusUnion(",
         ),
         (
             "SELECT id FROM jobs WHERE tenant = '-' AND (status_kind = 'Failed' OR (status_kind = 'Scheduled' AND current_attempt > 1))",
@@ -835,4 +823,418 @@ async fn cluster_engine_applies_the_pin_on_a_version_2_shard() {
     )
     .await;
     assert_eq!(rows, expected);
+}
+
+/// Add first attempts and retries on both sides of the clock to a seeded
+/// shard: waiting and future retries (failed once, rescheduled with a zero
+/// or a long backoff), then waiting first attempts that are never dequeued.
+async fn seed_scheduled(shard: &JobStoreShard) {
+    let now = now_ms();
+    for i in 0..12 {
+        let backoff = if i < 6 { 0 } else { 3_600_000 };
+        shard
+            .enqueue(
+                "-",
+                Some(format!("retry-{i:02}")),
+                PRIORITIES[i % 4],
+                now - 60_000 - i as i64,
+                Some(silo::retry::RetryPolicy {
+                    retry_count: 3,
+                    initial_interval_ms: backoff,
+                    max_interval_ms: backoff.max(1),
+                    randomize_interval: false,
+                    backoff_factor: 1.0,
+                }),
+                msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+    for task_id in dequeue_task_ids_until(shard, "w", "default", 12).await {
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "E".to_string(),
+                    error: vec![],
+                },
+            )
+            .await
+            .expect("report");
+    }
+    for i in 0..6 {
+        shard
+            .enqueue(
+                "-",
+                Some(format!("waiting-{i:02}")),
+                PRIORITIES[i % 4],
+                now - 30_000 - i as i64,
+                None,
+                msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+}
+
+fn scheduled_tab_shapes() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+)> {
+    // (status predicate, bound status, expected split, expected attempt, expected segments)
+    vec![
+        (
+            "status_kind = $2 AND current_attempt = 1",
+            "Scheduled",
+            "split=future",
+            "attempt=first",
+            "segments=[ScheduledFirst]",
+        ),
+        (
+            "status_kind = $2 AND current_attempt > 1",
+            "Scheduled",
+            "split=future",
+            "attempt=retry",
+            "segments=[ScheduledRetry]",
+        ),
+        (
+            "status_kind = $2",
+            "Waiting",
+            "split=waiting",
+            "attempt=none",
+            "segments=[ScheduledFirst,ScheduledRetry]",
+        ),
+    ]
+}
+
+#[silo::test]
+async fn scheduled_retrying_and_waiting_tabs_match_version_1_and_take_the_listing_path() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 60).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    for (predicate, status, split, attempt, segments) in scheduled_tab_shapes() {
+        for priority in [None, Some(0i64), Some(99)] {
+            let query = tab_query(predicate, priority.is_some());
+            let mut params = vec![utf8("-"), utf8(status)];
+            if let Some(p) = priority {
+                params.push(int(p));
+            }
+            params.push(int(100));
+            params.push(int(0));
+            let rows = assert_same_as_version_1(&shard, &engine, &query, &params).await;
+            assert!(!rows.is_empty(), "{query} with {params:?} returned nothing");
+            let line = plan_line(&engine, &query, &params).await;
+            for expected in [LISTING_LABEL, split, attempt, segments] {
+                assert!(
+                    line.contains(expected),
+                    "{query}: expected {expected} in {line}"
+                );
+            }
+        }
+    }
+}
+
+#[silo::test]
+async fn waiting_scheduled_and_running_list_merges_three_segments_without_a_split() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 60).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = "SELECT id FROM jobs WHERE tenant = $1 AND status_kind IN ($2, $3, $4) \
+                 ORDER BY enqueue_time_ms DESC, id ASC LIMIT $5 OFFSET $6";
+    let params = [
+        utf8("-"),
+        utf8("Waiting"),
+        utf8("Scheduled"),
+        utf8("Running"),
+        int(500),
+        int(0),
+    ];
+
+    let rows = assert_same_as_version_1(&shard, &engine, query, &params).await;
+    assert!(rows.iter().any(|id| id.starts_with("waiting-")));
+    assert!(rows.iter().any(|id| id.starts_with("retry-")));
+    assert!(rows.iter().any(|id| id.starts_with("job-")));
+    let line = plan_line(&engine, query, &params).await;
+    for expected in [
+        LISTING_LABEL,
+        "split=none",
+        "segments=[ScheduledFirst,ScheduledRetry,Running]",
+    ] {
+        assert!(line.contains(expected), "expected {expected} in {line}");
+    }
+}
+
+#[silo::test]
+async fn scheduled_rows_are_filtered_and_labeled_by_one_snapshot() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed_scheduled(&shard).await;
+    shard
+        .enqueue(
+            "-",
+            Some("edge".to_string()),
+            7,
+            now_ms() + 400,
+            None,
+            msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+
+    let labels = |batches: Vec<RecordBatch>| -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("id");
+            let kinds = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("status_kind");
+            for i in 0..batch.num_rows() {
+                out.push((ids.value(i).to_string(), kinds.value(i).to_string()));
+            }
+        }
+        out
+    };
+    let edge = "SELECT id, status_kind FROM jobs WHERE tenant = $1 AND priority = $2";
+    assert_eq!(
+        labels(collect(&engine, edge, &[utf8("-"), int(7)]).await),
+        vec![("edge".to_string(), "Scheduled".to_string())]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(
+        labels(collect(&engine, edge, &[utf8("-"), int(7)]).await),
+        vec![("edge".to_string(), "Waiting".to_string())]
+    );
+
+    // Every row a split admits carries that split's label.
+    let waiting = "SELECT id, status_kind FROM jobs WHERE tenant = $1 AND status_kind = $2";
+    let rows = labels(collect(&engine, waiting, &[utf8("-"), utf8("Waiting")]).await);
+    assert!(rows.len() >= 7, "{rows:?}");
+    assert!(rows.iter().all(|(_, kind)| kind == "Waiting"), "{rows:?}");
+    let rows = labels(collect(&engine, waiting, &[utf8("-"), utf8("Scheduled")]).await);
+    assert_eq!(rows.len(), 6, "{rows:?}");
+    assert!(rows.iter().all(|(_, kind)| kind == "Scheduled"), "{rows:?}");
+}
+
+#[silo::test]
+async fn attempt_pins_are_exact_only_under_the_listing_strategy() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 30).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let shapes = [
+        ("current_attempt = 1", "attempt=first"),
+        ("current_attempt > 1", "attempt=retry"),
+        ("current_attempt >= 2", "attempt=retry"),
+        ("1 = current_attempt", "attempt=first"),
+        ("current_attempt = $3", "attempt=first"),
+    ];
+    for (pin, attempt) in shapes {
+        let query = format!(
+            "SELECT id FROM jobs WHERE tenant = $1 AND status_kind = $2 AND {pin} \
+             ORDER BY enqueue_time_ms DESC, id ASC LIMIT 50"
+        );
+        let mut params = vec![utf8("-"), utf8("Scheduled")];
+        if pin.contains("$3") {
+            params.push(int(1));
+        }
+        set_version(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
+        let text = explain_text(&engine, &query, &params).await;
+        assert!(
+            text.contains("FilterExec") && text.contains("current_attempt"),
+            "{query}: version 1 must re-apply the pin:\n{text}"
+        );
+        let baseline = ids(&engine, &query, &params).await;
+
+        set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+        let text = explain_text(&engine, &query, &params).await;
+        assert!(
+            text.contains(LISTING_LABEL) && text.contains(attempt),
+            "{query}:\n{text}"
+        );
+        assert!(
+            !text.contains("FilterExec"),
+            "{query}: pin must be Exact:\n{text}"
+        );
+        assert_eq!(ids(&engine, &query, &params).await, baseline, "{query}");
+    }
+}
+
+#[silo::test]
+async fn pinned_scheduled_shape_projecting_payload_hydrates_only_the_split_and_pin() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 30).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = "SELECT id, current_attempt, payload FROM jobs WHERE tenant = $1 \
+                 AND status_kind = $2 AND current_attempt > 1 AND priority = $3 ORDER BY id";
+    let params = [utf8("-"), utf8("Scheduled"), int(99)];
+
+    set_version(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
+    let baseline = pretty_format_batches(&collect(&engine, query, &params).await)
+        .expect("format")
+        .to_string();
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    let line = plan_line(&engine, query, &params).await;
+    assert!(
+        line.contains("path=JobPairs")
+            && line.contains("attempt=retry")
+            && line.contains("split=future"),
+        "{line}"
+    );
+    let indexed = pretty_format_batches(&collect(&engine, query, &params).await)
+        .expect("format")
+        .to_string();
+    assert_eq!(indexed, baseline);
+    assert!(indexed.contains("retry-"), "{indexed}");
+}
+
+#[silo::test]
+async fn clock_split_counts_take_the_index_path_without_record_reads() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    seed(&shard, 30).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let shard_name = shard.name().to_string();
+    let counts = [
+        ("status_kind = $2", "Waiting"),
+        ("status_kind = $2 AND current_attempt = 1", "Scheduled"),
+        ("status_kind = $2 AND current_attempt > 1", "Scheduled"),
+    ];
+    for (predicate, status) in counts {
+        let count = format!("SELECT COUNT(*) FROM jobs WHERE tenant = $1 AND {predicate}");
+        let listing = format!("SELECT id FROM jobs WHERE tenant = $1 AND {predicate}");
+        let params = [utf8("-"), utf8(status)];
+
+        set_version(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
+        let walked = ids(&engine, &listing, &params).await.len();
+        assert!(walked > 0, "{listing}");
+
+        set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+        let line = plan_line(&engine, &count, &params).await;
+        assert!(line.contains(LISTING_LABEL), "{count}: {line}");
+        let lookups_before = metrics.query_point_lookups_value(&shard_name);
+        let batches = collect(&engine, &count, &params).await;
+        let counted: i64 = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    .expect("count")
+                    .values()
+                    .to_vec()
+            })
+            .sum();
+        assert_eq!(counted as usize, walked, "{count}");
+        assert_eq!(
+            metrics.query_point_lookups_value(&shard_name) - lookups_before,
+            0.0,
+            "{count}: no job or status records read"
+        );
+    }
+}
+
+#[silo::test]
+async fn attempt_pin_beside_a_stored_kind_or_without_a_status_stays_a_residual() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 30).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    // Only a Scheduled status carries `current_attempt`, so the pin beside a
+    // terminal kind matches nothing; it must still be applied, not dropped.
+    let shapes = [
+        (
+            "SELECT id FROM jobs WHERE tenant = $1 AND status_kind IN ('Running', 'Scheduled') AND current_attempt = 1 ORDER BY id",
+            true,
+        ),
+        (
+            "SELECT id FROM jobs WHERE tenant = $1 AND current_attempt = 1 AND priority = 99 ORDER BY id",
+            true,
+        ),
+        (
+            "SELECT id FROM jobs WHERE tenant = $1 AND status_kind = 'Failed' AND current_attempt = 1 ORDER BY id",
+            false,
+        ),
+    ];
+    for (query, expect_rows) in shapes {
+        let params = [utf8("-")];
+        set_version(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
+        let baseline = ids(&engine, query, &params).await;
+        assert_eq!(!baseline.is_empty(), expect_rows, "{query}: {baseline:?}");
+
+        set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+        let text = explain_text(&engine, query, &params).await;
+        assert!(
+            text.contains("ListingIndex(") && text.contains("attempt=none"),
+            "{query}:\n{text}"
+        );
+        assert!(
+            text.contains("FilterExec") && text.contains("current_attempt"),
+            "{query}: the pin must stay a residual filter:\n{text}"
+        );
+        assert_eq!(ids(&engine, query, &params).await, baseline, "{query}");
+    }
+}
+
+#[silo::test]
+async fn clock_split_scan_reads_within_the_rejected_key_budget() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    seed(&shard, 60).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let shard_name = shard.name().to_string();
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    let future = ids(
+        &engine,
+        "SELECT id FROM jobs WHERE tenant = $1 AND status_kind = $2",
+        &[utf8("-"), utf8("Scheduled")],
+    )
+    .await
+    .len();
+
+    let (limit, offset) = (5usize, 3usize);
+    let arms_before = metrics.query_listing_index_arms_value(&shard_name);
+    let keys_before = metrics.query_scanned_keys_value(&shard_name);
+    let rows = ids(
+        &engine,
+        &tab_query("status_kind = $2", false),
+        &[
+            utf8("-"),
+            utf8("Waiting"),
+            int(limit as i64),
+            int(offset as i64),
+        ],
+    )
+    .await;
+    assert_eq!(rows.len(), limit);
+    let arms = (metrics.query_listing_index_arms_value(&shard_name) - arms_before) as usize;
+    let keys = metrics.query_scanned_keys_value(&shard_name) - keys_before;
+    assert!(arms >= 1);
+    let budget = offset + limit + future + arms * (offset + limit) + arms;
+    assert!(
+        keys <= budget as f64,
+        "scanned {keys} keys, budget {budget} with {arms} arms"
+    );
 }

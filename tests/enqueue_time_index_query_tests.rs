@@ -158,10 +158,6 @@ async fn other_shapes_keep_their_path_regardless_of_the_flag() {
         ("SELECT id, enqueue_time_ms FROM jobs", "path=FullScanJoin"),
         ("SELECT id FROM jobs", "path=StatusIndex"),
         (
-            "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting'",
-            "path=JobPairs",
-        ),
-        (
             "SELECT id FROM jobs WHERE tenant = '-' AND array_contains(element_at(metadata, 'k'), 'v0')",
             "path=JobPairs",
         ),
@@ -375,7 +371,12 @@ async fn status_filtered_listings_return_the_same_rows_regardless_of_the_flag() 
 
     assert!(!cleared.is_empty(), "seed includes waiting jobs");
     assert_eq!(set, cleared);
-    assert!(explain_line(&engine, query).await.contains("path=JobPairs"));
+    assert!(
+        explain_line(&engine, query)
+            .await
+            .contains("path=StatusEnqueueTimeIndex"),
+        "the Waiting shape is index-served at version 2"
+    );
 }
 
 /// The enqueue-time path needs only version 1: a shard that completed the

@@ -642,6 +642,10 @@ pub enum JobsScanStrategy {
         /// The `priority = <value>` pin, when present. A value outside the
         /// priority domain yields no arms.
         priority: Option<i64>,
+        /// The `current_attempt` pin that narrowed the status list to one
+        /// Scheduled segment. Carried only beside a status predicate made up
+        /// solely of Waiting and Scheduled.
+        attempt: Option<AttemptPin>,
         /// Which Scheduled-segment rows the virtual status keeps.
         split: ClockSplit,
     },
@@ -650,7 +654,8 @@ pub enum JobsScanStrategy {
 }
 
 /// Which rows of the two Scheduled segments a listing keeps, decided per
-/// entry from its next-attempt time against the query's clock snapshot.
+/// entry from its next-attempt time against the query's clock snapshot. Rows
+/// of every other segment always pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockSplit {
     /// Every row of every listed segment.
@@ -659,6 +664,55 @@ pub enum ClockSplit {
     Waiting,
     /// Scheduled rows whose next attempt is after the snapshot.
     Future,
+}
+
+impl ClockSplit {
+    /// Whether a row of `segment` with `next_attempt_starts_after_ms` from its
+    /// entry value passes the split at `now_ms`.
+    fn keeps(
+        self,
+        segment: ListingSegment,
+        next_attempt_starts_after_ms: Option<i64>,
+        now_ms: i64,
+    ) -> bool {
+        let scheduled = matches!(
+            segment,
+            ListingSegment::ScheduledFirst | ListingSegment::ScheduledRetry
+        );
+        match self {
+            ClockSplit::None => true,
+            _ if !scheduled => true,
+            ClockSplit::Waiting => next_attempt_starts_after_ms.is_none_or(|t| t <= now_ms),
+            ClockSplit::Future => next_attempt_starts_after_ms.is_some_and(|t| t > now_ms),
+        }
+    }
+}
+
+/// A `current_attempt` conjunct that selects one Scheduled segment:
+/// `current_attempt = 1` for first attempts, `current_attempt > 1` or
+/// `current_attempt >= 2` for retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptPin {
+    First,
+    Retry,
+}
+
+impl AttemptPin {
+    fn segment(self) -> ListingSegment {
+        match self {
+            AttemptPin::First => ListingSegment::ScheduledFirst,
+            AttemptPin::Retry => ListingSegment::ScheduledRetry,
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttemptPin::First => write!(f, "first"),
+            AttemptPin::Retry => write!(f, "retry"),
+        }
+    }
 }
 
 impl std::fmt::Display for ClockSplit {
@@ -679,6 +733,7 @@ impl std::fmt::Display for JobsScanStrategy {
                 statuses,
                 segments,
                 priority,
+                attempt,
                 split,
             } => {
                 let statuses = statuses
@@ -693,11 +748,12 @@ impl std::fmt::Display for JobsScanStrategy {
                     .join(",");
                 write!(
                     f,
-                    "ListingIndex(tenant={:?}, statuses=[{}], segments=[{}], priority={}, split={})",
+                    "ListingIndex(tenant={:?}, statuses=[{}], segments=[{}], priority={}, attempt={}, split={})",
                     tenant,
                     statuses,
                     segments,
                     priority.map_or_else(|| "none".to_string(), |p| p.to_string()),
+                    attempt.map_or_else(|| "none".to_string(), |a| a.to_string()),
                     split
                 )
             }
@@ -815,6 +871,15 @@ fn classify_filter_pushdown(
             _ => Inexact,
         };
     }
+    if let Some(pin) = parse_attempt_pin(expr) {
+        return match strategy {
+            JobsScanStrategy::ListingIndex {
+                attempt: Some(carried),
+                ..
+            } if *carried == pin => Exact,
+            _ => Inexact,
+        };
+    }
     if let Some((col, val)) = parse_eq_filter(expr) {
         let col_name = col.rsplit('.').next().unwrap_or(&col);
         return match (col_name, strategy) {
@@ -865,10 +930,12 @@ fn classify_filter_pushdown(
     Inexact
 }
 
-/// Whether any filter is a priority pin. Paths that cannot apply a pin
-/// inside their scan refuse filter sets containing one.
+/// Whether any filter is a priority or attempt pin. Paths that cannot apply
+/// a pin inside their scan refuse filter sets containing one.
 fn filters_contain_pin(filters: &[Expr]) -> bool {
-    filters.iter().any(|f| parse_priority_pin(f).is_some())
+    filters
+        .iter()
+        .any(|f| parse_priority_pin(f).is_some() || parse_attempt_pin(f).is_some())
 }
 
 /// The tenant a strategy's scan is actually scoped to, if any.
@@ -905,10 +972,13 @@ pub fn parse_jobs_scan_strategy_with(filters: &[Expr], listing_index: bool) -> J
     let mut metadata_filter: Option<(String, String)> = None;
     let mut metadata_prefix_filter: Option<(String, String)> = None;
     let mut priority_pin: Option<i64> = None;
+    let mut attempt_pin: Option<AttemptPin> = None;
 
     for f in filters {
         if let Some(value) = parse_priority_pin(f) {
             priority_pin = Some(value);
+        } else if let Some(pin) = parse_attempt_pin(f) {
+            attempt_pin = Some(pin);
         } else if let Some((col, val)) = parse_eq_filter(f) {
             match col.as_str() {
                 "tenant" => tenant_filter = Some(val),
@@ -956,6 +1026,7 @@ pub fn parse_jobs_scan_strategy_with(filters: &[Expr], listing_index: bool) -> J
                 multi_status_filter.as_deref(),
                 state_shape_filter.is_some(),
                 priority_pin,
+                attempt_pin,
             )
         })
         .flatten()
@@ -997,19 +1068,23 @@ pub fn parse_jobs_scan_strategy_with(filters: &[Expr], listing_index: bool) -> J
 
 /// The `ListingIndex` strategy for a tenant-scoped filter set on a version-2
 /// shard, or `None` when the filter set keeps today's strategies: no tenant,
-/// neither a pure status predicate nor a priority pin, a state shape with
-/// residue standing in for the status predicate, or a status predicate the
-/// index does not serve yet.
+/// neither a pure status predicate nor a priority pin, or a state shape with
+/// residue standing in for the status predicate.
 ///
 /// A single equality drives the segment set ahead of an IN-list, as it drives
 /// the status strategies, so the status list a flagless parse would mark
-/// Exact is the one the arms enforce.
+/// Exact is the one the arms enforce. A stored kind maps to its segment;
+/// Waiting and Scheduled map to both Scheduled segments, narrowed to one by
+/// an attempt pin, and set the clock split when the list holds only one of
+/// them. An attempt pin beside any stored kind, or with no status predicate,
+/// is not carried and stays a residual filter.
 fn listing_index_strategy(
     tenant: Option<&str>,
     status: Option<QueryStatusFilter>,
     multi_status: Option<&[QueryStatusFilter]>,
     has_state_shape: bool,
     priority_pin: Option<i64>,
+    attempt_pin: Option<AttemptPin>,
 ) -> Option<JobsScanStrategy> {
     let tenant = tenant?;
     let statuses: Vec<QueryStatusFilter> = match (status, multi_status) {
@@ -1018,22 +1093,52 @@ fn listing_index_strategy(
         (None, None) if has_state_shape || priority_pin.is_none() => return None,
         (None, None) => Vec::new(),
     };
-    let mut segments = Vec::new();
+    let only_scheduled = !statuses.is_empty()
+        && statuses.iter().all(|s| {
+            matches!(
+                s,
+                QueryStatusFilter::Waiting | QueryStatusFilter::FutureScheduled
+            )
+        });
+    let attempt = attempt_pin.filter(|_| only_scheduled);
+    let scheduled_segments: Vec<ListingSegment> = match attempt {
+        Some(pin) => vec![pin.segment()],
+        None => vec![
+            ListingSegment::ScheduledFirst,
+            ListingSegment::ScheduledRetry,
+        ],
+    };
+    let mut segments: Vec<ListingSegment> = Vec::new();
     for status in &statuses {
-        match status {
-            QueryStatusFilter::Stored(kind) => segments.push(stored_kind_segment(*kind)),
-            QueryStatusFilter::Waiting | QueryStatusFilter::FutureScheduled => return None,
+        let add = match status {
+            QueryStatusFilter::Stored(kind) => vec![stored_kind_segment(*kind)],
+            QueryStatusFilter::Waiting | QueryStatusFilter::FutureScheduled => {
+                scheduled_segments.clone()
+            }
+        };
+        for segment in add {
+            if !segments.contains(&segment) {
+                segments.push(segment);
+            }
         }
     }
     if statuses.is_empty() {
         segments.extend(ListingSegment::ALL);
     }
+    let has_waiting = statuses.contains(&QueryStatusFilter::Waiting);
+    let has_future = statuses.contains(&QueryStatusFilter::FutureScheduled);
+    let split = match (has_waiting, has_future) {
+        (true, false) => ClockSplit::Waiting,
+        (false, true) => ClockSplit::Future,
+        _ => ClockSplit::None,
+    };
     Some(JobsScanStrategy::ListingIndex {
         tenant: tenant.to_string(),
         statuses,
         segments,
         priority: priority_pin,
-        split: ClockSplit::None,
+        attempt,
+        split,
     })
 }
 
@@ -1809,12 +1914,7 @@ fn status_enqueue_time_index_stream(
             if arms[i].buffer.is_empty() {
                 arms[i].refill(batch_size, remaining(sent, out.len() + 1)).await?;
             }
-            let keep = match split {
-                ClockSplit::None => true,
-                ClockSplit::Waiting => row.next_attempt_starts_after_ms.is_none_or(|t| t <= now_ms),
-                ClockSplit::Future => row.next_attempt_starts_after_ms.is_some_and(|t| t > now_ms),
-            };
-            if keep {
+            if split.keeps(row.segment, row.next_attempt_starts_after_ms, now_ms) {
                 out.push(row);
             }
             if out.len() >= batch_size {
@@ -2372,12 +2472,7 @@ fn job_pairs_stream(
                             let Some(value) = crate::keys::StatusEnqueueTimeIndexValue::decode(&kv.value) else {
                                 continue;
                             };
-                            let keep = match split {
-                                ClockSplit::None => true,
-                                ClockSplit::Waiting => value.next_attempt_starts_after_ms.is_none_or(|t| t <= now_ms),
-                                ClockSplit::Future => value.next_attempt_starts_after_ms.is_some_and(|t| t > now_ms),
-                            };
-                            if keep {
+                            if split.keeps(key.segment, value.next_attempt_starts_after_ms, now_ms) {
                                 pending.push((key.tenant, key.job_id));
                             }
                         }
@@ -4313,6 +4408,21 @@ fn parse_priority_pin(expr: &Expr) -> Option<i64> {
     parse_int_comparison(expr)
         .filter(|(col, op, _)| col == "priority" && *op == I64ComparisonOp::Eq)
         .map(|(_, _, value)| value)
+}
+
+/// The `current_attempt` pin an expression is: `= 1` selects first
+/// attempts; `> 1` or `>= 2` selects retries. Any other comparison on the
+/// column is not a pin.
+fn parse_attempt_pin(expr: &Expr) -> Option<AttemptPin> {
+    let (col, op, value) = parse_int_comparison(expr)?;
+    if col != "current_attempt" {
+        return None;
+    }
+    match (op, value) {
+        (I64ComparisonOp::Eq, 1) => Some(AttemptPin::First),
+        (I64ComparisonOp::Gt, 1) | (I64ComparisonOp::GtEq, 2) => Some(AttemptPin::Retry),
+        _ => None,
+    }
 }
 
 fn i64_comparison_op(op: &Operator) -> Option<I64ComparisonOp> {
