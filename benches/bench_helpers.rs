@@ -324,18 +324,18 @@ fn metadata_path() -> PathBuf {
 /// dataset generated from scratch.
 pub async fn ensure_golden_shard() -> GoldenShardMetadata {
     match load_cached_metadata() {
-        Some(meta) if meta.generator_version == GOLDEN_GENERATOR_VERSION => {
+        Ok(meta) => {
             println!("Using cached golden shard from {}", GOLDEN_DATA_DIR);
             return meta;
         }
-        Some(meta) => println!(
+        Err(CacheMiss::Absent) => {}
+        Err(CacheMiss::OtherVersion(version)) => println!(
             "Cached golden shard is generator version {} (current {}); regenerating",
-            meta.generator_version, GOLDEN_GENERATOR_VERSION
+            version, GOLDEN_GENERATOR_VERSION
         ),
-        None if Path::new(GOLDEN_DATA_DIR).exists() => {
+        Err(CacheMiss::Unreadable) => {
             println!("Golden shard directory has no readable metadata; regenerating")
         }
-        None => {}
     }
 
     if Path::new(GOLDEN_DATA_DIR).exists() {
@@ -346,13 +346,38 @@ pub async fn ensure_golden_shard() -> GoldenShardMetadata {
     generate_golden_dataset(&tenant_sizes).await
 }
 
-fn load_cached_metadata() -> Option<GoldenShardMetadata> {
+/// Why the cached golden shard cannot be used as it is.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheMiss {
+    /// No metadata file exists.
+    Absent,
+    /// The metadata file cannot be read or is not a JSON object.
+    Unreadable,
+    /// The metadata was written by this generator version, which is not the
+    /// current one; a file without a version reads as version zero.
+    OtherVersion(u32),
+}
+
+/// The generator version alone, read before the rest of the metadata so a
+/// cache from another version is recognized whatever other fields it lacks.
+#[derive(serde::Deserialize)]
+struct GoldenCacheVersion {
+    #[serde(default)]
+    generator_version: u32,
+}
+
+fn load_cached_metadata() -> Result<GoldenShardMetadata, CacheMiss> {
     let path = metadata_path();
     if !path.exists() {
-        return None;
+        return Err(CacheMiss::Absent);
     }
-    let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let data = std::fs::read_to_string(&path).map_err(|_| CacheMiss::Unreadable)?;
+    let version: GoldenCacheVersion =
+        serde_json::from_str(&data).map_err(|_| CacheMiss::Unreadable)?;
+    if version.generator_version != GOLDEN_GENERATOR_VERSION {
+        return Err(CacheMiss::OtherVersion(version.generator_version));
+    }
+    serde_json::from_str(&data).map_err(|_| CacheMiss::Unreadable)
 }
 
 async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShardMetadata {
