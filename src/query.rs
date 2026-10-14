@@ -1754,7 +1754,8 @@ struct ListingArm {
 
 impl ListingArm {
     /// Pull the next chunk into the buffer, never more keys than `remaining`
-    /// (the rows the limit still needs) or the batch size.
+    /// (the rows the limit still needs, at least one when called) or the
+    /// batch size.
     async fn refill(&mut self, batch_size: usize, remaining: Option<usize>) -> DfResult<()> {
         if self.exhausted {
             return Ok(());
@@ -1918,11 +1919,13 @@ fn status_enqueue_time_index_stream(
             let Some(row) = arms[i].buffer.pop_front() else {
                 break;
             };
-            if arms[i].buffer.is_empty() {
-                arms[i].refill(batch_size, remaining(sent, out.len() + 1)).await?;
-            }
             if split.keeps(row.segment, row.next_attempt_starts_after_ms, now_ms) {
                 out.push(row);
+            }
+            // Refill the emptied arm only while the limit is unmet, so the
+            // last key a listing reads is the one that meets its limit.
+            if arms[i].buffer.is_empty() && limit.is_none_or(|l| sent + out.len() < l) {
+                arms[i].refill(batch_size, remaining(sent, out.len())).await?;
             }
             if out.len() >= batch_size {
                 let batch = build_listing_index_batch(&projection, &shard_id, &tenant, &out, now_ms)?;

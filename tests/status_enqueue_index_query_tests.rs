@@ -1475,3 +1475,56 @@ async fn conflicting_duplicate_predicates_stay_residual_under_the_listing_strate
         set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
     }
 }
+
+#[silo::test]
+async fn pinned_page_reads_exactly_its_limit_in_keys() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let now = now_ms();
+    for i in 0..30 {
+        shard
+            .enqueue(
+                "-",
+                Some(format!("f-{i:03}")),
+                5,
+                now - 60_000 - i as i64,
+                None,
+                msgpack_payload(&serde_json::json!({})),
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+    }
+    for task_id in dequeue_task_ids_until(&shard, "w", "default", 30).await {
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "E".to_string(),
+                    error: vec![],
+                },
+            )
+            .await
+            .expect("report");
+    }
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let shard_name = shard.name().to_string();
+
+    for limit in [1_i64, 10, 16, 17] {
+        let keys_before = metrics.query_scanned_keys_value(&shard_name);
+        let rows = ids(
+            &engine,
+            &tab_query("status_kind = $2", true),
+            &[utf8("-"), utf8("Failed"), int(5), int(limit), int(0)],
+        )
+        .await;
+        assert_eq!(rows.len() as i64, limit);
+        let keys = metrics.query_scanned_keys_value(&shard_name) - keys_before;
+        assert_eq!(
+            keys, limit as f64,
+            "a pinned page of {limit} rows must read exactly {limit} keys"
+        );
+    }
+}
