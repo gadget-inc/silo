@@ -44,6 +44,17 @@ async fn open_shard_at(
     terminal_expire_s: Option<u64>,
     backfill: EnqueueTimeIndexBackfillConfig,
 ) -> Arc<JobStoreShard> {
+    open_shard_with_range(path, ShardRange::full(), terminal_expire_s, backfill).await
+}
+
+/// Open (or reopen) the shard at `path` owning `range`, as a split child does
+/// over its parent's data.
+async fn open_shard_with_range(
+    path: &std::path::Path,
+    range: ShardRange,
+    terminal_expire_s: Option<u64>,
+    backfill: EnqueueTimeIndexBackfillConfig,
+) -> Arc<JobStoreShard> {
     let cfg = DatabaseConfig {
         name: "test".to_string(),
         backend: Backend::Fs,
@@ -54,23 +65,27 @@ async fn open_shard_at(
         enqueue_time_index_backfill: backfill,
         ..Default::default()
     };
-    JobStoreShard::open(
-        &cfg,
-        MockGubernatorClient::new_arc(),
-        None,
-        ShardRange::full(),
-    )
-    .await
-    .expect("open shard")
+    JobStoreShard::open(&cfg, MockGubernatorClient::new_arc(), None, range)
+        .await
+        .expect("open shard")
 }
 
 async fn enqueue_many(shard: &JobStoreShard, prefix: &str, count: usize) -> Vec<String> {
+    enqueue_many_for(shard, TENANT, prefix, count).await
+}
+
+async fn enqueue_many_for(
+    shard: &JobStoreShard,
+    tenant: &str,
+    prefix: &str,
+    count: usize,
+) -> Vec<String> {
     let mut ids = Vec::with_capacity(count);
     for i in 0..count {
         let id = format!("{prefix}-{i:04}");
         shard
             .enqueue(
-                TENANT,
+                tenant,
                 Some(id.clone()),
                 PRIORITY,
                 now_ms() + i as i64,
@@ -124,7 +139,11 @@ async fn stored_status(shard: &JobStoreShard, id: &str) -> JobStatus {
 
 /// `(job_id, expire_ts)` of the tenant's enqueue-time entries, in key order.
 async fn enqueue_time_entries(db: &InstrumentedDb) -> Vec<(String, Option<i64>)> {
-    let start = idx_enqueue_time_tenant_prefix(TENANT);
+    enqueue_time_entries_for(db, TENANT).await
+}
+
+async fn enqueue_time_entries_for(db: &InstrumentedDb, tenant: &str) -> Vec<(String, Option<i64>)> {
+    let start = idx_enqueue_time_tenant_prefix(tenant);
     let end = end_bound(&start);
     let mut iter = db.scan::<Vec<u8>, _>(start..end).await.expect("scan");
     let mut out = Vec::new();
@@ -146,7 +165,11 @@ struct Entry {
 
 /// The tenant's status-segmented entries, in key order.
 async fn status_entries(db: &InstrumentedDb) -> Vec<Entry> {
-    let start = idx_status_enqueue_time_tenant_prefix(TENANT);
+    status_entries_for(db, TENANT).await
+}
+
+async fn status_entries_for(db: &InstrumentedDb, tenant: &str) -> Vec<Entry> {
+    let start = idx_status_enqueue_time_tenant_prefix(tenant);
     let end = end_bound(&start);
     let mut iter = db.scan::<Vec<u8>, _>(start..end).await.expect("scan");
     let mut out = Vec::new();
@@ -304,7 +327,17 @@ async fn plant_status_entry(
     enqueue_time_ms: i64,
     job_id: &str,
 ) -> Vec<u8> {
-    let key = idx_status_enqueue_time_key(TENANT, segment, PRIORITY, enqueue_time_ms, job_id);
+    plant_status_entry_for(db, TENANT, segment, enqueue_time_ms, job_id).await
+}
+
+async fn plant_status_entry_for(
+    db: &InstrumentedDb,
+    tenant: &str,
+    segment: ListingSegment,
+    enqueue_time_ms: i64,
+    job_id: &str,
+) -> Vec<u8> {
+    let key = idx_status_enqueue_time_key(tenant, segment, PRIORITY, enqueue_time_ms, job_id);
     db.put(
         &key,
         StatusEnqueueTimeIndexValue {
@@ -942,4 +975,147 @@ async fn entry_in_the_right_segment_with_a_stale_value_or_ttl_is_rewritten_once(
     let second = run_sweep(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
     assert_eq!(second.rows_written, 0, "{second:?}");
     assert_indexes_match_jobs(&shard).await;
+}
+
+/// Tenant hashes: zzz sits inside `[, 8000...)`, aaa outside it.
+const LEFT_CHILD_END: &str = "8000000000000000";
+
+/// Plant one orphan in each listing-index family for `tenant`: entries
+/// whose job has no `JOB_INFO` row.
+async fn plant_orphans_for(db: &InstrumentedDb, tenant: &str, suffix: &str) {
+    db.put(
+        idx_enqueue_time_key(tenant, 5_000, &format!("orphan-e-{suffix}")),
+        [],
+    )
+    .await
+    .expect("plant");
+    plant_status_entry_for(
+        db,
+        tenant,
+        ListingSegment::Failed,
+        7_000,
+        &format!("orphan-s-{suffix}"),
+    )
+    .await;
+}
+
+async fn orphan_ids_for(db: &InstrumentedDb, tenant: &str) -> Vec<String> {
+    let mut ids: Vec<String> = enqueue_time_entries_for(db, tenant)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .chain(
+            status_entries_for(db, tenant)
+                .await
+                .into_iter()
+                .map(|e| e.job_id),
+        )
+        .filter(|id| id.starts_with("orphan"))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// A split child sweeps only the keys inside its range: orphans of a tenant
+/// it owns are removed, and orphans of a tenant outside its range are left
+/// for the post-split cleanup.
+#[silo::test]
+async fn split_child_sweep_removes_in_range_orphans_and_leaves_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = open_shard_at(tmp.path(), None, Default::default()).await;
+    let inside = enqueue_many_for(&parent, "zzz", "z", 3).await;
+    let outside = enqueue_many_for(&parent, "aaa", "a", 3).await;
+    plant_orphans_for(parent.db(), "zzz", "in").await;
+    plant_orphans_for(parent.db(), "aaa", "out").await;
+    parent.close().await.expect("close");
+
+    let child = open_shard_with_range(
+        tmp.path(),
+        ShardRange::new("", LEFT_CHILD_END),
+        None,
+        Default::default(),
+    )
+    .await;
+    run_sweep(&child, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+
+    let db = child.db();
+    assert!(orphan_ids_for(db, "zzz").await.is_empty());
+    assert_eq!(
+        orphan_ids_for(db, "aaa").await,
+        vec!["orphan-e-out".to_string(), "orphan-s-out".to_string()],
+        "out-of-range orphans are left for the post-split cleanup"
+    );
+    for id in &inside {
+        assert!(
+            status_entries_for(db, "zzz")
+                .await
+                .iter()
+                .any(|e| &e.job_id == id)
+        );
+    }
+    for id in &outside {
+        assert!(
+            status_entries_for(db, "aaa")
+                .await
+                .iter()
+                .any(|e| &e.job_id == id)
+        );
+    }
+}
+
+/// A child cloned from a parent whose checkpoint sits inside the Orphans
+/// pass resumes that pass: orphans after the checkpoint are removed, those
+/// before it are not revisited, and the child reaches version 2.
+#[silo::test]
+async fn split_child_resumes_the_parents_orphan_pass_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = open_shard_at(tmp.path(), None, Default::default()).await;
+    let inside = enqueue_many_for(&parent, "zzz", "z", 3).await;
+    let db = parent.db();
+    db.put(idx_enqueue_time_key("zzz", 5_000, "orphan-e1"), [])
+        .await
+        .expect("plant");
+    let mut status_keys = Vec::new();
+    for id in ["orphan-a", "orphan-b", "orphan-c", "orphan-d"] {
+        status_keys
+            .push(plant_status_entry_for(db, "zzz", ListingSegment::Failed, 7_000, id).await);
+    }
+    write_progress(
+        db,
+        &format!(
+            r#"{{"version":2,"pass":"Orphans","last_key":"{}","rows_scanned":3,"rows_written":3}}"#,
+            hex::encode(&status_keys[1])
+        ),
+    )
+    .await;
+    parent.close().await.expect("close");
+
+    let child = open_shard_with_range(
+        tmp.path(),
+        ShardRange::new("", LEFT_CHILD_END),
+        None,
+        Default::default(),
+    )
+    .await;
+    assert_eq!(child.listing_index_version(), 0);
+    run_sweep(&child, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+
+    let db = child.db();
+    assert_eq!(
+        orphan_ids_for(db, "zzz").await,
+        vec![
+            "orphan-a".to_string(),
+            "orphan-b".to_string(),
+            "orphan-e1".to_string()
+        ],
+        "orphans after the checkpoint are removed, those before it are not revisited"
+    );
+    for id in &inside {
+        assert!(
+            status_entries_for(db, "zzz")
+                .await
+                .iter()
+                .any(|e| &e.job_id == id)
+        );
+    }
 }
