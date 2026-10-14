@@ -847,8 +847,9 @@ impl JobStoreShard {
     ///   - `ATTEMPT`             (scan all attempt rows for the job, re-put each)
     ///   - `JOB_CANCELLED`       (re-put with TTL if present)
     ///
-    /// `JOB_STATUS` and `IDX_STATUS_TIME` are written with TTL by the caller via
-    /// `set_job_status_with_index_opts`, so they are intentionally not handled here.
+    /// `JOB_STATUS`, `IDX_STATUS_TIME`, and `IDX_STATUS_ENQUEUE_TIME` are written
+    /// with TTL by the caller via `set_job_status_with_index_opts`, so they are
+    /// intentionally not handled here.
     ///
     /// All reads go through `writer` so that when the caller uses a
     /// `TxnWriter`, the JOB_INFO / ATTEMPT range / JOB_CANCELLED reads are

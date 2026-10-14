@@ -200,7 +200,7 @@ async fn status_record_without_job_fields_gains_them_on_its_next_transition() {
     // Replace the stored record with one shaped like a record written
     // without the job fields.
     let stored = stored_status(&shard, "job").await;
-    let legacy = JobStatus::new(
+    let without_job_fields = JobStatus::new(
         stored.kind,
         stored.changed_at_ms,
         stored.next_attempt_starts_after_ms,
@@ -208,9 +208,12 @@ async fn status_record_without_job_fields_gains_them_on_its_next_transition() {
     );
     shard
         .db()
-        .put(job_status_key("-", "job"), encode_job_status(&legacy))
+        .put(
+            job_status_key("-", "job"),
+            encode_job_status(&without_job_fields),
+        )
         .await
-        .expect("put legacy status");
+        .expect("put status without job fields");
     let reread = stored_status(&shard, "job").await;
     assert_eq!((reread.enqueue_time_ms, reread.priority), (None, None));
 

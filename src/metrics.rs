@@ -483,9 +483,8 @@ impl Metrics {
     }
 
     /// Add `n` to the per-shard counter of `(segment, priority)` arms a
-    /// status-segmented listing scan opened. Called once per scan after the
-    /// arms are resolved, so a test can check priority discovery against the
-    /// priorities present.
+    /// status-segmented listing scan opened, recorded once per scan after the
+    /// arms are resolved.
     pub fn record_query_listing_index_arms(&self, shard: &str, n: u64) {
         self.query_listing_index_arms
             .with_label_values(&[shard])

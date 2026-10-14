@@ -8,10 +8,10 @@
 //!
 //! The version-1 sweep walks `JOB_INFO` inside the shard's tenant range and
 //! writes each job's missing enqueue-time entry. The version-2 sweep makes two
-//! passes: the first walks `JOB_INFO` and writes both entries, placing the
-//! status-segmented entry under the job's stored status and removing any
-//! entry it has in another segment; the second walks both index families and
-//! removes entries whose job is gone.
+//! passes: the first walks `JOB_INFO`, writes each job's missing enqueue-time
+//! entry, and reconciles its status-segmented entry, placing it under the
+//! job's stored status and removing any entry in another segment; the second
+//! walks both index families and removes entries whose job is gone.
 //!
 //! Enumeration runs outside any transaction (a transactional scan would
 //! register the whole range in the read set and abort on every busy tenant);
@@ -77,8 +77,8 @@ enum BackfillPass {
     Orphans,
 }
 
-/// A marker written before versions existed records version 1.
-fn legacy_checkpoint_version() -> u8 {
+/// A checkpoint without a `version` field belongs to the version-1 sweep.
+fn checkpoint_version_default() -> u8 {
     ENQUEUE_TIME_INDEX_VERSION
 }
 
@@ -86,7 +86,7 @@ fn legacy_checkpoint_version() -> u8 {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct BackfillProgress {
     /// The target version this checkpoint belongs to.
-    #[serde(default = "legacy_checkpoint_version")]
+    #[serde(default = "checkpoint_version_default")]
     version: u8,
     #[serde(default)]
     pass: BackfillPass,
@@ -279,10 +279,14 @@ impl JobStoreShard {
             }
         }
 
-        self.set_listing_index_version(target_version).await?;
-        self.db
-            .delete(&enqueue_time_index_backfill_progress_key())
-            .await?;
+        // The marker and the checkpoint change together, so a restart never
+        // sees a completed version beside a checkpoint for it.
+        let mut completion = slatedb::WriteBatch::new();
+        completion.put(enqueue_time_index_backfill_complete_key(), [target_version]);
+        completion.delete(enqueue_time_index_backfill_progress_key());
+        self.db.write(completion).await?;
+        self.listing_index_version
+            .store(target_version, Ordering::Release);
         info!(
             shard = %self.name,
             target_version,
@@ -343,10 +347,16 @@ impl JobStoreShard {
                 backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
             }
         });
-        *self
-            .enqueue_time_index_backfill_task
-            .try_lock()
-            .expect("backfill task slot is uncontended at open") = Some(task);
+        match self.enqueue_time_index_backfill_task.try_lock() {
+            Ok(mut slot) => *slot = Some(task),
+            Err(_) => {
+                task.abort();
+                error!(
+                    shard = %self.name,
+                    "listing index backfill task slot is held at open; sweep not started"
+                );
+            }
+        }
     }
 
     fn backfill_result(

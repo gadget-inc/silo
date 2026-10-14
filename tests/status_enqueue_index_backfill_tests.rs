@@ -21,6 +21,7 @@ use silo::keys::{
     idx_status_enqueue_time_key, idx_status_enqueue_time_tenant_prefix, job_info_key,
     job_status_key, parse_enqueue_time_index_key, parse_status_enqueue_time_index_key,
 };
+use silo::query::ShardQueryEngine;
 use silo::settings::{Backend, DatabaseConfig, EnqueueTimeIndexBackfillConfig};
 use silo::shard_range::ShardRange;
 use test_helpers::*;
@@ -254,10 +255,49 @@ async fn enabled_sweep_with_status_index_reaches_version_2_in_one_run() {
         ids
     );
     assert_indexes_match_jobs(&shard).await;
+
+    // The query engine serves a status listing from the new index once the
+    // marker reads version 2.
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    let query = format!(
+        "SELECT id FROM jobs WHERE tenant = '{TENANT}' AND status_kind = 'Waiting' ORDER BY enqueue_time_ms DESC, id ASC"
+    );
+    let explain = engine
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .expect("explain")
+        .collect()
+        .await
+        .expect("collect");
+    let explain = datafusion::arrow::util::pretty::pretty_format_batches(&explain)
+        .expect("format")
+        .to_string();
+    assert!(explain.contains("path=StatusEnqueueTimeIndex"), "{explain}");
+    let listed = engine
+        .sql(&query)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    let listed: Vec<String> = listed
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("string column");
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(sorted(listed), ids);
 }
 
 /// Plant a status-segmented entry for `job_id` in `segment` at the standard
-/// priority and `enqueue_time_ms`, as an older binary might have left it.
+/// priority and `enqueue_time_ms`, regardless of the job's stored status.
 async fn plant_status_entry(
     db: &InstrumentedDb,
     segment: ListingSegment,
@@ -329,7 +369,7 @@ async fn empty_marker_loads_as_version_1_and_the_flag_gates_the_version_2_sweep(
         .await
         .expect("re-put without TTL");
     // Only the status-segmented entries are missing, as on a shard that
-    // completed the version-1 sweep under an older binary.
+    // sits at version 1.
     for entry in status_entries(shard.db()).await {
         let job = shard
             .get_job(TENANT, &entry.job_id)
@@ -400,7 +440,7 @@ async fn empty_marker_loads_as_version_1_and_the_flag_gates_the_version_2_sweep(
     assert_indexes_match_jobs(&shard).await;
 }
 
-fn legacy_checkpoint(after_id: &str) -> String {
+fn versionless_checkpoint(after_id: &str) -> String {
     format!(
         r#"{{"last_key":"{}","rows_scanned":8,"rows_written":8}}"#,
         hex::encode(job_info_key(TENANT, after_id))
@@ -408,12 +448,12 @@ fn legacy_checkpoint(after_id: &str) -> String {
 }
 
 #[silo::test]
-async fn legacy_checkpoint_is_honoured_by_a_version_1_sweep() {
+async fn versionless_checkpoint_is_honoured_by_a_version_1_sweep() {
     let tmp = tempfile::tempdir().unwrap();
     let shard = open_shard_at(tmp.path(), None, Default::default()).await;
     let ids = enqueue_many(&shard, "job", 10).await;
     strip_entries(&shard, &ids).await;
-    write_progress(shard.db(), &legacy_checkpoint(&ids[7])).await;
+    write_progress(shard.db(), &versionless_checkpoint(&ids[7])).await;
 
     run_sweep(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
 
@@ -426,17 +466,17 @@ async fn legacy_checkpoint_is_honoured_by_a_version_1_sweep() {
                 .collect()
         ),
         ids[8..].to_vec(),
-        "a version-1 sweep resumes after the legacy checkpoint"
+        "a version-1 sweep resumes after the versionless checkpoint"
     );
 }
 
 #[silo::test]
-async fn legacy_checkpoint_is_discarded_by_a_version_2_sweep() {
+async fn versionless_checkpoint_is_discarded_by_a_version_2_sweep() {
     let tmp = tempfile::tempdir().unwrap();
     let shard = open_shard_at(tmp.path(), None, Default::default()).await;
     let ids = enqueue_many(&shard, "job", 10).await;
     strip_entries(&shard, &ids).await;
-    write_progress(shard.db(), &legacy_checkpoint(&ids[7])).await;
+    write_progress(shard.db(), &versionless_checkpoint(&ids[7])).await;
     shard.close().await.expect("close");
 
     let shard = open_shard_at(tmp.path(), None, sweep_config(true, true)).await;
@@ -808,7 +848,6 @@ async fn jobs_deleted_or_transitioned_mid_sweep_end_in_the_right_place() {
 
 #[silo::test]
 async fn disabled_sweep_keeps_version_0_and_an_empty_marker_reads_version_1() {
-    use silo::query::ShardQueryEngine;
     let query = "SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-'";
     let plan_line = |explain: String| {
         explain
@@ -851,4 +890,56 @@ async fn disabled_sweep_keeps_version_0_and_an_empty_marker_reads_version_1() {
         line.contains("path=EnqueueTimeIndex"),
         "version 1 takes the enqueue-time path: {line}"
     );
+}
+
+#[silo::test]
+async fn entry_in_the_right_segment_with_a_stale_value_or_ttl_is_rewritten_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shard = open_shard_at(tmp.path(), Some(60), Default::default()).await;
+    let ids = enqueue_many(&shard, "job", 2).await;
+    let tasks = shard
+        .dequeue("worker", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    shard
+        .report_attempt_outcome(
+            tasks[0].attempt().task_id(),
+            AttemptOutcome::Success { result: vec![] },
+        )
+        .await
+        .expect("report");
+    strip_entries(&shard, &ids).await;
+
+    // Plant each job's entry in its own segment, but with an empty value and
+    // no TTL: the scheduled job's entry lacks its next-attempt time and the
+    // succeeded job's entry lacks the job record's TTL.
+    for id in &ids {
+        let job = shard
+            .get_job(TENANT, id)
+            .await
+            .expect("get_job")
+            .expect("exists");
+        let stored = stored_status(&shard, id).await;
+        plant_status_entry(
+            shard.db(),
+            ListingSegment::from_status(&stored),
+            job.enqueue_time_ms(),
+            id,
+        )
+        .await;
+    }
+    assert_eq!(status_entries(shard.db()).await.len(), 2);
+
+    let first = run_sweep(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    assert!(first.rows_written > 0, "{first:?}");
+    assert_indexes_match_jobs(&shard).await;
+
+    shard
+        .set_listing_index_version(0)
+        .await
+        .expect("clear marker");
+    let second = run_sweep(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    assert_eq!(second.rows_written, 0, "{second:?}");
+    assert_indexes_match_jobs(&shard).await;
 }

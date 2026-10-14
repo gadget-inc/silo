@@ -539,7 +539,7 @@ async fn scheduled_task_retarget_updates_the_entry_value() {
     );
 }
 
-#[test]
+#[silo::test]
 fn segment_derives_from_status_kind_and_attempt() {
     let cases = [
         (
@@ -578,7 +578,7 @@ fn segment_derives_from_status_kind_and_attempt() {
     }
 }
 
-#[test]
+#[silo::test]
 fn segment_discriminants_roundtrip_in_declaration_order() {
     for (i, segment) in ListingSegment::ALL.into_iter().enumerate() {
         assert_eq!(segment.as_u8() as usize, i);
@@ -597,5 +597,39 @@ async fn succeeded_entry_carries_the_job_ttl() {
     assert!(
         single_entry_ttl(&shard, "-", "job").await.is_some(),
         "a succeeded job's entry must carry the retention TTL"
+    );
+}
+
+#[silo::test]
+async fn transition_from_a_status_record_without_job_fields_moves_the_entry() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let start = now_ms() + 60_000;
+    enqueue_with(&shard, "-", "job", start, None).await;
+    assert_single_entry(&shard, "-", "job", ListingSegment::ScheduledFirst).await;
+
+    // Replace the stored record with one shaped like a record written
+    // without the job fields, so the transition must read JOB_INFO for them.
+    let stored = stored_status(&shard, "-", "job").await;
+    let without_job_fields = JobStatus::new(
+        stored.kind,
+        stored.changed_at_ms,
+        stored.next_attempt_starts_after_ms,
+        stored.current_attempt,
+    );
+    shard
+        .db()
+        .put(
+            job_status_key("-", "job"),
+            silo::codec::encode_job_status(&without_job_fields),
+        )
+        .await
+        .expect("put status without job fields");
+
+    shard.cancel_job("-", "job").await.expect("cancel");
+
+    let entry = assert_single_entry(&shard, "-", "job", ListingSegment::Cancelled).await;
+    assert_eq!(
+        entry.enqueue_time_ms,
+        stored.enqueue_time_ms.expect("enqueue time")
     );
 }

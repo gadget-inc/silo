@@ -615,6 +615,15 @@ async fn bench_tab_listing(
     bench_bound_query(engine, &label, &query, &params)
         .await
         .print();
+    if version == STATUS_ENQUEUE_TIME_INDEX_VERSION {
+        // The key budget's rejected term counts only keys before the page's
+        // last row, which bounds the walk only when the page fills.
+        assert_eq!(
+            rows.len(),
+            PAGE,
+            "{label}: the dataset must fill the page for the key budget to apply"
+        );
+    }
     let mut detail = format!(
         "rows={} scanned_keys={} lookups={} arms={}",
         rows.len(),

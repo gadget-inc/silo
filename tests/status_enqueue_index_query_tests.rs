@@ -345,7 +345,7 @@ async fn priority_pin_is_recognized_in_every_shape_datafusion_emits() {
 }
 
 #[silo::test]
-async fn version_1_keeps_the_prior_label_and_version_2_plans_no_sort_or_filter() {
+async fn version_1_takes_an_unindexed_path_and_version_2_plans_no_sort_or_filter() {
     let (_tmp, shard) = open_temp_shard().await;
     seed(&shard, 40).await;
     let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
@@ -371,7 +371,7 @@ async fn version_1_keeps_the_prior_label_and_version_2_plans_no_sort_or_filter()
             line.contains("path=JobPairs")
                 || line.contains("path=EnqueueTimeIndex")
                 || line.contains("path=FullScanJoin"),
-            "{query}: version 1 keeps the prior path, got {line}"
+            "{query}: version 1 takes an unindexed path, got {line}"
         );
 
         set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
@@ -1394,4 +1394,84 @@ async fn counter_counts_need_counters_enabled_and_no_limit() {
     let line = plan_line(&engine, limited, &params).await;
     assert!(!line.contains("path=CountFromCounters"), "{line}");
     assert_eq!(count_of(&engine, limited, &params).await, 3);
+}
+
+#[silo::test]
+async fn scheduled_record_without_an_attempt_number_lists_as_a_first_attempt_on_both_versions() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 12).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // Rewrite one future-scheduled job's status record without its attempt
+    // number; its index entry stays in the first-attempt segment.
+    let id = "job-0004";
+    let stored = shard
+        .get_job_status("-", id)
+        .await
+        .expect("get_job_status")
+        .expect("status exists");
+    let mut without_attempt = silo::job::JobStatus::new(
+        stored.kind,
+        stored.changed_at_ms,
+        stored.next_attempt_starts_after_ms,
+        None,
+    );
+    without_attempt.enqueue_time_ms = stored.enqueue_time_ms;
+    without_attempt.priority = stored.priority;
+    shard
+        .db()
+        .put(
+            silo::keys::job_status_key("-", id),
+            silo::codec::encode_job_status(&without_attempt),
+        )
+        .await
+        .expect("put status without attempt number");
+
+    let query = "SELECT id FROM jobs WHERE tenant = $1 AND status_kind = $2 AND current_attempt = 1 ORDER BY enqueue_time_ms DESC, id ASC";
+    let params = [utf8("-"), utf8("Scheduled")];
+    set_version(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
+    let unindexed = ids(&engine, query, &params).await;
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    let indexed = ids(&engine, query, &params).await;
+    assert!(indexed.contains(&id.to_string()), "{indexed:?}");
+    assert_eq!(unindexed, indexed);
+}
+
+#[silo::test]
+async fn conflicting_duplicate_predicates_stay_residual_under_the_listing_strategy() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 24).await;
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    let shapes = [
+        (
+            "status_kind = $2 AND priority = $3 AND priority = $4",
+            vec![utf8("-"), utf8("Failed"), int(5), int(50)],
+        ),
+        (
+            "status_kind = $2 AND current_attempt = 1 AND current_attempt > 1",
+            vec![utf8("-"), utf8("Scheduled")],
+        ),
+        (
+            "tenant = $2 AND status_kind = $3",
+            vec![utf8("-"), utf8("other"), utf8("Failed")],
+        ),
+    ];
+    for (predicate, params) in shapes {
+        let query = format!(
+            "SELECT id FROM jobs WHERE tenant = $1 AND {predicate} ORDER BY enqueue_time_ms DESC, id ASC"
+        );
+        // The planner may fold the contradiction away before the scan; when
+        // the listing strategy is planned, the losing predicate stays a
+        // residual filter above it.
+        let explain = explain_text(&engine, &query, &params).await;
+        if explain.contains("ListingIndex(") {
+            assert!(explain.contains("FilterExec"), "{query}: {explain}");
+        }
+        assert!(ids(&engine, &query, &params).await.is_empty(), "{query}");
+        set_version(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
+        assert!(ids(&engine, &query, &params).await.is_empty(), "{query}");
+        set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    }
 }

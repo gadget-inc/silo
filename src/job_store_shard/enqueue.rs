@@ -892,8 +892,9 @@ impl JobStoreShard {
 
     /// Update job status with optional row TTL on the new status/index records.
     ///
-    /// When `expire_ts` is `Some`, the new `JOB_STATUS` and `IDX_STATUS_TIME`
-    /// rows are written with a SlateDB TTL expiring at `expire_ts` (epoch ms).
+    /// When `expire_ts` is `Some`, the new `JOB_STATUS`, `IDX_STATUS_TIME`, and
+    /// `IDX_STATUS_ENQUEUE_TIME` rows are written with a SlateDB TTL expiring at
+    /// `expire_ts` (epoch ms).
     /// Used by the terminal-job expiration path; pass `None` everywhere else.
     ///
     /// `job_metric_info` is an optional `JobView` reference supplied by the

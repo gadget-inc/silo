@@ -88,7 +88,9 @@ pub struct GoldenShardMetadata {
     pub cancelled_jobs: Vec<(String, String)>,
     pub succeeded_jobs: Vec<(String, String)>,
     pub scheduled_future_jobs: Vec<(String, String)>,
+    #[serde(default)]
     pub retrying_future_jobs: Vec<(String, String)>,
+    #[serde(default)]
     pub running_jobs: Vec<(String, String)>,
 
     /// Job IDs for far-future scheduled jobs on the expedite tenant.
@@ -330,6 +332,9 @@ pub async fn ensure_golden_shard() -> GoldenShardMetadata {
             "Cached golden shard is generator version {} (current {}); regenerating",
             meta.generator_version, GOLDEN_GENERATOR_VERSION
         ),
+        None if Path::new(GOLDEN_DATA_DIR).exists() => {
+            println!("Golden shard directory has no readable metadata; regenerating")
+        }
         None => {}
     }
 
@@ -361,17 +366,12 @@ async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShar
     let shard = open_shard_for_generation().await;
     let now = now_ms();
 
+    // Known (tenant, job_id) pairs per shape from the deterministic distribution
+    let known = collect_known_job_ids(tenant_sizes);
+
     // Phase 1: Import Zipf-distributed jobs, then lease the Running shape
     import_zipf_jobs(&shard, tenant_sizes, now, total_jobs).await;
-    let running_count = tenant_sizes
-        .iter()
-        .map(|(_, count)| {
-            (0..*count)
-                .filter(|idx| golden_job_shape(*idx) == GoldenJobShape::Running)
-                .count()
-        })
-        .sum();
-    fill_running_jobs(&shard, running_count).await;
+    fill_running_jobs(&shard, known.running.len()).await;
 
     // Phase 2: Create far-future scheduled jobs for expedite benchmarks
     let expedite_job_ids = create_expedite_jobs(&shard, now).await;
@@ -420,9 +420,6 @@ async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShar
         );
         std::fs::remove_dir_all(&wal_path).expect("remove WAL directory");
     }
-
-    // Collect known job IDs per status
-    let known = collect_known_job_ids(tenant_sizes);
 
     let metadata = GoldenShardMetadata {
         generator_version: GOLDEN_GENERATOR_VERSION,
