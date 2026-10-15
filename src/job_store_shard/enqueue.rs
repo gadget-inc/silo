@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::codec::{encode_job_info, encode_job_status};
 use crate::concurrency::RequestTicketOutcome;
 use crate::dst_events::{self, DstEvent};
-use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit};
+use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit, ListingSegment};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::counters::{
@@ -20,7 +20,8 @@ use crate::job_store_shard::helpers::{
     retry_on_txn_conflict,
 };
 use crate::keys::{
-    idx_enqueue_time_key, idx_metadata_key, idx_status_time_key, job_info_key, job_status_key,
+    StatusEnqueueTimeIndexValue, idx_enqueue_time_key, idx_metadata_key,
+    idx_status_enqueue_time_key, idx_status_time_key, job_info_key, job_status_key,
     status_index_timestamp, tenant_status_counter_key,
 };
 use crate::retry::RetryPolicy;
@@ -471,7 +472,9 @@ impl JobStoreShard {
         };
 
         // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time
-        let job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
+        let mut job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
+        job_status.enqueue_time_ms = Some(job.enqueue_time_ms);
+        job_status.priority = Some(job.priority);
         let job_status_kind = job_status.kind;
 
         writer.put(job_info_key(tenant, job_id), &job_value)?;
@@ -889,8 +892,9 @@ impl JobStoreShard {
 
     /// Update job status with optional row TTL on the new status/index records.
     ///
-    /// When `expire_ts` is `Some`, the new `JOB_STATUS` and `IDX_STATUS_TIME`
-    /// rows are written with a SlateDB TTL expiring at `expire_ts` (epoch ms).
+    /// When `expire_ts` is `Some`, the new `JOB_STATUS`, `IDX_STATUS_TIME`, and
+    /// `IDX_STATUS_ENQUEUE_TIME` rows are written with a SlateDB TTL expiring at
+    /// `expire_ts` (epoch ms).
     /// Used by the terminal-job expiration path; pass `None` everywhere else.
     ///
     /// `job_metric_info` is an optional `JobView` reference supplied by the
@@ -900,12 +904,16 @@ impl JobStoreShard {
     /// the lookup is on the hot path for callers like dequeue and
     /// `report_attempt_outcome`. Callers without a `JobView` in scope pass
     /// `None` and the helper falls back to reading `JOB_INFO` itself.
+    ///
+    /// The new record carries the job's enqueue time and priority: from the
+    /// previous status record when it has them, else from `job_metric_info`,
+    /// else from the same single `JOB_INFO` read.
     pub(crate) async fn set_job_status_with_index_opts<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
         job_id: &str,
-        new_status: JobStatus,
+        mut new_status: JobStatus,
         expire_ts: Option<i64>,
         job_metric_info: Option<&JobView>,
     ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
@@ -929,20 +937,40 @@ impl JobStoreShard {
         let new_kind = new_status.kind;
         let needs_background_action_counters =
             background_action_queue_counter_transition_is_relevant(old_kind, new_kind);
+        let job_fields_from_old = old_status.as_ref().and_then(JobStatus::job_fields);
+        let loaded_view = if job_metric_info.is_none()
+            && (needs_background_action_counters || job_fields_from_old.is_none())
+        {
+            writer
+                .get(&job_info_key(tenant, job_id))
+                .await?
+                .map(|raw| JobView::new(raw).map_err(|e| JobStoreShardError::Codec(e.to_string())))
+                .transpose()?
+        } else {
+            None
+        };
+        let job_view = job_metric_info.or(loaded_view.as_ref());
+
+        let job_fields = job_fields_from_old
+            .or_else(|| job_view.map(|view| (view.enqueue_time_ms(), view.priority())));
+        (new_status.enqueue_time_ms, new_status.priority) = job_fields.unzip();
+
+        // The entry under the previous status leaves before the new one is
+        // put, so a transition that keeps the same key (Scheduled to
+        // Scheduled) ends with the put winning within the batch.
+        if let (Some(old), Some((enqueue_time_ms, priority))) = (old_status.as_ref(), job_fields) {
+            writer.delete(idx_status_enqueue_time_key(
+                tenant,
+                ListingSegment::from_status(old),
+                priority,
+                enqueue_time_ms,
+                job_id,
+            ))?;
+        }
+
         let derived_metric_info: Option<(String, Vec<(String, String)>)> =
             if needs_background_action_counters {
-                match job_metric_info {
-                    Some(view) => Some((view.task_group().to_string(), view.metadata())),
-                    None => writer
-                        .get(&job_info_key(tenant, job_id))
-                        .await?
-                        .map(|raw| {
-                            JobView::new(raw)
-                                .map(|view| (view.task_group().to_string(), view.metadata()))
-                                .map_err(|e| JobStoreShardError::Codec(e.to_string()))
-                        })
-                        .transpose()?,
-                }
+                job_view.map(|view| (view.task_group().to_string(), view.metadata()))
             } else {
                 None
             };
@@ -1011,6 +1039,23 @@ impl JobStoreShard {
         match expire_ts {
             Some(ets) => writer.put_with_expire(&timek, [], ets)?,
             None => writer.put(&timek, [])?,
+        }
+
+        // The status-segmented enqueue-time entry needs the job fields the
+        // status record carries; a record without them lists nothing.
+        if let Some((enqueue_time_ms, priority)) = new_status.job_fields() {
+            let entry_key = idx_status_enqueue_time_key(
+                tenant,
+                ListingSegment::from_status(&new_status),
+                priority,
+                enqueue_time_ms,
+                job_id,
+            );
+            let entry_value = StatusEnqueueTimeIndexValue::for_status(&new_status).encode();
+            match expire_ts {
+                Some(ets) => writer.put_with_expire(&entry_key, &entry_value, ets)?,
+                None => writer.put(&entry_key, &entry_value)?,
+            }
         }
 
         // Increment tenant status counter for the new status

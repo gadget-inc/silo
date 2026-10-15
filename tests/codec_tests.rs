@@ -103,6 +103,43 @@ fn test_job_status_roundtrip() {
     let decoded = decode_job_status_owned(&encoded).unwrap();
     assert_eq!(decoded.kind, JobStatusKind::Running);
     assert_eq!(decoded.changed_at_ms, 5000i64);
+    assert_eq!(decoded.enqueue_time_ms, None);
+    assert_eq!(decoded.priority, None);
+}
+
+#[silo::test]
+fn job_status_roundtrips_enqueue_time_and_priority() {
+    let mut status = JobStatus::scheduled(5000, 6000, 2);
+    status.enqueue_time_ms = Some(-1_234);
+    status.priority = Some(99);
+    let decoded = decode_job_status_owned(&encode_job_status(&status)).unwrap();
+    assert_eq!(decoded.kind, JobStatusKind::Scheduled);
+    assert_eq!(decoded.next_attempt_starts_after_ms, Some(6000));
+    assert_eq!(decoded.current_attempt, Some(2));
+    assert_eq!(decoded.enqueue_time_ms, Some(-1_234));
+    assert_eq!(decoded.priority, Some(99));
+}
+
+#[silo::test]
+fn job_status_encoded_without_job_fields_decodes_with_both_absent() {
+    use silo::fb::silo::fb;
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let root = fb::JobStatus::create(
+        &mut builder,
+        &fb::JobStatusArgs {
+            kind: fb::JobStatusKind::Failed,
+            changed_at_ms: 7000,
+            next_attempt_starts_after_ms: None,
+            current_attempt: None,
+            ..Default::default()
+        },
+    );
+    builder.finish(root, None);
+    let decoded = decode_job_status_owned(builder.finished_data()).unwrap();
+    assert_eq!(decoded.kind, JobStatusKind::Failed);
+    assert_eq!(decoded.changed_at_ms, 7000);
+    assert_eq!(decoded.enqueue_time_ms, None);
+    assert_eq!(decoded.priority, None);
 }
 
 #[silo::test]

@@ -10,7 +10,7 @@ use std::time::Duration;
 use silo::gubernator::MockGubernatorClient;
 use silo::instrumented_db::InstrumentedDb;
 use silo::job_attempt::AttemptOutcome;
-use silo::job_store_shard::JobStoreShard;
+use silo::job_store_shard::{ENQUEUE_TIME_INDEX_VERSION, JobStoreShard};
 use silo::keys::{
     end_bound, idx_enqueue_time_key, idx_enqueue_time_tenant_prefix, job_info_key,
     parse_enqueue_time_index_key,
@@ -144,7 +144,7 @@ async fn sweep_writes_only_missing_entries_and_reports_counts() {
     assert_eq!(indexed_ids(shard.db()).await.len(), 5);
 
     let result = shard
-        .backfill_enqueue_time_index(3, Duration::ZERO)
+        .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 3, Duration::ZERO)
         .await
         .expect("backfill");
 
@@ -177,7 +177,7 @@ async fn sweep_carries_the_terminal_ttl_of_the_job_it_indexes() {
     strip_entries(&shard, &ids).await;
 
     shard
-        .backfill_enqueue_time_index(100, Duration::ZERO)
+        .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 100, Duration::ZERO)
         .await
         .expect("backfill");
 
@@ -208,12 +208,12 @@ async fn completion_marker_gates_the_sweep_and_survives_reopen() {
     assert!(!shard.enqueue_time_index_complete());
 
     shard
-        .set_enqueue_time_index_complete(true)
+        .set_listing_index_version(ENQUEUE_TIME_INDEX_VERSION)
         .await
         .expect("set marker");
     assert!(shard.enqueue_time_index_complete());
     let result = shard
-        .backfill_enqueue_time_index(100, Duration::ZERO)
+        .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 100, Duration::ZERO)
         .await
         .expect("backfill");
     assert!(result.complete);
@@ -231,12 +231,12 @@ async fn completion_marker_gates_the_sweep_and_survives_reopen() {
     );
 
     shard
-        .set_enqueue_time_index_complete(false)
+        .set_listing_index_version(0)
         .await
         .expect("clear marker");
     assert!(!shard.enqueue_time_index_complete());
     let result = shard
-        .backfill_enqueue_time_index(100, Duration::ZERO)
+        .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 100, Duration::ZERO)
         .await
         .expect("backfill");
     assert_eq!(result.rows_written, 3);
@@ -303,7 +303,7 @@ async fn job_deleted_while_the_sweep_runs_has_no_entry() {
     let sweeper = Arc::clone(&shard);
     let sweep = tokio::spawn(async move {
         sweeper
-            .backfill_enqueue_time_index(1, Duration::from_millis(5))
+            .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 1, Duration::from_millis(5))
             .await
             .expect("backfill")
     });
@@ -335,7 +335,7 @@ async fn job_finishing_while_the_sweep_runs_gets_an_entry_with_its_ttl() {
     let sweeper = Arc::clone(&shard);
     let sweep = tokio::spawn(async move {
         sweeper
-            .backfill_enqueue_time_index(1, Duration::from_millis(5))
+            .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 1, Duration::from_millis(5))
             .await
             .expect("backfill")
     });
@@ -366,7 +366,7 @@ async fn sweep_completes_under_sustained_concurrent_writes() {
     let sweeper = Arc::clone(&shard);
     let sweep = tokio::spawn(async move {
         sweeper
-            .backfill_enqueue_time_index(8, Duration::from_millis(1))
+            .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 8, Duration::from_millis(1))
             .await
             .expect("backfill")
     });
@@ -416,6 +416,7 @@ async fn sweep_completes_under_sustained_concurrent_writes() {
 fn enabled(batch_size: usize, pause_ms: u64) -> EnqueueTimeIndexBackfillConfig {
     EnqueueTimeIndexBackfillConfig {
         enabled: true,
+        status_index: false,
         batch_size,
         pause_ms,
     }
@@ -450,7 +451,7 @@ async fn close_stops_the_sweep_and_it_resumes_from_its_checkpoint_after_reopen()
         "{resumed} entries should survive the close and leave the sweep partial"
     );
     let result = shard
-        .backfill_enqueue_time_index(50, Duration::ZERO)
+        .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 50, Duration::ZERO)
         .await
         .expect("backfill");
     assert!(result.complete);
@@ -535,7 +536,7 @@ async fn split_child_resumes_the_parents_checkpoint_and_indexes_every_in_range_j
         "the parent must stop partway through zzz, got {indexed_by_parent}"
     );
     let result = child
-        .backfill_enqueue_time_index(7, Duration::ZERO)
+        .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 7, Duration::ZERO)
         .await
         .expect("backfill");
     assert!(result.complete, "{result:?}");
@@ -552,7 +553,7 @@ async fn split_child_inherits_a_completed_parent_index() {
     enqueue_many_for(&parent, "aaa", "a", 30).await;
     strip_entries_for(&parent, "zzz", &inside).await;
     let result = parent
-        .backfill_enqueue_time_index(8, Duration::ZERO)
+        .backfill_listing_index(ENQUEUE_TIME_INDEX_VERSION, 8, Duration::ZERO)
         .await
         .expect("backfill");
     assert!(result.complete);
