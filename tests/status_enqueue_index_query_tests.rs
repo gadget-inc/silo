@@ -1528,3 +1528,77 @@ async fn pinned_page_reads_exactly_its_limit_in_keys() {
         );
     }
 }
+
+#[silo::test]
+async fn residual_filters_beside_the_listing_strategy_return_full_pages() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 60).await;
+    seed_scheduled(&shard).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+
+    // A residual on a key-carried column (enqueue_time_ms) keeps the key-only
+    // projection; residuals on task_group and current_attempt need their
+    // columns and hydrate. Each excludes the newest rows the walk would
+    // otherwise fill the page with.
+    let cutoff = now_ms() - 70_000;
+    let shapes: Vec<(String, Vec<ScalarValue>)> = vec![
+        (
+            "status_kind = $2 AND enqueue_time_ms < $3".to_string(),
+            vec![utf8("-"), utf8("Failed"), int(cutoff)],
+        ),
+        (
+            "status_kind IN ($2, $3) AND enqueue_time_ms < $4".to_string(),
+            vec![utf8("-"), utf8("Failed"), utf8("Succeeded"), int(cutoff)],
+        ),
+        (
+            "status_kind = $2 AND priority = $3 AND enqueue_time_ms < $4".to_string(),
+            vec![utf8("-"), utf8("Failed"), int(5), int(cutoff)],
+        ),
+        (
+            "status_kind = $2 AND task_group = $3".to_string(),
+            vec![utf8("-"), utf8("Failed"), utf8("default")],
+        ),
+        (
+            "status_kind = $2 AND current_attempt = 1".to_string(),
+            vec![utf8("-"), utf8("Failed")],
+        ),
+    ];
+    for (predicate, params) in &shapes {
+        for (limit, offset) in [(5_i64, 0_i64), (5, 5), (100, 0)] {
+            let query = format!(
+                "SELECT id FROM jobs WHERE tenant = $1 AND {predicate} ORDER BY enqueue_time_ms DESC, id ASC LIMIT {limit} OFFSET {offset}"
+            );
+            set_version(&shard, ENQUEUE_TIME_INDEX_VERSION).await;
+            let unindexed = ids(&engine, &query, params).await;
+            set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+            let indexed = ids(&engine, &query, params).await;
+            let explain = explain_text(&engine, &query, params).await;
+            assert_eq!(indexed, unindexed, "{query}\n{explain}");
+        }
+    }
+    // Paging the first shape by fives on version 2 reassembles its full
+    // residual-filtered list, which excludes rows and spans several pages.
+    set_version(&shard, STATUS_ENQUEUE_TIME_INDEX_VERSION).await;
+    let (predicate, params) = &shapes[0];
+    let listing = |limit: usize, offset: usize| {
+        format!(
+            "SELECT id FROM jobs WHERE tenant = $1 AND {predicate} ORDER BY enqueue_time_ms DESC, id ASC LIMIT {limit} OFFSET {offset}"
+        )
+    };
+    let all = ids(&engine, &listing(100, 0), params).await;
+    let unfiltered = ids(
+        &engine,
+        "SELECT id FROM jobs WHERE tenant = $1 AND status_kind = $2 ORDER BY enqueue_time_ms DESC, id ASC LIMIT 100",
+        &params[..2],
+    )
+    .await;
+    assert!(all.len() > 5 && all.len() < unfiltered.len(), "{all:?}");
+    let mut paged = Vec::new();
+    for offset in (0..all.len()).step_by(5) {
+        paged.extend(ids(&engine, &listing(5, offset), params).await);
+    }
+    assert_eq!(paged, all);
+    let explain = explain_text(&engine, &listing(5, 5), params).await;
+    assert!(explain.contains(LISTING_LABEL), "{explain}");
+    assert!(explain.contains("FilterExec"), "{explain}");
+}
