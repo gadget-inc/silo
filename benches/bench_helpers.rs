@@ -32,6 +32,21 @@ pub const NUM_TENANTS: usize = 300;
 pub const TARGET_TOTAL_JOBS: usize = 500_000;
 pub const BATCH_SIZE: usize = 500;
 
+/// Identifies the dataset this generator writes. A cache whose metadata
+/// carries a different version is deleted and regenerated.
+pub const GOLDEN_GENERATOR_VERSION: u32 = 3;
+
+/// Priorities cycled across the Zipf jobs by job index.
+pub const GOLDEN_PRIORITIES: [u8; 3] = [10, 50, 90];
+
+/// Task group of the Zipf jobs the generator dequeues so they sit Running.
+const RUNNING_TASK_GROUP: &str = "bench-running";
+/// Tasks claimed per dequeue while filling the Running population.
+const RUNNING_DEQUEUE_BATCH: usize = 100;
+/// How far ahead of generation the future Scheduled shapes are due, so a
+/// cache stays on the future side of the clock across many benchmark runs.
+const FUTURE_START_OFFSET_MS: i64 = 86_400_000 * 365;
+
 /// Tenant used for far-future scheduled jobs (expedite benchmarks).
 pub const BENCH_EXPEDITE_TENANT: &str = "bench_expedite";
 /// Number of far-future scheduled jobs to create for expedite benchmarks.
@@ -55,15 +70,28 @@ const METADATA_FILE: &str = "golden-metadata.json";
 /// Persisted metadata about the golden shard, written as JSON.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GoldenShardMetadata {
+    /// The generator version that wrote this cache; absent in a cache
+    /// written without one, which reads as zero and never matches.
+    #[serde(default)]
+    pub generator_version: u32,
     pub total_jobs: usize,
     pub checkpoint_id: Uuid,
 
-    /// Known (tenant, job_id) pairs for each status category from the Zipf data.
+    /// Known (tenant, job_id) pairs for each status category from the Zipf
+    /// data. `waiting_jobs` holds first attempts and retries whose start time
+    /// has passed; `scheduled_future_jobs` holds first attempts and
+    /// `retrying_future_jobs` retries whose start time is a year ahead of
+    /// generation; `running_jobs` were dequeued by the generator and hold a
+    /// lease nothing reaps.
     pub waiting_jobs: Vec<(String, String)>,
     pub failed_jobs: Vec<(String, String)>,
     pub cancelled_jobs: Vec<(String, String)>,
     pub succeeded_jobs: Vec<(String, String)>,
     pub scheduled_future_jobs: Vec<(String, String)>,
+    #[serde(default)]
+    pub retrying_future_jobs: Vec<(String, String)>,
+    #[serde(default)]
+    pub running_jobs: Vec<(String, String)>,
 
     /// Job IDs for far-future scheduled jobs on the expedite tenant.
     pub expedite_job_ids: Vec<String>,
@@ -130,52 +158,119 @@ pub fn metadata_for_job(job_idx: usize) -> Vec<(String, String)> {
     ]
 }
 
-/// Build import params for a single job. Status distribution:
-/// 60% Succeeded, 20% Failed, 10% Cancelled, 7% Waiting (start_at=now), 3% Scheduled (start_at=now+1hr)
-pub fn build_import_params(job_idx: usize, job_id: &str, now: i64) -> ImportJobParams {
-    let bucket = job_idx % 100;
-    let enqueue_time_ms = now - 86_400_000 + (job_idx as i64 * 17);
+/// The state a Zipf job lands in, chosen by its index within the tenant so
+/// every tenant carries every state at the same proportions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoldenJobShape {
+    /// One succeeded attempt.
+    Succeeded,
+    /// One failed attempt with no retries left.
+    Failed,
+    /// One cancelled attempt.
+    Cancelled,
+    /// No attempts, due at generation time.
+    Waiting,
+    /// One failed attempt with a retry due ten seconds after it.
+    WaitingRetry,
+    /// No attempts, due a year after generation.
+    ScheduledFuture,
+    /// One failed attempt with a retry due a year after generation.
+    RetryingFuture,
+    /// No attempts, imported in its own task group and dequeued once every
+    /// import has landed, so it holds a lease at benchmark time.
+    Running,
+}
 
-    let (attempts, start_at_ms) = if bucket < 60 {
-        let attempt = ImportedAttempt {
-            status: ImportedAttemptStatus::Succeeded { result: Vec::new() },
-            started_at_ms: enqueue_time_ms + 100,
-            finished_at_ms: enqueue_time_ms + 5000,
-        };
-        (vec![attempt], enqueue_time_ms)
-    } else if bucket < 80 {
-        let attempt = ImportedAttempt {
-            status: ImportedAttemptStatus::Failed {
-                error_code: "ERR_TIMEOUT".to_string(),
-                error: Vec::new(),
-            },
-            started_at_ms: enqueue_time_ms + 100,
-            finished_at_ms: enqueue_time_ms + 3000,
-        };
-        (vec![attempt], enqueue_time_ms)
-    } else if bucket < 90 {
-        let attempt = ImportedAttempt {
-            status: ImportedAttemptStatus::Cancelled,
-            started_at_ms: enqueue_time_ms + 100,
-            finished_at_ms: enqueue_time_ms + 200,
-        };
-        (vec![attempt], enqueue_time_ms)
-    } else if bucket < 97 {
-        (vec![], now)
-    } else {
-        (vec![], now + 3_600_000)
+/// Shape of the job at `job_idx`: per hundred jobs, 50 Succeeded, 18 Failed,
+/// 8 Cancelled, 8 Waiting, 4 WaitingRetry, 4 ScheduledFuture,
+/// 4 RetryingFuture, and 4 Running.
+pub fn golden_job_shape(job_idx: usize) -> GoldenJobShape {
+    match job_idx % 100 {
+        0..50 => GoldenJobShape::Succeeded,
+        50..68 => GoldenJobShape::Failed,
+        68..76 => GoldenJobShape::Cancelled,
+        76..84 => GoldenJobShape::Waiting,
+        84..88 => GoldenJobShape::WaitingRetry,
+        88..92 => GoldenJobShape::ScheduledFuture,
+        92..96 => GoldenJobShape::RetryingFuture,
+        _ => GoldenJobShape::Running,
+    }
+}
+
+/// Priority of the job at `job_idx`, cycling through [`GOLDEN_PRIORITIES`].
+pub fn golden_job_priority(job_idx: usize) -> u8 {
+    GOLDEN_PRIORITIES[job_idx % GOLDEN_PRIORITIES.len()]
+}
+
+/// A retry policy under which one failed attempt leaves retries remaining.
+fn retrying_policy() -> silo::retry::RetryPolicy {
+    silo::retry::RetryPolicy {
+        retry_count: 3,
+        initial_interval_ms: 10_000,
+        max_interval_ms: 3_600_000,
+        randomize_interval: false,
+        backoff_factor: 2.0,
+    }
+}
+
+/// Build import params for a single job from its [`golden_job_shape`].
+pub fn build_import_params(job_idx: usize, job_id: &str, now: i64) -> ImportJobParams {
+    let enqueue_time_ms = now - 86_400_000 + (job_idx as i64 * 17);
+    let failed_attempt = || ImportedAttempt {
+        status: ImportedAttemptStatus::Failed {
+            error_code: "ERR_TIMEOUT".to_string(),
+            error: Vec::new(),
+        },
+        started_at_ms: enqueue_time_ms + 100,
+        finished_at_ms: enqueue_time_ms + 3000,
+    };
+
+    let mut retry_policy = None;
+    let mut task_group = String::new();
+    let (attempts, start_at_ms) = match golden_job_shape(job_idx) {
+        GoldenJobShape::Succeeded => {
+            let attempt = ImportedAttempt {
+                status: ImportedAttemptStatus::Succeeded { result: Vec::new() },
+                started_at_ms: enqueue_time_ms + 100,
+                finished_at_ms: enqueue_time_ms + 5000,
+            };
+            (vec![attempt], enqueue_time_ms)
+        }
+        GoldenJobShape::Failed => (vec![failed_attempt()], enqueue_time_ms),
+        GoldenJobShape::Cancelled => {
+            let attempt = ImportedAttempt {
+                status: ImportedAttemptStatus::Cancelled,
+                started_at_ms: enqueue_time_ms + 100,
+                finished_at_ms: enqueue_time_ms + 200,
+            };
+            (vec![attempt], enqueue_time_ms)
+        }
+        GoldenJobShape::Waiting => (vec![], now),
+        GoldenJobShape::WaitingRetry => {
+            retry_policy = Some(retrying_policy());
+            (vec![failed_attempt()], enqueue_time_ms + 13_000)
+        }
+        GoldenJobShape::ScheduledFuture => (vec![], now + FUTURE_START_OFFSET_MS),
+        GoldenJobShape::RetryingFuture => {
+            retry_policy = Some(retrying_policy());
+            (vec![failed_attempt()], now + FUTURE_START_OFFSET_MS)
+        }
+        GoldenJobShape::Running => {
+            task_group = RUNNING_TASK_GROUP.to_string();
+            (vec![], enqueue_time_ms)
+        }
     };
 
     ImportJobParams {
         id: job_id.to_string(),
-        priority: 50,
+        priority: golden_job_priority(job_idx),
         enqueue_time_ms,
         start_at_ms,
-        retry_policy: None,
+        retry_policy,
         payload: rmp_serde::to_vec(&serde_json::json!({"idx": job_idx})).unwrap(),
         limits: vec![],
         metadata: Some(metadata_for_job(job_idx)),
-        task_group: String::new(),
+        task_group,
         attempts,
     }
 }
@@ -188,19 +283,16 @@ fn collect_known_job_ids(tenant_sizes: &[(String, usize)]) -> KnownJobIds {
     let mut ids = KnownJobIds::default();
     for (tenant, count) in tenant_sizes {
         for idx in 0..*count {
-            let bucket = idx % 100;
             let job_id = format!("{}-{:08}", tenant, idx);
             let pair = (tenant.clone(), job_id);
-            if bucket < 60 {
-                ids.succeeded.push(pair);
-            } else if bucket < 80 {
-                ids.failed.push(pair);
-            } else if bucket < 90 {
-                ids.cancelled.push(pair);
-            } else if bucket < 97 {
-                ids.waiting.push(pair);
-            } else {
-                ids.scheduled_future.push(pair);
+            match golden_job_shape(idx) {
+                GoldenJobShape::Succeeded => ids.succeeded.push(pair),
+                GoldenJobShape::Failed => ids.failed.push(pair),
+                GoldenJobShape::Cancelled => ids.cancelled.push(pair),
+                GoldenJobShape::Waiting | GoldenJobShape::WaitingRetry => ids.waiting.push(pair),
+                GoldenJobShape::ScheduledFuture => ids.scheduled_future.push(pair),
+                GoldenJobShape::RetryingFuture => ids.retrying_future.push(pair),
+                GoldenJobShape::Running => ids.running.push(pair),
             }
         }
     }
@@ -214,6 +306,8 @@ struct KnownJobIds {
     cancelled: Vec<(String, String)>,
     waiting: Vec<(String, String)>,
     scheduled_future: Vec<(String, String)>,
+    retrying_future: Vec<(String, String)>,
+    running: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,25 +318,66 @@ fn metadata_path() -> PathBuf {
     Path::new(GOLDEN_DATA_DIR).join(METADATA_FILE)
 }
 
-/// Ensure the golden shard exists. Returns metadata for use by benchmarks.
+/// Ensure the golden shard exists at the current generator version. Returns
+/// metadata for use by benchmarks. A cache written by another generator
+/// version, or a directory with no readable metadata, is removed and the
+/// dataset generated from scratch.
 pub async fn ensure_golden_shard() -> GoldenShardMetadata {
-    if let Some(meta) = load_cached_metadata() {
-        println!("Using cached golden shard from {}", GOLDEN_DATA_DIR);
-        return meta;
+    match load_cached_metadata() {
+        Ok(meta) => {
+            println!("Using cached golden shard from {}", GOLDEN_DATA_DIR);
+            return meta;
+        }
+        Err(CacheMiss::Absent) => {}
+        Err(CacheMiss::OtherVersion(version)) => println!(
+            "Cached golden shard is generator version {} (current {}); regenerating",
+            version, GOLDEN_GENERATOR_VERSION
+        ),
+        Err(CacheMiss::Unreadable) => {
+            println!("Golden shard directory has no readable metadata; regenerating")
+        }
     }
 
+    if Path::new(GOLDEN_DATA_DIR).exists() {
+        std::fs::remove_dir_all(GOLDEN_DATA_DIR).expect("remove stale golden data dir");
+    }
     std::fs::create_dir_all(GOLDEN_DATA_DIR).expect("create golden data dir");
     let tenant_sizes = compute_tenant_sizes();
     generate_golden_dataset(&tenant_sizes).await
 }
 
-fn load_cached_metadata() -> Option<GoldenShardMetadata> {
+/// Why the cached golden shard cannot be used as it is.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheMiss {
+    /// No metadata file exists.
+    Absent,
+    /// The metadata file cannot be read or is not a JSON object.
+    Unreadable,
+    /// The metadata was written by this generator version, which is not the
+    /// current one; a file without a version reads as version zero.
+    OtherVersion(u32),
+}
+
+/// The generator version alone, read before the rest of the metadata so a
+/// cache from another version is recognized whatever other fields it lacks.
+#[derive(serde::Deserialize)]
+struct GoldenCacheVersion {
+    #[serde(default)]
+    generator_version: u32,
+}
+
+fn load_cached_metadata() -> Result<GoldenShardMetadata, CacheMiss> {
     let path = metadata_path();
     if !path.exists() {
-        return None;
+        return Err(CacheMiss::Absent);
     }
-    let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let data = std::fs::read_to_string(&path).map_err(|_| CacheMiss::Unreadable)?;
+    let version: GoldenCacheVersion =
+        serde_json::from_str(&data).map_err(|_| CacheMiss::Unreadable)?;
+    if version.generator_version != GOLDEN_GENERATOR_VERSION {
+        return Err(CacheMiss::OtherVersion(version.generator_version));
+    }
+    serde_json::from_str(&data).map_err(|_| CacheMiss::Unreadable)
 }
 
 async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShardMetadata {
@@ -256,8 +391,12 @@ async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShar
     let shard = open_shard_for_generation().await;
     let now = now_ms();
 
-    // Phase 1: Import Zipf-distributed jobs
+    // Known (tenant, job_id) pairs per shape from the deterministic distribution
+    let known = collect_known_job_ids(tenant_sizes);
+
+    // Phase 1: Import Zipf-distributed jobs, then lease the Running shape
     import_zipf_jobs(&shard, tenant_sizes, now, total_jobs).await;
+    fill_running_jobs(&shard, known.running.len()).await;
 
     // Phase 2: Create far-future scheduled jobs for expedite benchmarks
     let expedite_job_ids = create_expedite_jobs(&shard, now).await;
@@ -307,10 +446,8 @@ async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShar
         std::fs::remove_dir_all(&wal_path).expect("remove WAL directory");
     }
 
-    // Collect known job IDs per status
-    let known = collect_known_job_ids(tenant_sizes);
-
     let metadata = GoldenShardMetadata {
+        generator_version: GOLDEN_GENERATOR_VERSION,
         total_jobs,
         checkpoint_id: checkpoint.id,
         waiting_jobs: known.waiting,
@@ -318,6 +455,8 @@ async fn generate_golden_dataset(tenant_sizes: &[(String, usize)]) -> GoldenShar
         cancelled_jobs: known.cancelled,
         succeeded_jobs: known.succeeded,
         scheduled_future_jobs: known.scheduled_future,
+        retrying_future_jobs: known.retrying_future,
+        running_jobs: known.running,
         expedite_job_ids,
         deep_queue_waiter_ids,
         deep_queue_holder_task_ids,
@@ -427,6 +566,42 @@ async fn import_zipf_jobs(
         done,
         elapsed.as_secs_f64(),
         done as f64 / elapsed.as_secs_f64()
+    );
+}
+
+/// Dequeue every job imported into the Running task group so each holds a
+/// lease. The broker fills its buffer for the group between claims, so an
+/// empty claim pauses and retries rather than ending the fill; a fill that
+/// makes no progress for a minute is a generator failure.
+async fn fill_running_jobs(shard: &Arc<JobStoreShard>, expected: usize) {
+    println!("  Leasing {} jobs so they sit Running...", expected);
+    let start = Instant::now();
+    let mut leased = 0usize;
+    let mut idle_since = Instant::now();
+    while leased < expected {
+        let want = std::cmp::min(RUNNING_DEQUEUE_BATCH, expected - leased);
+        let result = shard
+            .dequeue("bench-running-worker", RUNNING_TASK_GROUP, want)
+            .await
+            .expect("dequeue running job");
+        if result.tasks.is_empty() {
+            assert!(
+                idle_since.elapsed() < Duration::from_secs(60),
+                "leased {leased} of {expected} Running jobs, then the {RUNNING_TASK_GROUP} group stayed empty"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        idle_since = Instant::now();
+        leased += result.tasks.len();
+        if leased % 5000 < result.tasks.len() {
+            println!("    Leased {}/{} Running jobs...", leased, expected);
+        }
+    }
+    println!(
+        "  Leased {} Running jobs in {:.1}s",
+        leased,
+        start.elapsed().as_secs_f64()
     );
 }
 

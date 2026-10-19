@@ -192,8 +192,10 @@ impl JobStoreShard {
         // here — so we apply the TTL inline at each put site instead of calling
         // the helper.
         let num_attempts = params.attempts.len() as u32;
-        let (job_status, status_kind, is_terminal) =
+        let (mut job_status, status_kind, is_terminal) =
             determine_import_status(params, num_attempts, now_ms, effective_start_at_ms);
+        job_status.enqueue_time_ms = Some(effective_enqueue_time_ms);
+        job_status.priority = Some(params.priority);
         let terminal_expire_ts: Option<i64> = if is_terminal {
             self.terminal_expire_ts(status_kind, now_ms)
         } else {

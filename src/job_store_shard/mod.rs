@@ -5,7 +5,6 @@ pub(crate) mod counters;
 mod dequeue;
 mod drop_tenant_holders;
 mod enqueue;
-mod enqueue_time_index_backfill;
 mod expedite;
 mod floating;
 pub(crate) mod helpers;
@@ -14,6 +13,7 @@ pub mod import;
 mod lease;
 mod lease_task;
 pub(crate) mod limit_chain;
+mod listing_index_backfill;
 mod orphan_sweep;
 mod rate_limit;
 mod restart;
@@ -21,7 +21,9 @@ pub(crate) mod scan;
 
 pub use cleanup::{CleanupProgress, CleanupResult};
 pub use drop_tenant_holders::DropTenantStats;
-pub use enqueue_time_index_backfill::EnqueueTimeIndexBackfillResult;
+pub use listing_index_backfill::{
+    ENQUEUE_TIME_INDEX_VERSION, ListingIndexBackfillResult, STATUS_ENQUEUE_TIME_INDEX_VERSION,
+};
 
 pub use counters::{
     JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
@@ -43,7 +45,7 @@ use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::Arc;
 #[cfg(feature = "server")]
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -308,9 +310,9 @@ pub struct JobStoreShard {
     pub(crate) refresh_drain_lock: tokio::sync::Mutex<()>,
     /// Settings for the enqueue-time index backfill sweep.
     pub(crate) enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig,
-    /// Whether the enqueue-time index covers every job on this shard. Mirrors
-    /// the persisted completion marker; loaded at open.
-    pub(crate) enqueue_time_index_complete: AtomicBool,
+    /// The highest listing-index version the backfill has completed on this
+    /// shard. Mirrors the persisted completion marker; loaded at open.
+    pub(crate) listing_index_version: AtomicU8,
     /// The background backfill sweep spawned at open, if any; `close` waits
     /// for it to stop at a batch boundary before closing the database.
     pub(crate) enqueue_time_index_backfill_task:
@@ -701,7 +703,7 @@ impl JobStoreShard {
             refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             refresh_drain_lock: tokio::sync::Mutex::new(()),
             enqueue_time_index_backfill,
-            enqueue_time_index_complete: AtomicBool::new(false),
+            listing_index_version: AtomicU8::new(0),
             enqueue_time_index_backfill_task: tokio::sync::Mutex::new(None),
         });
 
@@ -716,10 +718,10 @@ impl JobStoreShard {
             "shard open: warm refresh pending groups"
         );
 
-        // The completion flag gates the query engine's index-served listing
-        // path, so it must reflect the persisted marker before the shard
-        // serves anything.
-        shard.load_enqueue_time_index_complete().await?;
+        // The listing-index version gates the query engine's index-served
+        // listing paths, so it must reflect the persisted marker before the
+        // shard serves anything.
+        shard.load_listing_index_version().await?;
 
         // Install the chain resumer before starting the grant scanner so the
         // scanner's first wake-up has a working callback for resuming limit
@@ -775,9 +777,9 @@ impl JobStoreShard {
             shard.spawn_counter_reconcile_task(range, interval_seconds);
         }
 
-        // Backfill the enqueue-time index for jobs that predate it. A no-op
-        // unless enabled in the database config and not yet complete.
-        shard.spawn_enqueue_time_index_backfill();
+        // Backfill the listing indexes for jobs that predate them. A no-op
+        // unless enabled in the database config and below the target version.
+        shard.spawn_listing_index_backfill();
 
         // Set the shard creation timestamp if this is the first time opening
         let created_at_started = std::time::Instant::now();
@@ -1789,7 +1791,11 @@ impl JobStoreShard {
     ///
     /// Returns an error if the job is currently running (has active leases/holders) or has pending tasks/requests. Jobs must finish or permanently fail before deletion.
     pub async fn delete_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        use crate::keys::{idx_enqueue_time_key, idx_metadata_key};
+        use crate::job::ListingSegment;
+        use crate::keys::{
+            idx_enqueue_time_key, idx_metadata_key, idx_status_enqueue_time_candidate_keys,
+            idx_status_enqueue_time_key,
+        };
         use slatedb::WriteBatch;
 
         // Check if job is running or has pending state
@@ -1821,6 +1827,7 @@ impl JobStoreShard {
         }
         // Clean up metadata and enqueue-time index entries (load job info to
         // enumerate metadata and recover the enqueue time)
+        let mut job_fields = status.as_ref().and_then(JobStatus::job_fields);
         let job_metric_info = if let Some(raw) = self.db.get(&job_info_key_bytes).await? {
             let view = JobView::new(raw)?;
             for (mk, mv) in view.metadata().into_iter() {
@@ -1828,10 +1835,34 @@ impl JobStoreShard {
                 batch.delete(&mkey);
             }
             batch.delete(idx_enqueue_time_key(tenant, view.enqueue_time_ms(), id));
+            job_fields.get_or_insert((view.enqueue_time_ms(), view.priority()));
             Some((view.task_group().to_string(), view.metadata()))
         } else {
             None
         };
+        // The status-segmented entry sits under the stored status; without a
+        // status record it could be in any segment, so every candidate goes.
+        if let Some((enqueue_time_ms, priority)) = job_fields {
+            match status.as_ref() {
+                Some(status) => batch.delete(idx_status_enqueue_time_key(
+                    tenant,
+                    ListingSegment::from_status(status),
+                    priority,
+                    enqueue_time_ms,
+                    id,
+                )),
+                None => {
+                    for key in idx_status_enqueue_time_candidate_keys(
+                        tenant,
+                        priority,
+                        enqueue_time_ms,
+                        id,
+                    ) {
+                        batch.delete(key);
+                    }
+                }
+            }
+        }
         batch.delete(&job_info_key_bytes);
         batch.delete(&job_status_key_bytes);
         // Also delete cancellation record if present

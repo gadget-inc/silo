@@ -845,18 +845,27 @@ fn default_enqueue_time_index_backfill_pause_ms() -> u64 {
     10
 }
 
-/// Settings for the one-shot per-shard sweep that writes the enqueue-time
-/// index entry (`IDX_ENQUEUE_TIME`) for jobs created before the index
-/// existed. The sweep runs once per shard, checkpoints its progress, and
-/// records a completion marker; the query engine serves listings from the
-/// index only on shards whose marker is set.
+/// Settings for the per-shard sweep that backfills the listing indexes for
+/// jobs created before they existed: the enqueue-time index
+/// (`IDX_ENQUEUE_TIME`, version 1) and the status-segmented enqueue-time
+/// index (`IDX_STATUS_ENQUEUE_TIME`, version 2). The sweep checkpoints its
+/// progress and records the version it completed in a marker; the query
+/// engine serves a listing from an index only on shards whose marker is at
+/// or above that index's version.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EnqueueTimeIndexBackfillConfig {
-    /// When true, a shard whose sweep has not completed runs it in the
-    /// background after opening. Defaults to false; enabling it is the
-    /// rollout step for index-served listings.
+    /// When true, a shard whose marker is below the target version runs the
+    /// sweep in the background after opening. Defaults to false; enabling
+    /// it is the rollout step for index-served listings.
     #[serde(default)]
     pub enabled: bool,
+    /// When true, the target version is 2 and the sweep also builds the
+    /// status-segmented index. Defaults to false, which targets version 1.
+    /// Every binary that can own a shard must maintain the status-segmented
+    /// index on each status transition before this is turned on, so the
+    /// rollout is a deploy followed by this flag.
+    #[serde(default)]
+    pub status_index: bool,
     /// Rows the sweep examines per transaction. Defaults to 256.
     #[serde(default = "default_enqueue_time_index_backfill_batch_size")]
     pub batch_size: usize,
@@ -866,10 +875,22 @@ pub struct EnqueueTimeIndexBackfillConfig {
     pub pause_ms: u64,
 }
 
+impl EnqueueTimeIndexBackfillConfig {
+    /// The listing-index version the sweep drives a shard to.
+    pub fn target_version(&self) -> u8 {
+        if self.status_index {
+            crate::job_store_shard::STATUS_ENQUEUE_TIME_INDEX_VERSION
+        } else {
+            crate::job_store_shard::ENQUEUE_TIME_INDEX_VERSION
+        }
+    }
+}
+
 impl Default for EnqueueTimeIndexBackfillConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            status_index: false,
             batch_size: default_enqueue_time_index_backfill_batch_size(),
             pause_ms: default_enqueue_time_index_backfill_pause_ms(),
         }

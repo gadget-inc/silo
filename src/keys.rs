@@ -10,7 +10,7 @@
 
 use storekey::{decode, encode_vec};
 
-use crate::job::{JobStatus, JobStatusKind};
+use crate::job::{JobStatus, JobStatusKind, ListingSegment};
 
 pub mod prefix {
     pub const JOB_INFO: u8 = 0x01;
@@ -26,6 +26,7 @@ pub mod prefix {
     pub const FLOATING_LIMIT: u8 = 0x0B;
     pub const REFRESH_TASK: u8 = 0x0C;
     pub const IDX_ENQUEUE_TIME: u8 = 0x0D;
+    pub const IDX_STATUS_ENQUEUE_TIME: u8 = 0x0E;
     pub const COUNTER_TOTAL_JOBS: u8 = 0xF0;
     pub const COUNTER_COMPLETED_JOBS: u8 = 0xF1;
     pub const CLEANUP_PROGRESS: u8 = 0xF2;
@@ -245,6 +246,134 @@ pub fn parse_enqueue_time_index_key(key: &[u8]) -> Option<ParsedEnqueueTimeIndex
         inverted_enqueue_time,
         job_id,
     })
+}
+
+/// Index: a tenant's jobs by listing segment and priority, each arm ordered
+/// by `enqueue_time_ms` descending, then job id ascending. A job has one
+/// entry, in the segment of its stored status; the value is a
+/// [`StatusEnqueueTimeIndexValue`].
+pub fn idx_status_enqueue_time_key(
+    tenant: &str,
+    segment: ListingSegment,
+    priority: u8,
+    enqueue_time_ms: i64,
+    job_id: &str,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::IDX_STATUS_ENQUEUE_TIME,
+        &(
+            tenant,
+            segment.as_u8(),
+            priority,
+            invert_enqueue_time(enqueue_time_ms),
+            job_id,
+        ),
+    )
+}
+
+/// Prefix covering every segment of a tenant's status-segmented index.
+pub fn idx_status_enqueue_time_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::IDX_STATUS_ENQUEUE_TIME, &(tenant,))
+}
+
+/// Prefix covering every priority arm of one segment.
+pub fn idx_status_enqueue_time_segment_prefix(tenant: &str, segment: ListingSegment) -> Vec<u8> {
+    encode_with_prefix(prefix::IDX_STATUS_ENQUEUE_TIME, &(tenant, segment.as_u8()))
+}
+
+/// Prefix covering one `(segment, priority)` arm, newest enqueue first.
+pub fn idx_status_enqueue_time_priority_prefix(
+    tenant: &str,
+    segment: ListingSegment,
+    priority: u8,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::IDX_STATUS_ENQUEUE_TIME,
+        &(tenant, segment.as_u8(), priority),
+    )
+}
+
+/// The job's key in every segment, in [`ListingSegment::ALL`] order. Enqueue
+/// time and priority are fixed per job, so these are the only keys the job
+/// can ever occupy.
+pub fn idx_status_enqueue_time_candidate_keys(
+    tenant: &str,
+    priority: u8,
+    enqueue_time_ms: i64,
+    job_id: &str,
+) -> [Vec<u8>; 6] {
+    ListingSegment::ALL.map(|segment| {
+        idx_status_enqueue_time_key(tenant, segment, priority, enqueue_time_ms, job_id)
+    })
+}
+
+/// Parsed status-segmented enqueue-time index key components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedStatusEnqueueTimeIndexKey {
+    pub tenant: String,
+    pub segment: ListingSegment,
+    pub priority: u8,
+    pub inverted_enqueue_time: u64,
+    pub job_id: String,
+}
+
+impl ParsedStatusEnqueueTimeIndexKey {
+    /// Get the original enqueue time from the inverted value.
+    pub fn enqueue_time_ms(&self) -> i64 {
+        uninvert_enqueue_time(self.inverted_enqueue_time)
+    }
+}
+
+/// Parse a status-segmented enqueue-time index key back to its components.
+pub fn parse_status_enqueue_time_index_key(key: &[u8]) -> Option<ParsedStatusEnqueueTimeIndexKey> {
+    if key.first() != Some(&prefix::IDX_STATUS_ENQUEUE_TIME) {
+        return None;
+    }
+    let (tenant, segment, priority, inverted_enqueue_time, job_id): (String, u8, u8, u64, String) =
+        decode(&key[1..]).ok()?;
+    Some(ParsedStatusEnqueueTimeIndexKey {
+        tenant,
+        segment: ListingSegment::from_u8(segment)?,
+        priority,
+        inverted_enqueue_time,
+        job_id,
+    })
+}
+
+/// The value stored under a status-segmented enqueue-time index key: the
+/// status record's next-attempt time, present only for the two Scheduled
+/// segments. Encoded as empty when absent, else eight big-endian bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusEnqueueTimeIndexValue {
+    pub next_attempt_starts_after_ms: Option<i64>,
+}
+
+impl StatusEnqueueTimeIndexValue {
+    /// The value a job with `status` lists under: its next-attempt time for
+    /// a Scheduled status, absent otherwise.
+    pub fn for_status(status: &JobStatus) -> Self {
+        Self {
+            next_attempt_starts_after_ms: (status.kind == JobStatusKind::Scheduled)
+                .then_some(status.next_attempt_starts_after_ms)
+                .flatten(),
+        }
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        self.next_attempt_starts_after_ms
+            .map(|ms| ms.to_be_bytes().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn decode(value: &[u8]) -> Option<Self> {
+        let next_attempt_starts_after_ms = match value {
+            [] => None,
+            bytes => Some(i64::from_be_bytes(bytes.try_into().ok()?)),
+        };
+        Some(Self {
+            next_attempt_starts_after_ms,
+        })
+    }
 }
 
 /// Index: jobs by metadata key/value (unsorted within key/value).

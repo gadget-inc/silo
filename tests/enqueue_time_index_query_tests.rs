@@ -10,7 +10,9 @@ use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
-use silo::job_store_shard::JobStoreShard;
+use silo::job_store_shard::{
+    ENQUEUE_TIME_INDEX_VERSION, JobStoreShard, STATUS_ENQUEUE_TIME_INDEX_VERSION,
+};
 use silo::query::ShardQueryEngine;
 use test_helpers::*;
 
@@ -42,9 +44,14 @@ async fn seed(shard: &JobStoreShard, count: usize) {
     }
 }
 
+/// Set the marker to version 2 (both listing indexes complete) or clear it.
 async fn mark_complete(shard: &JobStoreShard, complete: bool) {
     shard
-        .set_enqueue_time_index_complete(complete)
+        .set_listing_index_version(if complete {
+            STATUS_ENQUEUE_TIME_INDEX_VERSION
+        } else {
+            0
+        })
         .await
         .expect("set marker");
 }
@@ -150,10 +157,6 @@ async fn other_shapes_keep_their_path_regardless_of_the_flag() {
         ),
         ("SELECT id, enqueue_time_ms FROM jobs", "path=FullScanJoin"),
         ("SELECT id FROM jobs", "path=StatusIndex"),
-        (
-            "SELECT id FROM jobs WHERE tenant = '-' AND status_kind = 'Waiting'",
-            "path=JobPairs",
-        ),
         (
             "SELECT id FROM jobs WHERE tenant = '-' AND array_contains(element_at(metadata, 'k'), 'v0')",
             "path=JobPairs",
@@ -368,5 +371,32 @@ async fn status_filtered_listings_return_the_same_rows_regardless_of_the_flag() 
 
     assert!(!cleared.is_empty(), "seed includes waiting jobs");
     assert_eq!(set, cleared);
-    assert!(explain_line(&engine, query).await.contains("path=JobPairs"));
+    assert!(
+        explain_line(&engine, query)
+            .await
+            .contains("path=StatusEnqueueTimeIndex"),
+        "the Waiting shape is index-served at version 2"
+    );
+}
+
+/// The enqueue-time path needs only version 1: a shard that completed the
+/// enqueue-time sweep but not the status-segmented one still serves
+/// key-served tenant projections from the index.
+#[silo::test]
+async fn key_served_tenant_projections_take_the_index_path_at_version_1() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard, 6).await;
+    let engine = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("engine");
+    shard
+        .set_listing_index_version(ENQUEUE_TIME_INDEX_VERSION)
+        .await
+        .expect("set marker");
+    assert!(!shard.status_enqueue_time_index_complete());
+
+    let query = "SELECT id, enqueue_time_ms FROM jobs WHERE tenant = '-'";
+    let line = explain_line(&engine, query).await;
+    assert!(
+        line.contains(ENQUEUE_INDEX_LABEL),
+        "{query}: expected the enqueue-index path at version 1, got {line}"
+    );
 }
