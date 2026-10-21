@@ -5,20 +5,23 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, Int64Array, StringArray, UInt8Array, UInt32Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt8Array, UInt32Array, new_null_array,
 };
-use datafusion::arrow::compute::SortOptions;
+use datafusion::arrow::compute::{SortOptions, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session as CatalogSession;
+use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::physical_expr::expressions::col;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr, create_physical_expr};
 use datafusion::physical_plan::display::{DisplayAs, DisplayFormatType};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -936,6 +939,35 @@ fn classify_filter_pushdown(
     Inexact
 }
 
+/// Whether the strategy's scan applies `expr` itself, so the scan need not
+/// re-apply it. Every Exact classification qualifies. So do predicates the
+/// scan applies but reports Inexact so DataFusion re-checks them: the
+/// metadata predicate a tenant-scoped metadata strategy ranges over, and the
+/// id a tenant-less exact-id scan matches while walking every job.
+fn strategy_applies(expr: &Expr, strategy: &JobsScanStrategy) -> bool {
+    if classify_filter_pushdown(expr, strategy) == TableProviderFilterPushDown::Exact {
+        return true;
+    }
+    match strategy {
+        JobsScanStrategy::ExactId { tenant: None, id } => {
+            parse_eq_filter(expr).is_some_and(|(col, val)| col == "id" && *id == val)
+        }
+        JobsScanStrategy::MetadataExact {
+            tenant: Some(_),
+            key,
+            value,
+        } => parse_metadata_eq_filter(expr)
+            .or_else(|| parse_metadata_contains_filter(expr))
+            .is_some_and(|(k, v)| *key == k && *value == v),
+        JobsScanStrategy::MetadataPrefix {
+            tenant: Some(_),
+            key,
+            prefix,
+        } => parse_metadata_prefix_filter(expr).is_some_and(|(k, p)| *key == k && *prefix == p),
+        _ => false,
+    }
+}
+
 /// Whether any filter is a priority or attempt pin. Paths that cannot apply
 /// a pin inside their scan refuse filter sets containing one.
 fn filters_contain_pin(filters: &[Expr]) -> bool {
@@ -1446,6 +1478,67 @@ pub enum JobsScanPath {
 pub struct JobsScanDecision {
     pub strategy: JobsScanStrategy,
     pub path: JobsScanPath,
+    /// The pushed-down predicates the strategy does not answer, re-applied
+    /// inside the scan.
+    pub residual: Option<ResidualFilter>,
+}
+
+/// Pushed-down predicates the chosen strategy does not answer.
+///
+/// DataFusion classifies pushdown per call and keeps the scan's earlier
+/// filters when it pushes more, so a later optimizer pass can hand the
+/// classifier one leftover predicate on its own. A lone status predicate then
+/// parses to a status strategy and reads as Exact, and the Filter above the
+/// scan is removed even though the scan's full filter set plans an id or
+/// metadata lookup that never checks it. The scan therefore re-applies every
+/// predicate its strategy does not answer, whether or not a FilterExec still
+/// sits above it.
+#[derive(Debug, Clone)]
+pub struct ResidualFilter {
+    /// Conjunction of the unanswered predicates, on unqualified columns.
+    predicate: Expr,
+    /// The projection the path scans: the plan's projection widened with
+    /// every column the predicate reads.
+    scan_schema: SchemaRef,
+    /// Indices into `scan_schema` of the plan's projected columns.
+    output: Vec<usize>,
+}
+
+impl ResidualFilter {
+    /// The predicates in `filters` that `strategy` does not answer, with the
+    /// scan projection they need; None when the strategy answers every one.
+    fn new(projection: &SchemaRef, filters: &[Expr], strategy: &JobsScanStrategy) -> Option<Self> {
+        let predicate = filters
+            .iter()
+            .filter(|f| !strategy_applies(f, strategy))
+            .cloned()
+            .reduce(Expr::and)?;
+        let base = JobsScanner::base_schema();
+        let mut fields: Vec<Field> = projection
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let mut referenced: Vec<&str> = predicate
+            .column_refs()
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        referenced.sort_unstable();
+        for name in referenced {
+            if fields.iter().any(|f| f.name() == name) {
+                continue;
+            }
+            if let Ok(field) = base.field_with_name(name) {
+                fields.push(field.clone());
+            }
+        }
+        Some(Self {
+            predicate,
+            scan_schema: Arc::new(Schema::new(fields)),
+            output: (0..projection.fields().len()).collect(),
+        })
+    }
 }
 
 impl ScanPath for JobsScanDecision {
@@ -1485,14 +1578,24 @@ impl JobsScanner {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> JobsScanDecision {
-        let strategy =
-            parse_jobs_scan_strategy_with(filters, self.shard.status_enqueue_time_index_complete());
+        let filters: Vec<Expr> = filters.iter().map(unqualify_columns).collect();
+        let strategy = parse_jobs_scan_strategy_with(
+            &filters,
+            self.shard.status_enqueue_time_index_complete(),
+        );
+        let residual = ResidualFilter::new(projection, &filters, &strategy);
+        // A residual filters rows after the path emits them, so the path scans
+        // the widened projection and cannot stop at the limit itself.
+        let (projection, limit) = match &residual {
+            Some(residual) => (&residual.scan_schema, None),
+            None => (projection, limit),
+        };
         let needs = analyze_projection(projection, &strategy);
         let tenant_full_scan = matches!(&strategy, JobsScanStrategy::FullScan { tenant: Some(_) });
         // Pins are Exact only under the listing-index strategy, whose paths
         // apply them inside the scan; no other key-only path may serve a
         // filter set that carries one.
-        let pinned = filters_contain_pin(filters);
+        let pinned = filters_contain_pin(&filters);
         let counter_served = projection.fields().is_empty()
             && limit.is_none()
             && self.shard.count_from_status_counters
@@ -1519,7 +1622,11 @@ impl JobsScanner {
         } else {
             JobsScanPath::JobPairs
         };
-        JobsScanDecision { strategy, path }
+        JobsScanDecision {
+            strategy,
+            path,
+            residual,
+        }
     }
 }
 
@@ -1554,10 +1661,14 @@ impl Scan for JobsScanner {
 
     fn describe(&self, decision: &ScanDecision, _filters: &[Expr], limit: Option<usize>) -> String {
         let decision = Self::jobs_decision(decision);
-        format!(
+        let mut desc = format!(
             "jobs[{}], limit={:?}, path={:?}",
             decision.strategy, limit, decision.path
-        )
+        );
+        if let Some(residual) = &decision.residual {
+            desc.push_str(&format!(", residual=[{}]", residual.predicate));
+        }
+        desc
     }
 
     fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
@@ -1572,9 +1683,19 @@ impl Scan for JobsScanner {
         batch_size: usize,
         limit: Option<usize>,
     ) -> SendableRecordBatchStream {
-        let JobsScanDecision { strategy, path } = Self::jobs_decision(decision);
+        let JobsScanDecision {
+            strategy,
+            path,
+            residual,
+        } = Self::jobs_decision(decision);
         let shard = Arc::clone(&self.shard);
-        let needs = analyze_projection(&projection, &strategy);
+        // With a residual the path scans the widened projection with no limit;
+        // the residual stream filters, projects back, and stops at the limit.
+        let (scan_projection, scan_limit) = match &residual {
+            Some(residual) => (Arc::clone(&residual.scan_schema), None),
+            None => (Arc::clone(&projection), limit),
+        };
+        let needs = analyze_projection(&scan_projection, &strategy);
 
         // Each branch produces its own lazy `async_stream` generator that owns
         // the underlying scan cursor(s). Because nothing is spawned, dropping the
@@ -1583,46 +1704,51 @@ impl Scan for JobsScanner {
         let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> = match path {
             JobsScanPath::CountFromCounters => Box::pin(count_from_counters_stream(
                 shard,
-                projection.clone(),
+                scan_projection.clone(),
                 strategy,
             )),
             JobsScanPath::EnqueueTimeIndex => Box::pin(enqueue_time_index_stream(
                 shard,
-                projection.clone(),
+                scan_projection.clone(),
                 strategy,
                 batch_size,
-                limit,
+                scan_limit,
             )),
             JobsScanPath::StatusEnqueueTimeIndex => Box::pin(status_enqueue_time_index_stream(
                 shard,
-                projection.clone(),
+                scan_projection.clone(),
                 strategy,
                 batch_size,
-                limit,
+                scan_limit,
             )),
             JobsScanPath::StatusIndex => Box::pin(status_index_stream(
                 shard,
-                projection.clone(),
+                scan_projection.clone(),
                 strategy,
                 batch_size,
-                limit,
+                scan_limit,
             )),
             JobsScanPath::FullScanJoin => Box::pin(fullscan_join_stream(
                 shard,
-                projection.clone(),
+                scan_projection.clone(),
                 needs,
                 strategy,
                 batch_size,
-                limit,
+                scan_limit,
             )),
             JobsScanPath::JobPairs => Box::pin(job_pairs_stream(
                 shard,
-                projection.clone(),
+                scan_projection.clone(),
                 needs,
                 strategy,
                 batch_size,
-                limit,
+                scan_limit,
             )),
+        };
+
+        let inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>> = match residual {
+            Some(residual) => Box::pin(residual_stream(inner, residual, limit)),
+            None => inner,
         };
 
         Box::pin(RecordBatchStreamAdapter::new(projection, inner))
@@ -1639,6 +1765,63 @@ impl JobsScanner {
             .cloned()
             .expect("JobsScanner given another scanner's decision")
     }
+}
+
+/// Re-applies a residual predicate to a path's batches, projects the plan's
+/// columns back out, and stops at the limit.
+fn residual_stream(
+    mut inner: Pin<Box<dyn Stream<Item = DfResult<RecordBatch>> + Send>>,
+    residual: ResidualFilter,
+    limit: Option<usize>,
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    async_stream::try_stream! {
+        let df_schema = DFSchema::try_from(Arc::clone(&residual.scan_schema))?;
+        let predicate =
+            create_physical_expr(&residual.predicate, &df_schema, &ExecutionProps::new())?;
+        let mut remaining = limit;
+        while let Some(batch) = inner.next().await {
+            if remaining == Some(0) {
+                break;
+            }
+            let batch = batch?;
+            let mask = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+            let mask = mask
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "residual predicate {} did not evaluate to a boolean",
+                        residual.predicate
+                    ))
+                })?;
+            let kept = filter_record_batch(&batch, mask)?.project(&residual.output)?;
+            let kept = match remaining {
+                Some(n) if kept.num_rows() > n => kept.slice(0, n),
+                _ => kept,
+            };
+            if let Some(n) = remaining.as_mut() {
+                *n -= kept.num_rows();
+            }
+            if kept.num_rows() > 0 {
+                yield kept;
+            }
+        }
+    }
+}
+
+/// Strip table qualifiers from every column reference in an expression.
+fn unqualify_columns(expr: &Expr) -> Expr {
+    expr.clone()
+        .transform(|e| {
+            Ok(match e {
+                Expr::Column(c) if c.relation.is_some() => Transformed::yes(Expr::Column(
+                    datafusion::common::Column::new_unqualified(c.name),
+                )),
+                other => Transformed::no(other),
+            })
+        })
+        .map(|t| t.data)
+        .unwrap_or_else(|_| expr.clone())
 }
 
 /// Streams a tenant's enqueue-time index newest-first in bounded chunks,

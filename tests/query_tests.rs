@@ -241,6 +241,187 @@ async fn sql_status_and_exact_id() {
     assert_eq!(got, vec![j1]);
 }
 
+/// An exact-id lookup answers only the tenant and id predicates. Every other
+/// conjunct must be re-applied above the scan, so a job in a different state
+/// than the one asked for is not returned.
+#[silo::test]
+async fn sql_exact_id_with_non_matching_status_returns_nothing() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    // j1 is Waiting: a Running equality and a Failed IN-list must both miss.
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind='Running' AND id = 'j1'",
+    )
+    .await;
+    assert_eq!(got, Vec::<String>::new());
+
+    let got = query_ids(
+        &sql,
+        "SELECT id, status_kind FROM jobs WHERE tenant='-' AND status_kind IN ('Failed') AND id = 'j1'",
+    )
+    .await;
+    assert_eq!(got, Vec::<String>::new());
+
+    // A LIMIT between the filter and the scan must not change the answer.
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Failed') AND id = 'j1' LIMIT 1",
+    )
+    .await;
+    assert_eq!(got, Vec::<String>::new());
+
+    // Non-status residuals are re-applied too.
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND priority = 99 AND id = 'j1'",
+    )
+    .await;
+    assert_eq!(got, Vec::<String>::new());
+
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND current_attempt = 7 AND id = 'j1'",
+    )
+    .await;
+    assert_eq!(got, Vec::<String>::new());
+
+    // The matching predicate still finds the job.
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND status_kind IN ('Waiting') AND id = 'j1'",
+    )
+    .await;
+    assert_eq!(got, vec!["j1"]);
+}
+
+/// A metadata lookup answers only the tenant and metadata predicates; a
+/// status predicate beside it is re-applied.
+#[silo::test]
+async fn sql_metadata_with_non_matching_status_returns_nothing() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "m1",
+        10,
+        now,
+        vec![("app".to_string(), "alpha".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    // m1 is Waiting: a Running equality must miss.
+    let query = "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'app'), 'alpha') AND status_kind = 'Running'";
+    let text = sql.explain(query).await.expect("explain");
+    let line = text
+        .lines()
+        .find(|l| l.contains("SiloExecutionPlan:"))
+        .unwrap_or_else(|| panic!("no SiloExecutionPlan line in EXPLAIN:\n{text}"));
+    assert!(line.contains("MetadataExact("), "{text}");
+    assert!(
+        line.contains("residual=[") && line.contains("status_kind"),
+        "{text}"
+    );
+    assert_eq!(query_ids(&sql, query).await, Vec::<String>::new());
+
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'app'), 'alpha') AND status_kind IN ('Failed', 'Succeeded') LIMIT 5",
+    )
+    .await;
+    assert_eq!(got, Vec::<String>::new());
+
+    let got = query_ids(
+        &sql,
+        "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'app'), 'alpha') AND status_kind = 'Waiting'",
+    )
+    .await;
+    assert_eq!(got, vec!["m1"]);
+}
+
+/// The scan line of an exact-id lookup with a status predicate reports that
+/// predicate as a residual the scan re-applies.
+#[silo::test]
+async fn sql_exact_id_with_status_residual_reports_residual() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job(&shard, "j1", 10, now).await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    let text = sql
+        .explain("SELECT id, status_kind FROM jobs WHERE tenant='-' AND status_kind IN ('Failed') AND id = 'j1' LIMIT 1")
+        .await
+        .expect("explain");
+    let line = text
+        .lines()
+        .find(|l| l.contains("SiloExecutionPlan:"))
+        .unwrap_or_else(|| panic!("no SiloExecutionPlan line in EXPLAIN:\n{text}"));
+    assert!(line.contains("ExactId("), "{text}");
+    assert!(
+        line.contains("residual=[") && line.contains("status_kind"),
+        "{text}"
+    );
+
+    // A lookup whose every predicate the strategy answers reports no residual.
+    let text = sql
+        .explain("SELECT id, status_kind FROM jobs WHERE tenant='-' AND id = 'j1'")
+        .await
+        .expect("explain");
+    let line = text
+        .lines()
+        .find(|l| l.contains("SiloExecutionPlan:"))
+        .unwrap_or_else(|| panic!("no SiloExecutionPlan line in EXPLAIN:\n{text}"));
+    assert!(!line.contains("residual="), "{text}");
+}
+
+/// Predicates a strategy applies inside its scan are not residuals, even
+/// when they are classified Inexact so DataFusion re-checks them.
+#[silo::test]
+async fn sql_strategy_applied_predicates_are_not_residual() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let now = now_ms();
+
+    enqueue_job_with_metadata(
+        &shard,
+        "m1",
+        10,
+        now,
+        vec![("app".to_string(), "alpha".to_string())],
+    )
+    .await;
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+    for (query, label) in [
+        (
+            "SELECT id FROM jobs WHERE tenant='-' AND array_contains(element_at(metadata, 'app'), 'alpha') LIMIT 1",
+            "MetadataExact(",
+        ),
+        (
+            "SELECT id FROM jobs WHERE tenant='-' AND starts_with(array_any_value(element_at(metadata, 'app')), 'al') LIMIT 1",
+            "MetadataPrefix(",
+        ),
+        ("SELECT id FROM jobs WHERE id = 'm1'", "ExactId(tenant=None"),
+    ] {
+        let text = sql.explain(query).await.expect("explain");
+        let line = text
+            .lines()
+            .find(|l| l.contains("SiloExecutionPlan:"))
+            .unwrap_or_else(|| panic!("no SiloExecutionPlan line in EXPLAIN:\n{text}"));
+        assert!(line.contains(label), "{query}\n{text}");
+        assert!(!line.contains("residual="), "{query}\n{text}");
+        assert_eq!(query_ids(&sql, query).await, vec!["m1"], "{query}");
+    }
+}
+
 #[silo::test]
 async fn sql_status_and_prefix_id() {
     let (_tmp, shard) = open_temp_shard().await;

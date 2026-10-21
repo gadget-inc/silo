@@ -505,7 +505,7 @@ Silo picks the best scan strategy from your filters in this priority order:
 5. **Status filter** — `WHERE status_kind = '...'` — uses the status/time index
 6. **Full scan** — no indexed filter — scans all jobs for the tenant
 
-Only one index-backed filter is used per query. If you combine filters (e.g., status + metadata), the highest-priority one drives the scan and the rest are applied as post-filters.
+Only one index-backed filter is used per query. If you combine filters (e.g., status + metadata), the highest-priority one drives the scan and the rest are applied as post-filters. The `SiloExecutionPlan` line of `EXPLAIN` lists those post-filters as `residual=[...]`: the scan applies them itself, so the rows it returns match every filter whether or not a `FilterExec` also sits above it.
 
 A full scan is not always a walk over job records. When the query has a `tenant` filter, no other indexed filter, and a projection limited to `shard_id`, `tenant`, `id`, and `enqueue_time_ms`, Silo walks the tenant's enqueue-time index instead, newest first, on any shard whose index backfill has completed. `EXPLAIN` names the path on the `SiloExecutionPlan` line (`path=EnqueueTimeIndex`); the same shape on a shard still being backfilled shows `path=StatusIndex` or `path=FullScanJoin` and returns the same rows.
 
