@@ -111,6 +111,12 @@ pub fn sample(
 /// until the shutdown broadcast fires. Spawned from `main` when metrics are
 /// enabled. The owner-map read is raced against shutdown so a hung
 /// coordination backend cannot delay process exit.
+///
+/// Each coordinator read is also given at most one interval. A read that
+/// never returns would otherwise stop the loop, and every gauge it sets would
+/// keep reporting its last value as current. With the bound, a hung owner-map
+/// read costs only the unassigned gauge for that pass, and a hung owned-shard
+/// read skips the pass with a warning.
 pub async fn run_sampler(
     coordinator: Arc<dyn Coordinator>,
     metrics: Metrics,
@@ -135,15 +141,27 @@ pub async fn run_sampler(
         let owner_map = tokio::select! {
             biased;
             _ = shutdown.recv() => break,
-            result = coordinator.get_shard_owner_map() => match result {
-                Ok(map) => Some(map),
-                Err(e) => {
+            result = tokio::time::timeout(PLACEMENT_SAMPLE_INTERVAL, coordinator.get_shard_owner_map()) => match result {
+                Ok(Ok(map)) => Some(map),
+                Ok(Err(e)) => {
                     warn!(error = %e, "placement metrics sampler: could not read the shard owner map; unassigned gauge not updated this pass");
+                    None
+                }
+                Err(_) => {
+                    warn!(timeout_ms = PLACEMENT_SAMPLE_INTERVAL.as_millis() as u64, "placement metrics sampler: timed out reading the shard owner map; unassigned gauge not updated this pass");
                     None
                 }
             },
         };
-        let owned = coordinator.owned_shards().await;
+        let Ok(owned) =
+            tokio::time::timeout(PLACEMENT_SAMPLE_INTERVAL, coordinator.owned_shards()).await
+        else {
+            warn!(
+                timeout_ms = PLACEMENT_SAMPLE_INTERVAL.as_millis() as u64,
+                "placement metrics sampler: timed out reading the owned shard list; no gauges updated this pass"
+            );
+            continue;
+        };
         previous = sample(&metrics, &owned, owner_map.as_ref(), &previous);
         if let Some(renewed_ms) = coordinator.base().last_membership_renewal_ms() {
             metrics.set_membership_last_renewal_timestamp(renewed_ms);
