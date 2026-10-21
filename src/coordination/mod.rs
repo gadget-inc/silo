@@ -49,6 +49,7 @@ pub mod k8s;
 #[cfg(feature = "k8s")]
 pub mod k8s_backend;
 pub mod none;
+pub mod shard_map_cell;
 pub mod split;
 
 // Re-export the split splitter types and split enums
@@ -64,6 +65,7 @@ pub use k8s_backend::{
     LeaseWatchStream,
 };
 pub use none::NoneCoordinator;
+pub use shard_map_cell::ShardMapCell;
 
 /// Information about a cluster member
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -503,7 +505,8 @@ pub struct CoordinatorBase {
     pub grpc_addr: String,
     /// The shard map defining all shards and their ranges.
     /// This is loaded from the coordination backend or created during cluster init.
-    pub shard_map: Arc<Mutex<ShardMap>>,
+    /// Reads never wait; see [`ShardMapCell`].
+    pub shard_map: Arc<ShardMapCell>,
     pub owned: Arc<Mutex<HashSet<ShardId>>>,
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown_rx: watch::Receiver<bool>,
@@ -541,7 +544,7 @@ impl CoordinatorBase {
         Self {
             node_id: node_id.into(),
             grpc_addr: grpc_addr.into(),
-            shard_map: Arc::new(Mutex::new(shard_map)),
+            shard_map: Arc::new(ShardMapCell::new(shard_map)),
             owned: Arc::new(Mutex::new(HashSet::new())),
             shutdown_tx,
             shutdown_rx,
@@ -559,7 +562,7 @@ impl CoordinatorBase {
     pub fn new_with_shared(
         node_id: impl Into<String>,
         grpc_addr: impl Into<String>,
-        shard_map: Arc<Mutex<ShardMap>>,
+        shard_map: Arc<ShardMapCell>,
         owned: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
     ) -> Self {
@@ -579,19 +582,19 @@ impl CoordinatorBase {
         }
     }
 
-    /// Get the current shard map.
+    /// Get a copy of the current shard map.
     pub async fn get_shard_map(&self) -> ShardMap {
-        self.shard_map.lock().await.clone()
+        ShardMap::clone(&self.shard_map.load())
     }
 
     /// Get the number of shards.
     pub async fn num_shards(&self) -> usize {
-        self.shard_map.lock().await.len()
+        self.shard_map.load().len()
     }
 
     /// Get all shard IDs from the shard map.
     pub async fn shard_ids(&self) -> Vec<ShardId> {
-        self.shard_map.lock().await.shard_ids()
+        self.shard_map.load().shard_ids()
     }
 
     /// Mark a shard as paused for split (traffic should be rejected with retryable errors).
@@ -656,7 +659,7 @@ impl CoordinatorBase {
             .map(|m| (m.node_id.clone(), m.grpc_addr.clone()))
             .collect();
 
-        let shard_map = self.shard_map.lock().await.clone();
+        let shard_map = ShardMap::clone(&self.shard_map.load());
         let mut shard_to_addr = HashMap::new();
         let mut shard_to_node = HashMap::new();
 
@@ -702,11 +705,10 @@ impl CoordinatorBase {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let shard_map = self.shard_map.lock().await;
+            let shard_map = self.shard_map.load();
             let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
             let desired: HashSet<ShardId> =
                 compute_desired_shards_for_node(&shards, &self.node_id, &members);
-            drop(shard_map);
             let guard = self.owned.lock().await;
             if *guard == desired {
                 return true;
@@ -717,11 +719,10 @@ impl CoordinatorBase {
 
         // Log diff on timeout
         if let Ok(members) = get_members().await {
-            let shard_map = self.shard_map.lock().await;
+            let shard_map = self.shard_map.load();
             let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
             let desired: HashSet<ShardId> =
                 compute_desired_shards_for_node(&shards, &self.node_id, &members);
-            drop(shard_map);
             let owned_now: HashSet<ShardId> = {
                 let g = self.owned.lock().await;
                 g.clone()
@@ -760,10 +761,9 @@ impl CoordinatorBase {
             return None;
         }
 
-        let shard_map = self.shard_map.lock().await;
+        let shard_map = self.shard_map.load();
         let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
         let desired = compute_desired_shards_for_node(&shards, &self.node_id, members);
-        drop(shard_map);
 
         let mut to_cancel: Vec<ShardId> = guard_shard_ids
             .iter()

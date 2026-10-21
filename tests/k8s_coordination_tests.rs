@@ -30,7 +30,7 @@ use silo::coordination::CoordinationError;
 use silo::coordination::ShardPhase;
 use silo::coordination::k8s::K8sShardGuard;
 use silo::coordination::{
-    Coordinator, K8sBackend, K8sCoordinator, K8sCoordinatorConfig, KubeBackend,
+    Coordinator, K8sBackend, K8sCoordinator, K8sCoordinatorConfig, KubeBackend, ShardMapCell,
 };
 use silo::coordination::{ShardSplitter, SplitPhase};
 use silo::factory::ShardFactory;
@@ -874,7 +874,7 @@ async fn make_k8s_guard(
     // Create a shard map with this shard registered so the guard can look up its range
     let mut shard_map_inner = ShardMap::default();
     shard_map_inner.add_shard(ShardInfo::new(shard_id, ShardRange::full()));
-    let shard_map = Arc::new(Mutex::new(shard_map_inner));
+    let shard_map = Arc::new(ShardMapCell::new(shard_map_inner));
     // Create a NoneCoordinator as a placeholder for split recovery (these tests don't involve splits)
     let none_coord = silo::coordination::NoneCoordinator::new(
         node_id,
@@ -5439,7 +5439,7 @@ async fn make_k8s_guard_with_factory(
     let owned_arc = owned.clone();
     let mut shard_map_inner = ShardMap::default();
     shard_map_inner.add_shard(ShardInfo::new(shard_id, ShardRange::full()));
-    let shard_map = Arc::new(Mutex::new(shard_map_inner));
+    let shard_map = Arc::new(ShardMapCell::new(shard_map_inner));
     let none_coord = silo::coordination::NoneCoordinator::new(
         node_id,
         "http://127.0.0.1:0",
@@ -5783,7 +5783,7 @@ impl<B: K8sBackend> RecoveryNode<B> {
 
         let mut shard_map = ShardMap::default();
         shard_map.add_shard(ShardInfo::new(shard_id, ShardRange::full()));
-        let shard_map = Arc::new(Mutex::new(shard_map));
+        let shard_map = Arc::new(ShardMapCell::new(shard_map));
         let coordinator: Arc<dyn silo::coordination::Coordinator> = Arc::new(
             silo::coordination::NoneCoordinator::new(
                 node_id,

@@ -54,7 +54,7 @@ impl NoneCoordinator {
 
         // In single-node mode, we own all shards immediately - open them all
         {
-            let shard_map = base.shard_map.lock().await;
+            let shard_map = base.shard_map.load();
             let mut owned = base.owned.lock().await;
             for shard_info in shard_map.shards() {
                 let shard = factory
@@ -145,7 +145,7 @@ impl Coordinator for NoneCoordinator {
     }
 
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
-        let shard_map = self.base.shard_map.lock().await;
+        let shard_map = self.base.shard_map.load();
 
         // All shards owned by this node
         let mut shard_to_addr = HashMap::new();
@@ -157,7 +157,7 @@ impl Coordinator for NoneCoordinator {
         }
 
         Ok(ShardOwnerMap {
-            shard_map: shard_map.clone(),
+            shard_map: ShardMap::clone(&shard_map),
             shard_to_addr,
             shard_to_node,
         })
@@ -181,18 +181,18 @@ impl Coordinator for NoneCoordinator {
         shard_id: &ShardId,
         ring: Option<&str>,
     ) -> Result<(Option<String>, Option<String>), CoordinationError> {
-        let mut shard_map = self.base.shard_map.lock().await;
+        self.base.shard_map.update(|shard_map| {
+            // Find and update the shard
+            let shard = shard_map
+                .get_shard_mut(shard_id)
+                .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
 
-        // Find and update the shard
-        let shard = shard_map
-            .get_shard_mut(shard_id)
-            .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
+            let previous = shard.placement_ring.clone();
+            let current = ring.map(|s| s.to_string());
+            shard.placement_ring = current.clone();
 
-        let previous = shard.placement_ring.clone();
-        let current = ring.map(|s| s.to_string());
-        shard.placement_ring = current.clone();
-
-        Ok((previous, current))
+            Ok((previous, current))
+        })
     }
 }
 
