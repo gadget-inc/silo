@@ -145,9 +145,6 @@ pub async fn run_sampler(
         };
         let owned = coordinator.owned_shards().await;
         previous = sample(&metrics, &owned, owner_map.as_ref(), &previous);
-        if let Some(renewed_ms) = coordinator.base().last_membership_renewal_ms() {
-            metrics.set_membership_last_renewal_timestamp(renewed_ms);
-        }
     }
 
     debug!("placement metrics sampler shutting down");
