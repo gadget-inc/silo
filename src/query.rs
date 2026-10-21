@@ -939,6 +939,35 @@ fn classify_filter_pushdown(
     Inexact
 }
 
+/// Whether the strategy's scan applies `expr` itself, so the scan need not
+/// re-apply it. Every Exact classification qualifies. So do predicates the
+/// scan applies but reports Inexact so DataFusion re-checks them: the
+/// metadata predicate a tenant-scoped metadata strategy ranges over, and the
+/// id a tenant-less exact-id scan matches while walking every job.
+fn strategy_applies(expr: &Expr, strategy: &JobsScanStrategy) -> bool {
+    if classify_filter_pushdown(expr, strategy) == TableProviderFilterPushDown::Exact {
+        return true;
+    }
+    match strategy {
+        JobsScanStrategy::ExactId { tenant: None, id } => {
+            parse_eq_filter(expr).is_some_and(|(col, val)| col == "id" && *id == val)
+        }
+        JobsScanStrategy::MetadataExact {
+            tenant: Some(_),
+            key,
+            value,
+        } => parse_metadata_eq_filter(expr)
+            .or_else(|| parse_metadata_contains_filter(expr))
+            .is_some_and(|(k, v)| *key == k && *value == v),
+        JobsScanStrategy::MetadataPrefix {
+            tenant: Some(_),
+            key,
+            prefix,
+        } => parse_metadata_prefix_filter(expr).is_some_and(|(k, p)| *key == k && *prefix == p),
+        _ => false,
+    }
+}
+
 /// Whether any filter is a priority or attempt pin. Paths that cannot apply
 /// a pin inside their scan refuse filter sets containing one.
 fn filters_contain_pin(filters: &[Expr]) -> bool {
@@ -1481,9 +1510,7 @@ impl ResidualFilter {
     fn new(projection: &SchemaRef, filters: &[Expr], strategy: &JobsScanStrategy) -> Option<Self> {
         let predicate = filters
             .iter()
-            .filter(|f| {
-                classify_filter_pushdown(f, strategy) == TableProviderFilterPushDown::Inexact
-            })
+            .filter(|f| !strategy_applies(f, strategy))
             .cloned()
             .reduce(Expr::and)?;
         let base = JobsScanner::base_schema();
