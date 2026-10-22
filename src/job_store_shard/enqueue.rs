@@ -20,7 +20,7 @@ use crate::job_store_shard::helpers::{
     retry_on_txn_conflict,
 };
 use crate::keys::{
-    StatusEnqueueTimeIndexValue, idx_enqueue_time_key, idx_metadata_key,
+    MetadataIndexValue, StatusEnqueueTimeIndexValue, idx_enqueue_time_key, idx_metadata_key,
     idx_status_enqueue_time_key, idx_status_time_key, job_info_key, job_status_key,
     status_index_timestamp, tenant_status_counter_key,
 };
@@ -481,9 +481,10 @@ impl JobStoreShard {
         writer.put(idx_enqueue_time_key(tenant, start_at_ms, job_id), [])?;
 
         // Maintain metadata secondary index
+        let metadata_value = MetadataIndexValue::new(job.enqueue_time_ms).encode();
         for (mk, mv) in &job.metadata {
             let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-            writer.put(&mkey, [])?;
+            writer.put(&mkey, &metadata_value)?;
         }
 
         Self::write_job_status_with_index_and_metadata(writer, tenant, job_id, job_status)?;

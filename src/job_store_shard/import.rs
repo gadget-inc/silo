@@ -21,8 +21,8 @@ use crate::job_store_shard::{
     JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
 };
 use crate::keys::{
-    attempt_key, attempt_prefix, concurrency_holder_key, end_bound, idx_enqueue_time_key,
-    idx_metadata_key, job_cancelled_key, job_info_key, job_status_key,
+    MetadataIndexValue, attempt_key, attempt_prefix, concurrency_holder_key, end_bound,
+    idx_enqueue_time_key, idx_metadata_key, job_cancelled_key, job_info_key, job_status_key,
 };
 use crate::retry::{RetryPolicy, retries_exhausted};
 use crate::task::Task;
@@ -223,9 +223,10 @@ impl JobStoreShard {
         )?;
 
         // Write metadata secondary index
+        let metadata_value = MetadataIndexValue::new(effective_enqueue_time_ms).encode();
         for (mk, mv) in &job.metadata {
             let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-            put_with_optional_expire(&txn, &mkey, [], terminal_expire_ts)?;
+            put_with_optional_expire(&txn, &mkey, &metadata_value, terminal_expire_ts)?;
         }
 
         // [SILO-IMP-2] Write imported attempt records (existing statuses unchanged - vacuously true for new import)

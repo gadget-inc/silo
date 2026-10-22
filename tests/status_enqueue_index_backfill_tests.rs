@@ -33,6 +33,7 @@ fn sweep_config(enabled: bool, status_index: bool) -> EnqueueTimeIndexBackfillCo
     EnqueueTimeIndexBackfillConfig {
         enabled,
         status_index,
+        metadata_index: false,
         batch_size: 4,
         pause_ms: 0,
     }
@@ -551,6 +552,7 @@ async fn sweep_resumes_a_version_2_checkpoint_after_restart_in_the_jobs_pass() {
         EnqueueTimeIndexBackfillConfig {
             enabled: true,
             status_index: true,
+            metadata_index: false,
             batch_size: 1,
             pause_ms: 20,
         },

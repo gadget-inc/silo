@@ -417,6 +417,7 @@ fn enabled(batch_size: usize, pause_ms: u64) -> EnqueueTimeIndexBackfillConfig {
     EnqueueTimeIndexBackfillConfig {
         enabled: true,
         status_index: false,
+        metadata_index: false,
         batch_size,
         pause_ms,
     }

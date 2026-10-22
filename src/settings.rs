@@ -847,11 +847,12 @@ fn default_enqueue_time_index_backfill_pause_ms() -> u64 {
 
 /// Settings for the per-shard sweep that backfills the listing indexes for
 /// jobs created before they existed: the enqueue-time index
-/// (`IDX_ENQUEUE_TIME`, version 1) and the status-segmented enqueue-time
-/// index (`IDX_STATUS_ENQUEUE_TIME`, version 2). The sweep checkpoints its
-/// progress and records the version it completed in a marker; the query
-/// engine serves a listing from an index only on shards whose marker is at
-/// or above that index's version.
+/// (`IDX_ENQUEUE_TIME`, version 1), the status-segmented enqueue-time
+/// index (`IDX_STATUS_ENQUEUE_TIME`, version 2), and the enqueue time
+/// carried in each metadata index entry (`IDX_METADATA`, version 3). The
+/// sweep checkpoints its progress and records the version it completed in a
+/// marker; the query engine serves a listing from an index only on shards
+/// whose marker is at or above that index's version.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EnqueueTimeIndexBackfillConfig {
     /// When true, a shard whose marker is below the target version runs the
@@ -866,6 +867,14 @@ pub struct EnqueueTimeIndexBackfillConfig {
     /// rollout is a deploy followed by this flag.
     #[serde(default)]
     pub status_index: bool,
+    /// When true, the target version is 3 and the sweep also writes each
+    /// job's enqueue time into its metadata index entries, so a
+    /// metadata-filtered listing of ids and enqueue times is served from
+    /// the index alone. Implies `status_index`. Defaults to false. Every
+    /// binary that can own a shard must write the enqueue time into new
+    /// metadata entries before this is turned on.
+    #[serde(default)]
+    pub metadata_index: bool,
     /// Rows the sweep examines per transaction. Defaults to 256.
     #[serde(default = "default_enqueue_time_index_backfill_batch_size")]
     pub batch_size: usize,
@@ -878,7 +887,9 @@ pub struct EnqueueTimeIndexBackfillConfig {
 impl EnqueueTimeIndexBackfillConfig {
     /// The listing-index version the sweep drives a shard to.
     pub fn target_version(&self) -> u8 {
-        if self.status_index {
+        if self.metadata_index {
+            crate::job_store_shard::METADATA_ENQUEUE_TIME_INDEX_VERSION
+        } else if self.status_index {
             crate::job_store_shard::STATUS_ENQUEUE_TIME_INDEX_VERSION
         } else {
             crate::job_store_shard::ENQUEUE_TIME_INDEX_VERSION
@@ -891,6 +902,7 @@ impl Default for EnqueueTimeIndexBackfillConfig {
         Self {
             enabled: false,
             status_index: false,
+            metadata_index: false,
             batch_size: default_enqueue_time_index_backfill_batch_size(),
             pause_ms: default_enqueue_time_index_backfill_pause_ms(),
         }
