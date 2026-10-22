@@ -889,6 +889,33 @@ fn classify_filter_pushdown(
             _ => Inexact,
         };
     }
+    // A tenant-scoped metadata filter is answered by the index range its
+    // strategy walks: an entry exists for every (key, value) pair a job
+    // carries, so membership and prefix tests on the index are the predicate
+    // itself. Without a tenant the strategy walks every job record and the
+    // predicate stays a post-filter.
+    if let Some((k, v)) =
+        parse_metadata_eq_filter(expr).or_else(|| parse_metadata_contains_filter(expr))
+    {
+        return match strategy {
+            JobsScanStrategy::MetadataExact {
+                tenant: Some(_),
+                key,
+                value,
+            } if *key == k && *value == v => Exact,
+            _ => Inexact,
+        };
+    }
+    if let Some((k, p)) = parse_metadata_prefix_filter(expr) {
+        return match strategy {
+            JobsScanStrategy::MetadataPrefix {
+                tenant: Some(_),
+                key,
+                prefix,
+            } if *key == k && *prefix == p => Exact,
+            _ => Inexact,
+        };
+    }
     if let Some((col, val)) = parse_eq_filter(expr) {
         let col_name = col.rsplit('.').next().unwrap_or(&col);
         return match (col_name, strategy) {
@@ -940,10 +967,9 @@ fn classify_filter_pushdown(
 }
 
 /// Whether the strategy's scan applies `expr` itself, so the scan need not
-/// re-apply it. Every Exact classification qualifies. So do predicates the
-/// scan applies but reports Inexact so DataFusion re-checks them: the
-/// metadata predicate a tenant-scoped metadata strategy ranges over, and the
-/// id a tenant-less exact-id scan matches while walking every job.
+/// re-apply it. Every Exact classification qualifies. So does the id a
+/// tenant-less exact-id scan matches while walking every job, which it
+/// reports Inexact so DataFusion re-checks it.
 fn strategy_applies(expr: &Expr, strategy: &JobsScanStrategy) -> bool {
     if classify_filter_pushdown(expr, strategy) == TableProviderFilterPushDown::Exact {
         return true;
@@ -952,18 +978,6 @@ fn strategy_applies(expr: &Expr, strategy: &JobsScanStrategy) -> bool {
         JobsScanStrategy::ExactId { tenant: None, id } => {
             parse_eq_filter(expr).is_some_and(|(col, val)| col == "id" && *id == val)
         }
-        JobsScanStrategy::MetadataExact {
-            tenant: Some(_),
-            key,
-            value,
-        } => parse_metadata_eq_filter(expr)
-            .or_else(|| parse_metadata_contains_filter(expr))
-            .is_some_and(|(k, v)| *key == k && *value == v),
-        JobsScanStrategy::MetadataPrefix {
-            tenant: Some(_),
-            key,
-            prefix,
-        } => parse_metadata_prefix_filter(expr).is_some_and(|(k, p)| *key == k && *prefix == p),
         _ => false,
     }
 }
@@ -1463,6 +1477,12 @@ pub enum JobsScanPath {
     /// `enqueue_time_ms DESC, id ASC`, with the pins and the clock split
     /// applied inside the scan.
     StatusEnqueueTimeIndex,
+    /// Metadata strategy whose projection needs only columns carried by the
+    /// metadata index entry (or nothing, for a count), on a shard whose
+    /// listing index is at version 3. Walks the strategy's index range with
+    /// no point lookups: the id comes from the key and the enqueue time from
+    /// the value.
+    MetadataIndex,
     /// Scan the status/time index directly, no point lookups: the projection
     /// needs only tenant, id, status_kind, or status_changed_at_ms.
     StatusIndex,
@@ -1560,6 +1580,18 @@ fn projection_served_by_enqueue_time_index(projection: &SchemaRef) -> bool {
         })
 }
 
+/// Whether every projected column is carried by a metadata index entry (the
+/// key holds the tenant and id, the value the enqueue time), or the
+/// projection is empty (a count).
+fn projection_served_by_metadata_index(projection: &SchemaRef) -> bool {
+    projection.fields().iter().all(|f| {
+        matches!(
+            f.name().as_str(),
+            "shard_id" | "tenant" | "id" | "enqueue_time_ms"
+        )
+    })
+}
+
 /// Whether every projected column is carried by the status-segmented
 /// enqueue-time index key, or the projection is empty (a count).
 fn projection_served_by_status_enqueue_time_index(projection: &SchemaRef) -> bool {
@@ -1601,6 +1633,16 @@ impl JobsScanner {
             && self.shard.count_from_status_counters
             && !pinned
             && counter_tally(&strategy).is_some();
+        let tenant_metadata = matches!(
+            &strategy,
+            JobsScanStrategy::MetadataExact {
+                tenant: Some(_),
+                ..
+            } | JobsScanStrategy::MetadataPrefix {
+                tenant: Some(_),
+                ..
+            }
+        );
         let path = if counter_served {
             JobsScanPath::CountFromCounters
         } else if matches!(strategy, JobsScanStrategy::ListingIndex { .. }) {
@@ -1609,6 +1651,12 @@ impl JobsScanner {
             } else {
                 JobsScanPath::JobPairs
             }
+        } else if tenant_metadata
+            && projection_served_by_metadata_index(projection)
+            && self.shard.metadata_enqueue_time_index_complete()
+            && !pinned
+        {
+            JobsScanPath::MetadataIndex
         } else if tenant_full_scan
             && projection_served_by_enqueue_time_index(projection)
             && self.shard.enqueue_time_index_complete()
@@ -1715,6 +1763,13 @@ impl Scan for JobsScanner {
                 scan_limit,
             )),
             JobsScanPath::StatusEnqueueTimeIndex => Box::pin(status_enqueue_time_index_stream(
+                shard,
+                scan_projection.clone(),
+                strategy,
+                batch_size,
+                scan_limit,
+            )),
+            JobsScanPath::MetadataIndex => Box::pin(metadata_index_stream(
                 shard,
                 scan_projection.clone(),
                 strategy,
@@ -1908,6 +1963,102 @@ fn build_enqueue_time_index_batch(
     }
     RecordBatch::try_new(Arc::clone(projection), cols)
         .map_err(|e| DataFusionError::Execution(e.to_string()))
+}
+
+/// Streams the metadata index range a tenant-scoped metadata strategy
+/// selects, in bounded chunks, emitting RecordBatches whose every column
+/// comes from the index key or its value. On a version-3 shard every entry
+/// carries its job's enqueue time and points at a job that exists, so
+/// nothing needs hydrating. An entry whose value lacks the enqueue time is
+/// hydrated by point lookup when the projection needs it, and dropped when
+/// its job is gone.
+fn metadata_index_stream(
+    shard: Arc<JobStoreShard>,
+    projection: SchemaRef,
+    strategy: JobsScanStrategy,
+    batch_size: usize,
+    limit: Option<usize>,
+) -> impl Stream<Item = DfResult<RecordBatch>> {
+    async_stream::try_stream! {
+        let Some(tenant) = strategy_tenant(&strategy).map(str::to_string) else {
+            return; // guarded by the resolver; nothing to emit otherwise
+        };
+        let shard_id = shard.name().to_string();
+        let need_enqueue_time = projection
+            .fields()
+            .iter()
+            .any(|f| f.name() == "enqueue_time_ms");
+        let now_ms = crate::job_store_shard::helpers::now_epoch_ms();
+        let (start, end, extractor) = single_pairs_scan_plan(&strategy, now_ms)?;
+        let mut cursor = shard
+            .open_range_cursor(start, end, &crate::scan_options())
+            .await
+            .map_err(exec_err)?;
+        let mut sent = 0usize;
+        let mut done = false;
+        while !done {
+            if limit.is_some_and(|l| sent >= l) {
+                break;
+            }
+            // The cursor counts every key it pulls, so never pull more than
+            // the LIMIT still needs.
+            let want = limit.map_or(batch_size, |l| batch_size.min(l - sent));
+            let chunk = cursor.next_kv_chunk(want).await.map_err(exec_err)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let mut rows: Vec<(String, String, i64)> = Vec::with_capacity(chunk.len());
+            // Rows whose entry carries no enqueue time, to hydrate.
+            let mut unvalued: Vec<usize> = Vec::new();
+            for kv in &chunk {
+                match extractor(&kv.key) {
+                    ControlFlow::Continue(Some((tenant, job_id))) => {
+                        let enqueue_time_ms = crate::keys::MetadataIndexValue::decode(&kv.value)
+                            .and_then(|v| v.enqueue_time_ms);
+                        if enqueue_time_ms.is_none() && need_enqueue_time {
+                            unvalued.push(rows.len());
+                        }
+                        rows.push((tenant, job_id, enqueue_time_ms.unwrap_or_default()));
+                    }
+                    ControlFlow::Continue(None) => {}
+                    ControlFlow::Break(()) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if !unvalued.is_empty() {
+                let ids: Vec<String> = unvalued.iter().map(|&i| rows[i].1.clone()).collect();
+                if let Some(metrics) = &shard.metrics {
+                    metrics.record_query_point_lookups(shard.name(), ids.len() as u64);
+                }
+                let jobs = shard.get_jobs_batch(&tenant, &ids).await.map_err(exec_err)?;
+                let mut gone: Vec<usize> = Vec::new();
+                for i in unvalued {
+                    match jobs.get(&rows[i].1) {
+                        Some(view) => rows[i].2 = view.enqueue_time_ms(),
+                        None => gone.push(i),
+                    }
+                }
+                for i in gone.into_iter().rev() {
+                    rows.remove(i);
+                }
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            if let Some(l) = limit {
+                rows.truncate(l - sent);
+            }
+            let batch = if projection.fields().is_empty() {
+                make_empty_projection_batch(&projection, rows.len())?
+            } else {
+                build_enqueue_time_index_batch(&projection, &shard_id, &rows)?
+            };
+            sent += batch.num_rows();
+            yield batch;
+        }
+    }
 }
 
 /// One decoded status-segmented enqueue-time index entry.

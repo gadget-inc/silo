@@ -22,7 +22,8 @@ pub(crate) mod scan;
 pub use cleanup::{CleanupProgress, CleanupResult};
 pub use drop_tenant_holders::DropTenantStats;
 pub use listing_index_backfill::{
-    ENQUEUE_TIME_INDEX_VERSION, ListingIndexBackfillResult, STATUS_ENQUEUE_TIME_INDEX_VERSION,
+    ENQUEUE_TIME_INDEX_VERSION, ListingIndexBackfillResult, METADATA_ENQUEUE_TIME_INDEX_VERSION,
+    STATUS_ENQUEUE_TIME_INDEX_VERSION,
 };
 
 pub use counters::{

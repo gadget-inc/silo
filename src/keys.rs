@@ -376,9 +376,42 @@ impl StatusEnqueueTimeIndexValue {
     }
 }
 
-/// Index: jobs by metadata key/value (unsorted within key/value).
+/// Index: jobs by metadata key/value (unsorted within key/value). The value
+/// is a [`MetadataIndexValue`].
 pub fn idx_metadata_key(tenant: &str, key: &str, value: &str, job_id: &str) -> Vec<u8> {
     encode_with_prefix(prefix::IDX_METADATA, &(tenant, key, value, job_id))
+}
+
+/// The value stored under a metadata index key: the job's `enqueue_time_ms`,
+/// so a metadata-filtered listing of ids and enqueue times is answered from
+/// the index alone. Encoded as eight big-endian bytes; an entry written
+/// before the listing index reached version 3 has an empty value and no
+/// enqueue time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataIndexValue {
+    pub enqueue_time_ms: Option<i64>,
+}
+
+impl MetadataIndexValue {
+    pub fn new(enqueue_time_ms: i64) -> Self {
+        Self {
+            enqueue_time_ms: Some(enqueue_time_ms),
+        }
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        self.enqueue_time_ms
+            .map(|ms| ms.to_be_bytes().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn decode(value: &[u8]) -> Option<Self> {
+        let enqueue_time_ms = match value {
+            [] => None,
+            bytes => Some(i64::from_be_bytes(bytes.try_into().ok()?)),
+        };
+        Some(Self { enqueue_time_ms })
+    }
 }
 
 /// Prefix for scanning jobs by metadata key/value.
@@ -390,6 +423,11 @@ pub fn idx_metadata_prefix(tenant: &str, key: &str, value: &str) -> Vec<u8> {
 /// Used as the end boundary for prefix scans over metadata values.
 pub fn idx_metadata_key_only_prefix(tenant: &str, key: &str) -> Vec<u8> {
     encode_with_prefix(prefix::IDX_METADATA, &(tenant, key))
+}
+
+/// Prefix covering every metadata index entry of a tenant.
+pub fn idx_metadata_tenant_prefix(tenant: &str) -> Vec<u8> {
+    encode_with_prefix(prefix::IDX_METADATA, &(tenant,))
 }
 
 /// Parsed metadata index key components.

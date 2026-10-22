@@ -1,9 +1,9 @@
 use silo::job::ListingSegment;
 use silo::keys::{
-    StatusEnqueueTimeIndexValue, attempt_key, attempt_prefix, concurrency_holder_key,
-    concurrency_request_job_prefix, concurrency_request_key, end_bound, floating_limit_state_key,
-    idx_enqueue_time_key, idx_enqueue_time_tenant_prefix, idx_metadata_key,
-    idx_status_enqueue_time_candidate_keys, idx_status_enqueue_time_key,
+    MetadataIndexValue, StatusEnqueueTimeIndexValue, attempt_key, attempt_prefix,
+    concurrency_holder_key, concurrency_request_job_prefix, concurrency_request_key, end_bound,
+    floating_limit_state_key, idx_enqueue_time_key, idx_enqueue_time_tenant_prefix,
+    idx_metadata_key, idx_status_enqueue_time_candidate_keys, idx_status_enqueue_time_key,
     idx_status_enqueue_time_priority_prefix, idx_status_enqueue_time_segment_prefix,
     idx_status_enqueue_time_tenant_prefix, idx_status_time_key, idx_status_time_prefix,
     job_cancelled_key, job_info_key, job_info_prefix, job_status_key, leased_task_key,
@@ -345,6 +345,30 @@ fn test_metadata_index_roundtrip() {
     assert_eq!(parsed.key, "env");
     assert_eq!(parsed.value, "production");
     assert_eq!(parsed.job_id, "job123");
+}
+
+#[test]
+fn metadata_index_value_roundtrips_and_reads_an_empty_value_as_absent() {
+    for enqueue_time_ms in [i64::MIN, -1, 0, 1, 1_700_000_000_000, i64::MAX] {
+        let value = MetadataIndexValue::new(enqueue_time_ms);
+        let encoded = value.encode();
+        assert_eq!(encoded.len(), 8);
+        assert_eq!(MetadataIndexValue::decode(&encoded), Some(value));
+    }
+    assert_eq!(
+        MetadataIndexValue::decode(&[]),
+        Some(MetadataIndexValue {
+            enqueue_time_ms: None
+        })
+    );
+    assert_eq!(
+        MetadataIndexValue {
+            enqueue_time_ms: None
+        }
+        .encode(),
+        Vec::<u8>::new()
+    );
+    assert_eq!(MetadataIndexValue::decode(&[1, 2, 3]), None);
 }
 
 #[test]

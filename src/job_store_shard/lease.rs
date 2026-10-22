@@ -20,9 +20,9 @@ use crate::job_store_shard::{
     JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
 };
 use crate::keys::{
-    ParsedConcurrencyHolderKey, attempt_key, attempt_prefix, concurrency_holder_key,
-    concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key, idx_enqueue_time_key,
-    idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key,
+    MetadataIndexValue, ParsedConcurrencyHolderKey, attempt_key, attempt_prefix,
+    concurrency_holder_key, concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key,
+    idx_enqueue_time_key, idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key,
     parse_concurrency_holder_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
@@ -875,9 +875,10 @@ impl JobStoreShard {
         if let Some(info_raw) = writer.get(&info_key).await? {
             let view = JobView::new(info_raw.clone())?;
             writer.put_with_expire(&info_key, info_raw, expire_ts)?;
+            let metadata_value = MetadataIndexValue::new(view.enqueue_time_ms()).encode();
             for (mk, mv) in &view.metadata() {
                 let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-                writer.put_with_expire(&mkey, [], expire_ts)?;
+                writer.put_with_expire(&mkey, &metadata_value, expire_ts)?;
             }
             let entry_key = idx_enqueue_time_key(tenant, view.enqueue_time_ms(), job_id);
             writer.put_with_expire(&entry_key, [], expire_ts)?;
@@ -919,8 +920,9 @@ impl JobStoreShard {
         };
         let view = JobView::new(info_raw.clone())?;
         writer.put(&info_key, info_raw)?;
+        let metadata_value = MetadataIndexValue::new(view.enqueue_time_ms()).encode();
         for (mk, mv) in &view.metadata() {
-            writer.put(idx_metadata_key(tenant, mk, mv, job_id), [])?;
+            writer.put(idx_metadata_key(tenant, mk, mv, job_id), &metadata_value)?;
         }
         writer.put(
             idx_enqueue_time_key(tenant, view.enqueue_time_ms(), job_id),

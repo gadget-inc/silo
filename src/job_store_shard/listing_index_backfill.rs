@@ -1,6 +1,8 @@
 //! Backfill of the listing indexes for jobs created before they existed:
-//! the enqueue-time index (`IDX_ENQUEUE_TIME`, version 1) and the
-//! status-segmented enqueue-time index (`IDX_STATUS_ENQUEUE_TIME`, version 2).
+//! the enqueue-time index (`IDX_ENQUEUE_TIME`, version 1), the
+//! status-segmented enqueue-time index (`IDX_STATUS_ENQUEUE_TIME`, version
+//! 2), and the enqueue time carried in each metadata index entry's value
+//! (`IDX_METADATA`, version 3).
 //!
 //! A completion marker, mirrored by an in-memory version, records the highest
 //! version the sweep has completed; each query path requires its index's
@@ -11,7 +13,11 @@
 //! passes: the first walks `JOB_INFO`, writes each job's missing enqueue-time
 //! entry, and reconciles its status-segmented entry, placing it under the
 //! job's stored status and removing any entry in another segment; the second
-//! walks both index families and removes entries whose job is gone.
+//! walks both index families and removes entries whose job is gone. The
+//! version-3 sweep's jobs pass also rewrites each of the job's metadata
+//! entries whose value lacks the job's enqueue time or whose TTL differs
+//! from `JOB_INFO`'s, and a third pass walks the metadata index and removes
+//! entries whose job is gone.
 //!
 //! Enumeration runs outside any transaction (a transactional scan would
 //! register the whole range in the read set and abort on every busy tenant);
@@ -39,10 +45,11 @@ use crate::job_store_shard::helpers::{
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, shard_name_jitter_ms};
 use crate::keys::{
-    StatusEnqueueTimeIndexValue, end_bound, enqueue_time_index_backfill_complete_key,
-    enqueue_time_index_backfill_progress_key, idx_enqueue_time_key,
-    idx_status_enqueue_time_candidate_keys, idx_status_enqueue_time_key, job_info_key,
-    job_status_key, jobs_prefix, parse_enqueue_time_index_key, parse_job_info_key,
+    MetadataIndexValue, StatusEnqueueTimeIndexValue, end_bound,
+    enqueue_time_index_backfill_complete_key, enqueue_time_index_backfill_progress_key,
+    idx_enqueue_time_key, idx_metadata_key, idx_status_enqueue_time_candidate_keys,
+    idx_status_enqueue_time_key, job_info_key, job_status_key, jobs_prefix,
+    parse_enqueue_time_index_key, parse_job_info_key, parse_metadata_index_key,
     parse_status_enqueue_time_index_key, prefix,
 };
 
@@ -53,6 +60,11 @@ pub const ENQUEUE_TIME_INDEX_VERSION: u8 = 1;
 /// The listing-index version at which both the enqueue-time index and the
 /// status-segmented enqueue-time index cover every job on the shard.
 pub const STATUS_ENQUEUE_TIME_INDEX_VERSION: u8 = 2;
+
+/// The listing-index version at which, in addition, every metadata index
+/// entry on the shard carries its job's enqueue time and points at a job
+/// that exists.
+pub const METADATA_ENQUEUE_TIME_INDEX_VERSION: u8 = 3;
 
 /// Upper bound on the deterministic delay before a shard's background sweep
 /// starts, so shards opening together do not scan in lockstep.
@@ -72,9 +84,27 @@ enum BackfillPass {
     /// Every in-range `JOB_INFO` row: write the job's entries.
     #[default]
     Jobs,
-    /// Every in-range entry in both index families: remove entries whose
-    /// `JOB_INFO` is gone.
+    /// Every in-range entry in both listing-index families: remove entries
+    /// whose `JOB_INFO` is gone.
     Orphans,
+    /// Every in-range metadata index entry: remove entries whose `JOB_INFO`
+    /// is gone.
+    MetadataOrphans,
+}
+
+impl BackfillPass {
+    /// The pass that follows this one in a sweep to `target_version`, or
+    /// None when the sweep is done.
+    fn next(self, target_version: u8) -> Option<Self> {
+        match self {
+            Self::Jobs => {
+                (target_version >= STATUS_ENQUEUE_TIME_INDEX_VERSION).then_some(Self::Orphans)
+            }
+            Self::Orphans => (target_version >= METADATA_ENQUEUE_TIME_INDEX_VERSION)
+                .then_some(Self::MetadataOrphans),
+            Self::MetadataOrphans => None,
+        }
+    }
 }
 
 /// A checkpoint without a `version` field belongs to the version-1 sweep.
@@ -148,11 +178,20 @@ fn decode_marker_version(value: &[u8]) -> u8 {
 impl JobStoreShard {
     /// The highest listing-index version the backfill has completed on this
     /// shard: 0 before any sweep, [`ENQUEUE_TIME_INDEX_VERSION`] once the
-    /// enqueue-time index covers every job, and
+    /// enqueue-time index covers every job,
     /// [`STATUS_ENQUEUE_TIME_INDEX_VERSION`] once the status-segmented index
-    /// does too.
+    /// does too, and [`METADATA_ENQUEUE_TIME_INDEX_VERSION`] once every
+    /// metadata index entry carries its job's enqueue time as well.
     pub fn listing_index_version(&self) -> u8 {
         self.listing_index_version.load(Ordering::Acquire)
+    }
+
+    /// Whether every metadata index entry on this shard carries its job's
+    /// enqueue time and points at a job that exists, so the query engine may
+    /// serve a metadata-filtered listing of ids and enqueue times from the
+    /// index alone.
+    pub fn metadata_enqueue_time_index_complete(&self) -> bool {
+        self.listing_index_version() >= METADATA_ENQUEUE_TIME_INDEX_VERSION
     }
 
     /// Whether this shard's enqueue-time index covers every job, so the
@@ -258,10 +297,7 @@ impl JobStoreShard {
             }
 
             if batch.exhausted {
-                let next_pass = (progress.pass == BackfillPass::Jobs
-                    && target_version >= STATUS_ENQUEUE_TIME_INDEX_VERSION)
-                    .then_some(BackfillPass::Orphans);
-                match next_pass {
+                match progress.pass.next(target_version) {
                     Some(pass) => {
                         progress.pass = pass;
                         progress.last_key = None;
@@ -382,13 +418,17 @@ impl JobStoreShard {
         progress: &BackfillProgress,
         batch_size: usize,
     ) -> Result<BackfillBatch, JobStoreShardError> {
-        // The two index families have adjacent prefixes, so one walk covers
-        // the enqueue-time family and then the status-segmented family.
+        // The two listing-index families have adjacent prefixes, so one walk
+        // covers the enqueue-time family and then the status-segmented family.
         let (range_start, range_end) = match progress.pass {
             BackfillPass::Jobs => (jobs_prefix(), end_bound(&jobs_prefix())),
             BackfillPass::Orphans => (
                 vec![prefix::IDX_ENQUEUE_TIME],
                 end_bound(&[prefix::IDX_STATUS_ENQUEUE_TIME]),
+            ),
+            BackfillPass::MetadataOrphans => (
+                vec![prefix::IDX_METADATA],
+                end_bound(&[prefix::IDX_METADATA]),
             ),
         };
         let start = match &progress.last_key {
@@ -456,6 +496,9 @@ impl JobStoreShard {
                 }
                 _ => None,
             },
+            BackfillPass::MetadataOrphans => {
+                parse_metadata_index_key(key).map(|p| (p.tenant, p.job_id))
+            }
         }
     }
 
@@ -502,7 +545,9 @@ impl JobStoreShard {
                     self.backfill_job_entries(&txn, progress.version, candidate)
                         .await?
                 }
-                BackfillPass::Orphans => Self::remove_orphan_entry(&txn, candidate).await?,
+                BackfillPass::Orphans | BackfillPass::MetadataOrphans => {
+                    Self::remove_orphan_entry(&txn, candidate).await?
+                }
             };
             if changed {
                 written += 1;
@@ -516,10 +561,13 @@ impl JobStoreShard {
 
     /// Re-read the job's `JOB_INFO` (a row deleted since enumeration is
     /// skipped) and write its missing enqueue-time entry with the job's
-    /// current `expire_ts`. For version 2, also read its `JOB_STATUS` and put
-    /// the status-segmented entry under that status with the same TTL,
-    /// deleting the job's entry in every other segment; a job with no status
-    /// record gets no status-segmented entry in any segment.
+    /// current `expire_ts`. For version 3, also rewrite each of the job's
+    /// metadata entries whose value lacks the job's enqueue time or whose
+    /// TTL differs from `JOB_INFO`'s. For version 2 and above, also read its
+    /// `JOB_STATUS` and put the status-segmented entry under that status
+    /// with the same TTL, deleting the job's entry in every other segment; a
+    /// job with no status record gets no status-segmented entry in any
+    /// segment.
     async fn backfill_job_entries(
         &self,
         txn: &crate::instrumented_db::InstrumentedDbTransaction,
@@ -550,6 +598,20 @@ impl JobStoreShard {
         if txn.get(&entry_key).await?.is_none() {
             put_with_optional_expire(txn, &entry_key, [], info.expire_ts)?;
             changed = true;
+        }
+        if target_version >= METADATA_ENQUEUE_TIME_INDEX_VERSION {
+            let value = MetadataIndexValue::new(view.enqueue_time_ms()).encode();
+            for (mk, mv) in &view.metadata() {
+                let key = idx_metadata_key(tenant, mk, mv, job_id);
+                let current = txn.get_key_value(&key).await?;
+                let up_to_date = current.is_some_and(|row| {
+                    row.value.as_ref() == value.as_slice() && row.expire_ts == info.expire_ts
+                });
+                if !up_to_date {
+                    put_with_optional_expire(txn, &key, &value, info.expire_ts)?;
+                    changed = true;
+                }
+            }
         }
         if target_version < STATUS_ENQUEUE_TIME_INDEX_VERSION {
             return Ok(changed);
