@@ -177,8 +177,8 @@ pub struct Metrics {
     /// Driven by the placement metrics sampler.
     shards_unassigned: GaugeVec,
     coordination_shards_open: Gauge,
-    /// When this node last renewed its membership. Driven by the placement
-    /// metrics sampler.
+    /// When this node last renewed its membership. Set by the coordinator's
+    /// renewal path on each successful renewal.
     membership_last_renewal_timestamp: Gauge,
     broker_buffer_size: GaugeVec,
     broker_inflight_size: GaugeVec,
@@ -2194,14 +2194,11 @@ pub fn init() -> anyhow::Result<Metrics> {
         &registry,
         Gauge::new(
             "silo_coordination_membership_last_renewal_timestamp_seconds",
-            format!(
-                "Unix time of this node's last successful membership lease renewal, 0 until \
-                 one is recorded (never, with no coordination backend). Other nodes drop \
-                 a member whose lease goes a full TTL without a renewal, so \
-                 `time()` minus this value approaching the lease TTL means the node is \
-                 about to lose its membership; sampled every {}s, which bounds staleness",
-                PLACEMENT_SAMPLE_INTERVAL.as_secs()
-            ),
+            "Unix time of this node's last successful membership lease renewal, 0 until \
+             one is recorded (never, with no coordination backend). Other nodes drop \
+             a member whose lease goes a full TTL without a renewal, so \
+             `time()` minus this value approaching the lease TTL means the node is \
+             about to lose its membership; set by each renewal as it succeeds",
         )?,
     );
 
