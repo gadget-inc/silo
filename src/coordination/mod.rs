@@ -166,6 +166,17 @@ pub enum CoordinationError {
     ConnectionFailed(String),
     #[error("backend error: {0}")]
     BackendError(String),
+    /// A compare-and-swap write lost: the object's resourceVersion moved
+    /// since it was read.
+    #[error("CAS conflict: {0}")]
+    Conflict(String),
+    /// A write to an object the backend no longer has.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// A backend call abandoned at its time limit. The call may still have
+    /// taken effect.
+    #[error("{call} timed out after {}ms", .limit.as_millis())]
+    Timeout { call: &'static str, limit: Duration },
     #[error("shutdown in progress")]
     ShuttingDown,
     #[error("not supported by this backend")]

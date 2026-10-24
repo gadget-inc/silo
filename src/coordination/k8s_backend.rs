@@ -213,9 +213,12 @@ impl K8sBackend for KubeBackend {
             .await
         {
             Ok(l) => Ok(l),
-            Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::BackendError(
-                "CAS conflict: resourceVersion mismatch".into(),
+            Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::Conflict(
+                "resourceVersion mismatch".into(),
             )),
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                Err(CoordinationError::NotFound(format!("lease {name}")))
+            }
             Err(e) => Err(CoordinationError::BackendError(e.to_string())),
         }
     }
