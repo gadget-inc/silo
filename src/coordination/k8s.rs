@@ -35,20 +35,27 @@ const K8S_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the membership lease is renewed: a third of its TTL, and at least
 /// once a second.
-fn membership_renew_interval(lease_duration_secs: i32) -> Duration {
+pub fn membership_renew_interval(lease_duration_secs: i32) -> Duration {
     Duration::from_secs((lease_duration_secs / 3).max(1) as u64)
 }
 
-/// Longest one Kubernetes call of a membership renewal may take: one renew
-/// interval, so that a hung call is abandoned in time for later ticks to renew
-/// before the lease expires.
-fn membership_call_timeout(renew_interval: Duration) -> Duration {
-    renew_interval.min(K8S_CALL_TIMEOUT)
+/// Longest one membership renewal may take in total, retries included: one
+/// renew interval, so a renewal that uses its whole budget still ends by the
+/// time the next tick is due and the renewal cadence never slips.
+pub fn membership_renewal_budget(renew_interval: Duration) -> Duration {
+    renew_interval
+}
+
+/// Longest one Kubernetes call of a membership renewal may take: half the
+/// renewal budget, and no more than [`K8S_CALL_TIMEOUT`], so a first call
+/// that times out leaves room to retry it once within the budget.
+pub fn membership_call_timeout(renewal_budget: Duration) -> Duration {
+    (renewal_budget / 2).min(K8S_CALL_TIMEOUT)
 }
 
 /// Bound a Kubernetes call. One that outlives `limit` is abandoned and
-/// reported as an error naming it, so a request that never returns costs its
-/// caller one attempt instead of stalling it.
+/// reported as a [`CoordinationError::Timeout`] naming it, so a request that
+/// never returns costs its caller one attempt instead of stalling it.
 async fn with_k8s_timeout<T>(
     limit: Duration,
     call: &'static str,
@@ -56,11 +63,238 @@ async fn with_k8s_timeout<T>(
 ) -> Result<T, CoordinationError> {
     match tokio::time::timeout(limit, fut).await {
         Ok(result) => result,
-        Err(_) => Err(CoordinationError::BackendError(format!(
-            "{call} timed out after {}ms",
-            limit.as_millis()
-        ))),
+        Err(_) => Err(CoordinationError::Timeout { call, limit }),
     }
+}
+
+/// Renews this node's membership lease.
+///
+/// The renewer keeps the lease as this node last wrote it, so a renewal in
+/// the steady state is one compare-and-swap PUT conditioned on that copy's
+/// resourceVersion: the CAS is what guarantees the write lands on a lease
+/// that nobody else has touched. Only when the PUT is refused as a conflict
+/// or as not found does the renewal read the lease back, check that this
+/// node is still its holder, and write again with the current
+/// resourceVersion.
+///
+/// A renewal runs against a budget. Every call is bounded by the call
+/// timeout and by what is left of the budget, and a first attempt whose call
+/// times out with at least half a call timeout to spare is retried once, so a
+/// single slow Kubernetes call does not cost the renewal.
+pub struct MembershipLeaseRenewer<B: K8sBackend> {
+    backend: B,
+    namespace: String,
+    cluster_prefix: String,
+    lease_name: String,
+    member: MemberInfo,
+    lease_duration_secs: i32,
+    /// The lease as this node last wrote it. `None` makes the next renewal
+    /// read the lease before writing.
+    last_written: Option<Lease>,
+}
+
+/// What one membership renewal did.
+#[derive(Debug)]
+pub struct Renewal {
+    /// How many attempts the renewal made: one, or two after a retry.
+    pub attempts: u32,
+    /// `Ok` once the lease carries this renewal, else why the last attempt
+    /// failed.
+    pub result: Result<(), CoordinationError>,
+}
+
+impl<B: K8sBackend> MembershipLeaseRenewer<B> {
+    pub fn new(
+        backend: B,
+        namespace: String,
+        cluster_prefix: &str,
+        member: MemberInfo,
+        lease_duration_secs: i32,
+    ) -> Self {
+        Self {
+            backend,
+            namespace,
+            cluster_prefix: cluster_prefix.to_string(),
+            lease_name: keys::k8s_member_lease_name(cluster_prefix, &member.node_id),
+            member,
+            lease_duration_secs,
+            last_written: None,
+        }
+    }
+
+    /// Name of the Lease object this renewer maintains.
+    pub fn lease_name(&self) -> &str {
+        &self.lease_name
+    }
+
+    /// Create the membership lease, or take over one left by an earlier run
+    /// of this node, with a forced server-side apply. The applied lease is
+    /// what the first renewal writes against.
+    pub async fn create(&mut self) -> Result<(), CoordinationError> {
+        let now = format_microtime(Utc::now());
+        let lease_spec = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": self.lease_name,
+                "labels": {
+                    "silo.dev/type": "member",
+                    "silo.dev/cluster": self.cluster_prefix,
+                    "silo.dev/node": self.member.node_id
+                },
+                "annotations": {
+                    "silo.dev/member-info": self.member_info_json()?
+                }
+            },
+            "spec": {
+                "holderIdentity": self.member.node_id,
+                "leaseDurationSeconds": self.lease_duration_secs,
+                "acquireTime": now,
+                "renewTime": now
+            }
+        });
+        let applied = self
+            .backend
+            .patch_lease_apply(&self.namespace, &self.lease_name, lease_spec)
+            .await?;
+        self.last_written = Some(applied);
+        Ok(())
+    }
+
+    /// Renew the lease once, within `budget`, giving each Kubernetes call at
+    /// most `call_timeout`.
+    pub async fn renew(&mut self, call_timeout: Duration, budget: Duration) -> Renewal {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let result = self.renew_once(call_timeout, deadline).await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match result {
+                Err(CoordinationError::Timeout { .. })
+                    if attempts == 1 && remaining >= call_timeout / 2 =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    // The write may have landed after it was abandoned, so
+                    // the copy here may be stale: read before the next write.
+                    self.last_written = None;
+                    return Renewal {
+                        attempts,
+                        result: Err(e),
+                    };
+                }
+                Ok(()) => {
+                    return Renewal {
+                        attempts,
+                        result: Ok(()),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn renew_once(
+        &mut self,
+        call_timeout: Duration,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), CoordinationError> {
+        let base = match self.last_written.clone() {
+            Some(lease) => lease,
+            None => self.read_held_lease(call_timeout, deadline).await?,
+        };
+        let written = match self.write_renewal(&base, call_timeout, deadline).await {
+            Ok(written) => written,
+            Err(CoordinationError::Conflict(_)) | Err(CoordinationError::NotFound(_)) => {
+                let current = self.read_held_lease(call_timeout, deadline).await?;
+                self.write_renewal(&current, call_timeout, deadline).await?
+            }
+            Err(e) => return Err(e),
+        };
+        self.last_written = Some(written);
+        Ok(())
+    }
+
+    /// Read the lease and confirm this node still holds it.
+    async fn read_held_lease(
+        &self,
+        call_timeout: Duration,
+        deadline: tokio::time::Instant,
+    ) -> Result<Lease, CoordinationError> {
+        let existing = with_k8s_timeout(
+            call_limit(call_timeout, deadline),
+            "get membership lease",
+            self.backend.get_lease(&self.namespace, &self.lease_name),
+        )
+        .await?
+        .ok_or_else(|| CoordinationError::BackendError("membership lease was deleted".into()))?;
+
+        let holder = existing
+            .spec
+            .as_ref()
+            .and_then(|s| s.holder_identity.as_ref());
+        if holder != Some(&self.member.node_id) {
+            return Err(CoordinationError::BackendError(format!(
+                "we are no longer the membership lease holder (holder={:?})",
+                holder
+            )));
+        }
+        Ok(existing)
+    }
+
+    /// Write the lease with a fresh renewTime, conditioned on `base`'s
+    /// resourceVersion.
+    async fn write_renewal(
+        &self,
+        base: &Lease,
+        call_timeout: Duration,
+        deadline: tokio::time::Instant,
+    ) -> Result<Lease, CoordinationError> {
+        let current_rv = base
+            .metadata
+            .resource_version
+            .clone()
+            .ok_or_else(|| CoordinationError::BackendError("no resourceVersion".into()))?;
+        let updated_lease = Lease {
+            metadata: kube::api::ObjectMeta {
+                name: Some(self.lease_name.clone()),
+                namespace: Some(self.namespace.clone()),
+                resource_version: Some(current_rv),
+                uid: base.metadata.uid.clone(),
+                labels: base.metadata.labels.clone(),
+                annotations: Some(
+                    [("silo.dev/member-info".to_string(), self.member_info_json()?)].into(),
+                ),
+                ..Default::default()
+            },
+            spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
+                holder_identity: Some(self.member.node_id.clone()),
+                lease_duration_seconds: Some(self.lease_duration_secs),
+                acquire_time: base.spec.as_ref().and_then(|s| s.acquire_time.clone()),
+                renew_time: Some(MicroTime(Utc::now())),
+                ..Default::default()
+            }),
+        };
+        with_k8s_timeout(
+            call_limit(call_timeout, deadline),
+            "replace membership lease",
+            self.backend
+                .replace_lease(&self.namespace, &self.lease_name, &updated_lease),
+        )
+        .await
+    }
+
+    fn member_info_json(&self) -> Result<String, CoordinationError> {
+        serde_json::to_string(&self.member)
+            .map_err(|e| CoordinationError::BackendError(e.to_string()))
+    }
+}
+
+/// How long a call may take: the call timeout, or what is left before the
+/// renewal's deadline if that is less.
+fn call_limit(call_timeout: Duration, deadline: tokio::time::Instant) -> Duration {
+    call_timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
 }
 
 /// Configuration for starting a K8sCoordinator
@@ -155,8 +389,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         ));
 
         // Create or update membership lease
-        let member_lease_name = keys::k8s_member_lease_name(&cluster_prefix, &node_id);
-
         let member_info = MemberInfo {
             node_id: node_id.clone(),
             grpc_addr: grpc_addr.clone(),
@@ -164,34 +396,14 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             hostname: get_hostname(),
             placement_rings: placement_rings.clone(),
         };
-        let member_info_json = serde_json::to_string(&member_info)
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        let lease_spec = serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": {
-                "name": member_lease_name,
-                "labels": {
-                    "silo.dev/type": "member",
-                    "silo.dev/cluster": cluster_prefix,
-                    "silo.dev/node": node_id
-                },
-                "annotations": {
-                    "silo.dev/member-info": member_info_json
-                }
-            },
-            "spec": {
-                "holderIdentity": node_id,
-                "leaseDurationSeconds": lease_duration_secs as i32,
-                "acquireTime": format_microtime(Utc::now()),
-                "renewTime": format_microtime(Utc::now())
-            }
-        });
-
-        backend
-            .patch_lease_apply(&namespace, &member_lease_name, lease_spec)
-            .await?;
+        let mut membership_renewer = MembershipLeaseRenewer::new(
+            backend.clone(),
+            namespace.clone(),
+            &cluster_prefix,
+            member_info,
+            lease_duration_secs as i32,
+        );
+        membership_renewer.create().await?;
         base.record_membership_renewal();
 
         let members_cache = Arc::new(Mutex::new(Vec::new()));
@@ -229,7 +441,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
             let membership_renewal_shutdown = me_bg.base.shutdown_rx.clone();
             let _membership_renewal = AbortOnDrop(tokio::spawn(async move {
                 membership_renewal_me
-                    .run_membership_renewal(membership_renewal_shutdown)
+                    .run_membership_renewal(membership_renewer, membership_renewal_shutdown)
                     .await;
             }));
 
@@ -633,12 +845,18 @@ impl<B: K8sBackend> K8sCoordinator<B> {
     /// TTL without a renewal, and shard leases are permanent, so the shards a
     /// dropped node holds are unavailable until it renews again. Renewal
     /// therefore shares nothing with reconciliation: a slow reconcile cannot
-    /// delay it, and each Kubernetes call it makes is bounded well under the
-    /// TTL, so a call that never returns costs one attempt and the next tick
-    /// tries again.
-    async fn run_membership_renewal(&self, mut shutdown_rx: watch::Receiver<bool>) {
+    /// delay it. Each renewal is one Kubernetes write in the steady state,
+    /// bounded well under the TTL and retried once within the renewal's
+    /// budget if it times out, so a slow call costs one attempt rather than
+    /// the renewal, and a renewal that fails leaves the next tick on schedule.
+    async fn run_membership_renewal(
+        &self,
+        mut renewer: MembershipLeaseRenewer<B>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
         let renew_interval = membership_renew_interval(self.lease_duration_secs);
-        let call_timeout = membership_call_timeout(renew_interval);
+        let budget = membership_renewal_budget(renew_interval);
+        let call_timeout = membership_call_timeout(budget);
         let slow_renewal = (renew_interval / 2).min(Duration::from_secs(1));
         let mut renew_timer = tokio::time::interval(renew_interval);
         // After an attempt that overran, renew once and carry on from there
@@ -658,9 +876,9 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                 }
                 _ = renew_timer.tick() => {
                     let started = std::time::Instant::now();
-                    let result = self.renew_membership_lease(call_timeout).await;
+                    let renewal = renewer.renew(call_timeout, budget).await;
                     let elapsed = started.elapsed();
-                    match result {
+                    match renewal.result {
                         Ok(()) => {
                             last_renewed = std::time::Instant::now();
                             self.base.record_membership_renewal();
@@ -668,6 +886,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                 warn!(
                                     node_id = %self.base.node_id,
                                     elapsed_ms = elapsed.as_millis() as u64,
+                                    attempts = renewal.attempts,
                                     lease_ttl_secs = self.lease_duration_secs,
                                     "slow membership lease renewal"
                                 );
@@ -683,6 +902,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                                 node_id = %self.base.node_id,
                                 error = %e,
                                 elapsed_ms = elapsed.as_millis() as u64,
+                                attempts = renewal.attempts,
                                 since_last_renewal_ms = last_renewed.elapsed().as_millis() as u64,
                                 lease_ttl_secs = self.lease_duration_secs,
                                 "failed to renew membership lease"
@@ -829,85 +1049,6 @@ impl<B: K8sBackend> K8sCoordinator<B> {
 
         members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         Ok(members)
-    }
-
-    /// Renew the membership lease.
-    ///
-    /// We verify that we're still the holder before updating, and use CAS to ensure we don't accidentally renew someone else's lease if ours expired.
-    ///
-    /// Each of the two Kubernetes calls is given `call_timeout`.
-    async fn renew_membership_lease(
-        &self,
-        call_timeout: Duration,
-    ) -> Result<(), CoordinationError> {
-        let member_lease_name =
-            keys::k8s_member_lease_name(&self.cluster_prefix, &self.base.node_id);
-
-        // Get current lease to verify we still own it
-        let existing = with_k8s_timeout(
-            call_timeout,
-            "get membership lease",
-            self.backend.get_lease(&self.namespace, &member_lease_name),
-        )
-        .await?
-        .ok_or_else(|| CoordinationError::BackendError("membership lease was deleted".into()))?;
-
-        // Verify we're still the holder
-        let holder = existing
-            .spec
-            .as_ref()
-            .and_then(|s| s.holder_identity.as_ref());
-        if holder != Some(&self.base.node_id) {
-            return Err(CoordinationError::BackendError(format!(
-                "we are no longer the membership lease holder (holder={:?})",
-                holder
-            )));
-        }
-
-        let current_rv = existing
-            .metadata
-            .resource_version
-            .as_ref()
-            .ok_or_else(|| CoordinationError::BackendError("no resourceVersion".into()))?;
-
-        // Build updated lease with CAS
-        let member_info = MemberInfo {
-            node_id: self.base.node_id.clone(),
-            grpc_addr: self.base.grpc_addr.clone(),
-            startup_time_ms: self.base.startup_time_ms,
-            hostname: get_hostname(),
-            placement_rings: self.base.placement_rings.clone(),
-        };
-        let member_info_json = serde_json::to_string(&member_info)
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
-
-        let updated_lease = Lease {
-            metadata: kube::api::ObjectMeta {
-                name: Some(member_lease_name.clone()),
-                namespace: Some(self.namespace.clone()),
-                resource_version: Some(current_rv.clone()),
-                uid: existing.metadata.uid.clone(),
-                labels: existing.metadata.labels.clone(),
-                annotations: Some([("silo.dev/member-info".to_string(), member_info_json)].into()),
-                ..Default::default()
-            },
-            spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
-                holder_identity: Some(self.base.node_id.clone()),
-                lease_duration_seconds: Some(self.lease_duration_secs),
-                acquire_time: existing.spec.as_ref().and_then(|s| s.acquire_time.clone()),
-                renew_time: Some(MicroTime(Utc::now())),
-                ..Default::default()
-            }),
-        };
-
-        with_k8s_timeout(
-            call_timeout,
-            "replace membership lease",
-            self.backend
-                .replace_lease(&self.namespace, &member_lease_name, &updated_lease),
-        )
-        .await?;
-        Ok(())
     }
 
     async fn reconcile_shards(&self) -> Result<(), CoordinationError> {

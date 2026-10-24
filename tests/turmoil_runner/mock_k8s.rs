@@ -396,13 +396,13 @@ impl MockK8sState {
 
         let existing = ns_leases
             .get(name)
-            .ok_or_else(|| CoordinationError::BackendError(format!("lease {} not found", name)))?;
+            .ok_or_else(|| CoordinationError::NotFound(format!("lease {}", name)))?;
 
         // Check resourceVersion for CAS
         if let Some(provided_rv) = &lease.metadata.resource_version {
             if provided_rv != &existing.resource_version {
-                return Err(CoordinationError::BackendError(format!(
-                    "CAS conflict: resourceVersion mismatch (provided {} != current {})",
+                return Err(CoordinationError::Conflict(format!(
+                    "resourceVersion mismatch (provided {} != current {})",
                     provided_rv, existing.resource_version
                 )));
             }
@@ -985,6 +985,7 @@ fn match_configmap_labels(configmap: &StoredConfigMap, selector: Option<&str>) -
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StalledCall {
     GetLease,
+    ReplaceLease,
     ListLeases,
 }
 
@@ -992,7 +993,8 @@ pub enum StalledCall {
 /// run normally, like a request that is stuck and later answered.
 struct CallStall {
     call: StalledCall,
-    /// Substring the lease name (get) or label selector (list) must contain.
+    /// Substring the lease name (get, replace) or label selector (list) must
+    /// contain.
     target: String,
     duration: Duration,
     /// How many more calls may join the stall. `None` is every matching call
@@ -1027,8 +1029,8 @@ impl MockK8sBackend {
 
     /// Make this backend's next matching calls hang for `duration`, measured
     /// from the first call that stalls. `target` is a substring of the lease
-    /// name for [`StalledCall::GetLease`] and of the label selector for
-    /// [`StalledCall::ListLeases`]. `max_calls` bounds how many calls stall;
+    /// name for [`StalledCall::GetLease`] and [`StalledCall::ReplaceLease`],
+    /// and of the label selector for [`StalledCall::ListLeases`]. `max_calls` bounds how many calls stall;
     /// `None` stalls every matching call that starts inside the window.
     pub fn stall_calls(
         &self,
@@ -1104,6 +1106,7 @@ impl K8sBackend for MockK8sBackend {
         name: &str,
         lease: &Lease,
     ) -> Result<Lease, CoordinationError> {
+        self.stall_if_planted(StalledCall::ReplaceLease, name).await;
         let stored = self
             .state
             .replace_lease(namespace, name, lease.clone())

@@ -8,8 +8,8 @@
 //! The scenario runs the stall twice against the same three-node cluster, once
 //! per call the coordinator makes on a timer:
 //!
-//! 1. **renewal read**: the `get_lease` that starts a membership renewal hangs.
-//!    One call hangs and the next one would be answered normally.
+//! 1. **renewal write**: the `replace_lease` that renews the membership lease
+//!    hangs. One call hangs and the next one would be answered normally.
 //! 2. **safety-reconcile list**: `list_leases` of the member leases hangs.
 //!    Every list the node starts inside the window hangs, which includes the
 //!    one the 5s safety reconcile makes.
@@ -111,14 +111,14 @@ fn node_num_of(node_id: &str) -> Option<u32> {
 /// The two timer-driven calls whose hang the scenario replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StallPhase {
-    RenewalRead,
+    RenewalWrite,
     SafetyReconcileList,
 }
 
 impl StallPhase {
     fn name(self) -> &'static str {
         match self {
-            StallPhase::RenewalRead => "renewal get_lease",
+            StallPhase::RenewalWrite => "renewal replace_lease",
             StallPhase::SafetyReconcileList => "safety-reconcile list_leases",
         }
     }
@@ -126,8 +126,8 @@ impl StallPhase {
     /// Plant this phase's hang on the stalled node's Kubernetes client.
     fn plant(self, backend: &MockK8sBackend, stall: Duration) {
         match self {
-            StallPhase::RenewalRead => backend.stall_calls(
-                StalledCall::GetLease,
+            StallPhase::RenewalWrite => backend.stall_calls(
+                StalledCall::ReplaceLease,
                 format!("-member-{}", node_id(STALLED_NODE)),
                 stall,
                 Some(1),
@@ -647,7 +647,7 @@ pub fn run() {
         sim.client("controller", async move {
             let mut prober = Prober::new();
             let mut observations = Vec::new();
-            for phase in [StallPhase::RenewalRead, StallPhase::SafetyReconcileList] {
+            for phase in [StallPhase::RenewalWrite, StallPhase::SafetyReconcileList] {
                 observations.push(
                     run_phase(
                         phase,
