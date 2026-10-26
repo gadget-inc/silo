@@ -1981,3 +1981,94 @@ async fn configure_shard_treats_empty_ring_as_default() -> anyhow::Result<()> {
     shutdown_server(shutdown_tx, server).await?;
     Ok(())
 }
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_import_jobs_reports_running_job_per_job() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(10000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let import_request = |id: &str, attempts: Vec<ImportAttempt>| ImportJobRequest {
+            shard: grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+            id: id.to_string(),
+            priority: 10,
+            enqueue_time_ms: 1_700_000_000_000,
+            start_at_ms: 0,
+            retry_policy: None,
+            payload: Some(SerializedBytes {
+                encoding: Some(serialized_bytes::Encoding::Msgpack(
+                    rmp_serde::to_vec(&serde_json::json!({})).unwrap(),
+                )),
+            }),
+            limits: vec![],
+            tenant: None,
+            metadata: std::collections::HashMap::new(),
+            task_group: "default".to_string(),
+            attempts,
+        };
+        let failed_attempt = ImportAttempt {
+            status: AttemptStatus::Failed as i32,
+            started_at_ms: 1_700_000_000_000,
+            finished_at_ms: 1_700_000_001_000,
+            result: None,
+            error_code: Some("ERR".to_string()),
+            error_data: None,
+        };
+
+        // Import one job and lease it so it is Running
+        let resp = client
+            .import_jobs(ImportJobsRequest {
+                jobs: vec![import_request("grpc-import-running", vec![])],
+            })
+            .await?
+            .into_inner();
+        assert!(resp.results[0].success, "{:?}", resp.results[0].error);
+
+        let leased = client
+            .lease_tasks(LeaseTasksRequest {
+                shard: None,
+                worker_id: "worker-1".to_string(),
+                max_tasks: 1,
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(leased.tasks.len(), 1);
+        assert_eq!(leased.tasks[0].job_id, "grpc-import-running");
+
+        // Reimport a batch holding the Running job and a new one: the call succeeds
+        // and only the Running job's result reports a failure.
+        let resp = client
+            .import_jobs(ImportJobsRequest {
+                jobs: vec![
+                    import_request("grpc-import-running", vec![failed_attempt.clone()]),
+                    import_request("grpc-import-new", vec![failed_attempt]),
+                ],
+            })
+            .await?
+            .into_inner();
+        assert_eq!(resp.results.len(), 2);
+
+        let running = &resp.results[0];
+        assert_eq!(running.id, "grpc-import-running");
+        assert!(!running.success);
+        assert_eq!(running.status, JobStatus::Running as i32);
+        let err = running.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("currently running"),
+            "error should mention 'currently running', got: {err}"
+        );
+
+        let new = &resp.results[1];
+        assert_eq!(new.id, "grpc-import-new");
+        assert!(new.success, "{:?}", new.error);
+        assert_eq!(new.status, JobStatus::Failed as i32);
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
