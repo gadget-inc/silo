@@ -1801,16 +1801,6 @@ impl Silo for SiloService {
                         });
                     }
                 }
-                Err(
-                    e @ JobStoreShardError::JobNotReimportable(
-                        crate::job_store_shard::import::JobNotReimportableError {
-                            status: crate::job::JobStatusKind::Running,
-                            ..
-                        },
-                    ),
-                ) => {
-                    return Err(map_err(e));
-                }
                 Err(e) => {
                     for idx in indices {
                         results[idx] = Some(ImportJobResult {

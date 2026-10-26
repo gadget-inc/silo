@@ -1334,65 +1334,122 @@ async fn reimport_running_job_fails() {
     let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
     assert_eq!(dequeued.tasks.len(), 1);
 
-    // Try reimport while Running — should return an error, not a per-job result
     let mut reimport = base_import_params("reimp-rej-run");
     reimport.attempts = vec![failed_attempt(1_700_000_001_000)];
 
-    let err = shard
-        .import_jobs("-", vec![reimport])
-        .await
-        .expect_err("import should fail when job is running");
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("currently running"),
-        "error should mention 'currently running', got: {err_msg}"
-    );
-}
+    let results = shard.import_jobs("-", vec![reimport]).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_running_rejection(&results[0], "reimp-rej-run");
 
-#[silo::test]
-async fn reimport_running_job_in_batch_fails_entire_call() {
-    let (_tmp, shard) = test_helpers::open_temp_shard().await;
-
-    // Import two jobs: one will be running, one will be idle
-    let job_a = base_import_params("batch-run-a");
-    let job_b = base_import_params("batch-run-b");
-    shard.import_jobs("-", vec![job_a, job_b]).await.unwrap();
-
-    // Dequeue job_a to make it Running
-    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
-    assert_eq!(dequeued.tasks.len(), 1);
-    assert_eq!(dequeued.tasks[0].job().id(), "batch-run-a");
-
-    // Try reimporting both — the pre-check detects batch-run-a is Running
-    // and rejects the entire batch before any imports happen.
-    let mut reimport_b = base_import_params("batch-run-b");
-    reimport_b.attempts = vec![failed_attempt(1_700_000_001_000)];
-
-    let mut reimport_a = base_import_params("batch-run-a");
-    reimport_a.attempts = vec![failed_attempt(1_700_000_001_000)];
-
-    let err = shard
-        .import_jobs("-", vec![reimport_b, reimport_a])
-        .await
-        .expect_err("batch import should fail when any job is running");
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("currently running"),
-        "error should mention 'currently running', got: {err_msg}"
-    );
-
-    // job_b should NOT have been reimported — the pre-check rejects the
-    // entire batch before any imports are attempted.
-    let status_b = shard
-        .get_job_status("-", "batch-run-b")
+    // The job is untouched: still Running under its lease
+    let status = shard
+        .get_job_status("-", "reimp-rej-run")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        status_b.kind,
-        JobStatusKind::Scheduled,
-        "batch-run-b should still be Scheduled (not reimported)"
+    assert_eq!(status.kind, JobStatusKind::Running);
+}
+
+/// Asserts a per-job result for a job that was Running at import time.
+fn assert_running_rejection(result: &silo::job_store_shard::import::ImportJobResult, id: &str) {
+    assert_eq!(result.job_id, id);
+    assert!(
+        !result.success,
+        "{id} should not be reimportable while Running"
     );
+    let err = result
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("{id} should carry an error"));
+    assert!(
+        err.contains("currently running"),
+        "error for {id} should mention 'currently running', got: {err}"
+    );
+    assert_eq!(
+        result.status,
+        JobStatusKind::Running,
+        "result for {id} should report the job's actual status"
+    );
+}
+
+/// Imports `job_ids` as Scheduled, dequeues `running_id` so it is Running, then reimports
+/// the whole batch in the given order with one failed attempt and no retries each.
+/// Returns the per-job results.
+async fn reimport_batch_with_running_job(
+    shard: &Arc<JobStoreShard>,
+    job_ids: &[&str],
+    running_id: &str,
+) -> Vec<silo::job_store_shard::import::ImportJobResult> {
+    let initial = vec![base_import_params(running_id)];
+    shard.import_jobs("-", initial).await.unwrap();
+    let dequeued = shard.dequeue("worker-1", "default", 1).await.unwrap();
+    assert_eq!(dequeued.tasks.len(), 1);
+    assert_eq!(dequeued.tasks[0].job().id(), running_id);
+
+    let others: Vec<ImportJobParams> = job_ids
+        .iter()
+        .filter(|id| **id != running_id)
+        .map(|id| base_import_params(id))
+        .collect();
+    let results = shard.import_jobs("-", others).await.unwrap();
+    assert!(results.iter().all(|r| r.success));
+
+    let batch: Vec<ImportJobParams> = job_ids
+        .iter()
+        .map(|id| {
+            let mut params = base_import_params(id);
+            params.attempts = vec![failed_attempt(1_700_000_001_000)];
+            params
+        })
+        .collect();
+    let results = shard.import_jobs("-", batch).await.unwrap();
+    assert_eq!(results.len(), job_ids.len());
+
+    for (id, result) in job_ids.iter().zip(&results) {
+        if *id == running_id {
+            assert_running_rejection(result, id);
+        } else {
+            assert!(
+                result.success,
+                "{id} should be reimported: {:?}",
+                result.error
+            );
+            assert_eq!(result.status, JobStatusKind::Failed);
+            let status = shard.get_job_status("-", id).await.unwrap().unwrap();
+            assert_eq!(
+                status.kind,
+                JobStatusKind::Failed,
+                "{id} should be reimported"
+            );
+        }
+    }
+    results
+}
+
+#[silo::test]
+async fn reimport_batch_with_running_job_first_imports_the_rest() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    reimport_batch_with_running_job(
+        &shard,
+        &[
+            "batch-run-first-a",
+            "batch-run-first-b",
+            "batch-run-first-c",
+        ],
+        "batch-run-first-a",
+    )
+    .await;
+}
+
+#[silo::test]
+async fn reimport_batch_with_running_job_last_imports_the_rest() {
+    let (_tmp, shard) = test_helpers::open_temp_shard().await;
+    reimport_batch_with_running_job(
+        &shard,
+        &["batch-run-last-a", "batch-run-last-b", "batch-run-last-c"],
+        "batch-run-last-c",
+    )
+    .await;
 }
 
 #[silo::test]
