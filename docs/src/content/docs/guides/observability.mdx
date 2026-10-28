@@ -124,10 +124,13 @@ These metrics track the gRPC API performance.
 |--------|------|--------|-------------|
 | `silo_grpc_requests_total` | Counter | `method`, `status` | Total gRPC requests by method and status |
 | `silo_grpc_request_duration_seconds` | Histogram | `method` | gRPC request latency by method |
+| `silo_grpc_requests_in_flight` | Gauge | `method` | gRPC requests being handled right now, by method |
 
 **Key insights:**
 - Monitor error rates via `status` label (look for non-OK statuses)
 - `silo_grpc_request_duration_seconds` helps identify slow operations
+- `silo_grpc_requests_total` and `silo_grpc_request_duration_seconds` record a request only when it finishes, and never record one the client cancelled. A request that hangs is invisible to both until it returns. `silo_grpc_requests_in_flight` goes up when a handler starts and down when it returns or is cancelled, so a pile-up of stuck requests shows while it is happening. A value that climbs and stays up means handlers are not returning
+- `silo_grpc_requests_in_flight` covers the handler only. For the server-streaming `QueryArrow` it drops once the handler has returned its stream, while batches may still be on their way to the client
 - High latency on `LeaseTasks` may indicate database or broker issues
 
 ### SlateDB Storage Metrics

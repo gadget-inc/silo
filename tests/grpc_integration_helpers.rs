@@ -23,6 +23,21 @@ pub async fn setup_test_server(
     tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     SocketAddr,
 )> {
+    setup_test_server_with_metrics(factory, config, None).await
+}
+
+/// Same as [`setup_test_server`], with the server recording into `metrics`
+/// when given.
+pub async fn setup_test_server_with_metrics(
+    factory: Arc<ShardFactory>,
+    config: AppConfig,
+    metrics: Option<silo::metrics::Metrics>,
+) -> anyhow::Result<(
+    SiloClient<tonic::transport::Channel>,
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    SocketAddr,
+)> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -38,7 +53,7 @@ pub async fn setup_test_server(
         factory.clone(),
         coordinator,
         config,
-        None, // metrics
+        metrics,
         shutdown_rx,
     ));
 
