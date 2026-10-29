@@ -4820,30 +4820,21 @@ async fn k8s_reclaim_existing_leases_after_graceful_shutdown() {
     let owned_before: HashSet<ShardId> = c1.owned_shards().await.into_iter().collect();
     assert_eq!(owned_before.len(), num_shards as usize);
 
-    // Graceful shutdown releases leases
+    // Graceful shutdown releases leases. Each guard reaches ShutDown only after its
+    // release CAS returns, so the leases are already released when shutdown returns.
     c1.shutdown().await.unwrap();
     h1.abort();
 
-    // Brief pause to let K8s API fully process the lease CAS deletions from shutdown.
-    // Without this, the new coordinator may see in-flight leases that haven't been
-    // cleared yet.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Start a new coordinator with the same node_id -- reclaim should find nothing
-    let (c2, h2) = start_coordinator!(
-        &namespace,
-        &prefix,
-        "reclaim-k8s-1",
-        "http://127.0.0.1:50051",
-        num_shards
-    );
-    let reclaimed = c2.reclaim_existing_leases().await.expect("reclaim");
+    // reclaim_existing_leases only lists the K8s leases held by this node_id, so asking
+    // the shut-down c1 runs the same query a restart with this node_id would. A second
+    // coordinator can't be used here: K8sCoordinator::start spawns its reconcile loop,
+    // which acquires the freed leases within ~40ms, before its reclaim call can run.
+    let reclaimed = c1.reclaim_existing_leases().await.expect("reclaim");
     assert!(
         reclaimed.is_empty(),
-        "graceful shutdown should release all leases, so reclaim finds nothing"
+        "graceful shutdown should release all leases, so reclaim finds nothing, but found: {:?}",
+        reclaimed,
     );
-    c2.shutdown().await.unwrap();
-    h2.abort();
 }
 
 /// Test that reclaim_existing_leases finds shards after a simulated crash.
