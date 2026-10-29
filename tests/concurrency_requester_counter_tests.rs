@@ -583,3 +583,231 @@ async fn requester_counter_decrements_for_multiple_stale_requests() {
         "all stale request keys should be deleted"
     );
 }
+
+/// Fill a single-slot queue with one holder and park `waiters` requests
+/// behind it. Returns the holder's task id.
+async fn park_requests(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+    waiters: usize,
+) -> String {
+    let now = now_ms();
+    let limit = || {
+        vec![Limit::Concurrency(ConcurrencyLimit {
+            key: queue.to_string(),
+            max_concurrency: 1,
+        })]
+    };
+    shard
+        .enqueue(
+            tenant,
+            Some(format!("{queue}-holder")),
+            10,
+            now,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            limit(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue holder");
+    let tasks = shard.dequeue("w", "default", 1).await.expect("deq").tasks;
+    assert_eq!(tasks.len(), 1);
+    let holder_task_id = tasks[0].attempt().task_id().to_string();
+
+    for i in 0..waiters {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("{queue}-waiter-{i}")),
+                10,
+                now,
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                limit(),
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue waiter");
+    }
+    holder_task_id
+}
+
+async fn drift_requester_counter(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+    delta: i64,
+) {
+    shard
+        .db()
+        .merge(
+            concurrency_requester_counter_key(tenant, queue),
+            delta.to_le_bytes(),
+        )
+        .await
+        .expect("drift counter");
+}
+
+async fn requester_count(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+) -> i64 {
+    shard
+        .get_concurrency_requester_count(tenant, queue)
+        .await
+        .expect("get counter")
+}
+
+#[silo::test]
+async fn recount_corrects_negative_requester_counter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "recount-negative-q";
+    park_requests(&shard, "-", queue, 3).await;
+    assert_eq!(requester_count(&shard, "-", queue).await, 3);
+
+    drift_requester_counter(&shard, "-", queue, -5).await;
+    assert_eq!(requester_count(&shard, "-", queue).await, -2);
+
+    let delta = shard
+        .recount_requester_counter("-", queue)
+        .await
+        .expect("recount");
+    assert_eq!(delta, 5, "delta restores the live row count");
+    assert_eq!(requester_count(&shard, "-", queue).await, 3);
+}
+
+#[silo::test]
+async fn recount_corrects_too_high_requester_counter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "recount-high-q";
+    park_requests(&shard, "-", queue, 2).await;
+
+    drift_requester_counter(&shard, "-", queue, 4).await;
+    assert_eq!(requester_count(&shard, "-", queue).await, 6);
+
+    let delta = shard
+        .recount_requester_counter("-", queue)
+        .await
+        .expect("recount");
+    assert_eq!(delta, -4);
+    assert_eq!(requester_count(&shard, "-", queue).await, 2);
+}
+
+#[silo::test]
+async fn recount_leaves_correct_requester_counter_alone() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "recount-correct-q";
+    park_requests(&shard, "-", queue, 2).await;
+
+    let delta = shard
+        .recount_requester_counter("-", queue)
+        .await
+        .expect("recount");
+    assert_eq!(delta, 0, "a correct counter receives no merge");
+    assert_eq!(requester_count(&shard, "-", queue).await, 2);
+}
+
+#[silo::test]
+async fn recount_zeroes_counter_row_with_no_request_rows() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "recount-empty-q";
+    // A counter row with no request rows behind it.
+    drift_requester_counter(&shard, "-", queue, 7).await;
+    assert_eq!(requester_count(&shard, "-", queue).await, 7);
+
+    let delta = shard
+        .recount_requester_counter("-", queue)
+        .await
+        .expect("recount");
+    assert_eq!(delta, -7);
+    assert_eq!(requester_count(&shard, "-", queue).await, 0);
+}
+
+/// A request enqueued between the recount's snapshot and its commit is not
+/// lost: the recount merges a delta computed at the snapshot, and the
+/// concurrent enqueue's own `+1` merge lands on top of it.
+#[silo::test]
+async fn recount_keeps_request_enqueued_after_snapshot() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "recount-concurrent-q";
+    let now = now_ms();
+    park_requests(&shard, "-", queue, 2).await;
+    drift_requester_counter(&shard, "-", queue, -3).await;
+    assert_eq!(requester_count(&shard, "-", queue).await, -1);
+
+    let delta = shard
+        .recount_requester_counter_for_test(
+            "-",
+            queue,
+            inject_fake_request(&shard, "-", queue, "late-job", 1, now),
+        )
+        .await
+        .expect("recount");
+    assert_eq!(delta, 3, "delta is computed at the snapshot: 2 rows - (-1)");
+
+    let rows = count_concurrency_requests(shard.db()).await;
+    assert_eq!(rows, 3, "two parked waiters plus the late request");
+    assert_eq!(
+        requester_count(&shard, "-", queue).await,
+        3,
+        "counter equals the final row count"
+    );
+}
+
+/// `queue_counts` hides a counter at or below zero. One reconcile pass
+/// restores the true requester count for the queue.
+#[silo::test]
+async fn queue_counts_reports_true_requesters_after_reconcile() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "recount-queue-counts-q";
+    park_requests(&shard, "-", queue, 4).await;
+    drift_requester_counter(&shard, "-", queue, -9).await;
+    assert_eq!(requester_count(&shard, "-", queue).await, -5);
+
+    let sql = ShardQueryEngine::new(Arc::clone(&shard), "jobs").expect("new ShardQueryEngine");
+
+    assert_eq!(
+        queue_counts_requesters(&sql, queue).await,
+        0,
+        "a negative counter reads as zero before the recount"
+    );
+
+    let summary = shard
+        .reconcile_counters(&silo::shard_range::ShardRange::full())
+        .await;
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.requester_counters_corrected, 1);
+
+    assert_eq!(queue_counts_requesters(&sql, queue).await, 4);
+}
+
+/// The `requesters` column of `queue_counts` for one queue of tenant `-`,
+/// or 0 when the table has no row for it.
+async fn queue_counts_requesters(sql: &ShardQueryEngine, queue: &str) -> i64 {
+    let batches = sql
+        .sql(&format!(
+            "SELECT requesters FROM queue_counts WHERE tenant = '-' AND queue_name = '{queue}'"
+        ))
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("collect");
+    batches
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("requesters column")
+                .value(0)
+        })
+        .next()
+        .unwrap_or(0)
+}

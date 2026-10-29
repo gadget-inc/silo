@@ -770,10 +770,12 @@ impl JobStoreShard {
         // metrics are disabled.
         shard.spawn_db_status_watcher();
 
-        // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth.
-        // Only enabled when the deployment runs the standalone compactor, which
-        // drops terminal job rows without a writable Db handle and therefore
-        // cannot decrement counters at drop time.
+        // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth
+        // and recount per-queue requester counters from their request rows.
+        // Only enabled when the deployment sets a reconciliation interval,
+        // which deployments running the standalone compactor do: it drops
+        // terminal job rows without a writable Db handle and therefore cannot
+        // decrement counters at drop time.
         if let Some(interval_seconds) = counter_reconciliation_seconds {
             shard.spawn_counter_reconcile_task(range, interval_seconds);
         }
@@ -1253,6 +1255,7 @@ impl JobStoreShard {
                                 shard = %shard_name,
                                 scanned_jobs = summary.scanned_jobs,
                                 corrected = summary.corrected,
+                                requester_counters_corrected = summary.requester_counters_corrected,
                                 failed = summary.failed,
                                 "counter reconcile pass had failures; counters may remain stale until next pass"
                             );
@@ -1261,6 +1264,7 @@ impl JobStoreShard {
                                 shard = %shard_name,
                                 scanned_jobs = summary.scanned_jobs,
                                 corrected = summary.corrected,
+                                requester_counters_corrected = summary.requester_counters_corrected,
                                 "counter reconcile pass complete"
                             );
                         }

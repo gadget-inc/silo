@@ -8,11 +8,13 @@
 
 mod test_helpers;
 
+use silo::job::{ConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
 use silo::keys::{
-    shard_completed_jobs_counter_key, shard_total_jobs_counter_key, tenant_status_counter_key,
+    concurrency_requester_counter_key, shard_completed_jobs_counter_key,
+    shard_total_jobs_counter_key, tenant_status_counter_key,
 };
-use silo::shard_range::ShardRange;
+use silo::shard_range::{ShardRange, hash_tenant};
 use test_helpers::*;
 
 /// Inject a signed delta directly against a counter key, bypassing the normal
@@ -256,5 +258,144 @@ async fn reconcile_summary_reports_scanned_jobs() {
     assert_eq!(
         summary.scanned_jobs, 3,
         "should have scanned 3 JOB_STATUS rows"
+    );
+}
+
+/// Fill a single-slot queue with one holder and park `waiters` requests
+/// behind it, so the queue's requester counter should read `waiters`.
+async fn park_requests(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+    waiters: usize,
+) {
+    let limit = || {
+        vec![Limit::Concurrency(ConcurrencyLimit {
+            key: queue.to_string(),
+            max_concurrency: 1,
+        })]
+    };
+    shard
+        .enqueue(
+            tenant,
+            Some(format!("{queue}-holder")),
+            10u8,
+            now_ms(),
+            None,
+            msgpack_payload(&serde_json::json!({})),
+            limit(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue holder");
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1, "holder should dequeue");
+    for i in 0..waiters {
+        shard
+            .enqueue(
+                tenant,
+                Some(format!("{queue}-waiter-{i}")),
+                10u8,
+                now_ms(),
+                None,
+                msgpack_payload(&serde_json::json!({})),
+                limit(),
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue waiter");
+    }
+}
+
+async fn requester_count(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+) -> i64 {
+    shard
+        .get_concurrency_requester_count(tenant, queue)
+        .await
+        .expect("get requester counter")
+}
+
+#[silo::test]
+async fn reconcile_recounts_every_in_range_requester_counter() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    park_requests(&shard, "tenant-a", "qa", 2).await;
+    park_requests(&shard, "tenant-a", "qb", 3).await;
+    park_requests(&shard, "tenant-b", "qc", 1).await;
+
+    drift_counter(
+        &shard,
+        &concurrency_requester_counter_key("tenant-a", "qa"),
+        -4,
+    )
+    .await;
+    drift_counter(
+        &shard,
+        &concurrency_requester_counter_key("tenant-a", "qb"),
+        6,
+    )
+    .await;
+    // tenant-b/qc is left correct.
+
+    let summary = shard.reconcile_counters(&ShardRange::full()).await;
+    assert_eq!(summary.failed, 0);
+    assert_eq!(
+        summary.requester_counters_corrected, 2,
+        "only the two drifted queues receive a correction"
+    );
+    assert!(summary.corrected >= 2);
+
+    assert_eq!(requester_count(&shard, "tenant-a", "qa").await, 2);
+    assert_eq!(requester_count(&shard, "tenant-a", "qb").await, 3);
+    assert_eq!(requester_count(&shard, "tenant-b", "qc").await, 1);
+
+    let again = shard.reconcile_counters(&ShardRange::full()).await;
+    assert_eq!(again.failed, 0);
+    assert_eq!(again.requester_counters_corrected, 0);
+}
+
+#[silo::test]
+async fn reconcile_skips_requester_counters_of_out_of_range_tenants() {
+    let (_tmp, shard) = open_temp_shard().await;
+
+    park_requests(&shard, "tenant-in", "q", 2).await;
+    park_requests(&shard, "tenant-out", "q", 2).await;
+    drift_counter(
+        &shard,
+        &concurrency_requester_counter_key("tenant-in", "q"),
+        -3,
+    )
+    .await;
+    drift_counter(
+        &shard,
+        &concurrency_requester_counter_key("tenant-out", "q"),
+        -3,
+    )
+    .await;
+
+    // A range that contains exactly tenant-in's hash.
+    let in_hash = hash_tenant("tenant-in");
+    let range = ShardRange::new(in_hash.clone(), format!("{in_hash}0"));
+    assert!(range.contains_tenant("tenant-in"));
+    assert!(!range.contains_tenant("tenant-out"));
+
+    let summary = shard.reconcile_counters(&range).await;
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.requester_counters_corrected, 1);
+
+    assert_eq!(requester_count(&shard, "tenant-in", "q").await, 2);
+    assert_eq!(
+        requester_count(&shard, "tenant-out", "q").await,
+        -1,
+        "an out-of-range tenant's counter is left untouched"
     );
 }
