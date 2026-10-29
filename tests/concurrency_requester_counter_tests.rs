@@ -1105,18 +1105,16 @@ async fn replaced_job_holds_no_slot_from_its_old_chain() {
         }
     };
 
-    // Saturate both single-slot queues.
+    // Saturate both single-slot queues, dequeuing each holder as it lands.
     enqueue("user-holder", concurrency_limits(&[user])).await;
+    let tasks = shard.dequeue("w", "default", 1).await.expect("deq").tasks;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].attempt().job_id(), "user-holder");
     enqueue("platform-holder", concurrency_limits(&[platform])).await;
-    let tasks = shard.dequeue("w", "default", 2).await.expect("deq").tasks;
-    assert_eq!(tasks.len(), 2);
-    let platform_task = tasks
-        .iter()
-        .find(|t| t.attempt().job_id() == "platform-holder")
-        .expect("platform holder task")
-        .attempt()
-        .task_id()
-        .to_string();
+    let tasks = shard.dequeue("w", "default", 1).await.expect("deq").tasks;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].attempt().job_id(), "platform-holder");
+    let platform_task = tasks[0].attempt().task_id().to_string();
 
     // The job parks on the platform queue, first hop of its chain.
     enqueue("job-b", concurrency_limits(&[platform, user])).await;
