@@ -786,6 +786,37 @@ impl JobStoreShard {
         Ok(delta)
     }
 
+    /// Recount every per-queue requester counter under `tenant` on this
+    /// shard. Walks the tenant's requester counter rows, so a queue is
+    /// visited once a counter row exists for it, and runs
+    /// [`Self::recount_requester_counter`] on each. Safe to run on a live
+    /// tenant; the operator action behind the console's recount button.
+    pub async fn recount_tenant_requesters(
+        &self,
+        tenant: &str,
+    ) -> Result<TenantRequesterRecountStats, JobStoreShardError> {
+        let start = concurrency_requester_counter_tenant_prefix(tenant);
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut queues = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            if let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key) {
+                queues.push(parsed.queue);
+            }
+        }
+        drop(iter);
+
+        let mut stats = TenantRequesterRecountStats::default();
+        for queue in queues {
+            let delta = self.recount_requester_counter(tenant, &queue).await?;
+            stats.queues_scanned += 1;
+            if delta != 0 {
+                stats.queues_corrected += 1;
+            }
+        }
+        Ok(stats)
+    }
+
     /// Recount every in-range per-queue requester counter on this shard. Walks
     /// the requester counter prefix, so a queue is visited once a counter row
     /// exists for it, which is the case for any queue that has ever parked a
@@ -1086,6 +1117,15 @@ pub struct ReconcileSummary {
     pub requester_counters_corrected: u64,
     /// Number of sub-tasks that failed (each has been logged at warn).
     pub failed: u64,
+}
+
+/// Counts of what `recount_tenant_requesters` visited and changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TenantRequesterRecountStats {
+    /// Number of queues whose counter was recounted.
+    pub queues_scanned: usize,
+    /// Number of those queues whose counter received a correction.
+    pub queues_corrected: usize,
 }
 
 /// Outcome of one walk of the requester counter prefix.

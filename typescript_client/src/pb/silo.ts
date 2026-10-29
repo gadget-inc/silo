@@ -559,6 +559,38 @@ export interface DropTenantHoldersResponse {
     holdersDropped: bigint; // Number of concurrency holders deleted.
 }
 /**
+ * Recount every per-queue concurrency requester counter for a tenant on a
+ * single shard from the queue's live request rows, correcting any drift.
+ * Operator action; safe to run on a live tenant.
+ *
+ * @generated from protobuf message silo.v1.RecountTenantRequestersRequest
+ */
+export interface RecountTenantRequestersRequest {
+    /**
+     * @generated from protobuf field: string shard = 1
+     */
+    shard: string; // Shard ID (UUID) to operate on.
+    /**
+     * @generated from protobuf field: optional string tenant = 2
+     */
+    tenant?: string; // Tenant ID if multi-tenancy is enabled.
+}
+/**
+ * Response reporting what was recounted.
+ *
+ * @generated from protobuf message silo.v1.RecountTenantRequestersResponse
+ */
+export interface RecountTenantRequestersResponse {
+    /**
+     * @generated from protobuf field: uint64 queues_scanned = 1
+     */
+    queuesScanned: bigint; // Number of queues whose counter was recounted.
+    /**
+     * @generated from protobuf field: uint64 queues_corrected = 2
+     */
+    queuesCorrected: bigint; // Number of those whose counter was changed.
+}
+/**
  * Restart a cancelled or failed job, allowing it to be processed again.
  * The job will get a fresh set of retries according to its retry policy.
  *
@@ -3471,6 +3503,115 @@ class DropTenantHoldersResponse$Type extends MessageType<DropTenantHoldersRespon
  * @generated MessageType for protobuf message silo.v1.DropTenantHoldersResponse
  */
 export const DropTenantHoldersResponse = new DropTenantHoldersResponse$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class RecountTenantRequestersRequest$Type extends MessageType<RecountTenantRequestersRequest> {
+    constructor() {
+        super("silo.v1.RecountTenantRequestersRequest", [
+            { no: 1, name: "shard", kind: "scalar", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "tenant", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ }
+        ]);
+    }
+    create(value?: PartialMessage<RecountTenantRequestersRequest>): RecountTenantRequestersRequest {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.shard = "";
+        if (value !== undefined)
+            reflectionMergePartial<RecountTenantRequestersRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: RecountTenantRequestersRequest): RecountTenantRequestersRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string shard */ 1:
+                    message.shard = reader.string();
+                    break;
+                case /* optional string tenant */ 2:
+                    message.tenant = reader.string();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: RecountTenantRequestersRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string shard = 1; */
+        if (message.shard !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.shard);
+        /* optional string tenant = 2; */
+        if (message.tenant !== undefined)
+            writer.tag(2, WireType.LengthDelimited).string(message.tenant);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.RecountTenantRequestersRequest
+ */
+export const RecountTenantRequestersRequest = new RecountTenantRequestersRequest$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class RecountTenantRequestersResponse$Type extends MessageType<RecountTenantRequestersResponse> {
+    constructor() {
+        super("silo.v1.RecountTenantRequestersResponse", [
+            { no: 1, name: "queues_scanned", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ },
+            { no: 2, name: "queues_corrected", kind: "scalar", T: 4 /*ScalarType.UINT64*/, L: 0 /*LongType.BIGINT*/ }
+        ]);
+    }
+    create(value?: PartialMessage<RecountTenantRequestersResponse>): RecountTenantRequestersResponse {
+        const message = globalThis.Object.create((this.messagePrototype!));
+        message.queuesScanned = 0n;
+        message.queuesCorrected = 0n;
+        if (value !== undefined)
+            reflectionMergePartial<RecountTenantRequestersResponse>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: RecountTenantRequestersResponse): RecountTenantRequestersResponse {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* uint64 queues_scanned */ 1:
+                    message.queuesScanned = reader.uint64().toBigInt();
+                    break;
+                case /* uint64 queues_corrected */ 2:
+                    message.queuesCorrected = reader.uint64().toBigInt();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: RecountTenantRequestersResponse, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* uint64 queues_scanned = 1; */
+        if (message.queuesScanned !== 0n)
+            writer.tag(1, WireType.Varint).uint64(message.queuesScanned);
+        /* uint64 queues_corrected = 2; */
+        if (message.queuesCorrected !== 0n)
+            writer.tag(2, WireType.Varint).uint64(message.queuesCorrected);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message silo.v1.RecountTenantRequestersResponse
+ */
+export const RecountTenantRequestersResponse = new RecountTenantRequestersResponse$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class RestartJobRequest$Type extends MessageType<RestartJobRequest> {
     constructor() {
@@ -7333,6 +7474,7 @@ export const Silo = new ServiceType("silo.v1.Silo", [
     { name: "DeleteJob", options: {}, I: DeleteJobRequest, O: DeleteJobResponse },
     { name: "CancelJob", options: {}, I: CancelJobRequest, O: CancelJobResponse },
     { name: "DropTenantHolders", options: {}, I: DropTenantHoldersRequest, O: DropTenantHoldersResponse },
+    { name: "RecountTenantRequesters", options: {}, I: RecountTenantRequestersRequest, O: RecountTenantRequestersResponse },
     { name: "RestartJob", options: {}, I: RestartJobRequest, O: RestartJobResponse },
     { name: "ExpediteJob", options: {}, I: ExpediteJobRequest, O: ExpediteJobResponse },
     { name: "LeaseTask", options: {}, I: LeaseTaskRequest, O: LeaseTaskResponse },

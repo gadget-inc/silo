@@ -27,8 +27,8 @@ pub use listing_index_backfill::{
 };
 
 pub use counters::{
-    JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
-    counter_merge_operator,
+    JobStatusTruth, ReconcileSummary, ShardCounters, TenantRequesterRecountStats,
+    TenantStatusCounterScanRange, counter_merge_operator,
 };
 pub use expedite::JobNotExpediteableError;
 pub use import::JobNotReimportableError;

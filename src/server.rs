@@ -1241,6 +1241,24 @@ impl Silo for SiloService {
         }))
     }
 
+    async fn recount_tenant_requesters(
+        &self,
+        req: Request<RecountTenantRequestersRequest>,
+    ) -> Result<Response<RecountTenantRequestersResponse>, Status> {
+        let r = req.into_inner();
+        let (shard, tenant) = self
+            .resolve_shard_and_tenant(&r.shard, r.tenant.as_deref())
+            .await?;
+        let stats = shard
+            .recount_tenant_requesters(&tenant)
+            .await
+            .map_err(map_err)?;
+        Ok(Response::new(RecountTenantRequestersResponse {
+            queues_scanned: stats.queues_scanned as u64,
+            queues_corrected: stats.queues_corrected as u64,
+        }))
+    }
+
     async fn restart_job(
         &self,
         req: Request<RestartJobRequest>,

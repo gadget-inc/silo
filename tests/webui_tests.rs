@@ -11,7 +11,7 @@ use silo::coordination::{Coordinator, NoneCoordinator};
 use silo::factory::ShardFactory;
 use silo::gubernator::MockGubernatorClient;
 use silo::settings::{AppConfig, Backend, DatabaseTemplate};
-use silo::shard_range::ShardMap;
+use silo::shard_range::{ShardId, ShardInfo, ShardMap, ShardRange};
 use silo::webui::{AppState, create_router};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -95,6 +95,120 @@ async fn make_request(state: AppState, method: &str, path: &str) -> (StatusCode,
     let body_str = String::from_utf8_lossy(&body).to_string();
 
     (status, body_str)
+}
+
+/// Park `waiters` requests on `queue` for tenant `-` behind one holder.
+async fn park_requests(shard: &silo::job_store_shard::JobStoreShard, queue: &str, waiters: usize) {
+    let limit = || {
+        vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: queue.to_string(),
+            max_concurrency: 1,
+        })]
+    };
+    shard
+        .enqueue(
+            "-",
+            Some(format!("{queue}-holder")),
+            10,
+            test_helpers::now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            limit(),
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue holder");
+    let tasks = shard
+        .dequeue("w", "default", 1)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(tasks.len(), 1);
+    for i in 0..waiters {
+        shard
+            .enqueue(
+                "-",
+                Some(format!("{queue}-waiter-{i}")),
+                10,
+                test_helpers::now_ms(),
+                None,
+                test_helpers::msgpack_payload(&serde_json::json!({})),
+                limit(),
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue waiter");
+    }
+}
+
+#[silo::test]
+async fn test_recount_tenant_requesters_reports_shard_and_counts() {
+    let (_tmp, state, shard_map) = setup_test_state().await;
+    let shard_id = shard_map.shards()[0].id;
+    let shard = state.factory.get(&shard_id).expect("shard 0");
+
+    park_requests(&shard, "webui-recount-q", 3).await;
+    shard
+        .db()
+        .merge(
+            silo::keys::concurrency_requester_counter_key("-", "webui-recount-q"),
+            (-7i64).to_le_bytes(),
+        )
+        .await
+        .expect("drift counter");
+
+    let (status, body) =
+        make_request(state.clone(), "POST", "/tenant/recount-requesters?name=-").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Done"), "success box expected, got: {body}");
+    assert!(
+        body.contains(&format!(
+            "Recounted 1 queues on shard {shard_id}; corrected 1."
+        )),
+        "body should name the shard and counts, got: {body}"
+    );
+
+    assert_eq!(
+        shard
+            .get_concurrency_requester_count("-", "webui-recount-q")
+            .await
+            .expect("counter"),
+        3
+    );
+
+    let (_, body) = make_request(state, "POST", "/tenant/recount-requesters?name=-").await;
+    assert!(
+        body.contains(&format!(
+            "Recounted 1 queues on shard {shard_id}; corrected 0."
+        )),
+        "second run corrects nothing, got: {body}"
+    );
+}
+
+#[silo::test]
+async fn test_recount_tenant_requesters_without_owning_shard_is_an_error() {
+    let (_tmp, state, _shard_map) = setup_test_state().await;
+
+    // Give the coordinator a shard map that covers none of the tenant hash
+    // space the tenant falls in, so the owner-map lookup finds no shard.
+    let hashed = silo::shard_range::hash_tenant("-");
+    let elsewhere = if hashed.starts_with('0') { "f" } else { "0" };
+    let map = ShardMap::from_shards(vec![ShardInfo::new(
+        ShardId::new(),
+        ShardRange::new(elsewhere, format!("{elsewhere}0")),
+    )]);
+    assert!(map.shard_for_tenant("-").is_none());
+    *state.coordinator.base().shard_map.lock().await = map;
+
+    let (status, body) = make_request(state, "POST", "/tenant/recount-requesters?name=-").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Error"), "error box expected, got: {body}");
+    assert!(
+        body.contains("No owning shard found for this tenant"),
+        "body should explain the missing owner, got: {body}"
+    );
 }
 
 #[silo::test]

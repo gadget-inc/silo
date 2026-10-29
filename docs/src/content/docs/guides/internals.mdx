@@ -194,6 +194,10 @@ A holder is purged only after two consecutive full passes classify it as an orph
 
 The stale rule trades safety for recovery: a chain parked between limits or a task waiting in the task queue for longer than the threshold can lose its holder, and the queue then over-admits by one slot. That is the same tradeoff the web UI's Drop holders action makes for a whole tenant, applied here to one holder at a time. The `Running`-without-lease rule can likewise purge the holder of a worker whose lease lapsed before the reaper ran; the reaper is about to fail that attempt anyway. The sweep never touches leases, tasks, requests, or job status.
 
+### Console actions
+
+The tenant page of the web UI offers two operator actions on a tenant's concurrency state, each an RPC routed to the tenant's owning shard. **Drop holders** deletes every concurrency holder row for the tenant and releases the in-memory reservations, so a tenant wedged by leaked holders can be granted slots again; in-flight attempts keep running and may briefly double-run. **Recount requesters** recounts every per-queue requester counter for the tenant from the queue's live request rows and merges the difference, the same correction the periodic counter reconcile pass applies to every queue on the shard, so an operator can repair a known-bad tenant without waiting for the next pass. It is safe on a live tenant: the count and the counter are read at one snapshot, and concurrent enqueues, grants and cancels only add their own deltas on top. Both report what they changed.
+
 ### Why in-memory counts?
 
 Checking concurrency capacity requires knowing how many holders exist for a queue. Scanning the durable holder keys in SlateDB on every enqueue or grant would be too slow, so we maintain an in-memory `HashMap<queue, HashSet<task_id>>` of current holders (`ConcurrencyCounts` in `src/concurrency.rs`). This makes capacity checks a fast set-size lookup.
