@@ -351,10 +351,11 @@ pub struct DatabaseTemplate {
     pub concurrency_reconcile_interval_ms: u64,
     /// Interval in seconds for the periodic counter reconciliation background
     /// task that re-derives counter truth from JOB_INFO/JOB_STATUS to correct
-    /// drift caused by the standalone compactor dropping terminal job rows.
-    /// `None` (the default) disables the task entirely. `Some(n)` runs it
-    /// every `n` seconds. Other counter writes (in transactions, in
-    /// `reconcile_pending_requests`, etc.) are unaffected.
+    /// drift caused by the standalone compactor dropping terminal job rows,
+    /// and recounts every per-queue concurrency requester counter from its
+    /// live request rows. `None` (the default) disables the task entirely.
+    /// `Some(n)` runs it every `n` seconds. Other counter writes (in
+    /// transactions, in `reconcile_pending_requests`, etc.) are unaffected.
     #[serde(default)]
     pub counter_reconciliation_seconds: Option<u64>,
     /// When true, scan every concurrency holder into the in-memory cache before

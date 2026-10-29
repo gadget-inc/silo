@@ -15,18 +15,20 @@
 //! cause excessive transaction conflicts under concurrent load.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use slatedb::bytes::Bytes;
-use slatedb::{MergeOperator, MergeOperatorError};
+use slatedb::{IsolationLevel, MergeOperator, MergeOperatorError};
 
 use crate::codec::decode_job_status_owned;
 use crate::job::{JobStatusKind, JobView};
 use crate::job_store_shard::helpers::WriteBatcher;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    concurrency_requester_counter_key, concurrency_requester_counter_tenant_prefix, end_bound,
-    job_info_key, parse_concurrency_requester_counter_key, parse_job_info_key,
+    concurrency_request_prefix, concurrency_requester_counter_key,
+    concurrency_requester_counter_tenant_prefix, end_bound, job_info_key,
+    parse_concurrency_request_key, parse_concurrency_requester_counter_key, parse_job_info_key,
     parse_job_status_key, prefix, shard_completed_jobs_counter_key, shard_total_jobs_counter_key,
     tenant_status_counter_key,
 };
@@ -611,7 +613,9 @@ impl JobStoreShard {
 
     /// Re-derive shard-level and per-tenant counter truth by scanning the
     /// `JOB_INFO` and `JOB_STATUS` source-of-truth keys, then write a single
-    /// signed merge operand per counter to correct any drift.
+    /// signed merge operand per counter to correct any drift. Then recount
+    /// every in-range per-queue concurrency requester counter from its live
+    /// request rows (see [`Self::recount_requester_counter`]).
     ///
     /// Drift is expected because the standalone `silo-compactor` drops terminal
     /// job rows during compaction without a writable `Db` handle and therefore
@@ -620,8 +624,9 @@ impl JobStoreShard {
     ///
     /// The pass is best-effort: if any individual scan or merge fails, a
     /// `warn!` is logged and the rest of the pass continues. Concurrent writes
-    /// during the scan can leave the corrected value slightly off; the next
-    /// pass corrects that drift.
+    /// during the job scans can leave those corrected values slightly off; the
+    /// next pass corrects that drift. The requester recount is exact under
+    /// concurrent traffic.
     pub async fn reconcile_counters(&self, range: &ShardRange) -> ReconcileSummary {
         let mut summary = ReconcileSummary::default();
 
@@ -671,7 +676,194 @@ impl JobStoreShard {
             }
         }
 
+        match self.reconcile_requester_counters(range).await {
+            Ok(outcome) => {
+                summary.corrected += outcome.corrected;
+                summary.requester_counters_corrected += outcome.corrected;
+                summary.failed += outcome.failed;
+            }
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    shard = %self.name,
+                    error = %e,
+                    "counter reconcile failed (requester counters); per-queue requester counters will remain stale until next pass"
+                );
+            }
+        }
+
         summary
+    }
+
+    /// Recount one queue's concurrency requester counter from its live request
+    /// rows and merge the difference. Returns the delta applied, `0` when the
+    /// counter was already correct.
+    ///
+    /// The count and the counter read share one storage snapshot inside a
+    /// snapshot-isolation transaction, so the delta is exact for that
+    /// instant. Every other writer of the counter only merges signed deltas,
+    /// and merge is commutative, so requests enqueued, granted or cancelled
+    /// after the snapshot still land on the corrected value. Snapshot
+    /// isolation detects write-write conflicts only, and the counter key is
+    /// excluded from conflict detection like every other counter merge, so
+    /// the commit cannot fail on concurrent traffic. Recounts on one shard
+    /// are serialized from snapshot to commit, since a second recount that
+    /// snapshotted the same drift would merge the same delta again. A
+    /// counter row with no live request rows is corrected to zero; the row
+    /// is kept.
+    pub async fn recount_requester_counter(
+        &self,
+        tenant: &str,
+        queue: &str,
+    ) -> Result<i64, JobStoreShardError> {
+        self.recount_requester_counter_inner(tenant, queue, std::future::ready(()))
+            .await
+    }
+
+    /// Test-only: [`Self::recount_requester_counter`] that awaits
+    /// `after_snapshot` once the live rows and the counter have been read and
+    /// before the correction is merged, so a test can land concurrent writes
+    /// inside that window.
+    #[doc(hidden)]
+    pub async fn recount_requester_counter_for_test<F>(
+        &self,
+        tenant: &str,
+        queue: &str,
+        after_snapshot: F,
+    ) -> Result<i64, JobStoreShardError>
+    where
+        F: Future<Output = ()>,
+    {
+        self.recount_requester_counter_inner(tenant, queue, after_snapshot)
+            .await
+    }
+
+    async fn recount_requester_counter_inner<F>(
+        &self,
+        tenant: &str,
+        queue: &str,
+        after_snapshot: F,
+    ) -> Result<i64, JobStoreShardError>
+    where
+        F: Future<Output = ()>,
+    {
+        let _serialized = self.requester_recount_lock.lock().await;
+        let txn = self.db.begin(IsolationLevel::Snapshot).await?;
+
+        let start = concurrency_request_prefix(tenant, queue);
+        let end = end_bound(&start);
+        let mut iter = txn.scan::<Vec<u8>, _>(start..end).await?;
+        let mut live_rows: i64 = 0;
+        while let Some(kv) = iter.next().await? {
+            if parse_concurrency_request_key(&kv.key).is_some() {
+                live_rows += 1;
+            }
+        }
+
+        let counter_key = concurrency_requester_counter_key(tenant, queue);
+        let previous = match txn.get(&counter_key).await? {
+            Some(bytes) => decode_counter(&bytes),
+            None => 0,
+        };
+
+        after_snapshot.await;
+
+        let delta = live_rows.saturating_sub(previous);
+        if delta == 0 {
+            return Ok(0);
+        }
+
+        txn.merge(&counter_key, encode_counter(delta))?;
+        txn.unmark_write([counter_key.as_slice()])?;
+        txn.commit().await?;
+
+        tracing::warn!(
+            shard = %self.name,
+            tenant = %tenant,
+            queue = %queue,
+            previous,
+            live_rows,
+            delta,
+            "requester counter recount: corrected counter to live request row count"
+        );
+
+        Ok(delta)
+    }
+
+    /// Recount every per-queue requester counter under `tenant` on this
+    /// shard. Walks the tenant's requester counter rows, so a queue is
+    /// visited once a counter row exists for it, and runs
+    /// [`Self::recount_requester_counter`] on each. Safe to run on a live
+    /// tenant; the operator action behind the console's recount button.
+    pub async fn recount_tenant_requesters(
+        &self,
+        tenant: &str,
+    ) -> Result<TenantRequesterRecountStats, JobStoreShardError> {
+        let start = concurrency_requester_counter_tenant_prefix(tenant);
+        let end = end_bound(&start);
+        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
+        let mut queues = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            if let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key) {
+                queues.push(parsed.queue);
+            }
+        }
+        drop(iter);
+
+        let mut stats = TenantRequesterRecountStats::default();
+        for queue in queues {
+            let delta = self.recount_requester_counter(tenant, &queue).await?;
+            stats.queues_scanned += 1;
+            if delta != 0 {
+                stats.queues_corrected += 1;
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Recount every in-range per-queue requester counter on this shard. Walks
+    /// the requester counter prefix, so a queue is visited once a counter row
+    /// exists for it, which is the case for any queue that has ever parked a
+    /// request. A queue that fails to recount is logged and skipped; the
+    /// remaining queues are still visited.
+    async fn reconcile_requester_counters(
+        &self,
+        range: &ShardRange,
+    ) -> Result<RequesterReconcileOutcome, JobStoreShardError> {
+        let start = vec![prefix::COUNTER_CONCURRENCY_REQUESTERS];
+        let end = end_bound(&start);
+        let mut iter = self
+            .db
+            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .await?;
+        let mut queues = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            if let Some(parsed) = parse_concurrency_requester_counter_key(&kv.key)
+                && range.contains_tenant(&parsed.tenant)
+            {
+                queues.push((parsed.tenant, parsed.queue));
+            }
+        }
+        drop(iter);
+
+        let mut outcome = RequesterReconcileOutcome::default();
+        for (tenant, queue) in queues {
+            match self.recount_requester_counter(&tenant, &queue).await {
+                Ok(0) => {}
+                Ok(_) => outcome.corrected += 1,
+                Err(e) => {
+                    outcome.failed += 1;
+                    tracing::warn!(
+                        shard = %self.name,
+                        tenant = %tenant,
+                        queue = %queue,
+                        error = %e,
+                        "counter reconcile: requester counter recount failed; counter will remain stale until next pass"
+                    );
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     /// Walk the `JOB_STATUS` prefix once and aggregate everything either
@@ -921,8 +1113,28 @@ pub struct JobStatusTruth {
 pub struct ReconcileSummary {
     /// Number of `JOB_STATUS` rows scanned.
     pub scanned_jobs: u64,
-    /// Number of counters that received a non-zero correction merge.
+    /// Number of counters that received a non-zero correction merge, across
+    /// every counter kind the pass covers.
     pub corrected: u64,
+    /// Number of per-queue requester counters that received a non-zero
+    /// correction merge; included in `corrected`.
+    pub requester_counters_corrected: u64,
     /// Number of sub-tasks that failed (each has been logged at warn).
     pub failed: u64,
+}
+
+/// Counts of what `recount_tenant_requesters` visited and changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TenantRequesterRecountStats {
+    /// Number of queues whose counter was recounted.
+    pub queues_scanned: usize,
+    /// Number of those queues whose counter received a correction.
+    pub queues_corrected: usize,
+}
+
+/// Outcome of one walk of the requester counter prefix.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RequesterReconcileOutcome {
+    corrected: u64,
+    failed: u64,
 }

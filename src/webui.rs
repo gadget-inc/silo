@@ -989,6 +989,50 @@ async fn drop_tenant_holders_handler(
     }
 }
 
+/// Recount a tenant's per-queue concurrency requester counters from the live
+/// request rows, so a counter that drifted (in either direction) reads true
+/// again and the queue is re-driven by the periodic reconcile sweep.
+///
+/// Resolves the tenant's owning shard the same way `drop_tenant_holders_handler`
+/// does: an owner-map lookup, never a `jobs` table scan.
+async fn recount_tenant_requesters_handler(
+    State(state): State<AppState>,
+    Query(params): Query<TenantParams>,
+) -> impl IntoResponse {
+    fn error_box(msg: &str) -> Html<String> {
+        Html(format!(
+            r#"<div class="bg-red-900/30 border border-red-700 p-4"><div class="text-red-400 text-sm font-medium">Error</div><pre class="text-red-300 text-xs mt-2 whitespace-pre-wrap">{}</pre></div>"#,
+            msg
+        ))
+    }
+
+    let shard_id = match state.coordinator.get_shard_owner_map().await {
+        Ok(map) => map.shard_for_tenant(&params.name),
+        Err(e) => return error_box(&format!("Failed to resolve tenant shard: {}", e)),
+    };
+    let Some(shard_id) = shard_id else {
+        return error_box("No owning shard found for this tenant — nothing to recount.");
+    };
+
+    match state
+        .cluster_client
+        .recount_tenant_requesters(&shard_id, &params.name)
+        .await
+    {
+        Ok(stats) => {
+            let body = format!(
+                "Recounted {} queues on shard {}; corrected {}.",
+                stats.queues_scanned, shard_id, stats.queues_corrected
+            );
+            Html(format!(
+                r#"<div class="bg-emerald-900/30 border border-emerald-700 p-4"><div class="text-emerald-400 text-sm font-medium">Done</div><pre class="text-emerald-300 text-xs mt-2 whitespace-pre-wrap">{}</pre></div>"#,
+                body
+            ))
+        }
+        Err(e) => error_box(&format!("{}", e)),
+    }
+}
+
 async fn queues_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Key: queue_name -> (holders, waiters)
     let mut all_queues: HashMap<String, (usize, usize)> = HashMap::new();
@@ -2188,6 +2232,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/tenants", get(tenants_handler))
         .route("/tenant", get(tenant_handler))
         .route("/tenant/drop-state", post(drop_tenant_holders_handler))
+        .route(
+            "/tenant/recount-requesters",
+            post(recount_tenant_requesters_handler),
+        )
         .route("/cluster", get(cluster_handler))
         .route("/shard", get(shard_handler))
         .route("/shard/:id/split", post(shard_split_handler))

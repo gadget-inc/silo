@@ -335,6 +335,11 @@ pub fn classify_orphan_holder(
 /// in `Arc` because `slatedb::Error` is not `Clone`, and `Shared::Output` must be.
 type HydrateFut = Shared<BoxFuture<'static, Result<(), Arc<slatedb::Error>>>>;
 
+/// Test-only hook awaited by the grant scanner between reading a batch of
+/// request rows and acting on them. See
+/// `ConcurrencyManager::set_grant_scan_hook_for_test`.
+pub type GrantScanHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
 enum HydrationState {
     /// Never scanned (or last scan errored).
     NotHydrated,
@@ -1034,6 +1039,11 @@ pub struct ConcurrencyManager {
     /// `take_chain_resumer_for_test` to exercise the not-installed bailout
     /// path; production code calls `set_chain_resumer` once and never clears.
     chain_resumer: Mutex<Option<Arc<dyn LimitChainResumer>>>,
+    /// Test-only: awaited by `process_grants` after a batch of request rows
+    /// has been read from the scan iterator and before any of them is
+    /// validated or granted, so a test can change durable state inside the
+    /// window between the snapshot and the grant.
+    grant_scan_hook_for_test: Mutex<Option<GrantScanHook>>,
     /// Max grants written in a single `process_grants` pass. A single
     /// `request_grant_count` accumulation can be arbitrarily large (every
     /// release between scanner wakeups adds to it), and without a per-pass
@@ -1166,6 +1176,7 @@ impl ConcurrencyManager {
             reconcile_cursor: Mutex::new(None),
             metrics,
             chain_resumer: Mutex::new(None),
+            grant_scan_hook_for_test: Mutex::new(None),
             // Clamp to >= 1: a 0 batch would stall the drain loop and
             // `.buffered(0)` / `.buffer_unordered(0)` are invalid.
             grant_scanner_batch_size: scanner.batch_size.max(1),
@@ -1205,6 +1216,21 @@ impl ConcurrencyManager {
 
     fn chain_resumer(&self) -> Option<Arc<dyn LimitChainResumer>> {
         self.chain_resumer.lock().unwrap().clone()
+    }
+
+    /// Test-only: install a hook that `process_grants` awaits once per
+    /// scanned batch, after the rows have been read from the scan iterator
+    /// and before any of them is validated or granted. Writes the hook makes
+    /// are invisible to the iterator but visible to the scanner's later
+    /// point reads, which is the window a concurrent cancel, delete or
+    /// re-enqueue lands in.
+    #[doc(hidden)]
+    pub fn set_grant_scan_hook_for_test(&self, hook: Option<GrantScanHook>) {
+        *self.grant_scan_hook_for_test.lock().unwrap() = hook;
+    }
+
+    fn grant_scan_hook_for_test(&self) -> Option<GrantScanHook> {
+        self.grant_scan_hook_for_test.lock().unwrap().clone()
     }
 
     pub fn counts(&self) -> &ConcurrencyCounts {
@@ -2469,6 +2495,11 @@ impl ConcurrencyManager {
             /// duplicate-materialization guard checks it alongside the
             /// request's own start.
             status_start_ms: Option<i64>,
+            /// The job status's `changed_at_ms`, captured at validation. A
+            /// status written at or after this invocation began cannot vouch
+            /// for a request row read from the invocation's snapshot, so such
+            /// a candidate has its request row re-read before it is reserved.
+            status_changed_at_ms: Option<i64>,
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
@@ -2709,7 +2740,12 @@ impl ConcurrencyManager {
                     held_queues,
                     limits,
                     status_start_ms: None,
+                    status_changed_at_ms: None,
                 });
+            }
+
+            if let Some(hook) = self.grant_scan_hook_for_test() {
+                hook().await;
             }
 
             // --- Next-hop skip filter ---
@@ -2836,6 +2872,7 @@ impl ConcurrencyManager {
                         }
                         Ok(status) => {
                             req.status_start_ms = status.next_attempt_starts_after_ms;
+                            req.status_changed_at_ms = Some(status.changed_at_ms);
                             true
                         }
                         Err(_) => {
@@ -2970,6 +3007,48 @@ impl ConcurrencyManager {
             for req in &valid_requests {
                 if total_granted + chunk_grants.len() >= count as usize {
                     break;
+                }
+
+                // The scan iterator is a snapshot taken when the invocation
+                // began, and the status row that validated this candidate was
+                // read later. A status written at or after the invocation
+                // began may belong to a replacement of the job under the same
+                // id and attempt (a cancel, delete and re-enqueue, or a
+                // reimport), whose own chain has already parked or been
+                // granted elsewhere; the row this candidate came from was
+                // deleted by that path, which also decremented the requester
+                // counter for it. Re-read the row for such candidates and
+                // skip the ones that are gone: no grant, no holder, no delete
+                // and no counter change. A status older than the invocation
+                // vouches for the snapshot's row and pays no extra read.
+                if req
+                    .status_changed_at_ms
+                    .is_some_and(|changed_at_ms| changed_at_ms >= now_ms)
+                {
+                    match db.get(&req.request_key).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            tracing::debug!(
+                                job_id = %req.job_id,
+                                queue = %queue,
+                                task_id = %req.task_id,
+                                "grant scanner: skipping request whose row was deleted after the pass began"
+                            );
+                            if let Some(ref m) = self.metrics {
+                                m.record_concurrency_grant_vanished_request(&self.shard);
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                job_id = %req.job_id,
+                                queue = %queue,
+                                "grant scanner: request row re-read failed; skipping request this pass"
+                            );
+                            continue;
+                        }
+                    }
                 }
 
                 // Duplicate-materialization guard: at most one live terminal

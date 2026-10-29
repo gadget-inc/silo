@@ -27,8 +27,8 @@ pub use listing_index_backfill::{
 };
 
 pub use counters::{
-    JobStatusTruth, ReconcileSummary, ShardCounters, TenantStatusCounterScanRange,
-    counter_merge_operator,
+    JobStatusTruth, ReconcileSummary, ShardCounters, TenantRequesterRecountStats,
+    TenantStatusCounterScanRange, counter_merge_operator,
 };
 pub use expedite::JobNotExpediteableError;
 pub use import::JobNotReimportableError;
@@ -309,6 +309,10 @@ pub struct JobStoreShard {
     /// Serializes refresh index drains from scan to commit, so concurrent
     /// polls for one group cannot both lease the same row.
     pub(crate) refresh_drain_lock: tokio::sync::Mutex<()>,
+    /// Serializes requester counter recounts from snapshot to commit. A
+    /// recount's correction is a delta computed at its snapshot, so two
+    /// recounts of one queue that overlap would both merge the same delta.
+    pub(crate) requester_recount_lock: tokio::sync::Mutex<()>,
     /// Settings for the enqueue-time index backfill sweep.
     pub(crate) enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig,
     /// The highest listing-index version the backfill has completed on this
@@ -703,6 +707,7 @@ impl JobStoreShard {
                 .unwrap_or(i64::MAX),
             refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             refresh_drain_lock: tokio::sync::Mutex::new(()),
+            requester_recount_lock: tokio::sync::Mutex::new(()),
             enqueue_time_index_backfill,
             listing_index_version: AtomicU8::new(0),
             enqueue_time_index_backfill_task: tokio::sync::Mutex::new(None),
@@ -770,10 +775,12 @@ impl JobStoreShard {
         // metrics are disabled.
         shard.spawn_db_status_watcher();
 
-        // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth.
-        // Only enabled when the deployment runs the standalone compactor, which
-        // drops terminal job rows without a writable Db handle and therefore
-        // cannot decrement counters at drop time.
+        // Periodically reconcile job counters from JOB_INFO/JOB_STATUS truth
+        // and recount per-queue requester counters from their request rows.
+        // Only enabled when the deployment sets a reconciliation interval,
+        // which deployments running the standalone compactor do: it drops
+        // terminal job rows without a writable Db handle and therefore cannot
+        // decrement counters at drop time.
         if let Some(interval_seconds) = counter_reconciliation_seconds {
             shard.spawn_counter_reconcile_task(range, interval_seconds);
         }
@@ -1253,6 +1260,7 @@ impl JobStoreShard {
                                 shard = %shard_name,
                                 scanned_jobs = summary.scanned_jobs,
                                 corrected = summary.corrected,
+                                requester_counters_corrected = summary.requester_counters_corrected,
                                 failed = summary.failed,
                                 "counter reconcile pass had failures; counters may remain stale until next pass"
                             );
@@ -1261,6 +1269,7 @@ impl JobStoreShard {
                                 shard = %shard_name,
                                 scanned_jobs = summary.scanned_jobs,
                                 corrected = summary.corrected,
+                                requester_counters_corrected = summary.requester_counters_corrected,
                                 "counter reconcile pass complete"
                             );
                         }
@@ -1560,6 +1569,13 @@ impl JobStoreShard {
         self.concurrency
             .process_grants(&self.db, &range, tenant, queue, count)
             .await
+    }
+
+    /// Test-only: install or clear the grant scanner's per-batch hook. See
+    /// `ConcurrencyManager::set_grant_scan_hook_for_test`.
+    #[doc(hidden)]
+    pub fn set_grant_scan_hook_for_test(&self, hook: Option<crate::concurrency::GrantScanHook>) {
+        self.concurrency.set_grant_scan_hook_for_test(hook);
     }
 
     /// Test-only: drop the installed chain resumer so the next

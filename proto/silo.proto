@@ -229,6 +229,20 @@ message DropTenantHoldersResponse {
   uint64 holders_dropped = 1; // Number of concurrency holders deleted.
 }
 
+// Recount every per-queue concurrency requester counter for a tenant on a
+// single shard from the queue's live request rows, correcting any drift.
+// Operator action; safe to run on a live tenant.
+message RecountTenantRequestersRequest {
+  string shard = 1;           // Shard ID (UUID) to operate on.
+  optional string tenant = 2; // Tenant ID if multi-tenancy is enabled.
+}
+
+// Response reporting what was recounted.
+message RecountTenantRequestersResponse {
+  uint64 queues_scanned = 1;   // Number of queues whose counter was recounted.
+  uint64 queues_corrected = 2; // Number of those whose counter was changed.
+}
+
 // Restart a cancelled or failed job, allowing it to be processed again.
 // The job will get a fresh set of retries according to its retry policy.
 message RestartJobRequest { string shard = 1; string id = 2; optional string tenant = 3; }
@@ -693,6 +707,10 @@ service Silo {
   // Forcibly drop all concurrency holders and in-flight run attempts for a
   // tenant on this shard. Admin action to clear stuck concurrency state.
   rpc DropTenantHolders(DropTenantHoldersRequest) returns (DropTenantHoldersResponse);
+
+  // Recount a tenant's per-queue concurrency requester counters on this shard
+  // from the live request rows. Operator action to repair counter drift.
+  rpc RecountTenantRequesters(RecountTenantRequestersRequest) returns (RecountTenantRequestersResponse);
   
   // Restart a cancelled or failed job for another attempt.
   // Returns FAILED_PRECONDITION if job is not in a restartable state.

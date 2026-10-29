@@ -39,12 +39,13 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::coordination::{Coordinator, ShardOwnerMap, SplitCleanupStatus};
 use crate::factory::ShardFactory;
-use crate::job_store_shard::DropTenantStats;
+use crate::job_store_shard::{DropTenantStats, TenantRequesterRecountStats};
 use crate::pb::silo_client::SiloClient;
 use crate::pb::{
     CancelJobRequest, ColumnInfo, CompactShardRequest, DropTenantHoldersRequest, GetJobRequest,
     GetJobResponse, GetNodeInfoRequest, GetShardStorageInfoRequest, GetShardStorageInfoResponse,
-    JobStatus, RequestSplitRequest, RequestSplitResponse, SerializedBytes, serialized_bytes,
+    JobStatus, RecountTenantRequestersRequest, RequestSplitRequest, RequestSplitResponse,
+    SerializedBytes, serialized_bytes,
 };
 #[cfg(feature = "server")]
 use crate::pb::{QueryArrowRequest, QueryRequest};
@@ -945,6 +946,45 @@ impl ClusterClient {
             }
             Err(e) => {
                 // Invalidate connection on failure to force reconnect on next attempt
+                self.invalidate_connection(&addr);
+                Err(ClusterClientError::RpcFailed(e.to_string()))
+            }
+        }
+    }
+
+    /// Recount a tenant's per-queue concurrency requester counters on a shard
+    /// (local or remote) from the live request rows.
+    pub async fn recount_tenant_requesters(
+        &self,
+        shard_id: &ShardId,
+        tenant: &str,
+    ) -> Result<TenantRequesterRecountStats, ClusterClientError> {
+        if let Some(shard) = self.factory.get(shard_id) {
+            debug!(shard_id = %shard_id, tenant, "recounting tenant requester counters on local shard");
+            return shard
+                .recount_tenant_requesters(tenant)
+                .await
+                .map_err(|e| ClusterClientError::QueryFailed(e.to_string()));
+        }
+
+        let addr = self.get_shard_addr(shard_id).await?;
+        debug!(shard_id = %shard_id, addr = %addr, tenant, "recounting tenant requester counters on remote shard");
+
+        let mut client = self.get_client(&addr).await?;
+        let request = RecountTenantRequestersRequest {
+            shard: shard_id.to_string(),
+            tenant: Some(tenant.to_string()),
+        };
+
+        match client.recount_tenant_requesters(request).await {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                Ok(TenantRequesterRecountStats {
+                    queues_scanned: resp.queues_scanned as usize,
+                    queues_corrected: resp.queues_corrected as usize,
+                })
+            }
+            Err(e) => {
                 self.invalidate_connection(&addr);
                 Err(ClusterClientError::RpcFailed(e.to_string()))
             }

@@ -234,6 +234,9 @@ pub struct Metrics {
     /// Sizes of the grant scanner's pending lanes, labeled `lane=hot|cold`.
     concurrency_pending_grants: GaugeVec,
     concurrency_grant_next_hop_skips: CounterVec,
+    /// Grant-scanner candidates skipped because their request row was gone
+    /// by the time the scanner re-read it.
+    concurrency_grant_vanished_requests: CounterVec,
     /// Floating limit refreshes forced open after the outstanding-refresh flag
     /// was found stale, labelled by `reason`.
     floating_limit_refresh_resets: CounterVec,
@@ -861,6 +864,14 @@ impl Metrics {
     /// hop was saturated with a deep requester backlog.
     pub fn record_concurrency_grant_next_hop_skip(&self, shard: &str) {
         self.concurrency_grant_next_hop_skips
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record a grant-scanner candidate skipped because its request row was
+    /// deleted after the pass began: no grant, no holder, no counter change.
+    pub fn record_concurrency_grant_vanished_request(&self, shard: &str) {
+        self.concurrency_grant_vanished_requests
             .with_label_values(&[shard])
             .inc();
     }
@@ -2590,6 +2601,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_grant_vanished_requests = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_grant_vanished_requests_total",
+                "Grant-scanner candidates skipped without a grant or a requester counter change because their request row was deleted after the pass began",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let floating_limit_refresh_resets = register(
         &registry,
         CounterVec::new(
@@ -2730,6 +2752,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_reconcile_duration,
         concurrency_pending_grants,
         concurrency_grant_next_hop_skips,
+        concurrency_grant_vanished_requests,
         floating_limit_refresh_resets,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
