@@ -1566,6 +1566,13 @@ impl JobStoreShard {
             .await
     }
 
+    /// Test-only: install or clear the grant scanner's per-batch hook. See
+    /// `ConcurrencyManager::set_grant_scan_hook_for_test`.
+    #[doc(hidden)]
+    pub fn set_grant_scan_hook_for_test(&self, hook: Option<crate::concurrency::GrantScanHook>) {
+        self.concurrency.set_grant_scan_hook_for_test(hook);
+    }
+
     /// Test-only: drop the installed chain resumer so the next
     /// `process_concurrency_grants` exercises the scanner's
     /// release-and-bail branch. Returns the removed resumer (caller may

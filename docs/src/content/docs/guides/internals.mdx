@@ -176,6 +176,12 @@ When a holder finishes (or is cancelled), the system promotes the next eligible 
 
 Each holder record stores the time it was granted plus the owning `job_id` and total `attempt_number`, so the `queues` SQL table can show which job holds a slot. A record that carries no owner decodes with those fields absent and is treated as owner-unknown.
 
+### Grant scanner
+
+Promotion is done by the grant scanner, a per-shard task that is woken for a `(tenant, queue)` whenever a holder is released, a floating limit is raised, or the periodic reconcile sweep finds a requester counter above zero. An invocation scans the queue's requester records in `(start_time, priority, request_id)` order through an iterator that is a snapshot of the queue taken when the invocation began, then validates each candidate against a fresh read of its job's status row: only a `Scheduled` job on the request's attempt number is granted, and a request whose job is missing, terminal, or on another attempt is deleted as stale, with the queue's requester counter decremented for it.
+
+A status row written at or after the invocation began cannot vouch for a request read from the snapshot. The job may have been cancelled, deleted and enqueued again under the same id, or reimported, and the path that replaced it deleted the request row and decremented the requester counter already; granting the snapshot's copy would hand the replacement job a slot its own chain knows nothing about and decrement the counter a second time. So before reserving a slot for a candidate whose status changed at or after the invocation's start time, the scanner re-reads the candidate's request row, and skips the candidate without a grant, a holder, a delete, or a counter change when the row is gone. Each skip is counted in `silo_concurrency_grant_vanished_requests_total{shard}`. A candidate whose status predates the invocation is granted without the extra read.
+
 ### Orphan holder sweep
 
 A holder can outlive its task: if the expired lease reaper reaps its lease and nothing ever reports an outcome for the task, the holder row stays behind and occupies a slot forever. On the periodic concurrency-reconcile tick, each shard walks its durable holder rows in bounded slices (`orphan_holder_sweep_slice` rows per tick, resuming from a cursor) and classifies every holder older than `orphan_holder_grace_ms` using point reads only:
