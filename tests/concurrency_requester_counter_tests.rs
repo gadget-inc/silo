@@ -772,32 +772,26 @@ async fn overlapping_recounts_apply_the_correction_once() {
     drift_requester_counter(&shard, "-", queue, -3).await;
     assert_eq!(requester_count(&shard, "-", queue).await, -1);
 
-    let second = {
-        let shard = Arc::clone(&shard);
-        async move {
-            let second = tokio::spawn(async move {
+    let mut second_handle: Option<tokio::task::JoinHandle<i64>> = None;
+    let first_delta = shard
+        .recount_requester_counter_for_test("-", queue, async {
+            let shard = Arc::clone(&shard);
+            second_handle = Some(tokio::spawn(async move {
                 shard
                     .recount_requester_counter("-", "recount-overlap-q")
                     .await
                     .expect("second recount")
-            });
+            }));
             // Give the second recount time to run; it must wait for the
             // first to commit instead.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            second
-        }
-    };
-    let (first_delta, second) = {
-        let mut second_handle = None;
-        let first_delta = shard
-            .recount_requester_counter_for_test("-", queue, async {
-                second_handle = Some(second.await);
-            })
-            .await
-            .expect("first recount");
-        (first_delta, second_handle.expect("hook ran"))
-    };
-    let second_delta = second.await.expect("join second recount");
+        })
+        .await
+        .expect("first recount");
+    let second_delta = second_handle
+        .expect("hook ran")
+        .await
+        .expect("join second recount");
 
     assert_eq!(first_delta, 3);
     assert_eq!(
