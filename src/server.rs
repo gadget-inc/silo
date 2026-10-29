@@ -711,8 +711,7 @@ impl SiloService {
     > {
         let shard_id = Self::parse_shard_id(&job_req.shard)?;
         let tenant = self.validate_tenant(job_req.tenant.as_deref())?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
-            .await?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)?;
 
         if job_req.id.is_empty() {
             return Err(Status::invalid_argument("job id is required for import"));
@@ -811,8 +810,7 @@ impl SiloService {
         let shard_id = Self::parse_shard_id(shard)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
         let tenant = self.validate_tenant(tenant)?;
-        self.validate_tenant_in_shard_range(&shard_id, &tenant)
-            .await?;
+        self.validate_tenant_in_shard_range(&shard_id, &tenant)?;
         Ok((shard, tenant))
     }
 
@@ -847,7 +845,12 @@ impl SiloService {
     /// This prevents clients from accidentally sending requests to the wrong shard,
     /// which could happen if topology information is stale or the client has a bug.
     /// Returns an error if the tenant_id is outside the shard's range.
-    async fn validate_tenant_in_shard_range(
+    ///
+    /// Runs on every tenant-scoped RPC, so it is deliberately not `async`: it
+    /// reads a snapshot of the shard map and can never park the request behind
+    /// a lock or the runtime's run queue.
+    #[allow(clippy::result_large_err)]
+    fn validate_tenant_in_shard_range(
         &self,
         shard_id: &crate::shard_range::ShardId,
         tenant_id: &str,
@@ -859,10 +862,7 @@ impl SiloService {
         }
 
         // Look up the shard's range from the coordinator's shard map
-        let shard_map = self.coordinator.get_shard_map().await.map_err(|e| {
-            tracing::error!(error = %e, "failed to get shard map for tenant validation");
-            Status::internal("failed to validate tenant routing")
-        })?;
+        let shard_map = self.coordinator.base().shard_map.load();
 
         // Find the shard in the map
         let Some(shard_info) = shard_map.shards().iter().find(|s| &s.id == shard_id) else {
@@ -896,7 +896,8 @@ impl SiloService {
     /// When tenancy is enabled, the client MUST send tenant_id so the server can verify
     /// the request is routed to the correct shard. When tenancy is disabled, tenant_id
     /// is ignored (workers don't have meaningful tenant routing).
-    async fn validate_worker_tenant(
+    #[allow(clippy::result_large_err)]
+    fn validate_worker_tenant(
         &self,
         shard_id: &crate::shard_range::ShardId,
         tenant_id: Option<&str>,
@@ -907,7 +908,7 @@ impl SiloService {
 
         let tenant = tenant_id.and_then(|t| if t.is_empty() { None } else { Some(t) });
         match tenant {
-            Some(t) => self.validate_tenant_in_shard_range(shard_id, t).await,
+            Some(t) => self.validate_tenant_in_shard_range(shard_id, t),
             None => Err(Status::invalid_argument(
                 "tenant_id is required for worker operations when tenancy is enabled",
             )),
@@ -1428,8 +1429,7 @@ impl Silo for SiloService {
         let shard_str = r.shard.to_string();
         let shard_id = Self::parse_shard_id(&r.shard)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
-        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())
-            .await?;
+        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())?;
         let (outcome, status_str) = match r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?
@@ -1500,8 +1500,7 @@ impl Silo for SiloService {
         let r = req.into_inner();
         let shard_id = Self::parse_shard_id(&r.shard)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
-        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())
-            .await?;
+        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())?;
         let outcome = r
             .outcome
             .ok_or_else(|| Status::invalid_argument("missing outcome"))?;
@@ -1530,8 +1529,7 @@ impl Silo for SiloService {
         let r = req.into_inner();
         let shard_id = Self::parse_shard_id(&r.shard)?;
         let shard = self.shard_with_redirect(&shard_id).await?;
-        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())
-            .await?;
+        self.validate_worker_tenant(&shard_id, r.tenant_id.as_deref())?;
         let result = shard
             .heartbeat_task(&r.worker_id, &r.task_id)
             .await

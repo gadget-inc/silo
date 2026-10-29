@@ -111,7 +111,7 @@ async fn make_guard_with_node_id(
         shard_id,
         silo::shard_range::ShardRange::full(),
     ));
-    let shard_map = Arc::new(tokio::sync::Mutex::new(shard_map));
+    let shard_map = Arc::new(silo::coordination::ShardMapCell::new(shard_map));
     // Create a NoneCoordinator as a placeholder for split recovery (these tests don't involve splits)
     let none_coord = silo::coordination::NoneCoordinator::new(
         cluster_prefix,
@@ -3674,7 +3674,7 @@ async fn make_guard_with_factory(
         shard_id,
         silo::shard_range::ShardRange::full(),
     ));
-    let shard_map = Arc::new(tokio::sync::Mutex::new(shard_map));
+    let shard_map = Arc::new(silo::coordination::ShardMapCell::new(shard_map));
     let none_coord = silo::coordination::NoneCoordinator::new(
         &node_id,
         "http://127.0.0.1:0",
