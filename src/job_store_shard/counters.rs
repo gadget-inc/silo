@@ -706,8 +706,11 @@ impl JobStoreShard {
     /// after the snapshot still land on the corrected value. Snapshot
     /// isolation detects write-write conflicts only, and the counter key is
     /// excluded from conflict detection like every other counter merge, so
-    /// the commit cannot fail on concurrent traffic. A counter row with no
-    /// live request rows is corrected to zero; the row is kept.
+    /// the commit cannot fail on concurrent traffic. Recounts on one shard
+    /// are serialized from snapshot to commit, since a second recount that
+    /// snapshotted the same drift would merge the same delta again. A
+    /// counter row with no live request rows is corrected to zero; the row
+    /// is kept.
     pub async fn recount_requester_counter(
         &self,
         tenant: &str,
@@ -744,6 +747,7 @@ impl JobStoreShard {
     where
         F: Future<Output = ()>,
     {
+        let _serialized = self.requester_recount_lock.lock().await;
         let txn = self.db.begin(IsolationLevel::Snapshot).await?;
 
         let start = concurrency_request_prefix(tenant, queue);

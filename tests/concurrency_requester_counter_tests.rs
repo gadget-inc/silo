@@ -761,6 +761,52 @@ async fn recount_keeps_request_enqueued_after_snapshot() {
     );
 }
 
+/// A second recount of the same queue started while one is between its
+/// snapshot and its commit waits for the first, then finds nothing to
+/// correct, so the drift is corrected once rather than twice.
+#[silo::test]
+async fn overlapping_recounts_apply_the_correction_once() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "recount-overlap-q";
+    park_requests(&shard, "-", queue, 2).await;
+    drift_requester_counter(&shard, "-", queue, -3).await;
+    assert_eq!(requester_count(&shard, "-", queue).await, -1);
+
+    let second = {
+        let shard = Arc::clone(&shard);
+        async move {
+            let second = tokio::spawn(async move {
+                shard
+                    .recount_requester_counter("-", "recount-overlap-q")
+                    .await
+                    .expect("second recount")
+            });
+            // Give the second recount time to run; it must wait for the
+            // first to commit instead.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            second
+        }
+    };
+    let (first_delta, second) = {
+        let mut second_handle = None;
+        let first_delta = shard
+            .recount_requester_counter_for_test("-", queue, async {
+                second_handle = Some(second.await);
+            })
+            .await
+            .expect("first recount");
+        (first_delta, second_handle.expect("hook ran"))
+    };
+    let second_delta = second.await.expect("join second recount");
+
+    assert_eq!(first_delta, 3);
+    assert_eq!(
+        second_delta, 0,
+        "the second recount saw the corrected counter"
+    );
+    assert_eq!(requester_count(&shard, "-", queue).await, 2);
+}
+
 /// `queue_counts` hides a counter at or below zero. One reconcile pass
 /// restores the true requester count for the queue.
 #[silo::test]

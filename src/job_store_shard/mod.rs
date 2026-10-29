@@ -309,6 +309,10 @@ pub struct JobStoreShard {
     /// Serializes refresh index drains from scan to commit, so concurrent
     /// polls for one group cannot both lease the same row.
     pub(crate) refresh_drain_lock: tokio::sync::Mutex<()>,
+    /// Serializes requester counter recounts from snapshot to commit. A
+    /// recount's correction is a delta computed at its snapshot, so two
+    /// recounts of one queue that overlap would both merge the same delta.
+    pub(crate) requester_recount_lock: tokio::sync::Mutex<()>,
     /// Settings for the enqueue-time index backfill sweep.
     pub(crate) enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig,
     /// The highest listing-index version the backfill has completed on this
@@ -703,6 +707,7 @@ impl JobStoreShard {
                 .unwrap_or(i64::MAX),
             refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             refresh_drain_lock: tokio::sync::Mutex::new(()),
+            requester_recount_lock: tokio::sync::Mutex::new(()),
             enqueue_time_index_backfill,
             listing_index_version: AtomicU8::new(0),
             enqueue_time_index_backfill_task: tokio::sync::Mutex::new(None),
