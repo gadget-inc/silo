@@ -732,8 +732,10 @@ impl ConcurrencyCounts {
     /// Push a `(tenant, queue, task_id)` tuple onto the per-task_id
     /// reconciliation queue. Idempotent: BTreeSet dedupes repeats.
     ///
-    /// Called by `PendingGrantGuard::drop` and `PendingHolderReleaseGuard::drop`
-    /// in `dequeue.rs` when a dequeue future is cancelled around its commit.
+    /// Called by the cancellation guards (`PendingGrantGuard` and
+    /// `PendingHolderReleaseGuard` on the dequeue and outcome paths,
+    /// `PendingEnqueueGrantGuard` on the enqueue path) when a request future
+    /// is dropped between an in-memory holder change and its commit.
     /// The actual reconciliation runs on the periodic
     /// `spawn_concurrency_reconcile_task`, woken sub-tick via
     /// `ConcurrencyManager::request_reconciliation`.
@@ -1014,8 +1016,9 @@ pub struct ConcurrencyManager {
     grant_notify: tokio::sync::Notify,
     grant_running: AtomicBool,
     /// Sub-tick wake for the periodic holder reconciler. Fired by
-    /// `request_reconciliation` after a dequeue future is cancelled around
-    /// its commit (via `PendingGrantGuard::drop` / `PendingHolderReleaseGuard::drop`).
+    /// `request_reconciliation` after a request future is cancelled around
+    /// its commit (via the `Drop` of `PendingGrantGuard`,
+    /// `PendingHolderReleaseGuard` or `PendingEnqueueGrantGuard`).
     /// Sibling to `grant_notify` — separate notify because the grant scanner
     /// and the holder reconciler are distinct concerns (granting vs
     /// reconciling); the periodic-reconcile task selects on this directly.
@@ -1670,9 +1673,11 @@ impl ConcurrencyManager {
     /// Queue a `(tenant, queue, task_id)` for the periodic reconciler to
     /// verify against the durable holder row. Wakes the reconciler sub-tick.
     ///
-    /// Called by `PendingGrantGuard::drop` and `PendingHolderReleaseGuard::drop`
-    /// in `dequeue.rs` after a dequeue future is cancelled around its commit
-    /// — the only place where in-memory and durable holder state can drift.
+    /// Called from the `Drop` of `PendingGrantGuard`,
+    /// `PendingHolderReleaseGuard` and `PendingEnqueueGrantGuard` after a
+    /// dequeue, outcome or enqueue future is cancelled between an in-memory
+    /// holder change and its commit — the places where in-memory and
+    /// durable holder state can drift.
     pub fn request_reconciliation(&self, tenant: String, queue: String, task_id: String) {
         self.counts.enqueue_reconciliation(tenant, queue, task_id);
         self.reconcile_notify.notify_one();
