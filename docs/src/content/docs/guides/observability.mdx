@@ -188,12 +188,14 @@ SlateDB periodically compacts SST files to reclaim space and improve read perfor
 | `silo_slatedb_bytes_compacted_total` | Counter | `shard` | Total number of bytes compacted |
 | `silo_slatedb_running_compactions` | Gauge | `shard` | Number of compactions currently running |
 | `silo_slatedb_last_compaction_ts_seconds` | Gauge | `shard` | Unix timestamp of the last compaction |
+| `silo_periodic_full_compaction_submissions_total` | Counter | `shard`, `outcome` | Full-compaction specs submitted by the periodic schedule, with `outcome` `submitted` or `failed` |
 | `silo_slatedb_l0_sst_count` | Gauge | `shard` | Number of Level-0 SSTs (high values indicate compaction lag) |
 
 **Key insights:**
 - `silo_slatedb_running_compactions` > 0 indicates compaction is actively working
 - Monitor `silo_slatedb_bytes_compacted_total` rate to understand compaction throughput
 - If `silo_slatedb_last_compaction_ts_seconds` is very old, compaction may be stuck or disabled
+- `silo_periodic_full_compaction_submissions_total` should rise by one per shard per `periodic_full_compaction_s`, spread across the period rather than in a burst; a rising `failed` series means the compaction spec could not be written
 - High `silo_slatedb_l0_sst_count` means scans must merge across many unsorted files, directly increasing scan latency. This is the most important metric for diagnosing slow scans
 
 #### Cache Metrics
