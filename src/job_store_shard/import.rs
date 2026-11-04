@@ -357,8 +357,14 @@ impl JobStoreShard {
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
-            self.finish_enqueue(job_id, &params.task_group, effective_start_at_ms, &grants)
-                .await?;
+            self.finish_enqueue(
+                tenant,
+                job_id,
+                &params.task_group,
+                effective_start_at_ms,
+                &grants,
+            )
+            .await?;
         }
 
         debug!(job_id = %job_id, status = ?status_kind, "imported job");
@@ -865,7 +871,7 @@ impl JobStoreShard {
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
-            self.finish_enqueue(job_id, &task_group, effective_start_at_ms, &grants)
+            self.finish_enqueue(tenant, job_id, &task_group, effective_start_at_ms, &grants)
                 .await?;
         }
 

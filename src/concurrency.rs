@@ -64,9 +64,9 @@ use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
     concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
-    concurrency_requester_counter_key, end_bound, floating_limit_state_key, job_info_key,
-    job_status_key, parse_concurrency_holder_key, parse_concurrency_request_key,
-    parse_concurrency_requester_counter_key, task_key,
+    concurrency_requester_counter_key, end_bound, floating_limit_state_key,
+    holder_reconcile_barrier_key, job_info_key, job_status_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, parse_concurrency_requester_counter_key, task_key,
 };
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
@@ -732,8 +732,10 @@ impl ConcurrencyCounts {
     /// Push a `(tenant, queue, task_id)` tuple onto the per-task_id
     /// reconciliation queue. Idempotent: BTreeSet dedupes repeats.
     ///
-    /// Called by `PendingGrantGuard::drop` and `PendingHolderReleaseGuard::drop`
-    /// in `dequeue.rs` when a dequeue future is cancelled around its commit.
+    /// Called by the cancellation guards (`PendingGrantGuard` and
+    /// `PendingHolderReleaseGuard` on the dequeue and outcome paths,
+    /// `PendingEnqueueGrantGuard` on the enqueue path) when a request future
+    /// is dropped between an in-memory holder change and its commit.
     /// The actual reconciliation runs on the periodic
     /// `spawn_concurrency_reconcile_task`, woken sub-tick via
     /// `ConcurrencyManager::request_reconciliation`.
@@ -1014,8 +1016,9 @@ pub struct ConcurrencyManager {
     grant_notify: tokio::sync::Notify,
     grant_running: AtomicBool,
     /// Sub-tick wake for the periodic holder reconciler. Fired by
-    /// `request_reconciliation` after a dequeue future is cancelled around
-    /// its commit (via `PendingGrantGuard::drop` / `PendingHolderReleaseGuard::drop`).
+    /// `request_reconciliation` after a request future is cancelled around
+    /// its commit (via the `Drop` of `PendingGrantGuard`,
+    /// `PendingHolderReleaseGuard` or `PendingEnqueueGrantGuard`).
     /// Sibling to `grant_notify` — separate notify because the grant scanner
     /// and the holder reconciler are distinct concerns (granting vs
     /// reconciling); the periodic-reconcile task selects on this directly.
@@ -1654,6 +1657,25 @@ impl ConcurrencyManager {
         self.counts.release_reservation(tenant, queue, task_id);
     }
 
+    /// Confirm a grant whose holder row is now durable. Every path that
+    /// writes a holder row for a `try_reserve` reservation calls this after
+    /// its commit. A reservation the drift pass released while the batch was
+    /// still in flight is absent here, but so is one a cancel or outcome
+    /// released after the row became visible, and only the durable row tells
+    /// them apart; the reconciler reads it behind the writer-loop barrier and
+    /// re-inserts the holder when the row exists.
+    pub fn confirm_grant(&self, tenant: &str, queue: &str, task_id: &str) {
+        if !self.counts.contains_holder(tenant, queue, task_id) {
+            tracing::info!(
+                tenant = %tenant,
+                queue = %queue,
+                task_id = %task_id,
+                "in-memory holder released before its batch committed; queueing reconciliation"
+            );
+            self.request_reconciliation(tenant.to_string(), queue.to_string(), task_id.to_string());
+        }
+    }
+
     /// Signal that a concurrency slot was freed for the given queue.
     /// Called by callers after releasing a holder (post-commit).
     /// Wakes the grant scanner to process pending requests.
@@ -1670,9 +1692,11 @@ impl ConcurrencyManager {
     /// Queue a `(tenant, queue, task_id)` for the periodic reconciler to
     /// verify against the durable holder row. Wakes the reconciler sub-tick.
     ///
-    /// Called by `PendingGrantGuard::drop` and `PendingHolderReleaseGuard::drop`
-    /// in `dequeue.rs` after a dequeue future is cancelled around its commit
-    /// — the only place where in-memory and durable holder state can drift.
+    /// Called from the `Drop` of `PendingGrantGuard`,
+    /// `PendingHolderReleaseGuard` and `PendingEnqueueGrantGuard` after a
+    /// dequeue, outcome or enqueue future is cancelled between an in-memory
+    /// holder change and its commit — the places where in-memory and
+    /// durable holder state can drift.
     pub fn request_reconciliation(&self, tenant: String, queue: String, task_id: String) {
         self.counts.enqueue_reconciliation(tenant, queue, task_id);
         self.reconcile_notify.notify_one();
@@ -1682,7 +1706,12 @@ impl ConcurrencyManager {
     /// `(tenant, queue, task_id)` against the durable holder row.
     ///
     /// Per-task_id, idempotent. Resolves the ambiguity of "cancellation mid
-    /// commit-await may or may not have applied to the WAL" deterministically:
+    /// commit-await may or may not have applied to the WAL" deterministically.
+    /// A dropped future's batch may still sit in SlateDB's writer-loop queue,
+    /// so before any point read the pass submits a barrier write of its own
+    /// and waits for it to apply: the loop is single-writer and in order, so
+    /// every batch a guard could have sent is visible by then and the row
+    /// read below is the row that will exist.
     ///
     /// | durable | in-memory | action                                   |
     /// |---------|-----------|------------------------------------------|
@@ -1706,6 +1735,29 @@ impl ConcurrencyManager {
         let pending = self.counts.drain_pending_reconciliations();
         if pending.is_empty() {
             return false;
+        }
+
+        let mut barrier = WriteBatch::new();
+        barrier.put(holder_reconcile_barrier_key(), []);
+        if let Err(e) = db
+            .write_with_options(
+                barrier,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                pending = pending.len(),
+                "reconciler: barrier write failed; re-queueing for next tick"
+            );
+            for (tenant, queue, task_id) in pending {
+                self.counts.enqueue_reconciliation(tenant, queue, task_id);
+            }
+            return true;
         }
         let mut requeued = false;
 
@@ -1831,14 +1883,16 @@ impl ConcurrencyManager {
     ///    re-check in `reconcile_pending_holders` guards against the snapshot
     ///    racing a holder *delete* (the original ghost case). But it cannot
     ///    distinguish a true ghost from an in-flight reservation:
-    ///    `process_grants` calls `try_reserve_internal` (which inserts into the
-    ///    in-memory holder set) *before* its durable holder write commits, so a
-    ///    just-reserved-not-yet-durable slot looks identical to a ghost to a
-    ///    point-in-time `db.get`. Releasing it would over-grant the queue. The
-    ///    consecutive-pass requirement closes that gap: an in-flight reservation
-    ///    commits within milliseconds — far inside one `concurrency_reconcile_interval`
-    ///    — so it never survives to a second pass, whereas a real ghost is
-    ///    permanent and survives every pass.
+    ///    `process_grants` and the enqueue chain call `try_reserve_internal`
+    ///    (which inserts into the in-memory holder set) *before* the durable
+    ///    holder write commits, so a just-reserved-not-yet-durable slot looks
+    ///    identical to a ghost to a point-in-time `db.get`. Releasing it
+    ///    would over-grant the queue once its batch lands. Two things close
+    ///    that gap: a candidate must survive consecutive full passes, whereas
+    ///    a real ghost is permanent and survives every pass; and every commit
+    ///    confirms its grants (`confirm_grant`), handing a reservation that
+    ///    was released while its batch was still in flight to
+    ///    `reconcile_pending_holders`, which puts it back if its row exists.
     /// 2. **Publish metrics** (only when metrics are enabled):
     ///    * `silo_concurrency_holder_drift` — Σ |in_mem - durable| across hydrated queues
     ///    * `silo_concurrency_reconciliation_pending` — current size of the
@@ -3351,6 +3405,10 @@ impl ConcurrencyManager {
                 "grant scanner: chunk write failed, rolled back this chunk's reservations"
             );
             return Err(());
+        }
+
+        for (q, tid) in chunk_reservations {
+            self.confirm_grant(tenant, q, tid);
         }
 
         for (request_id, task_group) in chunk_grants {

@@ -6,7 +6,7 @@ use tracing::{debug, info_span};
 use uuid::Uuid;
 
 use crate::codec::{encode_job_info, encode_job_status};
-use crate::concurrency::RequestTicketOutcome;
+use crate::concurrency::{ConcurrencyManager, RequestTicketOutcome};
 use crate::dst_events::{self, DstEvent};
 use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit, ListingSegment};
 use crate::job_store_shard::JobStoreShard;
@@ -53,6 +53,69 @@ impl ScheduledRefreshes {
     /// Task groups that received an index row in this batch.
     pub fn task_groups(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(|(_, _, g)| g.as_str())
+    }
+}
+
+/// RAII guard over the in-memory concurrency reservations one enqueue makes
+/// before its batch is durable.
+///
+/// `handle_enqueue` reserves a slot in the in-memory holder set before any
+/// durable write, and the chain then awaits further reads and finally the
+/// commit. If the enqueue future is dropped at any of those awaits (the
+/// client gave up on the RPC) the reservation would otherwise survive with
+/// no durable holder row behind it, blocking the slot until the drift pass
+/// notices. The chain walker records each reservation here as it is made;
+/// on a normal exit the caller `disarm`s the guard (keeping the grants for
+/// logging after a commit, or rolling them back after a failed one), and if
+/// the future is dropped or panics instead, `Drop` queues every recorded
+/// tuple for the holder reconciler, which point-reads the durable row and
+/// releases the reservation when no row exists.
+pub(crate) struct PendingEnqueueGrantGuard<'a> {
+    concurrency: &'a ConcurrencyManager,
+    tenant: &'a str,
+    grants: Vec<(String, String)>,
+    armed: bool,
+}
+
+impl<'a> PendingEnqueueGrantGuard<'a> {
+    pub(crate) fn new(concurrency: &'a ConcurrencyManager, tenant: &'a str) -> Self {
+        Self {
+            concurrency,
+            tenant,
+            grants: Vec::new(),
+            armed: true,
+        }
+    }
+
+    /// The `(queue, task_id)` reservations recorded so far, for the chain
+    /// walker to append to.
+    pub(crate) fn grants_mut(&mut self) -> &mut Vec<(String, String)> {
+        &mut self.grants
+    }
+
+    /// Neutralize the guard and hand its reservations back. After a commit
+    /// they are backed by durable rows; after a failed commit the caller
+    /// rolls them back itself.
+    pub(crate) fn disarm(&mut self) -> Vec<(String, String)> {
+        self.armed = false;
+        std::mem::take(&mut self.grants)
+    }
+}
+
+impl Drop for PendingEnqueueGrantGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed || self.grants.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            tenant = %self.tenant,
+            count = self.grants.len(),
+            "enqueue future dropped/panicked with pending concurrency grants; queueing reconciliation"
+        );
+        for (queue, task_id) in std::mem::take(&mut self.grants) {
+            self.concurrency
+                .request_reconciliation(self.tenant.to_string(), queue, task_id);
+        }
     }
 }
 
@@ -240,26 +303,28 @@ impl JobStoreShard {
         let mut batch = WriteBatch::new();
         let mut scheduled_refreshes = ScheduledRefreshes::default();
         let background_action_metadata = metadata.clone().unwrap_or_default();
-        let grants = self
-            .write_enqueue_data(
-                &mut DbWriteBatcher::new(&self.db, &mut batch),
-                &mut scheduled_refreshes,
-                tenant,
-                job_id,
-                priority,
-                start_at_ms,
-                retry_policy,
-                payload,
-                limits,
-                metadata,
-                task_group,
-            )
-            .await?;
+        let mut grant_guard = PendingEnqueueGrantGuard::new(&self.concurrency, tenant);
+        self.write_enqueue_data(
+            &mut DbWriteBatcher::new(&self.db, &mut batch),
+            &mut scheduled_refreshes,
+            grant_guard.grants_mut(),
+            tenant,
+            job_id,
+            priority,
+            start_at_ms,
+            retry_policy,
+            payload,
+            limits,
+            metadata,
+            task_group,
+        )
+        .await?;
 
         // Include counter in the same batch for efficiency
         if let Err(e) =
             self.increment_total_jobs_counter(&mut DbWriteBatcher::new(&self.db, &mut batch))
         {
+            self.rollback_grants(tenant, &grant_guard.disarm());
             self.rollback_background_action_queue_counter_transition(
                 tenant,
                 task_group,
@@ -293,7 +358,7 @@ impl JobStoreShard {
             .await
         {
             dst_events::cancel_write(write_op);
-            self.rollback_grants(tenant, &grants);
+            self.rollback_grants(tenant, &grant_guard.disarm());
             self.rollback_background_action_queue_counter_transition(
                 tenant,
                 task_group,
@@ -303,10 +368,11 @@ impl JobStoreShard {
             );
             return Err(e.into());
         }
+        let grants = grant_guard.disarm();
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
-        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, start_at_ms, &grants)
             .await
     }
 
@@ -367,24 +433,26 @@ impl JobStoreShard {
         }
 
         let mut scheduled_refreshes = ScheduledRefreshes::default();
-        let grants = self
-            .write_enqueue_data(
-                &mut TxnWriter(&txn),
-                &mut scheduled_refreshes,
-                tenant,
-                job_id,
-                priority,
-                start_at_ms,
-                retry_policy,
-                payload,
-                limits,
-                metadata,
-                task_group,
-            )
-            .await?;
+        let mut grant_guard = PendingEnqueueGrantGuard::new(&self.concurrency, tenant);
+        self.write_enqueue_data(
+            &mut TxnWriter(&txn),
+            &mut scheduled_refreshes,
+            grant_guard.grants_mut(),
+            tenant,
+            job_id,
+            priority,
+            start_at_ms,
+            retry_policy,
+            payload,
+            limits,
+            metadata,
+            task_group,
+        )
+        .await?;
 
         // Include counter in the transaction (unmark_write excludes it from conflict detection)
         if let Err(e) = self.increment_total_jobs_counter(&mut TxnWriter(&txn)) {
+            self.rollback_grants(tenant, &grant_guard.disarm());
             self.rollback_background_action_queue_counter_transition(
                 tenant,
                 task_group,
@@ -416,7 +484,7 @@ impl JobStoreShard {
             .await
         {
             dst_events::cancel_write(write_op);
-            self.rollback_grants(tenant, &grants);
+            self.rollback_grants(tenant, &grant_guard.disarm());
             self.rollback_background_action_queue_counter_transition(
                 tenant,
                 task_group,
@@ -426,20 +494,27 @@ impl JobStoreShard {
             );
             return Err(e.into());
         }
+        let grants = grant_guard.disarm();
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
-        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, start_at_ms, &grants)
             .await
     }
 
     /// Write all enqueue data (job info, metadata, status, limit tasks) to the writer.
     /// Shared between the WriteBatch and transaction enqueue paths.
+    ///
+    /// In-memory concurrency grants made by the limit chain are appended to
+    /// `grants` as they happen, so the caller's `PendingEnqueueGrantGuard`
+    /// sees every reservation the moment it exists. On `Err` the chain has
+    /// already rolled back its own grants and `grants` is unchanged.
     #[allow(clippy::too_many_arguments)]
     async fn write_enqueue_data<W: WriteBatcher>(
         &self,
         writer: &mut W,
         scheduled_refreshes: &mut ScheduledRefreshes,
+        grants: &mut Vec<(String, String)>,
         tenant: &str,
         job_id: &str,
         priority: u8,
@@ -449,7 +524,7 @@ impl JobStoreShard {
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
         task_group: &str,
-    ) -> Result<Vec<(String, String)>, JobStoreShardError> {
+    ) -> Result<(), JobStoreShardError> {
         let now_ms = now_epoch_ms();
 
         let job = JobInfo {
@@ -489,39 +564,38 @@ impl JobStoreShard {
 
         Self::write_job_status_with_index_and_metadata(writer, tenant, job_id, job_status)?;
 
-        let result = self
-            .enqueue_limit_task_at_index(
-                writer,
-                LimitTaskParams {
-                    tenant,
-                    task_id: &first_task_id,
-                    job_id,
-                    attempt_number: 1,
-                    relative_attempt_number: 1,
-                    limit_index: 0,
-                    limits: &job.limits,
-                    priority,
-                    // Fresh enqueue: the task_key starts at the job's schedule. If
-                    // the job is future-scheduled (`start_at_ms > now_ms`) the
-                    // resulting `RequestTicket` lands at the future time so the
-                    // broker picks it up exactly then. Use `effective_start_at_ms`
-                    // (not the raw `start_at_ms`) so an immediate enqueue
-                    // (`start_at_ms <= 0`) keys the task at `now_ms` — matching the
-                    // `effective_start_at_ms` the JobStatus stores and the import
-                    // path, so identity lookups never have to fall back to time=0.
-                    // Fresh chain head → epoch is just the write time; no
-                    // predecessor tombstone to dodge.
-                    scheduled_at_ms: effective_start_at_ms,
-                    task_key_epoch_ms: now_ms,
-                    now_ms,
-                    held_queues: Vec::new(),
-                    task_group,
-                    skip_try_reserve: false,
-                    scheduled_refreshes,
-                },
-            )
-            .await
-            .map(|result| result.grants)?;
+        self.enqueue_limit_task_at_index_into(
+            writer,
+            grants,
+            LimitTaskParams {
+                tenant,
+                task_id: &first_task_id,
+                job_id,
+                attempt_number: 1,
+                relative_attempt_number: 1,
+                limit_index: 0,
+                limits: &job.limits,
+                priority,
+                // Fresh enqueue: the task_key starts at the job's schedule. If
+                // the job is future-scheduled (`start_at_ms > now_ms`) the
+                // resulting `RequestTicket` lands at the future time so the
+                // broker picks it up exactly then. Use `effective_start_at_ms`
+                // (not the raw `start_at_ms`) so an immediate enqueue
+                // (`start_at_ms <= 0`) keys the task at `now_ms` — matching the
+                // `effective_start_at_ms` the JobStatus stores and the import
+                // path, so identity lookups never have to fall back to time=0.
+                // Fresh chain head → epoch is just the write time; no
+                // predecessor tombstone to dodge.
+                scheduled_at_ms: effective_start_at_ms,
+                task_key_epoch_ms: now_ms,
+                now_ms,
+                held_queues: Vec::new(),
+                task_group,
+                skip_try_reserve: false,
+                scheduled_refreshes,
+            },
+        )
+        .await?;
         self.apply_background_action_queue_counter_transition(
             tenant,
             task_group,
@@ -529,19 +603,21 @@ impl JobStoreShard {
             job_status_kind,
             &job.metadata,
         );
-        Ok(result)
+        Ok(())
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
-    /// Logs grants and wakes up the broker for the given task group.
+    /// Confirms and logs grants and wakes up the broker for the given task group.
     pub(crate) async fn finish_enqueue(
         &self,
+        tenant: &str,
         job_id: &str,
         task_group: &str,
         start_at_ms: i64,
         grants: &[(String, String)],
     ) -> Result<(), JobStoreShardError> {
         for (queue, task_id) in grants {
+            self.concurrency.confirm_grant(tenant, queue, task_id);
             let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
             let _g = span.enter();
             debug!("granted concurrency slot immediately");
@@ -587,19 +663,38 @@ impl JobStoreShard {
         writer: &mut W,
         params: LimitTaskParams<'_>,
     ) -> Result<LimitTaskWriteResult, JobStoreShardError> {
+        let mut grants: Vec<(String, String)> = Vec::new();
+        let pending_task_key_start_ms = self
+            .enqueue_limit_task_at_index_into(writer, &mut grants, params)
+            .await?;
+        Ok(LimitTaskWriteResult {
+            grants,
+            pending_task_key_start_ms,
+        })
+    }
+
+    /// `enqueue_limit_task_at_index` writing its grants into a caller-owned
+    /// vector instead of a fresh one, so a caller holding the vector inside
+    /// a cancellation guard observes each reservation as soon as it is made.
+    /// Entries already in `grants` are left alone; on `Err` the entries this
+    /// walk appended are rolled back and removed again, so `grants` holds
+    /// only live reservations whichever way the walk ends.
+    pub(crate) async fn enqueue_limit_task_at_index_into<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        grants: &mut Vec<(String, String)>,
+        params: LimitTaskParams<'_>,
+    ) -> Result<Option<i64>, JobStoreShardError> {
         // Save the tenant ref so we can roll back grants if walk_limit_chain errors.
         // (references are Copy, so this doesn't conflict with moving `params`.)
         let tenant_for_rollback: &str = params.tenant;
-        let mut grants: Vec<(String, String)> = Vec::new();
-        match self.walk_limit_chain(writer, params, &mut grants).await {
-            Ok(pending_task_key_start_ms) => Ok(LimitTaskWriteResult {
-                grants,
-                pending_task_key_start_ms,
-            }),
+        let first_new_grant = grants.len();
+        match self.walk_limit_chain(writer, params, grants).await {
+            Ok(pending_task_key_start_ms) => Ok(pending_task_key_start_ms),
             Err(e) => {
-                for (queue, task_id) in &grants {
+                for (queue, task_id) in grants.drain(first_new_grant..) {
                     self.concurrency
-                        .rollback_grant(tenant_for_rollback, queue, task_id);
+                        .rollback_grant(tenant_for_rollback, &queue, &task_id);
                 }
                 Err(e)
             }
@@ -798,9 +893,26 @@ impl JobStoreShard {
                         crate::concurrency::ConcurrencyLimitType::Floating,
                     );
 
+                    // The in-memory reservation `handle_enqueue` made is
+                    // recorded in `grants` before any further await, so an
+                    // error or cancellation during the waiter scan below is
+                    // rolled back or reconciled like any other chain exit.
                     let mut has_waiters =
                         matches!(outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
+                    let grant_result = record_grant_outcome(
+                        outcome,
+                        &fl.key,
+                        scheduled_at_ms,
+                        grants,
+                        &current_task_id,
+                        &mut current_held_queues,
+                        &mut current_index,
+                    );
+
                     if refresh_ready && !has_waiters {
+                        if let Some(hook) = self.floating_waiter_scan_hook_for_test() {
+                            hook().await?;
+                        }
                         has_waiters = self
                             .has_waiting_concurrency_requests(tenant, &fl.key)
                             .await?;
@@ -819,15 +931,7 @@ impl JobStoreShard {
                         scheduled_refreshes.record(tenant, &fl.key, task_group);
                     }
 
-                    match record_grant_outcome(
-                        outcome,
-                        &fl.key,
-                        scheduled_at_ms,
-                        grants,
-                        &current_task_id,
-                        &mut current_held_queues,
-                        &mut current_index,
-                    ) {
+                    match grant_result {
                         GrantResult::Granted => {}
                         GrantResult::Queued {
                             pending_task_key_start_ms,

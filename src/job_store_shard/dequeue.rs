@@ -168,7 +168,7 @@ impl Drop for ClaimedInflightGuard<'_> {
 ///
 /// **What it does.** Holds the `(tenant, queue, task_id)` tuples awaiting
 /// commit confirmation. On every normal exit (handler-error / commit-failure
-/// / commit-success), the dequeue body calls `take()` or `clear()` to handle
+/// / commit-success), the dequeue body calls `disarm()` or `take_all()` to handle
 /// the contents itself. If the future is instead dropped or panics, the Drop
 /// fires with whatever is still in `pending` and enqueues each tuple onto
 /// `ConcurrencyManager`'s reconciliation queue. The periodic reconciler then
@@ -196,13 +196,14 @@ impl<'a> PendingGrantGuard<'a> {
         }
     }
 
-    /// Empty the buffer without disarming. Used after commit-success — the
-    /// reservations are now backed by durable rows, no further action needed,
-    /// and the guard stays armed for the next iteration.
-    fn clear(&mut self) {
-        if let Some(v) = self.pending.as_mut() {
-            v.clear();
-        }
+    /// Drain the buffer without disarming. Used after commit-success — the
+    /// reservations are now backed by durable rows and the caller confirms
+    /// each one — and the guard stays armed for the next iteration.
+    fn take_all(&mut self) -> Vec<(String, String, String)> {
+        self.pending
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Take ownership of the pending tuples back, neutralizing the guard so
@@ -466,10 +467,12 @@ impl JobStoreShard {
             self.mark_refresh_pending_groups(state.scheduled_refreshes.task_groups());
 
             // DB write succeeded — grants are now backed by durable holder
-            // rows, no rollback needed. Clear the guard's buffer (keeps it
-            // armed for the next iteration); the next iteration's pushes
-            // start from empty.
-            grant_guard.clear();
+            // rows, no rollback needed. Confirm each one in memory and empty
+            // the guard's buffer (keeps it armed for the next iteration); the
+            // next iteration's pushes start from empty.
+            for (tenant, queue, task_id) in grant_guard.take_all() {
+                self.concurrency.confirm_grant(&tenant, &queue, &task_id);
+            }
 
             // Post-commit: drop in-memory slots for any holders we removed in
             // this batch (e.g. a RunAttempt task we dropped because its job_info

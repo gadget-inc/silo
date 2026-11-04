@@ -36,6 +36,7 @@ pub mod prefix {
     pub const CLEANUP_COMPLETED_AT: u8 = 0xF6;
     pub const COUNTER_CONCURRENCY_REQUESTERS: u8 = 0xF7;
     pub const COUNTER_TENANT_STATUS: u8 = 0xF8;
+    pub const HOLDER_RECONCILE_BARRIER: u8 = 0xF9;
     pub const ENQUEUE_TIME_INDEX_BACKFILL_PROGRESS: u8 = 0xFB;
     pub const ENQUEUE_TIME_INDEX_BACKFILL_COMPLETE: u8 = 0xFC;
 }
@@ -889,6 +890,13 @@ pub fn enqueue_time_index_backfill_progress_key() -> Vec<u8> {
 /// has completed on this shard.
 pub fn enqueue_time_index_backfill_complete_key() -> Vec<u8> {
     vec![prefix::ENQUEUE_TIME_INDEX_BACKFILL_COMPLETE]
+}
+
+/// Key the holder reconciler overwrites before its point reads. SlateDB
+/// applies batches from one writer loop in submission order, so once this
+/// write is applied every batch submitted before it is visible to reads.
+pub fn holder_reconcile_barrier_key() -> Vec<u8> {
+    vec![prefix::HOLDER_RECONCILE_BARRIER]
 }
 
 /// Key for the per-queue concurrency requester counter.

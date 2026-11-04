@@ -42,6 +42,7 @@ use helpers::DbWriteBatcher;
 use helpers::WriteBatcher;
 pub use helpers::now_epoch_ms;
 
+use futures::future::BoxFuture;
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::Arc;
 #[cfg(feature = "server")]
@@ -240,6 +241,12 @@ pub struct DequeueResult {
 }
 
 /// Represents a single shard of the system. Owns the SlateDB instance.
+/// Test-only hook awaited by the enqueue chain between a floating limit's
+/// immediate grant and its waiter scan. See
+/// `JobStoreShard::set_floating_waiter_scan_hook_for_test`.
+pub type FloatingWaiterScanHook =
+    Arc<dyn Fn() -> BoxFuture<'static, Result<(), JobStoreShardError>> + Send + Sync>;
+
 pub struct JobStoreShard {
     pub(crate) name: String,
     pub(crate) db: Arc<InstrumentedDb>,
@@ -267,6 +274,9 @@ pub struct JobStoreShard {
     orphan_holder_stale_ms: i64,
     /// Cursor and candidate state the orphan sweep carries between ticks.
     orphan_sweep: std::sync::Mutex<orphan_sweep::OrphanSweepPass>,
+    /// Test-only hook the enqueue chain awaits before a floating limit's
+    /// waiter scan. See `set_floating_waiter_scan_hook_for_test`.
+    floating_waiter_scan_hook_for_test: std::sync::Mutex<Option<FloatingWaiterScanHook>>,
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
     cancellation: CancellationToken,
@@ -690,6 +700,7 @@ impl JobStoreShard {
             orphan_holder_grace_ms: i64::try_from(orphan_holder_grace_ms).unwrap_or(i64::MAX),
             orphan_holder_stale_ms: i64::try_from(orphan_holder_stale_ms).unwrap_or(i64::MAX),
             orphan_sweep: std::sync::Mutex::new(orphan_sweep::OrphanSweepPass::default()),
+            floating_waiter_scan_hook_for_test: std::sync::Mutex::new(None),
             cancellation: CancellationToken::new(),
             close_completed: std::sync::atomic::AtomicBool::new(false),
             store,
@@ -762,12 +773,13 @@ impl JobStoreShard {
         shard.spawn_concurrency_reconcile_task(range.clone());
 
         // Reactive holder reconciler — wakes on `reconcile_notify` from a
-        // `PendingGrantGuard` / `PendingHolderReleaseGuard` Drop in dequeue
-        // and immediately reconciles. Sibling to the periodic task above; no
-        // jitter and no interval, so a dropped dequeue future un-wedges its
-        // queue within milliseconds rather than waiting up to one reconcile
-        // interval. The periodic task still runs `reconcile_pending_holders`
-        // on its tick as a safety net against missed notifications.
+        // `PendingGrantGuard` / `PendingHolderReleaseGuard` /
+        // `PendingEnqueueGrantGuard` Drop and immediately reconciles.
+        // Sibling to the periodic task above; no jitter and no interval, so
+        // a dropped dequeue or enqueue future un-wedges its queue within
+        // milliseconds rather than waiting up to one reconcile interval. The
+        // periodic task still runs `reconcile_pending_holders` on its tick
+        // as a safety net against missed notifications.
         shard.spawn_holder_reconcile_task(range.clone());
 
         // Watch slatedb's status channel and emit prometheus metrics on each
@@ -1014,11 +1026,12 @@ impl JobStoreShard {
 
     /// Reactive holder reconciler — drains the per-task_id reconciliation
     /// queue immediately on a `reconcile_notify` wake from a dropped
-    /// `PendingGrantGuard` / `PendingHolderReleaseGuard`. No jitter, no
-    /// periodic tick: a wedged queue (durable=0, in_mem=1 after the dequeue
-    /// future was cancelled around its commit) un-wedges as soon as Drop
-    /// runs. The periodic task (`spawn_concurrency_reconcile_task`) still
-    /// calls `reconcile_pending_holders` on its tick as a safety net.
+    /// `PendingGrantGuard`, `PendingHolderReleaseGuard` or
+    /// `PendingEnqueueGrantGuard`. No jitter, no periodic tick: a wedged
+    /// queue (durable=0, in_mem=1 after a dequeue or enqueue future was
+    /// cancelled around its commit) un-wedges as soon as Drop runs. The
+    /// periodic task (`spawn_concurrency_reconcile_task`) still calls
+    /// `reconcile_pending_holders` on its tick as a safety net.
     ///
     /// If a pass re-queues anything (transient hydrate / `db.get` failure),
     /// we sleep `RECONCILE_RETRY_BACKOFF` then poke `reconcile_notify` so
@@ -1353,6 +1366,13 @@ impl JobStoreShard {
             .request_reconciliation(tenant, queue, task_id);
     }
 
+    /// Test-only: confirm a grant as a commit site would after its batch
+    /// landed. See `ConcurrencyManager::confirm_grant`.
+    #[doc(hidden)]
+    pub fn concurrency_confirm_grant_for_test(&self, tenant: &str, queue: &str, task_id: &str) {
+        self.concurrency.confirm_grant(tenant, queue, task_id);
+    }
+
     /// Test-only: insert an in-memory holder directly, used to set up the
     /// "in_mem present, durable absent" ghost quadrant.
     pub fn concurrency_insert_holder(&self, tenant: &str, queue: &str, task_id: &str) {
@@ -1576,6 +1596,33 @@ impl JobStoreShard {
     #[doc(hidden)]
     pub fn set_grant_scan_hook_for_test(&self, hook: Option<crate::concurrency::GrantScanHook>) {
         self.concurrency.set_grant_scan_hook_for_test(hook);
+    }
+
+    /// Test-only: install or clear a hook the enqueue chain awaits after a
+    /// floating limit's immediate grant and before its waiter scan. The hook
+    /// runs with the in-memory reservation held and nothing durable written,
+    /// which is the window a failing or abandoned scan sits in; an `Err` it
+    /// returns surfaces as the scan's error.
+    #[doc(hidden)]
+    pub fn set_floating_waiter_scan_hook_for_test(&self, hook: Option<FloatingWaiterScanHook>) {
+        *self
+            .floating_waiter_scan_hook_for_test
+            .lock()
+            .expect("floating waiter scan hook lock") = hook;
+    }
+
+    pub(crate) fn floating_waiter_scan_hook_for_test(&self) -> Option<FloatingWaiterScanHook> {
+        self.floating_waiter_scan_hook_for_test
+            .lock()
+            .expect("floating waiter scan hook lock")
+            .clone()
+    }
+
+    /// Test-only: number of `(tenant, queue, task_id)` tuples queued for the
+    /// holder reconciler and not yet drained.
+    #[doc(hidden)]
+    pub fn pending_holder_reconciliation_count_for_test(&self) -> usize {
+        self.concurrency.counts().pending_reconciliations_len()
     }
 
     /// Test-only: drop the installed chain resumer so the next
