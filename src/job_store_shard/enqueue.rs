@@ -372,7 +372,7 @@ impl JobStoreShard {
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
-        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, start_at_ms, &grants)
             .await
     }
 
@@ -498,7 +498,7 @@ impl JobStoreShard {
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
-        self.finish_enqueue(job_id, task_group, start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, start_at_ms, &grants)
             .await
     }
 
@@ -607,15 +607,17 @@ impl JobStoreShard {
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
-    /// Logs grants and wakes up the broker for the given task group.
+    /// Confirms and logs grants and wakes up the broker for the given task group.
     pub(crate) async fn finish_enqueue(
         &self,
+        tenant: &str,
         job_id: &str,
         task_group: &str,
         start_at_ms: i64,
         grants: &[(String, String)],
     ) -> Result<(), JobStoreShardError> {
         for (queue, task_id) in grants {
+            self.concurrency.confirm_grant(tenant, queue, task_id);
             let span = info_span!("concurrency.grant", queue = %queue, task_id = %task_id, job_id = %job_id, attempt = 1u32, source = "immediate");
             let _g = span.enter();
             debug!("granted concurrency slot immediately");

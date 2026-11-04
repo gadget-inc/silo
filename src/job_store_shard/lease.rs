@@ -483,6 +483,10 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(retry_scheduled_refreshes.task_groups());
+        for (queue, grant_task_id) in &retry_grants {
+            self.concurrency
+                .confirm_grant(&tenant, queue, grant_task_id);
+        }
 
         // Post-commit: release in-memory concurrency counts and signal grant
         // scanner. Drain the guard (leaving it armed-but-empty so its Drop is a

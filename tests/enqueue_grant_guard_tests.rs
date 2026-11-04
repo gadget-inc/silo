@@ -59,6 +59,23 @@ fn parking_scan_hook(reached: Arc<tokio::sync::Notify>) -> FloatingWaiterScanHoo
     })
 }
 
+/// A hook that reports when the chain reaches the waiter scan and parks
+/// there until `release` is notified, then lets the chain continue.
+fn gated_scan_hook(
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> FloatingWaiterScanHook {
+    Arc::new(move || {
+        let reached = Arc::clone(&reached);
+        let release = Arc::clone(&release);
+        Box::pin(async move {
+            reached.notify_one();
+            release.notified().await;
+            Ok(())
+        })
+    })
+}
+
 async fn enqueue_with_limit(
     shard: &JobStoreShard,
     id: Option<String>,
@@ -257,4 +274,174 @@ async fn completed_enqueue_leaves_nothing_pending_on_txn_path() {
         fc_limit("fl-complete-q", 1),
     )
     .await;
+}
+
+/// Park an enqueue inside its waiter scan with its reservation held so the
+/// drift pass can run against it. Returns the parked task and the gate that
+/// lets it continue to its commit.
+async fn park_enqueue_with_reservation(
+    shard: &Arc<JobStoreShard>,
+    queue: &'static str,
+) -> (
+    tokio::task::JoinHandle<Result<String, JobStoreShardError>>,
+    Arc<tokio::sync::Notify>,
+) {
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    shard.set_floating_waiter_scan_hook_for_test(Some(gated_scan_hook(
+        Arc::clone(&reached),
+        Arc::clone(&release),
+    )));
+    let enqueue = {
+        let shard = Arc::clone(shard);
+        tokio::spawn(async move { enqueue_with_limit(&shard, None, fc_limit(queue, 1)).await })
+    };
+    reached.notified().await;
+    assert_eq!(shard.concurrency_holder_count(TENANT, queue), 1);
+    (enqueue, release)
+}
+
+async fn run_two_drift_passes(shard: &JobStoreShard) {
+    for _ in 0..2 {
+        shard.report_holder_drift_for_test().await;
+        shard.reconcile_pending_holders_for_test().await;
+    }
+}
+
+/// A reservation with no durable row that is seen by two consecutive drift
+/// passes is released as a ghost. If its chain was merely slow and commits
+/// afterwards, the commit hands the holder to the reconciler, which puts it
+/// back, so the in-memory set matches the durable row and the queue admits
+/// exactly its capacity.
+#[silo::test]
+async fn drift_release_of_slow_reservation_is_undone_by_its_commit() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-slow-reservation-q";
+    let (enqueue, release) = park_enqueue_with_reservation(&shard, queue).await;
+
+    run_two_drift_passes(&shard).await;
+    assert_eq!(
+        shard.concurrency_holder_count(TENANT, queue),
+        0,
+        "a reservation with no durable row is released after two drift passes"
+    );
+
+    release.notify_one();
+    let job_id = enqueue
+        .await
+        .expect("enqueue task joins")
+        .expect("the slow enqueue commits");
+    shard.set_floating_waiter_scan_hook_for_test(None);
+    // The commit found its holder gone and handed it to the reconciler,
+    // which puts it back because the row now exists. The reactive task may
+    // already have run; driving a pass here and waiting covers both.
+    shard.reconcile_pending_holders_for_test().await;
+    let in_memory = poll_until(
+        || async { shard.concurrency_holder_count(TENANT, queue) },
+        |n| *n == 1,
+        5_000,
+    )
+    .await;
+    assert_eq!(
+        in_memory, 1,
+        "the commit restores the in-memory holder the drift pass released"
+    );
+    assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+
+    // Capacity is honoured again: a second job on the max=1 queue waits.
+    enqueue_with_limit(&shard, None, fc_limit(queue, 1))
+        .await
+        .expect("enqueue second job");
+    assert_eq!(shard.concurrency_holder_count(TENANT, queue), 1);
+    let leased = shard
+        .dequeue("w1", TASK_GROUP, 2)
+        .await
+        .expect("dequeue")
+        .tasks;
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].job().id(), job_id);
+}
+
+/// Seed a durable holder row and hydrate the queue around it, so later
+/// reconciles compare against a hydrated in-memory set.
+async fn hydrate_queue_with_seed(shard: &JobStoreShard, queue: &str) {
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(
+        silo::keys::concurrency_holder_key(TENANT, queue, "seed"),
+        silo::codec::encode_holder(&silo::task::HolderRecord {
+            granted_at_ms: now_ms(),
+            job_id: None,
+            attempt_number: None,
+        }),
+    );
+    shard.db().write(batch).await.expect("seed write");
+    shard.db().flush().await.expect("flush seed");
+    shard.request_concurrency_reconciliation(TENANT.to_string(), queue.to_string(), "seed".into());
+    shard.reconcile_pending_holders_for_test().await;
+    assert!(shard.concurrency_contains_holder(TENANT, queue, "seed"));
+}
+
+/// A grant whose holder is still in memory at commit needs nothing from the
+/// reconciler.
+#[silo::test]
+async fn confirm_leaves_present_holder_alone() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "confirm-present-q";
+    hydrate_queue_with_seed(&shard, queue).await;
+    shard.concurrency_insert_holder(TENANT, queue, "live");
+
+    shard.concurrency_confirm_grant_for_test(TENANT, queue, "live");
+    assert_eq!(shard.pending_holder_reconciliation_count_for_test(), 0);
+    assert!(shard.concurrency_contains_holder(TENANT, queue, "live"));
+}
+
+/// A holder released by a cancel or outcome between the batch landing and
+/// its confirmation has no durable row any more, so confirming it must not
+/// bring it back.
+#[silo::test]
+async fn confirm_does_not_revive_holder_released_with_its_row() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "confirm-released-q";
+    hydrate_queue_with_seed(&shard, queue).await;
+
+    shard.concurrency_confirm_grant_for_test(TENANT, queue, "gone");
+    shard.reconcile_pending_holders_for_test().await;
+    let in_memory = poll_until(
+        || async { shard.concurrency_contains_holder(TENANT, queue, "gone") },
+        |present| !*present,
+        1_000,
+    )
+    .await;
+    assert!(!in_memory, "a holder with no durable row stays released");
+    assert_eq!(shard.pending_holder_reconciliation_count_for_test(), 0);
+}
+
+/// A holder the drift pass released while its batch was in flight still
+/// has its durable row once the batch lands, so confirming it brings it
+/// back through the reconciler.
+#[silo::test]
+async fn confirm_restores_holder_whose_row_landed() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "confirm-landed-q";
+    hydrate_queue_with_seed(&shard, queue).await;
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(
+        silo::keys::concurrency_holder_key(TENANT, queue, "landed"),
+        silo::codec::encode_holder(&silo::task::HolderRecord {
+            granted_at_ms: now_ms(),
+            job_id: None,
+            attempt_number: None,
+        }),
+    );
+    shard.db().write(batch).await.expect("holder write");
+
+    shard.concurrency_confirm_grant_for_test(TENANT, queue, "landed");
+    shard.reconcile_pending_holders_for_test().await;
+    let in_memory = poll_until(
+        || async { shard.concurrency_contains_holder(TENANT, queue, "landed") },
+        |present| *present,
+        5_000,
+    )
+    .await;
+    assert!(in_memory, "a holder whose row exists is put back");
 }

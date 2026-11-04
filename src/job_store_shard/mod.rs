@@ -1366,6 +1366,13 @@ impl JobStoreShard {
             .request_reconciliation(tenant, queue, task_id);
     }
 
+    /// Test-only: confirm a grant as a commit site would after its batch
+    /// landed. See `ConcurrencyManager::confirm_grant`.
+    #[doc(hidden)]
+    pub fn concurrency_confirm_grant_for_test(&self, tenant: &str, queue: &str, task_id: &str) {
+        self.concurrency.confirm_grant(tenant, queue, task_id);
+    }
+
     /// Test-only: insert an in-memory holder directly, used to set up the
     /// "in_mem present, durable absent" ghost quadrant.
     pub fn concurrency_insert_holder(&self, tenant: &str, queue: &str, task_id: &str) {
