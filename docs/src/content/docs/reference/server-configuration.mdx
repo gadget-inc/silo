@@ -197,7 +197,7 @@ This option is **optional**. If omitted, no periodic compaction is submitted.
 
 #### `periodic_full_compaction_slot_s`
 
-Length in seconds of one slot of the periodic full-compaction schedule. Defaults to `60`. The number of slots is `periodic_full_compaction_s / periodic_full_compaction_slot_s`, rounded down; a slot length that does not divide the period leaves a quiet tail at the end of each period in which nothing is submitted, and a slot longer than the period submits every shard in the first slot of each period. The value must be at least `1`.
+Length in seconds of one slot of the periodic full-compaction schedule. Defaults to `60`. The number of slots is `periodic_full_compaction_s / periodic_full_compaction_slot_s`, rounded down; a slot length that does not divide the period leaves a quiet tail at the end of each period in which nothing is submitted, and a slot longer than the period is shortened to the period, so every shard is submitted once per period in a single slot. The value must be at least `1`.
 
 Each submission is counted by `silo_periodic_full_compaction_submissions_total{shard, outcome}` and logged with its slot and period.
 

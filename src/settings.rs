@@ -502,8 +502,9 @@ pub struct DatabaseTemplate {
     pub periodic_full_compaction_s: Option<u64>,
     /// Length in seconds of one slot of the periodic full-compaction schedule.
     /// Defaults to 60. A slot length that does not divide the period leaves a
-    /// quiet tail at the end of each period; a slot longer than the period
-    /// submits every shard in the first slot of the period.
+    /// quiet tail at the end of each period; a slot longer than the period is
+    /// shortened to the period, so every shard is submitted once per period in
+    /// a single slot.
     #[serde(default = "default_periodic_full_compaction_slot_s")]
     pub periodic_full_compaction_slot_s: u64,
     /// When true, unfiltered per-tenant `SELECT COUNT(*)` statements are answered

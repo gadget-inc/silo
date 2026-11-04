@@ -157,6 +157,16 @@ fn a_slot_longer_than_the_period_is_one_slot_per_period() {
     let schedule = CompactionSchedule::new(100, 300).expect("non-zero period and slot");
     assert_eq!(schedule.slot_count(), 1);
     assert_eq!(schedule.tail_s(), 0);
+    assert_eq!(
+        schedule.slot_s(),
+        100,
+        "the slot is shortened to the period so a ticker firing once per slot sees every period"
+    );
+    assert_eq!(
+        schedule.delay_until_slot_midpoint(Duration::from_secs(100 * 7)),
+        Duration::from_secs(50),
+        "ticks align to the period, not the configured slot"
+    );
     for shard in fixed_shards(10) {
         assert_eq!(schedule.slot_for(shard), 0);
     }

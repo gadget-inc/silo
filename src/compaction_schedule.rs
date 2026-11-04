@@ -38,8 +38,9 @@ impl CompactionSchedule {
     ///
     /// A slot length that does not divide the period leaves a quiet tail of
     /// `period_s % slot_s` seconds at the end of every period in which no
-    /// shard is due; a slot longer than the period collapses to a single slot
-    /// spanning the whole period.
+    /// shard is due. A slot longer than the period is shortened to the
+    /// period, giving a single slot that spans it, so a ticker firing once
+    /// per slot still sees every period.
     pub fn new(period_s: u64, slot_s: u64) -> Result<Self, CompactionScheduleError> {
         if period_s == 0 {
             return Err(CompactionScheduleError::ZeroPeriod);
@@ -47,20 +48,24 @@ impl CompactionSchedule {
         if slot_s == 0 {
             return Err(CompactionScheduleError::ZeroSlot);
         }
-        Ok(Self { period_s, slot_s })
+        Ok(Self {
+            period_s,
+            slot_s: slot_s.min(period_s),
+        })
     }
 
     pub fn period_s(&self) -> u64 {
         self.period_s
     }
 
+    /// Slot length in seconds, never longer than the period.
     pub fn slot_s(&self) -> u64 {
         self.slot_s
     }
 
     /// Number of slots in a period, at least one.
     pub fn slot_count(&self) -> u64 {
-        (self.period_s / self.slot_s).max(1)
+        self.period_s / self.slot_s
     }
 
     /// Seconds at the end of each period in which no slot is active.
