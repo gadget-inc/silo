@@ -64,9 +64,9 @@ use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
     concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
-    concurrency_requester_counter_key, end_bound, floating_limit_state_key, job_info_key,
-    job_status_key, parse_concurrency_holder_key, parse_concurrency_request_key,
-    parse_concurrency_requester_counter_key, task_key,
+    concurrency_requester_counter_key, end_bound, floating_limit_state_key,
+    holder_reconcile_barrier_key, job_info_key, job_status_key, parse_concurrency_holder_key,
+    parse_concurrency_request_key, parse_concurrency_requester_counter_key, task_key,
 };
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
@@ -1687,7 +1687,12 @@ impl ConcurrencyManager {
     /// `(tenant, queue, task_id)` against the durable holder row.
     ///
     /// Per-task_id, idempotent. Resolves the ambiguity of "cancellation mid
-    /// commit-await may or may not have applied to the WAL" deterministically:
+    /// commit-await may or may not have applied to the WAL" deterministically.
+    /// A dropped future's batch may still sit in SlateDB's writer-loop queue,
+    /// so before any point read the pass submits a barrier write of its own
+    /// and waits for it to apply: the loop is single-writer and in order, so
+    /// every batch a guard could have sent is visible by then and the row
+    /// read below is the row that will exist.
     ///
     /// | durable | in-memory | action                                   |
     /// |---------|-----------|------------------------------------------|
@@ -1711,6 +1716,29 @@ impl ConcurrencyManager {
         let pending = self.counts.drain_pending_reconciliations();
         if pending.is_empty() {
             return false;
+        }
+
+        let mut barrier = WriteBatch::new();
+        barrier.put(holder_reconcile_barrier_key(), []);
+        if let Err(e) = db
+            .write_with_options(
+                barrier,
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                pending = pending.len(),
+                "reconciler: barrier write failed; re-queueing for next tick"
+            );
+            for (tenant, queue, task_id) in pending {
+                self.counts.enqueue_reconciliation(tenant, queue, task_id);
+            }
+            return true;
         }
         let mut requeued = false;
 

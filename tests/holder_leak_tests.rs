@@ -2789,3 +2789,76 @@ async fn orphan_sweep_covers_every_row_with_small_slice() {
     assert_eq!(run_orphan_sweep_pass(&shard, 2).await, 5);
     assert_eq!(count_concurrency_holders(shard.db()).await, 0);
 }
+
+/// A future dropped around its commit may have handed its batch to SlateDB's
+/// writer loop without the loop having applied it yet. The reconciler must
+/// not read the holder row before that batch lands, or it releases an
+/// in-memory entry whose durable row is about to appear. On a current-thread
+/// runtime the writer loop only runs when this test yields, so a single poll
+/// of the write future leaves the batch queued and unapplied.
+#[silo::test]
+async fn reconcile_pending_holders_sees_batch_queued_before_it() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let tenant = "-";
+    let queue = "barrier-q";
+    let task_id = "queued-holder";
+
+    // Hydrate the queue so the in-memory entry is authoritative.
+    {
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            concurrency_holder_key(tenant, queue, "hydrate-seed"),
+            holder_without_owner(),
+        );
+        shard.db().write(batch).await.expect("seed write");
+        shard.db().flush().await.expect("flush seed");
+    }
+    shard.request_concurrency_reconciliation(
+        tenant.to_string(),
+        queue.to_string(),
+        "hydrate-seed".to_string(),
+    );
+    shard.reconcile_pending_holders_for_test().await;
+    assert!(shard.concurrency_contains_holder(tenant, queue, "hydrate-seed"));
+
+    // The reservation a request future makes before its batch commits.
+    shard.concurrency_insert_holder(tenant, queue, task_id);
+
+    // Hand the holder row's batch to the writer loop without letting the loop
+    // run: one poll submits it and parks on the completion channel.
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(
+        concurrency_holder_key(tenant, queue, task_id),
+        holder_without_owner(),
+    );
+    let mut write = Box::pin(shard.db().write(batch));
+    assert!(
+        futures::poll!(write.as_mut()).is_pending(),
+        "the write must park after submitting its batch"
+    );
+
+    // The guard's Drop, then the reconciler pass that follows it.
+    shard.request_concurrency_reconciliation(
+        tenant.to_string(),
+        queue.to_string(),
+        task_id.to_string(),
+    );
+    let requeued = shard.reconcile_pending_holders_for_test().await;
+    assert!(!requeued, "no transient error expected");
+
+    assert!(
+        shard.concurrency_contains_holder(tenant, queue, task_id),
+        "the reconciler released a reservation whose holder row was queued to land"
+    );
+    write.await.expect("queued write lands");
+    assert!(
+        shard
+            .db()
+            .get(&concurrency_holder_key(tenant, queue, task_id))
+            .await
+            .expect("get holder")
+            .is_some(),
+        "the queued batch wrote the holder row"
+    );
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 2);
+}

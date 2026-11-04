@@ -9,20 +9,23 @@ use crate::concurrency::ConcurrencyManager;
 ///
 /// **Why this exists.** A handler that finishes/releases a task deletes the
 /// durable holder row in its batch and queues a matching in-memory release.
-/// `write_with_options(... await_durable: true)` applies the batch to the WAL
-/// on first poll, so by the time the await yields, the durable row may already
-/// be gone — but the post-commit `atomic_release` loop only runs if the await
-/// resolves cleanly. Cancellation mid-await (the request future is dropped)
-/// leaves durable=0, in_memory=1: a ghost holder that wedges the queue (the
-/// prod 300/300 bug).
+/// `write_with_options(... await_durable: true)` hands the batch to SlateDB's
+/// writer loop on first poll and then waits for it; the loop applies the
+/// batch on its own schedule, so by the time the await yields the durable
+/// row may already be gone — but the post-commit `atomic_release` loop only
+/// runs if the await resolves cleanly. Cancellation mid-await (the request
+/// future is dropped) leaves durable=0, in_memory=1: a ghost holder that
+/// wedges the queue (the prod 300/300 bug).
 ///
 /// **What it does.** On normal exit the caller calls `take_all()` (commit
 /// success) or `disarm()` (commit failure) to neutralize the guard and run the
 /// in-memory release loop itself. If the future is dropped or panics, `Drop`
-/// enqueues each tuple for the reconciler, which point-looks-up the durable
-/// holder row to decide whether to release the in-memory entry (the WAL apply
-/// landed) or leave it alone (the WAL apply did not). Per-task_id, idempotent,
-/// correct in both branches of the ambiguity.
+/// enqueues each tuple for the reconciler. The reconciler first writes a
+/// barrier through the same writer loop so any batch the dropped future
+/// handed over is applied, then point-looks-up the durable holder row to
+/// decide whether to release the in-memory entry (the batch landed) or
+/// leave it alone (it never did). Per-task_id, idempotent, correct in both
+/// branches of the ambiguity.
 ///
 /// Used by `dequeue.rs` and `lease.rs::report_attempt_outcome`.
 pub(crate) struct PendingHolderReleaseGuard<'a> {
