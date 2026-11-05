@@ -40,11 +40,18 @@
                 <table class="min-w-full divide-y divide-zinc-700">
                     <thead class="bg-zinc-850">
                         <tr>
-                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Tenant</th>
-                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Jobs</th>
-                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Scheduled</th>
-                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Running</th>
-                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">Terminal</th>
+                            {% for header in sort_headers %}
+                            <th class="px-3 py-2 text-left text-xs font-medium text-zinc-400 uppercase tracking-wider">
+                                <a href="{{ header.href }}" class="inline-flex items-center gap-1 hover:text-zinc-200 {% if header.is_active %}text-zinc-200{% endif %}">
+                                    {{ header.label }}
+                                    {% if header.is_active %}
+                                    <span class="text-emerald-400">{{ header.indicator }}</span>
+                                    {% else %}
+                                    <span class="text-zinc-600">↕</span>
+                                    {% endif %}
+                                </a>
+                            </th>
+                            {% endfor %}
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-zinc-700">
@@ -72,13 +79,13 @@
             </div>
             <div class="flex gap-2">
                 {% if page > 1 %}
-                <a href="/tenants?page={{ page - 1 }}&per_page={{ per_page }}" class="px-3 py-1 text-sm bg-zinc-700 text-zinc-300 hover:bg-zinc-600 border border-zinc-600">Previous</a>
+                <a href="/tenants?page={{ page - 1 }}&per_page={{ per_page }}&sort={{ sort }}&dir={{ dir }}" class="px-3 py-1 text-sm bg-zinc-700 text-zinc-300 hover:bg-zinc-600 border border-zinc-600">Previous</a>
                 {% else %}
                 <span class="px-3 py-1 text-sm bg-zinc-800 text-zinc-600 border border-zinc-700 cursor-not-allowed">Previous</span>
                 {% endif %}
 
                 {% if page < total_pages %}
-                <a href="/tenants?page={{ page + 1 }}&per_page={{ per_page }}" class="px-3 py-1 text-sm bg-zinc-700 text-zinc-300 hover:bg-zinc-600 border border-zinc-600">Next</a>
+                <a href="/tenants?page={{ page + 1 }}&per_page={{ per_page }}&sort={{ sort }}&dir={{ dir }}" class="px-3 py-1 text-sm bg-zinc-700 text-zinc-300 hover:bg-zinc-600 border border-zinc-600">Next</a>
                 {% else %}
                 <span class="px-3 py-1 text-sm bg-zinc-800 text-zinc-600 border border-zinc-700 cursor-not-allowed">Next</span>
                 {% endif %}
