@@ -224,10 +224,9 @@ impl JobStoreShard {
             }
         }
 
-        // Wake the broker to pick up the new task promptly
-        if start_at_ms <= now_epoch_ms() {
-            self.brokers.wakeup(&task_group);
-        }
+        // Wake the broker to pick up the new task promptly, or record its
+        // start time when it is future-dated.
+        self.brokers.notify_task_written(&task_group, start_at_ms);
 
         Ok(())
     }
