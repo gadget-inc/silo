@@ -118,6 +118,25 @@ impl LeaseOverwriteSource {
     }
 }
 
+/// Result of one periodic full-compaction submission, recorded as the
+/// `outcome` label on `silo_periodic_full_compaction_submissions_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionSubmissionOutcome {
+    /// The compaction spec was written for the compactor to pick up.
+    Submitted,
+    /// Writing the compaction spec failed.
+    Failed,
+}
+
+impl CompactionSubmissionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionSubmissionOutcome::Submitted => "submitted",
+            CompactionSubmissionOutcome::Failed => "failed",
+        }
+    }
+}
+
 // (shard_id, tenant, task_group, queue, queue_kind)
 type BackgroundActionMetricKey = (String, String, String, String, String);
 type BackgroundActionGaugeState = Arc<Mutex<HashMap<BackgroundActionMetricKey, GaugeSeriesState>>>;
@@ -201,6 +220,9 @@ pub struct Metrics {
     lease_reaper_scans_total: CounterVec,
     lease_reaper_leases_reaped_total: CounterVec,
     lease_reaper_errors_total: CounterVec,
+
+    // Periodic full compaction
+    periodic_full_compaction_submissions_total: CounterVec,
 
     // Concurrency metrics
     concurrency_tickets_granted: CounterVec,
@@ -729,6 +751,17 @@ impl Metrics {
     pub fn record_lease_reaper_error(&self, shard: &str) {
         self.lease_reaper_errors_total
             .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record one periodic full-compaction submission for `shard`.
+    pub fn record_periodic_full_compaction(
+        &self,
+        shard: &str,
+        outcome: CompactionSubmissionOutcome,
+    ) {
+        self.periodic_full_compaction_submissions_total
+            .with_label_values(&[shard, outcome.as_str()])
             .inc();
     }
 
@@ -2410,6 +2443,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let periodic_full_compaction_submissions_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_periodic_full_compaction_submissions_total",
+                "Total periodic full-compaction submissions per shard, by outcome (submitted, failed)",
+            ),
+            &["shard", "outcome"],
+        )?,
+    );
+
     // Concurrency metrics
     let concurrency_tickets_granted = register(
         &registry,
@@ -2735,6 +2779,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_scans_total,
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
+        periodic_full_compaction_submissions_total,
         concurrency_tickets_granted,
         concurrency_orphan_holders_purged,
         concurrency_tickets_converted,

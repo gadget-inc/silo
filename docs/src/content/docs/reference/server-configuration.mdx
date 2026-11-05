@@ -93,6 +93,9 @@ apply_wal_on_close = true
 # concurrency_reconcile_interval_ms = 5000
 # Optional: periodic counter reconciliation (disabled when omitted)
 # counter_reconciliation_seconds = 900
+# Optional: staggered periodic full compaction (disabled when omitted)
+# periodic_full_compaction_s = 3600
+# periodic_full_compaction_slot_s = 60
 # Optional: orphan concurrency holder sweep (see the per-option sections below)
 # orphan_holder_sweep_slice = 5000
 # orphan_holder_grace_ms = 60000
@@ -113,6 +116,8 @@ path = "/var/lib/silo/wal/%shard%"
 | `apply_wal_on_close` | bool | `true` | Flush WAL to object storage before closing shards (recommended for durability) |
 | `concurrency_reconcile_interval_ms` | number | `5000` | Optional interval for periodic pending-request reconciliation in the concurrency manager |
 | `counter_reconciliation_seconds` | number | unset | Interval for the periodic counter reconciliation pass, which rederives the job counters from the job rows and recounts every per-queue concurrency requester counter from its live request rows; omitted disables the pass |
+| `periodic_full_compaction_s` | number | unset | Period, in seconds, in which every shard gets one full-compaction spec submitted; shards are spread across the period by a hash of their id; omitted disables periodic compaction |
+| `periodic_full_compaction_slot_s` | number | `60` | Length, in seconds, of one slot of the periodic full-compaction schedule |
 | `orphan_holder_sweep_slice` | number | `5000` | Max durable concurrency holder rows the orphan holder sweep walks per reconcile tick; values below 1 are treated as 1 |
 | `orphan_holder_grace_ms` | number | `60000` | Minimum age of a concurrency holder before the orphan holder sweep classifies it |
 | `orphan_holder_stale_ms` | number | `86400000` | Age past which a concurrency holder with no unexpired lease is purged regardless of its job's status; `0` disables this rule |
@@ -183,6 +188,18 @@ This option is **optional**. If omitted, Silo uses the default value of `5000` m
 When set, each shard runs a counter reconciliation pass every this-many seconds. The pass rederives the per-shard total and completed job counters and the per-tenant status counters from the job rows, then recounts every per-queue concurrency requester counter from the queue's live request rows and merges the difference. The job counters drift when the standalone compactor drops expired terminal job rows, which it does without a writable database handle; the requester counters drift when a request row is deleted by one path after another path has already accounted for it. Each requester counter correction is logged at `warn` with the tenant, queue, previous value and delta.
 
 This option is **optional**. If omitted, the pass does not run.
+
+#### `periodic_full_compaction_s`
+
+When set, every shard gets a full-compaction spec submitted once every this-many seconds. The spec is picked up and executed by the standalone silo-compactor deployment; the silo node only writes it. A full compaction rewrites every SST of the shard, which leaves the shard's block cache, meta cache and local object-store cache cold, so submissions are staggered rather than fired together: the period is divided into slots of `periodic_full_compaction_slot_s` seconds, each shard is pinned to one slot by a hash of its id, and the current slot is derived from wall-clock time since the Unix epoch. A shard is therefore submitted at the same point in every period whichever node owns it and whenever that node started, and a node's shards go cold one slot at a time instead of all at once. A node submits each shard at most once per period, so a shard that opens partway through its slot is still submitted only once.
+
+This option is **optional**. If omitted, no periodic compaction is submitted.
+
+#### `periodic_full_compaction_slot_s`
+
+Length in seconds of one slot of the periodic full-compaction schedule. Defaults to `60`. The number of slots is `periodic_full_compaction_s / periodic_full_compaction_slot_s`, rounded down; a slot length that does not divide the period leaves a quiet tail at the end of each period in which nothing is submitted, and a slot longer than the period is shortened to the period, so every shard is submitted once per period in a single slot. The value must be at least `1`.
+
+Each submission is counted by `silo_periodic_full_compaction_submissions_total{shard, outcome}` and logged with its slot and period.
 
 #### `orphan_holder_sweep_slice`
 

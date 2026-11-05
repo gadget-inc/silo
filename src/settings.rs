@@ -1,3 +1,4 @@
+use crate::compaction_schedule::{CompactionSchedule, CompactionScheduleError};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::fs;
@@ -489,13 +490,23 @@ pub struct DatabaseTemplate {
     /// counter values from the surviving job rows.
     #[serde(default)]
     pub terminal_job_expire_s: Option<u64>,
-    /// When set, every pod runs a background ticker that submits a full-compaction
-    /// spec for each shard it owns, every this-many seconds. `None` (the default)
-    /// disables periodic compaction entirely (no ticker is spawned). The spec is
-    /// consumed and executed by the standalone silo-compactor deployment, not by
-    /// the silo pod itself.
+    /// When set, every shard gets a full-compaction spec submitted once every
+    /// this-many seconds. The period is divided into
+    /// `periodic_full_compaction_slot_s` slots and each shard is pinned to one
+    /// slot by a hash of its id, so a node's shards go cold one slot at a time
+    /// and the cluster's submissions are spread across the period. `None` (the
+    /// default) disables periodic compaction entirely (no ticker is spawned).
+    /// The spec is consumed and executed by the standalone silo-compactor
+    /// deployment, not by the silo pod itself.
     #[serde(default)]
     pub periodic_full_compaction_s: Option<u64>,
+    /// Length in seconds of one slot of the periodic full-compaction schedule.
+    /// Defaults to 60. A slot length that does not divide the period leaves a
+    /// quiet tail at the end of each period; a slot longer than the period is
+    /// shortened to the period, so every shard is submitted once per period in
+    /// a single slot.
+    #[serde(default = "default_periodic_full_compaction_slot_s")]
+    pub periodic_full_compaction_slot_s: u64,
     /// When true, unfiltered per-tenant `SELECT COUNT(*)` statements are answered
     /// from per-status counters instead of a full status-index scan. See
     /// `DatabaseConfig::count_from_status_counters`. Defaults to true.
@@ -517,6 +528,18 @@ pub struct DatabaseTemplate {
     /// (512 MB for block cache, 128 MB for meta cache).
     #[serde(default)]
     pub memory_cache: Option<MemoryCacheConfig>,
+}
+
+impl DatabaseTemplate {
+    /// The staggered full-compaction schedule these settings describe, or
+    /// `None` when `periodic_full_compaction_s` is unset.
+    pub fn compaction_schedule(
+        &self,
+    ) -> Result<Option<CompactionSchedule>, CompactionScheduleError> {
+        self.periodic_full_compaction_s
+            .map(|period_s| CompactionSchedule::new(period_s, self.periodic_full_compaction_slot_s))
+            .transpose()
+    }
 }
 
 impl Default for DatabaseTemplate {
@@ -549,6 +572,7 @@ impl Default for DatabaseTemplate {
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
+            periodic_full_compaction_slot_s: default_periodic_full_compaction_slot_s(),
             count_from_status_counters: default_count_from_status_counters(),
             enqueue_time_index_backfill: EnqueueTimeIndexBackfillConfig::default(),
             slatedb: None,
@@ -836,6 +860,10 @@ fn default_slow_query_log_ms() -> u64 {
 
 fn default_count_from_status_counters() -> bool {
     true
+}
+
+fn default_periodic_full_compaction_slot_s() -> u64 {
+    60
 }
 
 fn default_enqueue_time_index_backfill_batch_size() -> usize {
@@ -1260,6 +1288,92 @@ mod tests {
         )
         .expect("config with periodic_full_compaction_s should parse");
         assert_eq!(db.periodic_full_compaction_s, Some(5));
+    }
+
+    #[test]
+    fn periodic_full_compaction_slot_s_defaults_to_sixty() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            periodic_full_compaction_s = 3600
+            "#,
+        )
+        .expect("config without periodic_full_compaction_slot_s should parse");
+        assert_eq!(db.periodic_full_compaction_slot_s, 60);
+        let schedule = db
+            .compaction_schedule()
+            .expect("3600 s period with 60 s slots is valid")
+            .expect("a period enables the schedule");
+        assert_eq!(schedule.slot_count(), 60);
+    }
+
+    #[test]
+    fn periodic_full_compaction_slot_s_parses_when_present() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            periodic_full_compaction_s = 600
+            periodic_full_compaction_slot_s = 30
+            "#,
+        )
+        .expect("config with periodic_full_compaction_slot_s should parse");
+        assert_eq!(db.periodic_full_compaction_slot_s, 30);
+        let schedule = db
+            .compaction_schedule()
+            .expect("600 s period with 30 s slots is valid")
+            .expect("a period enables the schedule");
+        assert_eq!(schedule.slot_count(), 20);
+    }
+
+    #[test]
+    fn compaction_schedule_is_disabled_without_a_period() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            periodic_full_compaction_slot_s = 30
+            "#,
+        )
+        .expect("slot length without a period should parse");
+        assert_eq!(db.compaction_schedule(), Ok(None));
+    }
+
+    #[test]
+    fn compaction_schedule_with_a_slot_that_does_not_divide_the_period_leaves_a_tail() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            periodic_full_compaction_s = 100
+            periodic_full_compaction_slot_s = 30
+            "#,
+        )
+        .expect("non-dividing slot length should parse");
+        let schedule = db
+            .compaction_schedule()
+            .expect("non-dividing slot length is accepted")
+            .expect("a period enables the schedule");
+        assert_eq!(schedule.slot_count(), 3);
+        assert_eq!(schedule.tail_s(), 10);
+    }
+
+    #[test]
+    fn compaction_schedule_rejects_a_zero_slot_length() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            periodic_full_compaction_s = 100
+            periodic_full_compaction_slot_s = 0
+            "#,
+        )
+        .expect("zero slot length should parse");
+        assert_eq!(
+            db.compaction_schedule(),
+            Err(crate::compaction_schedule::CompactionScheduleError::ZeroSlot)
+        );
     }
 
     #[test]

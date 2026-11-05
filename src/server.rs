@@ -26,12 +26,13 @@ use datafusion::common::{ParamValues, ScalarValue};
 /// File descriptor set for gRPC reflection
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("silo_descriptor");
 
+use crate::compaction_schedule::SubmissionTracker;
 use crate::coordination::{Coordinator, ShardSplitter, member_in_ring};
 use crate::factory::ShardFactory;
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::metrics::Metrics;
+use crate::metrics::{CompactionSubmissionOutcome, Metrics};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
 use crate::settings::AppConfig;
@@ -2443,6 +2444,13 @@ pub async fn run_server(
     run_server_with_incoming(incoming, factory, coordinator, cfg, metrics, shutdown).await
 }
 
+/// Wall-clock time since the Unix epoch; zero if the clock is before it.
+fn unix_now() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
 /// Generic variant that accepts any incoming stream of IOs (e.g., Turmoil TcpListener) and runs the server
 /// with a periodic reaper. Use this in simulations to inject custom accept loops.
 pub async fn run_server_with_incoming<S, IO>(
@@ -2462,6 +2470,7 @@ where
         + 'static
         + tonic::transport::server::Connected,
 {
+    let compaction_schedule = cfg.database.compaction_schedule()?;
     let svc = SiloService::new(factory.clone(), coordinator, cfg.clone(), metrics.clone());
     let interceptor = make_auth_interceptor(cfg.server.auth_token.clone());
     let silo_server = SiloServer::new(svc)
@@ -2578,34 +2587,62 @@ where
         }
     });
 
-    // Optional per-pod periodic full-compaction ticker. Disabled when the
-    // `periodic_full_compaction_s` database setting is absent.
-    let compaction_ticker: Option<JoinHandle<()>> =
-        cfg.database.periodic_full_compaction_s.map(|secs| {
-            let compaction_factory = factory.clone();
-            let mut compaction_tick_rx = tick_tx.subscribe();
-            let period = std::time::Duration::from_secs(secs);
-            tokio::spawn(async move {
-                // interval_at => skip the immediate first tick; first run at t=secs.
-                let mut interval =
-                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = interval.tick() => {
-                            for (shard_id, shard) in compaction_factory.instances().iter() {
-                                let shard_label = shard_id.to_string();
-                                match shard.submit_full_compaction().await {
-                                    Ok(()) => info!(shard = %shard_label, "periodic full compaction submitted"),
-                                    Err(e) => warn!(shard = %shard_label, error = %e, "periodic full compaction failed"),
+    // Staggered periodic full-compaction ticker. Disabled when the
+    // `periodic_full_compaction_s` database setting is absent. Every shard is
+    // pinned to one slot of the period by a hash of its id, and the current
+    // slot comes from wall-clock time, so a shard keeps its cadence across
+    // ownership moves and node restarts.
+    let compaction_ticker: Option<JoinHandle<()>> = compaction_schedule.map(|schedule| {
+        let compaction_factory = factory.clone();
+        let compaction_metrics = metrics.clone();
+        let mut compaction_tick_rx = tick_tx.subscribe();
+        tokio::spawn(async move {
+            info!(
+                period_s = schedule.period_s(),
+                slot_s = schedule.slot_s(),
+                slots = schedule.slot_count(),
+                tail_s = schedule.tail_s(),
+                "periodic full compaction schedule active"
+            );
+            let mut tracker = SubmissionTracker::default();
+            // Ticks fire at the midpoint of each wall-clock slot so timer
+            // jitter cannot push a tick across a slot boundary; the tracker
+            // still guards against two ticks landing in one slot.
+            let slot = Duration::from_secs(schedule.slot_s());
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + schedule.delay_until_slot_midpoint(unix_now()),
+                slot,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = interval.tick() => {
+                        let instances = compaction_factory.instances();
+                        let due = tracker.due(&schedule, unix_now().as_secs(), instances.keys().copied());
+                        for shard in due {
+                            let Some(instance) = instances.get(&shard.shard) else { continue };
+                            let shard_label = shard.shard.to_string();
+                            let outcome = match instance.submit_full_compaction().await {
+                                Ok(()) => {
+                                    info!(shard = %shard_label, slot = shard.slot, period = shard.period, "periodic full compaction submitted");
+                                    CompactionSubmissionOutcome::Submitted
                                 }
+                                Err(e) => {
+                                    warn!(shard = %shard_label, slot = shard.slot, period = shard.period, error = %e, "periodic full compaction failed");
+                                    CompactionSubmissionOutcome::Failed
+                                }
+                            };
+                            if let Some(ref m) = compaction_metrics {
+                                m.record_periodic_full_compaction(&shard_label, outcome);
                             }
                         }
-                        _ = compaction_tick_rx.recv() => { break; }
                     }
+                    _ = compaction_tick_rx.recv() => { break; }
                 }
-            })
-        });
+            }
+        })
+    });
 
     // Create reflection service for grpcurl/debugging
     let reflection_service = ReflectionBuilder::configure()

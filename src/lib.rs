@@ -4,6 +4,7 @@ pub mod cluster_client;
 #[cfg(feature = "server")]
 pub mod cluster_query;
 pub mod codec;
+pub mod compaction_schedule;
 pub mod concurrency;
 pub mod coordination;
 pub mod dst_events;

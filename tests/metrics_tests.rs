@@ -11,7 +11,7 @@ use axum::{
     routing::get,
 };
 use http_body_util::BodyExt;
-use silo::metrics;
+use silo::metrics::{self, CompactionSubmissionOutcome};
 use tower::ServiceExt;
 
 /// Helper to create a metrics router for testing
@@ -896,4 +896,28 @@ async fn test_metrics_leasable_to_start_latency() {
         "ready-to-start series should still be emitted, found: {:?}",
         ready_count
     );
+}
+
+#[silo::test]
+async fn periodic_full_compaction_submissions_are_counted_by_shard_and_outcome() {
+    let m = metrics::init().expect("init metrics");
+    m.record_periodic_full_compaction("shard-a", CompactionSubmissionOutcome::Submitted);
+    m.record_periodic_full_compaction("shard-a", CompactionSubmissionOutcome::Submitted);
+    m.record_periodic_full_compaction("shard-a", CompactionSubmissionOutcome::Failed);
+    m.record_periodic_full_compaction("shard-b", CompactionSubmissionOutcome::Submitted);
+
+    let body = gather_metrics_text(&m);
+    let value = |shard: &str, outcome: &str| {
+        extract_metric_value(
+            &body,
+            &[
+                "silo_periodic_full_compaction_submissions_total",
+                &format!("shard=\"{shard}\""),
+                &format!("outcome=\"{outcome}\""),
+            ],
+        )
+    };
+    assert_eq!(value("shard-a", "submitted"), 2.0);
+    assert_eq!(value("shard-a", "failed"), 1.0);
+    assert_eq!(value("shard-b", "submitted"), 1.0);
 }
