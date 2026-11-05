@@ -1,6 +1,9 @@
 //! Job cancellation operations.
 
 use slatedb::IsolationLevel;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::codec::{decode_cancellation_at_ms, decode_task, encode_job_cancellation};
 use crate::job::{JobCancellation, JobStatus, JobStatusKind, JobView, Limit};
@@ -9,14 +12,26 @@ use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, find_task_by_identity, now_epoch_ms,
     put_with_optional_expire, retry_on_txn_conflict,
 };
-use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::job_store_shard::{CancelPendingJobOutcome, JobStoreShard, JobStoreShardError};
 use crate::keys::{
     concurrency_holder_key, concurrency_request_job_prefix, concurrency_requester_counter_key,
     end_bound, job_cancelled_key, job_info_key, job_status_key,
 };
 use crate::task::Task;
 
+#[derive(Clone, Copy)]
+enum CancellationMode {
+    Any,
+    PendingOnly,
+}
+
 impl JobStoreShard {
+    pub(crate) fn pending_cancel_lock_index(&self, tenant: &str, id: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        (tenant, id).hash(&mut hasher);
+        hasher.finish() as usize % self.pending_cancel_locks.len()
+    }
+
     /// Cancel a job by id. Prevents further execution and signals running workers to stop.
     ///
     /// Cancellation semantics:
@@ -31,7 +46,58 @@ impl JobStoreShard {
     /// changes during the cancellation flow. Retries automatically on conflict.
     #[tracing::instrument(skip_all, fields(shard = %self.name))]
     pub async fn cancel_job(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
-        retry_on_txn_conflict("cancel_job", || self.cancel_job_inner(tenant, id)).await
+        retry_on_txn_conflict("cancel_job", || {
+            self.cancel_job_inner(tenant, id, CancellationMode::Any)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Cancel only if the job is still pending. The status check is repeated inside
+    /// every transaction attempt, so racing leases cannot turn this into an abort.
+    #[tracing::instrument(skip_all, fields(shard = %self.name))]
+    pub async fn cancel_pending_job(
+        self: &Arc<Self>,
+        tenant: &str,
+        id: &str,
+    ) -> Result<CancelPendingJobOutcome, JobStoreShardError> {
+        // Keep the exclusion guard until the storage operation finishes even if
+        // the caller disconnects while a transaction is being committed.
+        let shard = Arc::clone(self);
+        let tenant = tenant.to_string();
+        let id = id.to_string();
+        tokio::spawn(
+            async move { shard.cancel_pending_job_guarded(&tenant, &id).await }.in_current_span(),
+        )
+        .await?
+    }
+
+    async fn cancel_pending_job_guarded(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<CancelPendingJobOutcome, JobStoreShardError> {
+        // Production dequeue uses unconditional write batches, so transaction
+        // conflict detection alone cannot stop a lease staged before this cancel
+        // from being committed afterwards. Serialize with that job's dequeue.
+        let _guard = self.pending_cancel_locks[self.pending_cancel_lock_index(tenant, id)]
+            .write()
+            .await;
+        match retry_on_txn_conflict("cancel_pending_job", || {
+            self.cancel_job_inner(tenant, id, CancellationMode::PendingOnly)
+        })
+        .await
+        {
+            Err(JobStoreShardError::JobAlreadyCancelled(_))
+            | Err(JobStoreShardError::JobAlreadyTerminal(_, JobStatusKind::Cancelled)) => {
+                Ok(CancelPendingJobOutcome::AlreadyCancelled)
+            }
+            Err(JobStoreShardError::JobAlreadyTerminal(_, _)) => {
+                Ok(CancelPendingJobOutcome::Terminal)
+            }
+            Err(JobStoreShardError::JobNotFound(_)) => Ok(CancelPendingJobOutcome::NotFound),
+            result => result,
+        }
     }
 
     /// Inner implementation of cancel_job that runs within a single transaction attempt.
@@ -46,7 +112,12 @@ impl JobStoreShard {
     ///
     /// Post-commit, in-memory concurrency counts are updated and grant-next is triggered
     /// for any freed concurrency slots.
-    async fn cancel_job_inner(&self, tenant: &str, id: &str) -> Result<(), JobStoreShardError> {
+    async fn cancel_job_inner(
+        &self,
+        tenant: &str,
+        id: &str,
+        mode: CancellationMode,
+    ) -> Result<CancelPendingJobOutcome, JobStoreShardError> {
         let now_ms = now_epoch_ms();
 
         // Start a transaction with SerializableSnapshot isolation for conflict detection
@@ -76,6 +147,10 @@ impl JobStoreShard {
                 id.to_string(),
                 status.kind,
             ));
+        }
+
+        if matches!(mode, CancellationMode::PendingOnly) && status.kind == JobStatusKind::Running {
+            return Ok(CancelPendingJobOutcome::Running);
         }
 
         // Track whether we're transitioning a scheduled job to terminal state.
@@ -337,7 +412,7 @@ impl JobStoreShard {
             self.concurrency.request_grant(tenant, queue);
         }
 
-        Ok(())
+        Ok(CancelPendingJobOutcome::Cancelled)
     }
 
     /// Delete concurrency request records for a specific job across all its concurrency queues.

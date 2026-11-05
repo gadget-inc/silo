@@ -51,6 +51,8 @@ import type { RecountTenantRequestersResponse } from "./silo";
 import type { RecountTenantRequestersRequest } from "./silo";
 import type { DropTenantHoldersResponse } from "./silo";
 import type { DropTenantHoldersRequest } from "./silo";
+import type { CancelPendingJobsResponse } from "./silo";
+import type { CancelPendingJobsRequest } from "./silo";
 import type { CancelJobResponse } from "./silo";
 import type { CancelJobRequest } from "./silo";
 import type { DeleteJobResponse } from "./silo";
@@ -122,6 +124,12 @@ export interface ISiloClient {
      * @generated from protobuf rpc: CancelJob
      */
     cancelJob(input: CancelJobRequest, options?: RpcOptions): UnaryCall<CancelJobRequest, CancelJobResponse>;
+    /**
+     * Cancel a bounded batch without interrupting running jobs.
+     *
+     * @generated from protobuf rpc: CancelPendingJobs
+     */
+    cancelPendingJobs(input: CancelPendingJobsRequest, options?: RpcOptions): UnaryCall<CancelPendingJobsRequest, CancelPendingJobsResponse>;
     /**
      * Forcibly drop all concurrency holders and in-flight run attempts for a
      * tenant on this shard. Admin action to clear stuck concurrency state.
@@ -388,13 +396,22 @@ export class SiloClient implements ISiloClient, ServiceInfo {
         return stackIntercept<CancelJobRequest, CancelJobResponse>("unary", this._transport, method, opt, input);
     }
     /**
+     * Cancel a bounded batch without interrupting running jobs.
+     *
+     * @generated from protobuf rpc: CancelPendingJobs
+     */
+    cancelPendingJobs(input: CancelPendingJobsRequest, options?: RpcOptions): UnaryCall<CancelPendingJobsRequest, CancelPendingJobsResponse> {
+        const method = this.methods[7], opt = this._transport.mergeOptions(options);
+        return stackIntercept<CancelPendingJobsRequest, CancelPendingJobsResponse>("unary", this._transport, method, opt, input);
+    }
+    /**
      * Forcibly drop all concurrency holders and in-flight run attempts for a
      * tenant on this shard. Admin action to clear stuck concurrency state.
      *
      * @generated from protobuf rpc: DropTenantHolders
      */
     dropTenantHolders(input: DropTenantHoldersRequest, options?: RpcOptions): UnaryCall<DropTenantHoldersRequest, DropTenantHoldersResponse> {
-        const method = this.methods[7], opt = this._transport.mergeOptions(options);
+        const method = this.methods[8], opt = this._transport.mergeOptions(options);
         return stackIntercept<DropTenantHoldersRequest, DropTenantHoldersResponse>("unary", this._transport, method, opt, input);
     }
     /**

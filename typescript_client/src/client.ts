@@ -14,6 +14,7 @@ import { RpcError } from "@protobuf-ts/runtime-rpc";
 import { pack, unpack } from "msgpackr";
 import { SiloClient } from "./pb/silo.client";
 import type {
+  CancelPendingJobResult,
   Limit,
   QueryParameter,
   SerializedBytes,
@@ -2102,6 +2103,32 @@ export class SiloGRPCClient {
       });
     } catch (error) {
       throwMappedRpcError(error, { operation: "cancelJob", jobId: id, tenant });
+    }
+  }
+
+  /**
+   * Cancel up to 1000 unique jobs in one tenant without interrupting running jobs.
+   * Returns one result per ID in request order, including state races and failures.
+   * Retried requests report already-cancelled jobs separately from new cancellations.
+   */
+  public async cancelPendingJobs(
+    ids: string[],
+    tenant?: string,
+  ): Promise<CancelPendingJobResult[]> {
+    if (ids.length === 0) return [];
+    if (ids.length > 1000 || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+      throw new SiloInvalidArgumentError("expected at most 1000 nonempty, unique job IDs");
+    }
+    try {
+      return await this._withShardRetry(tenant, async (client, shard) => {
+        const { response } = await client.cancelPendingJobs(
+          { shard, ids, tenant },
+          this._rpcOptions(),
+        );
+        return response.results;
+      });
+    } catch (error) {
+      throwMappedRpcError(error, { operation: "cancelPendingJobs", tenant });
     }
   }
 
