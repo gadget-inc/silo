@@ -66,6 +66,11 @@ struct DequeueIterationState {
     /// Floating queues whose refresh a chain continuation in this
     /// iteration's batch already scheduled.
     scheduled_refreshes: ScheduledRefreshes,
+    /// The earliest start time of a task row this iteration's batch wrote
+    /// (a chain follow-up or a rate-limit retry). Reported to the broker
+    /// after commit so it scans for the row when due; the ack path alone
+    /// only tells it about deletions.
+    followup_task_start_ms: Option<i64>,
     processed_internal: bool,
 }
 
@@ -84,8 +89,16 @@ impl DequeueIterationState {
             leased_task_ids: HashSet::new(),
             materialized_attempts: HashSet::new(),
             scheduled_refreshes: ScheduledRefreshes::default(),
+            followup_task_start_ms: None,
             processed_internal: false,
         }
+    }
+
+    fn note_followup_task(&mut self, start_time_ms: i64) {
+        self.followup_task_start_ms = Some(
+            self.followup_task_start_ms
+                .map_or(start_time_ms, |current| current.min(start_time_ms)),
+        );
     }
 
     fn ack_deleted(&mut self, key: &[u8]) {
@@ -525,6 +538,14 @@ impl JobStoreShard {
                 processed_internal = state.processed_internal,
                 "dequeue: acked and evicted keys"
             );
+
+            // Tell the broker about the task rows this batch wrote, so the
+            // next iteration's nudge (or a later poll) scans for them: a row
+            // due now wakes the scanner, a future-dated one lowers the
+            // broker's recorded next-ready time.
+            if let Some(start_ms) = state.followup_task_start_ms {
+                self.brokers.notify_task_written(task_group, start_ms);
+            }
 
             // If we only processed internal tasks and haven't filled max_tasks, loop again
             // to pick up the follow-up tasks we just inserted into the broker
@@ -984,6 +1005,9 @@ impl JobStoreShard {
         {
             state.background_action_transitions.push(transition);
         }
+        if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms {
+            state.note_followup_task(task_key_start_ms);
+        }
 
         // Metrics: account the grant as a Scanned-path ticket.
         if let Some(ref m) = self.metrics {
@@ -1179,6 +1203,9 @@ impl JobStoreShard {
                         },
                     )
                     .await?;
+                if let Some(task_key_start_ms) = chain_result.pending_task_key_start_ms {
+                    state.note_followup_task(task_key_start_ms);
+                }
                 // Track any immediate grants for rollback if DB write fails
                 for (queue, task_id) in chain_result.grants {
                     state
@@ -1233,6 +1260,7 @@ impl JobStoreShard {
                     result.reset_time_ms,
                     now_ms,
                 );
+                state.note_followup_task(retry_backoff);
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     tenant,
@@ -1269,6 +1297,7 @@ impl JobStoreShard {
             Err(e) => {
                 tracing::warn!(job_id = %job_id, error = %e, "gubernator rate limit check failed, will retry");
                 let retry_backoff = now_ms + rate_limit.retry_initial_backoff_ms;
+                state.note_followup_task(retry_backoff);
                 self.schedule_rate_limit_retry(
                     &mut DbWriteBatcher::new(&self.db, &mut state.batch),
                     tenant,

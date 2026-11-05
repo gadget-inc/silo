@@ -46,6 +46,10 @@ struct AckTombstone {
 /// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key bytes.
 /// - Populates from SlateDB in the background with exponential backoff when no work is found.
 /// - Ensures tasks claimed but not yet durably leased are tracked as in-flight and not reinserted.
+/// - Scans only when a scan can find something: after a write that may have
+///   readied a task, when the earliest future-dated row becomes due, or when
+///   the last scan stopped with ready rows remaining. An empty poll on its own
+///   never triggers a scan.
 pub struct TaskBroker {
     // The task group this broker is responsible for
     task_group: String,
@@ -70,6 +74,12 @@ pub struct TaskBroker {
     notify: Arc<Notify>,
     // Whether the background scanner should be woken up
     scan_requested: Arc<AtomicBool>,
+    // Set by a write that may have made a task ready; cleared when a scan
+    // begins, so a write that lands mid-scan forces one more pass.
+    dirty: AtomicBool,
+    // When a scan could next find a task to buffer. One lock covers the time
+    // and the note generation so a note and a scan's result never interleave.
+    next_ready: Mutex<NextReady>,
     // The target buffer size
     target_buffer: usize,
     // The batch size for the background scanner to read out of the DB
@@ -95,6 +105,34 @@ impl TaskBroker {
         range: ShardRange,
         tombstone_revive_after_generations: u64,
     ) -> Arc<Self> {
+        // scan_batch must be >= target_buffer / 2 (the low watermark) so that
+        // a single scan pass can refill from low-watermark to target. With a
+        // smaller batch the scanner needs multiple passes and each pass
+        // re-reads every already-buffered entry from the start of the key
+        // range, wasting O(buffer_size) reads/pass.
+        Self::new_with_limits(
+            task_group,
+            db,
+            shard_name,
+            metrics,
+            range,
+            tombstone_revive_after_generations,
+            8192,
+            4096,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_limits(
+        task_group: String,
+        db: Arc<InstrumentedDb>,
+        shard_name: String,
+        metrics: Option<Metrics>,
+        range: ShardRange,
+        tombstone_revive_after_generations: u64,
+        target_buffer: usize,
+        scan_batch: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             task_group,
             db,
@@ -106,13 +144,10 @@ impl TaskBroker {
             running: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
-            target_buffer: 8192,
-            // Must be >= target_buffer / 2 (the low watermark) so that a
-            // single scan pass can refill from low-watermark to target.
-            // With a smaller batch the scanner needs multiple passes and
-            // each pass re-reads every already-buffered entry from the
-            // start of the key range, wasting O(buffer_size) reads/pass.
-            scan_batch: 4096,
+            dirty: AtomicBool::new(false),
+            next_ready: Mutex::new(NextReady::default()),
+            target_buffer,
+            scan_batch,
             shard_name,
             metrics,
             range,
@@ -142,7 +177,17 @@ impl TaskBroker {
     }
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
+    ///
+    /// Records in `next_ready` why the scan stopped, which gates the nudges
+    /// that empty polls send (see `nudge`).
     async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
+        // Clear `dirty` and read the note generation before the iterator is
+        // created: a write or note that lands after this point may describe a
+        // row the iterator's view does not include, so it must set `dirty`
+        // again (forcing one more pass) or survive this scan's result.
+        self.dirty.store(false, Ordering::SeqCst);
+        let notes_before = self.next_ready.lock().unwrap().note_generation;
+
         // [SILO-SCAN-1] Scan only this task group's key range
         let start = task_group_prefix(&self.task_group);
         let end = end_bound(&start);
@@ -152,6 +197,7 @@ impl TaskBroker {
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await
         else {
+            self.record_scan_stop(ScanStop::MoreReady, 0, notes_before);
             return 0;
         };
 
@@ -166,9 +212,17 @@ impl TaskBroker {
         let mut skipped_already_buffered = 0u64;
         let mut skipped_defunct = 0u64;
         let mut revived = 0u64;
+        // Leaving the loop through its condition means the batch or buffer
+        // limit was hit with ready rows possibly remaining.
+        let mut stop = ScanStop::MoreReady;
         while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
-            let Ok(Some(kv)) = iter.next().await else {
-                break;
+            let kv = match iter.next().await {
+                Ok(Some(kv)) => kv,
+                Ok(None) => {
+                    stop = ScanStop::EndOfRange;
+                    break;
+                }
+                Err(_) => break,
             };
             total_read += 1;
 
@@ -183,6 +237,9 @@ impl TaskBroker {
             // remaining key in the range is also future-dated.
             if parsed_key.start_time_ms > now_ms as u64 {
                 skipped_future += 1;
+                stop = ScanStop::Future {
+                    start_time_ms: parsed_key.start_time_ms as i64,
+                };
                 break;
             }
 
@@ -279,6 +336,8 @@ impl TaskBroker {
                 skipped_already_buffered += 1;
             }
         }
+
+        self.record_scan_stop(stop, skipped_tombstone, notes_before);
 
         if total_read > 0
             && let Some(ref m) = self.metrics
@@ -411,8 +470,11 @@ impl TaskBroker {
                     continue;
                 }
 
-                // Sleep with early wakeup support
-                let delay = tokio::time::sleep(Duration::from_millis(sleep_ms));
+                // Sleep with early wakeup support. Wake no later than the
+                // earliest future-dated row becomes due, so a scheduled task
+                // is picked up on time even when no poll nudges the scanner.
+                let delay_ms = broker.delay_until_next_ready_ms(sleep_ms);
+                let delay = tokio::time::sleep(Duration::from_millis(delay_ms));
                 tokio::pin!(delay);
                 tokio::select! {
                     biased;
@@ -470,7 +532,8 @@ impl TaskBroker {
         claimed
     }
 
-    /// Try to claim tasks. If none available, wait briefly for scanner to populate.
+    /// Try to claim tasks. If none available, wait briefly for the buffer to
+    /// fill, waking the scanner only when a scan could find something.
     async fn claim_ready_or_nudge(&self, max: usize) -> Vec<BrokerTask> {
         // Try fast path first
         let claimed = self.claim_ready(max);
@@ -478,10 +541,17 @@ impl TaskBroker {
             return claimed;
         }
 
-        // Wake scanner and wait briefly
-        self.wakeup();
+        // An empty poll on a quiet broker never scans: the scanner is woken
+        // only when a write has landed since the last scan or a scheduled row
+        // has become due (see `nudge`). The wait is kept either way, and
+        // re-checked each tick, so a write that lands during it is picked up
+        // by this poll instead of the next.
+        let mut woken = self.nudge(crate::job_store_shard::now_epoch_ms());
         for _ in 0..5 {
             tokio::time::sleep(Duration::from_millis(5)).await;
+            if !woken {
+                woken = self.nudge(crate::job_store_shard::now_epoch_ms());
+            }
             let claimed = self.claim_ready(max);
             if !claimed.is_empty() {
                 return claimed;
@@ -526,6 +596,9 @@ impl TaskBroker {
         for k in keys {
             inflight.remove(k);
         }
+        // The rows may still be durable and were skipped as in-flight by any
+        // scan that ran meanwhile, so the next nudge must scan again.
+        self.dirty.store(true, Ordering::SeqCst);
     }
 
     /// Acknowledge durable dequeue outcomes.
@@ -557,11 +630,101 @@ impl TaskBroker {
         }
     }
 
-    /// Wake the scanner to refill promptly.
+    /// Wake the scanner to refill promptly. Called after a write that may
+    /// have made a task ready (enqueue of a due task, lease release, restart,
+    /// expedite, grant, limit-chain advance).
     fn wakeup(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
         self.scan_requested.store(true, Ordering::SeqCst);
         self.notify.notify_one();
     }
+
+    /// Wake the scanner from an empty poll, but only when a scan could find
+    /// something: a write landed since the last scan began, the last scan
+    /// stopped with ready rows remaining, or the earliest future-dated row
+    /// it stopped at is now due. Returns whether the scanner was woken.
+    fn nudge(&self, now_ms: i64) -> bool {
+        if self.dirty.load(Ordering::SeqCst) || now_ms >= self.next_ready_at_ms() {
+            self.wakeup();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record that a task row with `start_time_ms` was written, without
+    /// waking the scanner. Lowers the recorded next-ready time so a nudge or
+    /// the scanner's own timer fires when the row becomes due even if it
+    /// sorts before the row the last scan stopped at.
+    fn note_scheduled(&self, start_time_ms: i64) {
+        let mut next_ready = self.next_ready.lock().unwrap();
+        next_ready.note_generation += 1;
+        next_ready.at_ms = next_ready.at_ms.min(start_time_ms);
+    }
+
+    /// Store why a scan stopped. A scan that overlapped a `note_scheduled`
+    /// may have missed the noted row, so it only lowers the recorded time.
+    fn record_scan_stop(&self, stop: ScanStop, skipped_tombstone: u64, notes_before: u64) {
+        let next_ready_at_ms = match stop {
+            // A key suppressed by an ack tombstone is point-read once its
+            // tombstone ages past the revive bound, which takes further scan
+            // generations: keep nudges scanning until the key stops showing.
+            _ if skipped_tombstone > 0 => 0,
+            ScanStop::MoreReady => 0,
+            ScanStop::EndOfRange => i64::MAX,
+            ScanStop::Future { start_time_ms } => start_time_ms,
+        };
+        let mut next_ready = self.next_ready.lock().unwrap();
+        if next_ready.note_generation == notes_before {
+            next_ready.at_ms = next_ready_at_ms;
+        } else {
+            next_ready.at_ms = next_ready.at_ms.min(next_ready_at_ms);
+        }
+    }
+
+    /// The scanner's idle delay: the backoff, shortened to the time until the
+    /// earliest future-dated row becomes due. A recorded time that is already
+    /// due never shortens the backoff, which exists for exactly that case.
+    fn delay_until_next_ready_ms(&self, backoff_ms: u64) -> u64 {
+        let next_ready_at_ms = self.next_ready_at_ms();
+        let now_ms = crate::job_store_shard::now_epoch_ms();
+        if next_ready_at_ms == i64::MAX || next_ready_at_ms <= now_ms {
+            return backoff_ms;
+        }
+        backoff_ms.min((next_ready_at_ms - now_ms) as u64)
+    }
+
+    /// The earliest start time at which a scan could find a task to buffer:
+    /// `i64::MAX` once a scan has read the whole range, `0` when the last scan
+    /// stopped with ready rows possibly remaining, otherwise the start time of
+    /// the first future-dated row the last scan stopped at.
+    fn next_ready_at_ms(&self) -> i64 {
+        self.next_ready.lock().unwrap().at_ms
+    }
+}
+
+/// When a scan could next find a task to buffer. See
+/// [`TaskBroker::next_ready_at_ms`] for the meaning of `at_ms`. The default
+/// (`at_ms` of 0) means nothing is known about the range yet, so the first
+/// nudge scans.
+#[derive(Debug, Clone, Copy, Default)]
+struct NextReady {
+    at_ms: i64,
+    /// Bumped by every `note_scheduled`. A scan that overlapped a note keeps
+    /// the lower of its own result and the noted time instead of overwriting.
+    note_generation: u64,
+}
+
+/// Why a scan stopped reading the task line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanStop {
+    /// Every key in the range was read.
+    EndOfRange,
+    /// The first future-dated key, which sorts before every later one.
+    Future { start_time_ms: i64 },
+    /// The batch or buffer limit was hit, or the iterator failed, with ready
+    /// rows possibly remaining.
+    MoreReady,
 }
 
 impl Drop for TaskBroker {
@@ -650,6 +813,31 @@ impl TaskBrokerRegistry {
                 broker.wakeup();
             }
         }
+    }
+
+    /// Record a committed task row with `start_time_ms`: wake the scanner
+    /// when the row is due now, otherwise lower the broker's recorded
+    /// next-ready time so the row is scanned for once it becomes due.
+    ///
+    /// Call after the write is durable. A broker created later starts with
+    /// nothing known about its range and scans on its first nudge, so a
+    /// future-dated row only needs noting on a broker that already exists.
+    pub fn notify_task_written(&self, task_group: &str, start_time_ms: i64) {
+        if start_time_ms <= crate::job_store_shard::now_epoch_ms() {
+            self.wakeup(task_group);
+        } else if let Some(broker) = self.brokers.get(task_group) {
+            broker.note_scheduled(start_time_ms);
+        }
+    }
+
+    /// The next-ready time recorded by a task group's broker, if one exists:
+    /// `i64::MAX` when its last scan read the whole range, `0` when a scan
+    /// may find ready rows, otherwise the start time of the earliest
+    /// future-dated row.
+    pub fn group_next_ready_at_ms(&self, task_group: &str) -> Option<i64> {
+        self.brokers
+            .get(task_group)
+            .map(|e| e.value().next_ready_at_ms())
     }
 
     /// Requeue tasks back into the appropriate broker's buffer after a failed durable write.
@@ -882,6 +1070,242 @@ mod inflight_release_tests {
             broker.buffer_len(),
             1,
             "requeue should re-buffer for immediate re-pickup"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scan_gating_tests {
+    use super::*;
+    use crate::codec::encode_task;
+    use crate::instrumented_db::InstrumentedDb;
+    use crate::job_store_shard::now_epoch_ms;
+    use crate::shard_range::ShardRange;
+    use crate::task::Task;
+
+    async fn broker_with_scan_batch(scan_batch: usize) -> Arc<TaskBroker> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::DbBuilder::new("test", store)
+            .build()
+            .await
+            .expect("open in-memory db");
+        let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
+        TaskBroker::new_with_limits(
+            "tg".to_string(),
+            db,
+            "shard".to_string(),
+            None,
+            ShardRange::full(),
+            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+            8192,
+            scan_batch,
+        )
+    }
+
+    async fn empty_broker() -> Arc<TaskBroker> {
+        broker_with_scan_batch(4096).await
+    }
+
+    async fn put_run_attempt(broker: &TaskBroker, job_id: &str, start_time_ms: i64) -> Vec<u8> {
+        let task = Task::RunAttempt {
+            id: format!("task-{job_id}"),
+            tenant: "-".to_string(),
+            job_id: job_id.to_string(),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            held_queues: vec![],
+            task_group: "tg".to_string(),
+        };
+        let key = crate::keys::task_key("tg", start_time_ms, 0, job_id, 1, start_time_ms);
+        broker
+            .db
+            .put(&key, &encode_task(&task))
+            .await
+            .expect("put row");
+        key
+    }
+
+    async fn scan(broker: &TaskBroker, now_ms: i64) -> usize {
+        let generation = broker.begin_scan_generation();
+        let inserted = broker.scan_tasks(now_ms, generation).await;
+        broker.complete_scan_generation(generation);
+        inserted
+    }
+
+    /// A broker that knows nothing about its range scans on its first nudge;
+    /// once a scan has read the whole range, nudges are skipped until a write
+    /// marks the broker dirty.
+    #[tokio::test]
+    async fn nudges_are_skipped_once_the_range_is_known_empty() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert!(broker.nudge(now_ms), "first nudge must scan");
+        assert!(broker.scan_requested.swap(false, Ordering::SeqCst));
+
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.next_ready_at_ms(), i64::MAX);
+        for _ in 0..100 {
+            assert!(!broker.nudge(now_ms));
+        }
+        assert!(!broker.scan_requested.load(Ordering::SeqCst));
+
+        broker.wakeup();
+        assert!(broker.nudge(now_ms), "a write re-arms the nudge");
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert!(!broker.nudge(now_ms), "the scan clears dirty");
+    }
+
+    /// A scan that stops at a future-dated row records its start time, and a
+    /// nudge scans again only once that time has arrived.
+    #[tokio::test]
+    async fn scan_stopping_at_a_future_row_records_when_it_is_due() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        let due_ms = now_ms + 5_000;
+        put_run_attempt(&broker, "future", due_ms).await;
+
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.next_ready_at_ms(), due_ms);
+        assert!(!broker.nudge(now_ms));
+        assert!(!broker.nudge(due_ms - 1));
+        assert!(broker.nudge(due_ms));
+
+        assert_eq!(scan(&broker, due_ms).await, 1);
+        assert_eq!(broker.next_ready_at_ms(), i64::MAX);
+        assert_eq!(broker.claim_ready(10).len(), 1);
+    }
+
+    /// Noting a scheduled row lowers the recorded next-ready time and never
+    /// raises it.
+    #[tokio::test]
+    async fn note_scheduled_only_lowers_the_recorded_time() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.next_ready_at_ms(), i64::MAX);
+
+        broker.note_scheduled(now_ms + 1_000);
+        assert_eq!(broker.next_ready_at_ms(), now_ms + 1_000);
+        broker.note_scheduled(now_ms + 2_000);
+        assert_eq!(broker.next_ready_at_ms(), now_ms + 1_000);
+        broker.note_scheduled(now_ms + 500);
+        assert_eq!(broker.next_ready_at_ms(), now_ms + 500);
+        assert!(!broker.nudge(now_ms + 499));
+        assert!(broker.nudge(now_ms + 500));
+    }
+
+    /// A scan that overlaps a note keeps the noted time rather than replacing
+    /// it with its own result, since its view may predate the noted row.
+    #[tokio::test]
+    async fn note_during_a_scan_survives_the_scan_result() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.next_ready_at_ms(), i64::MAX);
+
+        let notes_before = broker.next_ready.lock().unwrap().note_generation;
+
+        broker.note_scheduled(now_ms + 700);
+        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before);
+        assert_eq!(broker.next_ready_at_ms(), now_ms + 700);
+
+        let notes_before = broker.next_ready.lock().unwrap().note_generation;
+        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before);
+        assert_eq!(broker.next_ready_at_ms(), i64::MAX);
+    }
+
+    /// A scan that hits its batch limit with ready rows remaining leaves the
+    /// gate open so the next nudge scans again.
+    #[tokio::test]
+    async fn scan_stopping_at_the_batch_limit_leaves_nudges_armed() {
+        let broker = broker_with_scan_batch(2).await;
+        let now_ms = now_epoch_ms();
+        for job in ["a", "b", "c"] {
+            put_run_attempt(&broker, job, now_ms - 10).await;
+        }
+
+        assert_eq!(scan(&broker, now_ms).await, 2);
+        assert_eq!(broker.next_ready_at_ms(), 0);
+        assert!(broker.nudge(now_ms));
+
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.next_ready_at_ms(), i64::MAX);
+        assert_eq!(broker.claim_ready(10).len(), 3);
+    }
+
+    /// Releasing in-flight keys without re-buffering leaves rows that may
+    /// still be durable, so the next nudge must scan.
+    #[tokio::test]
+    async fn release_inflight_re_arms_the_nudge() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        let key = put_run_attempt(&broker, "stranded", now_ms - 10).await;
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.claim_ready(1).len(), 1);
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert!(!broker.nudge(now_ms));
+
+        broker.release_inflight(std::slice::from_ref(&key));
+        assert!(broker.nudge(now_ms));
+        assert_eq!(scan(&broker, now_ms).await, 1);
+    }
+
+    /// An empty poll on a broker with nothing to find waits out its window
+    /// without ever asking the scanner to run.
+    #[tokio::test]
+    async fn empty_poll_does_not_request_a_scan_when_nothing_can_be_ready() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(scan(&broker, now_ms).await, 0);
+
+        for _ in 0..4 {
+            assert!(broker.claim_ready_or_nudge(10).await.is_empty());
+        }
+        assert!(!broker.scan_requested.load(Ordering::SeqCst));
+        assert!(!broker.dirty.load(Ordering::SeqCst));
+    }
+
+    /// A write that lands while an empty poll is waiting wakes the scanner
+    /// from inside the wait, so that poll's window is not wasted.
+    #[tokio::test]
+    async fn write_during_an_empty_poll_requests_a_scan() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(scan(&broker, now_ms).await, 0);
+
+        let waiter = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move { broker.claim_ready_or_nudge(10).await })
+        };
+        tokio::time::sleep(Duration::from_millis(8)).await;
+        assert!(!broker.scan_requested.load(Ordering::SeqCst));
+        broker.wakeup();
+        assert!(waiter.await.expect("poll task").is_empty());
+        assert!(broker.scan_requested.load(Ordering::SeqCst));
+    }
+
+    /// The scanner's idle delay shortens to the time until the earliest
+    /// future-dated row is due, and is otherwise the backoff.
+    #[tokio::test]
+    async fn idle_delay_wakes_for_the_next_due_row() {
+        let broker = empty_broker().await;
+        assert_eq!(broker.delay_until_next_ready_ms(2_000), 2_000);
+
+        let now_ms = now_epoch_ms();
+        put_run_attempt(&broker, "soon", now_ms + 60_000).await;
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        let delay = broker.delay_until_next_ready_ms(2_000);
+        assert!(delay <= 2_000, "delay {delay} never exceeds the backoff");
+
+        broker.note_scheduled(now_ms + 300);
+        let delay = broker.delay_until_next_ready_ms(2_000);
+        assert!(delay <= 300, "delay {delay} shortens to the due row");
+
+        broker.note_scheduled(now_ms - 1);
+        assert_eq!(
+            broker.delay_until_next_ready_ms(2_000),
+            2_000,
+            "an already-due time keeps the backoff"
         );
     }
 }

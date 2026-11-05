@@ -1324,6 +1324,12 @@ impl JobStoreShard {
         self.brokers.buffer_len()
     }
 
+    /// The next-ready time recorded by a task group's broker, if one exists.
+    /// See [`TaskBrokerRegistry::group_next_ready_at_ms`].
+    pub fn broker_next_ready_at_ms(&self, task_group: &str) -> Option<i64> {
+        self.brokers.group_next_ready_at_ms(task_group)
+    }
+
     /// Number of tasks currently held in the broker's in-flight set for a task
     /// group (claimed by a worker but not yet durably acked). Exposed for
     /// observability and for tests that assert the dequeue drop-guard releases

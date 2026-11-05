@@ -505,11 +505,10 @@ impl JobStoreShard {
                 .atomic_release(&release_tenant, &queue, &release_task_id);
             self.concurrency.request_grant(&release_tenant, &queue);
         }
-        // If we scheduled a follow-up that is ready now, wake the scanner
-        if let Some(nt) = followup_next_time
-            && nt <= now_epoch_ms()
-        {
-            self.brokers.wakeup(&task_group);
+        // A follow-up that is ready now wakes the scanner; a future-dated one
+        // lowers the broker's recorded next-ready time.
+        if let Some(nt) = followup_next_time {
+            self.brokers.notify_task_written(&task_group, nt);
         }
         if let Some(err) = job_missing_error {
             return Err(err);

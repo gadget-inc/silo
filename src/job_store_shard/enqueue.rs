@@ -607,7 +607,9 @@ impl JobStoreShard {
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
-    /// Confirms and logs grants and wakes up the broker for the given task group.
+    /// Confirms and logs grants and tells the broker for the given task group
+    /// about the written task: a due task wakes it, a future-dated one lowers
+    /// its recorded next-ready time.
     pub(crate) async fn finish_enqueue(
         &self,
         tenant: &str,
@@ -623,9 +625,7 @@ impl JobStoreShard {
             debug!("granted concurrency slot immediately");
         }
 
-        if start_at_ms <= now_epoch_ms() {
-            self.brokers.wakeup(task_group);
-        }
+        self.brokers.notify_task_written(task_group, start_at_ms);
 
         Ok(())
     }
