@@ -1178,6 +1178,178 @@ describe("Shard Routing", () => {
       // Should NOT retry — thrown immediately
       expect(conn.client.enqueue).toHaveBeenCalledTimes(1);
     });
+
+    // A client whose one server holds every enqueue open until `drop()` fails
+    // them all together, the way a dropped connection does. Enqueues made
+    // after the drop succeed. Each getClusterInfo stays open until the test
+    // settles it.
+    const setupDroppedConnection = () => {
+      client = new SiloGRPCClient({
+        servers: "localhost:7450",
+        useTls: false,
+        shardRouting: {
+          maxRetries: 3,
+          retryDelayMs: 1,
+          topologyRefreshIntervalMs: 0,
+        },
+      });
+
+      const topology = {
+        numShards: 1,
+        shardOwners: [
+          {
+            shardId: "00000000-0000-0000-0000-000000000001",
+            grpcAddr: "localhost:7450",
+            nodeId: "node-1",
+            rangeStart: "",
+            rangeEnd: "",
+          },
+        ],
+        thisNodeId: "node-1",
+        thisGrpcAddr: "localhost:7450",
+      };
+      (client as any)._shards = [
+        {
+          shardId: "00000000-0000-0000-0000-000000000001",
+          serverAddr: "localhost:7450",
+          rangeStart: "",
+          rangeEnd: "",
+        },
+      ];
+      (client as any)._shardToServer.set(
+        "00000000-0000-0000-0000-000000000001",
+        "localhost:7450",
+      );
+      (client as any)._topologyReady = true;
+
+      const connections = (client as any)._connections as Map<string, any>;
+      const conn = connections.values().next().value;
+
+      let dropped = false;
+      const failInFlight: Array<() => void> = [];
+      conn.client.enqueue = vi.fn().mockImplementation(() => {
+        if (dropped) {
+          return { response: Promise.resolve({ id: "job-after-drop" }) };
+        }
+        return {
+          response: new Promise((_resolve, reject) => {
+            failInFlight.push(() =>
+              reject(new RpcError("Connection dropped", "UNAVAILABLE", {})),
+            );
+          }),
+        };
+      });
+
+      const refreshes: Array<{ succeed: () => void; fail: () => void }> = [];
+      conn.client.getClusterInfo = vi.fn().mockImplementation(() => ({
+        response: new Promise((resolve, reject) => {
+          refreshes.push({
+            succeed: () => resolve(topology),
+            fail: () =>
+              reject(new RpcError("Deadline exceeded", "DEADLINE_EXCEEDED", {})),
+          });
+        }),
+      }));
+
+      const enqueueMany = (count: number) =>
+        Array.from({ length: count }, (_, n) =>
+          client.enqueue({
+            tenant: "test-tenant",
+            payload: { n },
+            taskGroup: "default",
+          }),
+        );
+
+      return {
+        conn,
+        refreshes,
+        enqueueMany,
+        drop: () => {
+          dropped = true;
+          for (const fail of failInFlight.splice(0)) fail();
+        },
+      };
+    };
+
+    it("shares one topology refresh between calls that fail together", async () => {
+      const { conn, refreshes, enqueueMany, drop } = setupDroppedConnection();
+
+      const calls = enqueueMany(50);
+      await vi.waitFor(() => expect(conn.client.enqueue).toHaveBeenCalledTimes(50));
+
+      drop();
+      await vi.waitFor(() => expect(conn.client.getClusterInfo).toHaveBeenCalled());
+      // Let every failed call reach its refresh before the refresh is answered
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(conn.client.getClusterInfo).toHaveBeenCalledTimes(1);
+
+      refreshes[0].succeed();
+      const handles = await Promise.all(calls);
+
+      expect(handles.map((handle) => handle.id)).toEqual(Array(50).fill("job-after-drop"));
+      expect(conn.client.getClusterInfo).toHaveBeenCalledTimes(1);
+      // Every call was tried once before the drop and once after
+      expect(conn.client.enqueue).toHaveBeenCalledTimes(100);
+    });
+
+    it("refreshes again for a call that fails after the shared refresh finished", async () => {
+      const { conn, refreshes, enqueueMany, drop } = setupDroppedConnection();
+
+      const [first] = enqueueMany(1);
+      await vi.waitFor(() => expect(conn.client.enqueue).toHaveBeenCalledTimes(1));
+      drop();
+      await vi.waitFor(() => expect(refreshes).toHaveLength(1));
+      refreshes[0].succeed();
+      await first;
+
+      // A later failure on the same client must not reuse the finished refresh
+      conn.client.enqueue = vi
+        .fn()
+        .mockImplementationOnce(() => {
+          throw new RpcError("Connection dropped", "UNAVAILABLE", {});
+        })
+        .mockReturnValue({ response: Promise.resolve({ id: "job-second" }) });
+      const [second] = enqueueMany(1);
+      await vi.waitFor(() => expect(refreshes).toHaveLength(2));
+      refreshes[1].succeed();
+
+      expect((await second).id).toBe("job-second");
+      expect(conn.client.getClusterInfo).toHaveBeenCalledTimes(2);
+    });
+
+    it("fails every waiting call when the shared refresh fails, then refreshes afresh", async () => {
+      const { conn, refreshes, enqueueMany, drop } = setupDroppedConnection();
+
+      const calls = enqueueMany(10);
+      await vi.waitFor(() => expect(conn.client.enqueue).toHaveBeenCalledTimes(10));
+      drop();
+      await vi.waitFor(() => expect(refreshes).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      refreshes[0].fail();
+      const results = await Promise.allSettled(calls);
+
+      expect(results.map((result) => result.status)).toEqual(Array(10).fill("rejected"));
+      for (const result of results) {
+        expect((result as PromiseRejectedResult).reason.message).toBe(
+          "Failed to refresh cluster topology from any server",
+        );
+      }
+      expect(conn.client.getClusterInfo).toHaveBeenCalledTimes(1);
+
+      // The failed refresh is not kept: the next call that needs one starts its own
+      conn.client.enqueue = vi
+        .fn()
+        .mockImplementationOnce(() => {
+          throw new RpcError("Connection dropped", "UNAVAILABLE", {});
+        })
+        .mockReturnValue({ response: Promise.resolve({ id: "job-recovered" }) });
+      const [next] = enqueueMany(1);
+      await vi.waitFor(() => expect(refreshes).toHaveLength(2));
+      refreshes[1].succeed();
+
+      expect((await next).id).toBe("job-recovered");
+    });
   });
 
   describe("gRPC retry configuration", () => {
