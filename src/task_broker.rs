@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::str;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -77,14 +77,9 @@ pub struct TaskBroker {
     // Set by a write that may have made a task ready; cleared when a scan
     // begins, so a write that lands mid-scan forces one more pass.
     dirty: AtomicBool,
-    // The earliest start time at which a scan could find a task to buffer:
-    // `i64::MAX` once a scan has read the whole range, `0` when the last scan
-    // stopped with ready rows possibly remaining, otherwise the start time of
-    // the first future-dated row the last scan stopped at.
-    next_ready_at_ms: AtomicI64,
-    // Bumped by every `note_scheduled`. A scan that overlapped a note keeps
-    // the lower of its own result and the noted time instead of overwriting.
-    note_generation: AtomicU64,
+    // When a scan could next find a task to buffer. One lock covers the time
+    // and the note generation so a note and a scan's result never interleave.
+    next_ready: Mutex<NextReady>,
     // The target buffer size
     target_buffer: usize,
     // The batch size for the background scanner to read out of the DB
@@ -150,9 +145,7 @@ impl TaskBroker {
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
             dirty: AtomicBool::new(false),
-            // Nothing is known about the range yet, so the first nudge scans.
-            next_ready_at_ms: AtomicI64::new(0),
-            note_generation: AtomicU64::new(0),
+            next_ready: Mutex::new(NextReady::default()),
             target_buffer,
             scan_batch,
             shard_name,
@@ -185,15 +178,15 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     ///
-    /// Records in `next_ready_at_ms` why the scan stopped, which gates the
-    /// nudges that empty polls send (see `nudge`).
+    /// Records in `next_ready` why the scan stopped, which gates the nudges
+    /// that empty polls send (see `nudge`).
     async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
         // Clear `dirty` and read the note generation before the iterator is
         // created: a write or note that lands after this point may describe a
         // row the iterator's view does not include, so it must set `dirty`
         // again (forcing one more pass) or survive this scan's result.
         self.dirty.store(false, Ordering::SeqCst);
-        let notes_before = self.note_generation.load(Ordering::SeqCst);
+        let notes_before = self.next_ready.lock().unwrap().note_generation;
 
         // [SILO-SCAN-1] Scan only this task group's key range
         let start = task_group_prefix(&self.task_group);
@@ -651,9 +644,7 @@ impl TaskBroker {
     /// stopped with ready rows remaining, or the earliest future-dated row
     /// it stopped at is now due. Returns whether the scanner was woken.
     fn nudge(&self, now_ms: i64) -> bool {
-        if self.dirty.load(Ordering::SeqCst)
-            || now_ms >= self.next_ready_at_ms.load(Ordering::SeqCst)
-        {
+        if self.dirty.load(Ordering::SeqCst) || now_ms >= self.next_ready_at_ms() {
             self.wakeup();
             true
         } else {
@@ -666,9 +657,9 @@ impl TaskBroker {
     /// the scanner's own timer fires when the row becomes due even if it
     /// sorts before the row the last scan stopped at.
     fn note_scheduled(&self, start_time_ms: i64) {
-        self.note_generation.fetch_add(1, Ordering::SeqCst);
-        self.next_ready_at_ms
-            .fetch_min(start_time_ms, Ordering::SeqCst);
+        let mut next_ready = self.next_ready.lock().unwrap();
+        next_ready.note_generation += 1;
+        next_ready.at_ms = next_ready.at_ms.min(start_time_ms);
     }
 
     /// Store why a scan stopped. A scan that overlapped a `note_scheduled`
@@ -683,12 +674,11 @@ impl TaskBroker {
             ScanStop::EndOfRange => i64::MAX,
             ScanStop::Future { start_time_ms } => start_time_ms,
         };
-        if self.note_generation.load(Ordering::SeqCst) == notes_before {
-            self.next_ready_at_ms
-                .store(next_ready_at_ms, Ordering::SeqCst);
+        let mut next_ready = self.next_ready.lock().unwrap();
+        if next_ready.note_generation == notes_before {
+            next_ready.at_ms = next_ready_at_ms;
         } else {
-            self.next_ready_at_ms
-                .fetch_min(next_ready_at_ms, Ordering::SeqCst);
+            next_ready.at_ms = next_ready.at_ms.min(next_ready_at_ms);
         }
     }
 
@@ -696,7 +686,7 @@ impl TaskBroker {
     /// earliest future-dated row becomes due. A recorded time that is already
     /// due never shortens the backoff, which exists for exactly that case.
     fn delay_until_next_ready_ms(&self, backoff_ms: u64) -> u64 {
-        let next_ready_at_ms = self.next_ready_at_ms.load(Ordering::SeqCst);
+        let next_ready_at_ms = self.next_ready_at_ms();
         let now_ms = crate::job_store_shard::now_epoch_ms();
         if next_ready_at_ms == i64::MAX || next_ready_at_ms <= now_ms {
             return backoff_ms;
@@ -704,10 +694,25 @@ impl TaskBroker {
         backoff_ms.min((next_ready_at_ms - now_ms) as u64)
     }
 
-    #[cfg(test)]
+    /// The earliest start time at which a scan could find a task to buffer:
+    /// `i64::MAX` once a scan has read the whole range, `0` when the last scan
+    /// stopped with ready rows possibly remaining, otherwise the start time of
+    /// the first future-dated row the last scan stopped at.
     fn next_ready_at_ms(&self) -> i64 {
-        self.next_ready_at_ms.load(Ordering::SeqCst)
+        self.next_ready.lock().unwrap().at_ms
     }
+}
+
+/// When a scan could next find a task to buffer. See
+/// [`TaskBroker::next_ready_at_ms`] for the meaning of `at_ms`. The default
+/// (`at_ms` of 0) means nothing is known about the range yet, so the first
+/// nudge scans.
+#[derive(Debug, Clone, Copy, Default)]
+struct NextReady {
+    at_ms: i64,
+    /// Bumped by every `note_scheduled`. A scan that overlapped a note keeps
+    /// the lower of its own result and the noted time instead of overwriting.
+    note_generation: u64,
 }
 
 /// Why a scan stopped reading the task line.
@@ -832,7 +837,7 @@ impl TaskBrokerRegistry {
     pub fn group_next_ready_at_ms(&self, task_group: &str) -> Option<i64> {
         self.brokers
             .get(task_group)
-            .map(|e| e.value().next_ready_at_ms.load(Ordering::SeqCst))
+            .map(|e| e.value().next_ready_at_ms())
     }
 
     /// Requeue tasks back into the appropriate broker's buffer after a failed durable write.
@@ -1198,13 +1203,13 @@ mod scan_gating_tests {
         assert_eq!(scan(&broker, now_ms).await, 0);
         assert_eq!(broker.next_ready_at_ms(), i64::MAX);
 
-        let notes_before = broker.note_generation.load(Ordering::SeqCst);
+        let notes_before = broker.next_ready.lock().unwrap().note_generation;
 
         broker.note_scheduled(now_ms + 700);
         broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before);
         assert_eq!(broker.next_ready_at_ms(), now_ms + 700);
 
-        let notes_before = broker.note_generation.load(Ordering::SeqCst);
+        let notes_before = broker.next_ready.lock().unwrap().note_generation;
         broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before);
         assert_eq!(broker.next_ready_at_ms(), i64::MAX);
     }
