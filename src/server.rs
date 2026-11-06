@@ -195,13 +195,11 @@ fn map_err(e: JobStoreShardError) -> Status {
 }
 
 /// Extract msgpack payload bytes from a proto SerializedBytes field.
-fn extract_payload_bytes(payload: &Option<SerializedBytes>) -> Vec<u8> {
+fn extract_payload_bytes(payload: Option<SerializedBytes>) -> Vec<u8> {
     payload
-        .as_ref()
         .and_then(|p| {
             p.encoding
-                .as_ref()
-                .map(|serialized_bytes::Encoding::Msgpack(data)| data.clone())
+                .map(|serialized_bytes::Encoding::Msgpack(data)| data)
         })
         .unwrap_or_default()
 }
@@ -731,7 +729,7 @@ impl SiloService {
 
         Self::validate_metadata(&job_req.metadata)?;
 
-        let payload_bytes = extract_payload_bytes(&job_req.payload);
+        let payload_bytes = extract_payload_bytes(job_req.payload);
         let retry = job_req.retry_policy.map(proto_retry_to_domain);
         let limits: Vec<crate::job::Limit> = job_req
             .limits
@@ -969,7 +967,7 @@ impl Silo for SiloService {
             ));
         }
 
-        let payload_bytes = extract_payload_bytes(&r.payload);
+        let payload_bytes = extract_payload_bytes(r.payload);
         let retry = r.retry_policy.map(proto_retry_to_domain);
         let limits: Vec<crate::job::Limit> = r
             .limits

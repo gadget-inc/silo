@@ -608,7 +608,7 @@ impl JobStoreShard {
                     row.value.as_ref() == value.as_slice() && row.expire_ts == info.expire_ts
                 });
                 if !up_to_date {
-                    put_with_optional_expire(txn, &key, &value, info.expire_ts)?;
+                    put_with_optional_expire(txn, &key, value, info.expire_ts)?;
                     changed = true;
                 }
             }

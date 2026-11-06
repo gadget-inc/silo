@@ -222,7 +222,7 @@ impl JobStoreShard {
         let metadata_value = MetadataIndexValue::new(effective_enqueue_time_ms).encode();
         for (mk, mv) in &job.metadata {
             let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-            put_with_optional_expire(&txn, &mkey, &metadata_value, terminal_expire_ts)?;
+            put_with_optional_expire(&txn, &mkey, metadata_value, terminal_expire_ts)?;
         }
 
         // [SILO-IMP-2] Write imported attempt records (existing statuses unchanged - vacuously true for new import)

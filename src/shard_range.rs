@@ -19,6 +19,17 @@ pub fn hash_tenant(tenant_id: &str) -> String {
     format!("{:016x}", hash)
 }
 
+/// The bytes of [`hash_tenant`]'s string, formatted on the stack.
+fn hash_tenant_bytes(tenant_id: &str) -> [u8; 16] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hash = xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0);
+    let mut out = [0u8; 16];
+    for (i, digit) in out.iter_mut().enumerate() {
+        *digit = HEX[((hash >> (60 - 4 * i)) & 0xf) as usize];
+    }
+    out
+}
+
 /// A unique identifier for a shard.
 ///
 /// Shards have immutable identities that persist across restarts and
@@ -115,11 +126,16 @@ impl ShardRange {
     ///
     /// Uses lexicographical (string) comparison.
     pub fn contains(&self, tenant_id: &str) -> bool {
+        self.contains_bytes(tenant_id.as_bytes())
+    }
+
+    /// [`Self::contains`] over raw bytes; `str` ordering is byte ordering.
+    fn contains_bytes(&self, key: &[u8]) -> bool {
         // Check start bound (inclusive)
-        let after_start = self.start.is_empty() || tenant_id >= self.start.as_str();
+        let after_start = self.start.is_empty() || key >= self.start.as_bytes();
 
         // Check end bound (exclusive)
-        let before_end = self.end.is_empty() || tenant_id < self.end.as_str();
+        let before_end = self.end.is_empty() || key < self.end.as_bytes();
 
         after_start && before_end
     }
@@ -127,9 +143,10 @@ impl ShardRange {
     /// Check if this range contains the hash of the given tenant ID.
     ///
     /// Hashes the tenant ID with XXH64 and checks if the result falls
-    /// within this range's bounds.
+    /// within this range's bounds. Called per task a broker scan reads, so
+    /// the hash is compared from a stack buffer rather than a `String`.
     pub fn contains_tenant(&self, tenant_id: &str) -> bool {
-        self.contains(&hash_tenant(tenant_id))
+        self.contains_bytes(&hash_tenant_bytes(tenant_id))
     }
 
     /// Check if this range is unbounded at the start.

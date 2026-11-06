@@ -4,6 +4,7 @@ use flatbuffers::FlatBufferBuilder;
 use crate::fb::silo::fb;
 use crate::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind, Limit};
 use crate::job_attempt::{AttemptStatus, JobAttempt};
+use crate::retry::RetryPolicy;
 use crate::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 /// Error type for codec operations
@@ -22,6 +23,122 @@ impl From<CodecError> for String {
 // ---------------------------------------------------------------------------
 // Encode helpers
 // ---------------------------------------------------------------------------
+
+/// Move a finished buffer out of `builder` without copying it into a second
+/// allocation. The builder writes back to front, so the finished bytes are
+/// shifted to the front of the builder's own buffer.
+fn into_finished_vec(builder: FlatBufferBuilder<'_>) -> Vec<u8> {
+    let (mut buf, head) = builder.collapse();
+    buf.drain(..head);
+    buf
+}
+
+/// Builder bytes a string takes: a length prefix, the bytes, a NUL, and up
+/// to three bytes of alignment padding.
+fn string_hint(s: &str) -> usize {
+    s.len() + 8
+}
+
+/// Builder bytes a vector of strings takes, offsets included.
+fn strings_hint(strings: &[String]) -> usize {
+    strings.iter().map(|s| string_hint(s) + 4).sum()
+}
+
+fn kv_pairs_hint(pairs: &[(String, String)]) -> usize {
+    pairs
+        .iter()
+        .map(|(k, v)| 24 + string_hint(k) + string_hint(v))
+        .sum()
+}
+
+fn limits_hint(limits: &[Limit]) -> usize {
+    limits
+        .iter()
+        .map(|limit| {
+            64 + match limit {
+                Limit::Concurrency(cl) => string_hint(&cl.key),
+                Limit::RateLimit(rl) => 48 + string_hint(&rl.name) + string_hint(&rl.unique_key),
+                Limit::FloatingConcurrency(fl) => {
+                    string_hint(&fl.key) + kv_pairs_hint(&fl.metadata)
+                }
+            }
+        })
+        .sum()
+}
+
+/// Builder bytes a task's union table takes beyond its fixed fields, so a
+/// builder sized with it holds the task without regrowing.
+fn task_hint(task: &Task) -> usize {
+    match task {
+        Task::RunAttempt {
+            id,
+            tenant,
+            job_id,
+            held_queues,
+            task_group,
+            ..
+        } => {
+            string_hint(id)
+                + string_hint(tenant)
+                + string_hint(job_id)
+                + string_hint(task_group)
+                + strings_hint(held_queues)
+        }
+        Task::RequestTicket {
+            queue,
+            tenant,
+            job_id,
+            task_id,
+            task_group,
+            held_queues,
+            limits,
+            ..
+        } => {
+            string_hint(queue)
+                + string_hint(tenant)
+                + string_hint(job_id)
+                + string_hint(task_id)
+                + string_hint(task_group)
+                + strings_hint(held_queues)
+                + limits_hint(limits)
+        }
+        Task::CheckRateLimit {
+            task_id,
+            tenant,
+            job_id,
+            rate_limit,
+            held_queues,
+            task_group,
+            ..
+        } => {
+            96 + string_hint(task_id)
+                + string_hint(tenant)
+                + string_hint(job_id)
+                + string_hint(&rate_limit.name)
+                + string_hint(&rate_limit.unique_key)
+                + strings_hint(held_queues)
+                + string_hint(task_group)
+        }
+        Task::RefreshFloatingLimit {
+            task_id,
+            tenant,
+            queue_key,
+            metadata,
+            task_group,
+            ..
+        } => {
+            string_hint(task_id)
+                + string_hint(tenant)
+                + string_hint(queue_key)
+                + kv_pairs_hint(metadata)
+                + string_hint(task_group)
+        }
+    }
+}
+
+/// Fixed bytes of a task-bearing buffer: the root table, the union table's
+/// scalar fields, vtables, and the header.
+const TASK_FIXED_HINT: usize = 128;
 
 /// Build a vector of KeyValuePair offsets from string pairs.
 fn build_kv_pair_offsets<'a, A: flatbuffers::Allocator + 'a>(
@@ -190,6 +307,59 @@ pub(crate) fn limit_entries_to_owned<'a>(
         .collect()
 }
 
+/// Build a `RunAttempt` table from borrowed fields.
+#[allow(clippy::too_many_arguments)]
+fn build_run_attempt<'a, 'b, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    id: &str,
+    tenant: &str,
+    job_id: &str,
+    attempt_number: u32,
+    relative_attempt_number: u32,
+    held_queues: impl IntoIterator<Item = &'b str>,
+    task_group: &str,
+) -> flatbuffers::WIPOffset<fb::RunAttempt<'a>> {
+    let id = builder.create_string(id);
+    let tenant = builder.create_string(tenant);
+    let job_id = builder.create_string(job_id);
+    let hq: Vec<_> = held_queues
+        .into_iter()
+        .map(|s| builder.create_string(s))
+        .collect();
+    let held_queues = builder.create_vector(&hq);
+    let task_group = builder.create_string(task_group);
+    fb::RunAttempt::create(
+        builder,
+        &fb::RunAttemptArgs {
+            id: Some(id),
+            tenant: Some(tenant),
+            job_id: Some(job_id),
+            attempt_number,
+            relative_attempt_number,
+            held_queues: Some(held_queues),
+            task_group: Some(task_group),
+        },
+    )
+}
+
+/// Build a `RunAttempt` table copied from one in another buffer. Absent
+/// fields become empty, as they do through [`DecodedTask::to_task`].
+fn build_run_attempt_from<'a, A: flatbuffers::Allocator + 'a>(
+    builder: &mut FlatBufferBuilder<'a, A>,
+    ra: fb::RunAttempt<'_>,
+) -> flatbuffers::WIPOffset<fb::RunAttempt<'a>> {
+    build_run_attempt(
+        builder,
+        ra.id().unwrap_or_default(),
+        ra.tenant().unwrap_or_default(),
+        ra.job_id().unwrap_or_default(),
+        ra.attempt_number(),
+        ra.relative_attempt_number(),
+        ra.held_queues().into_iter().flatten(),
+        ra.task_group().unwrap_or_default(),
+    )
+}
+
 /// Build a Task union (TaskVariant) into the builder. Returns (type, offset).
 fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
     builder: &mut FlatBufferBuilder<'a, A>,
@@ -208,26 +378,15 @@ fn build_task_union<'a, A: flatbuffers::Allocator + 'a>(
             held_queues,
             task_group,
         } => {
-            let id = builder.create_string(id);
-            let tenant = builder.create_string(tenant);
-            let job_id = builder.create_string(job_id);
-            let hq: Vec<_> = held_queues
-                .iter()
-                .map(|s| builder.create_string(s))
-                .collect();
-            let held_queues = builder.create_vector(&hq);
-            let task_group = builder.create_string(task_group);
-            let ra = fb::RunAttempt::create(
+            let ra = build_run_attempt(
                 builder,
-                &fb::RunAttemptArgs {
-                    id: Some(id),
-                    tenant: Some(tenant),
-                    job_id: Some(job_id),
-                    attempt_number: *attempt_number,
-                    relative_attempt_number: *relative_attempt_number,
-                    held_queues: Some(held_queues),
-                    task_group: Some(task_group),
-                },
+                id,
+                tenant,
+                job_id,
+                *attempt_number,
+                *relative_attempt_number,
+                held_queues.iter().map(String::as_str),
+                task_group,
             );
             (fb::TaskVariant::RunAttempt, ra.as_union_value())
         }
@@ -388,7 +547,7 @@ fn build_refresh_floating_limit<'a, A: flatbuffers::Allocator + 'a>(
 /// row decodes through `decode_task_validated` like any task value.
 #[inline]
 pub fn encode_refresh_index_row(task: &Task, not_before_ms: Option<i64>) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let mut builder = FlatBufferBuilder::with_capacity(TASK_FIXED_HINT + task_hint(task));
     let rfl = build_refresh_floating_limit(&mut builder, task, not_before_ms);
     let root = fb::Task::create(
         &mut builder,
@@ -398,7 +557,7 @@ pub fn encode_refresh_index_row(task: &Task, not_before_ms: Option<i64>) -> Vec<
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +566,7 @@ pub fn encode_refresh_index_row(task: &Task, not_before_ms: Option<i64>) -> Vec<
 
 #[inline]
 pub fn encode_task(task: &Task) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(256);
+    let mut builder = FlatBufferBuilder::with_capacity(TASK_FIXED_HINT + task_hint(task));
     let (vtype, voff) = build_task_union(&mut builder, task);
     let root = fb::Task::create(
         &mut builder,
@@ -417,35 +576,172 @@ pub fn encode_task(task: &Task) -> Vec<u8> {
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
+/// Encode a `RunAttempt` task from borrowed fields; the bytes match
+/// [`encode_task`] of the equivalent `Task::RunAttempt`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_run_attempt(
+    id: &str,
+    tenant: &str,
+    job_id: &str,
+    attempt_number: u32,
+    relative_attempt_number: u32,
+    held_queues: &[String],
+    task_group: &str,
+) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::with_capacity(
+        TASK_FIXED_HINT
+            + string_hint(id)
+            + string_hint(tenant)
+            + string_hint(job_id)
+            + strings_hint(held_queues)
+            + string_hint(task_group),
+    );
+    let ra = build_run_attempt(
+        &mut builder,
+        id,
+        tenant,
+        job_id,
+        attempt_number,
+        relative_attempt_number,
+        held_queues.iter().map(String::as_str),
+        task_group,
+    );
+    let root = fb::Task::create(
+        &mut builder,
+        &fb::TaskArgs {
+            variant_type: fb::TaskVariant::RunAttempt,
+            variant: Some(ra.as_union_value()),
+        },
+    );
+    builder.finish(root, None);
+    into_finished_vec(builder)
+}
+
+/// Encode a lease record from borrowed parts.
 #[inline]
-pub fn encode_lease(record: &LeaseRecord) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(256);
-    let worker_id = builder.create_string(&record.worker_id);
-    let (vtype, voff) = build_task_union(&mut builder, &record.task);
+pub fn encode_lease_parts(
+    worker_id: &str,
+    task: &Task,
+    expiry_ms: i64,
+    started_at_ms: i64,
+) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::with_capacity(
+        TASK_FIXED_HINT + string_hint(worker_id) + task_hint(task),
+    );
+    let worker_id = builder.create_string(worker_id);
+    let (task_type, task) = build_task_union(&mut builder, task);
+    finish_lease(
+        builder,
+        worker_id,
+        task_type,
+        task,
+        expiry_ms,
+        started_at_ms,
+    )
+}
+
+/// Encode a lease record whose task is the `RunAttempt` table `ra`, copied
+/// field by field from its source buffer rather than through an owned
+/// [`Task`]. The record decodes the same as [`encode_lease_parts`] of
+/// `ra`'s [`DecodedTask::to_task`].
+pub fn encode_run_attempt_lease(
+    worker_id: &str,
+    ra: fb::RunAttempt<'_>,
+    expiry_ms: i64,
+    started_at_ms: i64,
+) -> Vec<u8> {
+    let strings = [ra.id(), ra.tenant(), ra.job_id(), ra.task_group()];
+    let held_queues = ra.held_queues().into_iter().flatten();
+    let hint = strings
+        .iter()
+        .flatten()
+        .map(|s| string_hint(s))
+        .sum::<usize>()
+        + held_queues.map(|s| string_hint(s) + 4).sum::<usize>();
+    let mut builder =
+        FlatBufferBuilder::with_capacity(TASK_FIXED_HINT + string_hint(worker_id) + hint);
+    let worker_id = builder.create_string(worker_id);
+    let task = build_run_attempt_from(&mut builder, ra);
+    finish_lease(
+        builder,
+        worker_id,
+        fb::TaskVariant::RunAttempt,
+        task.as_union_value(),
+        expiry_ms,
+        started_at_ms,
+    )
+}
+
+fn finish_lease<'a>(
+    mut builder: FlatBufferBuilder<'a>,
+    worker_id: flatbuffers::WIPOffset<&'a str>,
+    task_type: fb::TaskVariant,
+    task: flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>,
+    expiry_ms: i64,
+    started_at_ms: i64,
+) -> Vec<u8> {
     let root = fb::LeaseRecord::create(
         &mut builder,
         &fb::LeaseRecordArgs {
             worker_id: Some(worker_id),
-            task_type: vtype,
-            task: Some(voff),
-            expiry_ms: record.expiry_ms,
-            started_at_ms: record.started_at_ms,
+            task_type,
+            task: Some(task),
+            expiry_ms,
+            started_at_ms,
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
+}
+
+#[inline]
+pub fn encode_lease(record: &LeaseRecord) -> Vec<u8> {
+    encode_lease_parts(
+        &record.worker_id,
+        &record.task,
+        record.expiry_ms,
+        record.started_at_ms,
+    )
 }
 
 #[inline]
 pub fn encode_attempt(attempt: &JobAttempt) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(256);
-    let job_id = builder.create_string(&attempt.job_id);
-    let task_id = builder.create_string(&attempt.task_id);
+    encode_attempt_parts(
+        &attempt.job_id,
+        attempt.attempt_number,
+        attempt.relative_attempt_number,
+        &attempt.task_id,
+        attempt.started_at_ms,
+        &attempt.status,
+    )
+}
 
-    let (status_kind, finished_at_ms, result, error_code, error) = match &attempt.status {
+/// Encode a job attempt record from borrowed parts.
+pub fn encode_attempt_parts(
+    job_id: &str,
+    attempt_number: u32,
+    relative_attempt_number: u32,
+    task_id: &str,
+    started_at_ms: i64,
+    status: &AttemptStatus,
+) -> Vec<u8> {
+    let status_hint = match status {
+        AttemptStatus::Running | AttemptStatus::Cancelled { .. } => 0,
+        AttemptStatus::Succeeded { result, .. } => result.len() + 8,
+        AttemptStatus::Failed {
+            error_code, error, ..
+        } => string_hint(error_code) + error.len() + 8,
+    };
+    let mut builder = FlatBufferBuilder::with_capacity(
+        96 + string_hint(job_id) + string_hint(task_id) + status_hint,
+    );
+    let job_id = builder.create_string(job_id);
+    let task_id = builder.create_string(task_id);
+
+    let (status_kind, finished_at_ms, result, error_code, error) = match status {
         AttemptStatus::Running => (fb::AttemptStatusKind::Running, None, None, None, None),
         AttemptStatus::Succeeded {
             finished_at_ms,
@@ -488,10 +784,10 @@ pub fn encode_attempt(attempt: &JobAttempt) -> Vec<u8> {
         &mut builder,
         &fb::JobAttemptArgs {
             job_id: Some(job_id),
-            attempt_number: attempt.attempt_number,
-            relative_attempt_number: attempt.relative_attempt_number,
+            attempt_number,
+            relative_attempt_number,
             task_id: Some(task_id),
-            started_at_ms: attempt.started_at_ms,
+            started_at_ms,
             status_kind,
             finished_at_ms,
             result,
@@ -500,17 +796,51 @@ pub fn encode_attempt(attempt: &JobAttempt) -> Vec<u8> {
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 #[inline]
 pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(512);
-    let id = builder.create_string(&job.id);
-    let payload = builder.create_vector(&job.payload);
-    let task_group = builder.create_string(&job.task_group);
+    encode_job_info_parts(
+        &job.id,
+        job.priority,
+        job.enqueue_time_ms,
+        &job.payload,
+        job.retry_policy.as_ref(),
+        &job.metadata,
+        &job.limits,
+        &job.task_group,
+    )
+}
 
-    let retry_policy = job.retry_policy.as_ref().map(|rp| {
+/// Encode a job info record from borrowed parts; the bytes match
+/// [`encode_job_info`] of the equivalent [`JobInfo`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_job_info_parts(
+    id: &str,
+    priority: u8,
+    enqueue_time_ms: i64,
+    payload: &[u8],
+    retry_policy: Option<&RetryPolicy>,
+    metadata: &[(String, String)],
+    limits: &[Limit],
+    task_group: &str,
+) -> Vec<u8> {
+    // Sized up front so a large payload is copied into the builder once,
+    // instead of again on every doubling of the buffer.
+    let mut builder = FlatBufferBuilder::with_capacity(
+        160 + string_hint(id)
+            + payload.len()
+            + 8
+            + string_hint(task_group)
+            + kv_pairs_hint(metadata)
+            + limits_hint(limits),
+    );
+    let id = builder.create_string(id);
+    let payload = builder.create_vector(payload);
+    let task_group = builder.create_string(task_group);
+
+    let retry_policy = retry_policy.map(|rp| {
         fb::RetryPolicy::create(
             &mut builder,
             &fb::RetryPolicyArgs {
@@ -523,18 +853,18 @@ pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
         )
     });
 
-    let md = build_kv_pair_offsets(&mut builder, &job.metadata);
+    let md = build_kv_pair_offsets(&mut builder, metadata);
     let metadata = builder.create_vector(&md);
 
-    let limit_offsets = build_limit_entry_offsets(&mut builder, &job.limits);
+    let limit_offsets = build_limit_entry_offsets(&mut builder, limits);
     let limits = builder.create_vector(&limit_offsets);
 
     let root = fb::JobInfo::create(
         &mut builder,
         &fb::JobInfoArgs {
             id: Some(id),
-            priority: job.priority,
-            enqueue_time_ms: job.enqueue_time_ms,
+            priority,
+            enqueue_time_ms,
             payload: Some(payload),
             retry_policy,
             metadata: Some(metadata),
@@ -543,7 +873,7 @@ pub fn encode_job_info(job: &JobInfo) -> Vec<u8> {
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 #[inline]
@@ -568,7 +898,7 @@ pub fn encode_job_status(status: &JobStatus) -> Vec<u8> {
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 #[inline]
@@ -584,12 +914,27 @@ pub fn encode_holder(holder: &HolderRecord) -> Vec<u8> {
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 #[inline]
 pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(128);
+    let ConcurrencyAction::EnqueueTask {
+        job_id,
+        task_group,
+        held_queues,
+        task_id,
+        limits,
+        ..
+    } = action;
+    let mut builder = FlatBufferBuilder::with_capacity(
+        TASK_FIXED_HINT
+            + string_hint(job_id)
+            + string_hint(task_group)
+            + string_hint(task_id)
+            + strings_hint(held_queues)
+            + limits_hint(limits),
+    );
     match action {
         ConcurrencyAction::EnqueueTask {
             start_time_ms,
@@ -638,7 +983,7 @@ pub fn encode_concurrency_action(action: &ConcurrencyAction) -> Vec<u8> {
             builder.finish(root, None);
         }
     }
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 #[inline]
@@ -651,12 +996,12 @@ pub fn encode_job_cancellation(cancellation: &JobCancellation) -> Vec<u8> {
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 #[inline]
 pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Vec<u8> {
-    let mut builder = FlatBufferBuilder::with_capacity(128);
+    let mut builder = FlatBufferBuilder::with_capacity(96 + kv_pairs_hint(&state.metadata));
     let md = build_kv_pair_offsets(&mut builder, &state.metadata);
     let metadata = builder.create_vector(&md);
     let root = fb::FloatingLimitState::create(
@@ -675,7 +1020,7 @@ pub fn encode_floating_limit_state(state: &FloatingLimitState) -> Vec<u8> {
         },
     );
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    into_finished_vec(builder)
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +1171,11 @@ macro_rules! decoded_wrapper {
             pub fn fb(&self) -> fb::$fb_type<'_> {
                 // SAFETY: data was validated at construction
                 unsafe { flatbuffers::root_unchecked::<fb::$fb_type>(&self.data) }
+            }
+
+            /// The validated record bytes.
+            pub fn as_bytes(&self) -> &Bytes {
+                &self.data
             }
         }
     };

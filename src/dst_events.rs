@@ -75,6 +75,12 @@ pub enum DstEvent {
     ShardReopened { node_id: String, shard_id: String },
 }
 
+/// Whether events are recorded: true only with the `dst` feature. A caller
+/// that builds an event's owned fields on a hot path, or stashes them for a
+/// later emit, checks this first so production builds skip that work; the
+/// emit functions themselves are no-ops without the feature.
+pub const ENABLED: bool = cfg!(feature = "dst");
+
 #[cfg(feature = "dst")]
 mod dst_impl {
     use super::DstEvent;

@@ -7,12 +7,12 @@ use slatedb::config::WriteOptions;
 use uuid::Uuid;
 
 use crate::codec::{
-    decode_floating_limit_state, decode_lease, encode_attempt, encode_floating_limit_state,
-    encode_lease,
+    decode_floating_limit_state, decode_lease, encode_attempt_parts, encode_floating_limit_state,
+    encode_lease_parts, encode_run_attempt_lease,
 };
 use crate::dst_events::{self, DstEvent};
 use crate::job::{FloatingLimitState, JobStatus, JobView};
-use crate::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
+use crate::job_attempt::{AttemptOutcome, AttemptStatus};
 use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::holder_release_guard::PendingHolderReleaseGuard;
@@ -58,20 +58,15 @@ impl JobStoreShard {
             });
         }
 
-        // Extract tenant and job_id from the lease (authoritative source)
-        let tenant = decoded.tenant().to_string();
-        let job_id = decoded.job_id().to_string();
-
         // [SILO-HB-3] Renew by creating new record with updated expiry
         let new_expiry_ms = now_epoch_ms() + DEFAULT_LEASE_MS;
-        let task = decoded.to_task()?;
-        let record = crate::task::LeaseRecord {
-            worker_id: worker_id.to_string(),
-            task,
-            expiry_ms: new_expiry_ms,
-            started_at_ms: decoded.started_at_ms(),
+        let started_at_ms = decoded.started_at_ms();
+        let value = match decoded.fb().task_as_run_attempt() {
+            Some(ra) => encode_run_attempt_lease(worker_id, ra, new_expiry_ms, started_at_ms),
+            None => {
+                encode_lease_parts(worker_id, &decoded.to_task()?, new_expiry_ms, started_at_ms)
+            }
         };
-        let value = encode_lease(&record);
 
         let mut batch = WriteBatch::new();
         batch.put(&key, &value);
@@ -86,8 +81,11 @@ impl JobStoreShard {
             .await?;
 
         // Check cancellation status to return in response
-        // Worker discovers cancellation via heartbeat response per Alloy spec
-        let cancelled_at_ms = self.get_job_cancellation(&tenant, &job_id).await?;
+        // Worker discovers cancellation via heartbeat response per Alloy spec.
+        // Tenant and job id come from the lease (authoritative source).
+        let cancelled_at_ms = self
+            .get_job_cancellation(decoded.tenant(), decoded.job_id())
+            .await?;
 
         Ok(HeartbeatResult {
             cancelled: cancelled_at_ms.is_some(),
@@ -100,7 +98,7 @@ impl JobStoreShard {
     pub async fn report_attempt_outcome(
         &self,
         task_id: &str,
-        outcome: AttemptOutcome,
+        mut outcome: AttemptOutcome,
     ) -> Result<(), JobStoreShardError> {
         // [SILO-SUCC-1][SILO-FAIL-1][SILO-RETRY-1] Load lease; must exist
         let leased_task_key = leased_task_key(task_id);
@@ -130,15 +128,17 @@ impl JobStoreShard {
         // `terminal_job_expire_s` for Failed/Cancelled. We resolve it inside
         // each terminal branch below via `self.terminal_expire_ts(kind, now_ms)`.
         let mut terminal_expire_ts: Option<i64> = None;
-        let attempt_status = match &outcome {
+        // The attempt record takes the result or error bytes; `outcome` is
+        // only matched on its variant from here on.
+        let attempt_status = match &mut outcome {
             AttemptOutcome::Success { result } => AttemptStatus::Succeeded {
                 finished_at_ms: now_ms,
-                result: result.clone(),
+                result: std::mem::take(result),
             },
             AttemptOutcome::Error { error_code, error } => AttemptStatus::Failed {
                 finished_at_ms: now_ms,
-                error_code: error_code.clone(),
-                error: error.clone(),
+                error_code: std::mem::take(error_code),
+                error: std::mem::take(error),
             },
             AttemptOutcome::Cancelled => AttemptStatus::Cancelled {
                 finished_at_ms: now_ms,
@@ -149,15 +149,14 @@ impl JobStoreShard {
         // started_at_ms is stored on the lease record, so no extra DB read needed
         let started_at_ms = decoded.started_at_ms();
 
-        let attempt = JobAttempt {
-            job_id: job_id.clone(),
+        let attempt_val = encode_attempt_parts(
+            &job_id,
             attempt_number,
             relative_attempt_number,
-            task_id: task_id.to_string(),
+            task_id,
             started_at_ms,
-            status: attempt_status,
-        };
-        let attempt_val = encode_attempt(&attempt);
+            &attempt_status,
+        );
 
         // Atomically update attempt and remove lease.
         // Note: the attempt put is deferred until after we determine whether the
@@ -174,11 +173,19 @@ impl JobStoreShard {
         let mut retry_scheduled_refreshes = ScheduledRefreshes::default();
         let mut background_action_transitions: Vec<BackgroundActionMetricTransition> = Vec::new();
         // Track the new job status for DST event emission
-        let mut new_job_status_for_dst: Option<String> = None;
+        let mut new_job_status_for_dst: Option<&'static str> = None;
         // Whether the job reached a terminal status during this call. Drives
         // both the `expire_terminal_job_records` invocation and the TTL on the
         // new attempt row written below.
         let mut reached_terminal = false;
+
+        // One JOB_INFO read serves every branch below: the status update's
+        // job fields and gauges, the retry policy, and the terminal-record
+        // expiry, which would otherwise each read and decode it again.
+        let job_view = match self.db.get(&job_info_key(&tenant, &job_id)).await? {
+            Some(raw) => Some(JobView::new(raw)?),
+            None => None,
+        };
 
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
@@ -186,9 +193,6 @@ impl JobStoreShard {
                 let job_status = JobStatus::succeeded(now_ms);
                 terminal_expire_ts =
                     self.terminal_expire_ts(crate::job::JobStatusKind::Succeeded, now_ms);
-                // No JobView is loaded on the Success/Cancelled branches; the
-                // helper falls back to its own JOB_INFO get. The Error branch
-                // below already loads `view` and threads it through.
                 if let Some(transition) = self
                     .set_job_status_with_index_opts(
                         &mut DbWriteBatcher::new(&self.db, &mut batch),
@@ -196,7 +200,7 @@ impl JobStoreShard {
                         &job_id,
                         job_status,
                         terminal_expire_ts,
-                        None,
+                        job_view.as_ref(),
                     )
                     .await?
                 {
@@ -211,7 +215,7 @@ impl JobStoreShard {
                     );
                     return Err(e);
                 }
-                new_job_status_for_dst = Some("Succeeded".to_string());
+                new_job_status_for_dst = Some("Succeeded");
                 reached_terminal = true;
             }
             // Worker acknowledges cancellation - set job status to Cancelled
@@ -226,7 +230,7 @@ impl JobStoreShard {
                         &job_id,
                         job_status,
                         terminal_expire_ts,
-                        None,
+                        job_view.as_ref(),
                     )
                     .await?
                 {
@@ -241,18 +245,15 @@ impl JobStoreShard {
                     );
                     return Err(e);
                 }
-                new_job_status_for_dst = Some("Cancelled".to_string());
+                new_job_status_for_dst = Some("Cancelled");
                 reached_terminal = true;
             }
             // Error: maybe enqueue next attempt; otherwise mark job failed
             AttemptOutcome::Error { .. } => {
                 let mut scheduled_followup: bool = false;
 
-                // Load job info to get priority and retry policy
-                let job_info_key = job_info_key(&tenant, &job_id);
-                let maybe_job = self.db.get(&job_info_key).await?;
-                if let Some(jbytes) = maybe_job {
-                    let view = JobView::new(jbytes)?;
+                // The job info gives the priority and retry policy
+                if let Some(view) = &job_view {
                     let priority = view.priority();
                     let task_group = view.task_group();
                     let limits = view.limits();
@@ -314,7 +315,7 @@ impl JobStoreShard {
                                 &tenant,
                                 &job_id,
                                 job_status,
-                                Some(&view),
+                                Some(view),
                             )
                             .await?
                         {
@@ -322,7 +323,7 @@ impl JobStoreShard {
                         }
                         scheduled_followup = true;
                         followup_next_time = Some(next_time);
-                        new_job_status_for_dst = Some("Scheduled".to_string());
+                        new_job_status_for_dst = Some("Scheduled");
                     }
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
                     if !scheduled_followup {
@@ -336,7 +337,7 @@ impl JobStoreShard {
                                 &job_id,
                                 job_status,
                                 terminal_expire_ts,
-                                Some(&view),
+                                Some(view),
                             )
                             .await?
                         {
@@ -351,7 +352,7 @@ impl JobStoreShard {
                             );
                             return Err(e);
                         }
-                        new_job_status_for_dst = Some("Failed".to_string());
+                        new_job_status_for_dst = Some("Failed");
                         reached_terminal = true;
                     }
                 } else {
@@ -379,10 +380,11 @@ impl JobStoreShard {
         if reached_terminal
             && let Some(ts) = terminal_expire_ts
             && let Err(e) = self
-                .expire_terminal_job_records(
+                .expire_terminal_job_records_with_view(
                     &mut DbWriteBatcher::new(&self.db, &mut batch),
                     &tenant,
                     &job_id,
+                    job_view.as_ref(),
                     ts,
                 )
                 .await
@@ -434,23 +436,25 @@ impl JobStoreShard {
         // Two-phase DST events: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.
         let write_op = dst_events::next_write_op();
-        dst_events::emit_pending(
-            DstEvent::TaskReleased {
-                tenant: tenant.to_string(),
-                job_id: job_id.clone(),
-                task_id: task_id.to_string(),
-            },
-            write_op,
-        );
-        if let Some(new_status) = new_job_status_for_dst {
+        if dst_events::ENABLED {
             dst_events::emit_pending(
-                DstEvent::JobStatusChanged {
+                DstEvent::TaskReleased {
                     tenant: tenant.to_string(),
                     job_id: job_id.clone(),
-                    new_status,
+                    task_id: task_id.to_string(),
                 },
                 write_op,
             );
+            if let Some(new_status) = new_job_status_for_dst {
+                dst_events::emit_pending(
+                    DstEvent::JobStatusChanged {
+                        tenant: tenant.to_string(),
+                        job_id: job_id.clone(),
+                        new_status: new_status.to_string(),
+                    },
+                    write_op,
+                );
+            }
         }
 
         // Commit durable state — write_with_options with await_durable:true blocks
@@ -879,14 +883,31 @@ impl JobStoreShard {
         job_id: &str,
         expire_ts: i64,
     ) -> Result<(), JobStoreShardError> {
-        let info_key = job_info_key(tenant, job_id);
-        if let Some(info_raw) = writer.get(&info_key).await? {
-            let view = JobView::new(info_raw.clone())?;
-            writer.put_with_expire(&info_key, info_raw, expire_ts)?;
+        let view = match writer.get(&job_info_key(tenant, job_id)).await? {
+            Some(info_raw) => Some(JobView::new(info_raw)?),
+            None => None,
+        };
+        self.expire_terminal_job_records_with_view(writer, tenant, job_id, view.as_ref(), expire_ts)
+            .await
+    }
+
+    /// [`Self::expire_terminal_job_records`] for a caller that has already
+    /// read the job's `JOB_INFO` (`None` when the row is absent) from the
+    /// same view `writer` reads.
+    pub(crate) async fn expire_terminal_job_records_with_view<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        view: Option<&JobView>,
+        expire_ts: i64,
+    ) -> Result<(), JobStoreShardError> {
+        if let Some(view) = view {
+            writer.put_with_expire(job_info_key(tenant, job_id), view.as_bytes(), expire_ts)?;
             let metadata_value = MetadataIndexValue::new(view.enqueue_time_ms()).encode();
-            for (mk, mv) in &view.metadata() {
+            for (mk, mv) in view.metadata_iter() {
                 let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-                writer.put_with_expire(&mkey, &metadata_value, expire_ts)?;
+                writer.put_with_expire(&mkey, metadata_value, expire_ts)?;
             }
             let entry_key = idx_enqueue_time_key(tenant, view.enqueue_time_ms(), job_id);
             writer.put_with_expire(&entry_key, [], expire_ts)?;
@@ -929,8 +950,8 @@ impl JobStoreShard {
         let view = JobView::new(info_raw.clone())?;
         writer.put(&info_key, info_raw)?;
         let metadata_value = MetadataIndexValue::new(view.enqueue_time_ms()).encode();
-        for (mk, mv) in &view.metadata() {
-            writer.put(idx_metadata_key(tenant, mk, mv, job_id), &metadata_value)?;
+        for (mk, mv) in view.metadata_iter() {
+            writer.put(idx_metadata_key(tenant, mk, mv, job_id), metadata_value)?;
         }
         writer.put(
             idx_enqueue_time_key(tenant, view.enqueue_time_ms(), job_id),

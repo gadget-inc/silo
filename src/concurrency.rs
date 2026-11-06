@@ -406,6 +406,53 @@ fn queue_key(tenant: &str, queue: &str) -> QueueKey {
     (Arc::from(tenant), Arc::from(queue))
 }
 
+/// A `(tenant, queue)` pair as either an owned [`QueueKey`] or borrowed
+/// strings. `ConcurrencyCounts.queues` is looked up through
+/// `&dyn QueueKeyParts`, so finding an existing queue never allocates its
+/// key; only inserting a new queue builds a [`QueueKey`].
+trait QueueKeyParts {
+    fn parts(&self) -> (&str, &str);
+}
+
+impl QueueKeyParts for QueueKey {
+    fn parts(&self) -> (&str, &str) {
+        (&self.0, &self.1)
+    }
+}
+
+impl QueueKeyParts for (&str, &str) {
+    fn parts(&self) -> (&str, &str) {
+        *self
+    }
+}
+
+// Hashes the two strings in order, as the derived `Hash` of `QueueKey` does,
+// which `Borrow` requires of a lookup form.
+impl std::hash::Hash for dyn QueueKeyParts + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl PartialEq for dyn QueueKeyParts + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn QueueKeyParts + '_ {}
+
+impl<'a> std::borrow::Borrow<dyn QueueKeyParts + 'a> for QueueKey {
+    fn borrow(&self) -> &(dyn QueueKeyParts + 'a) {
+        self
+    }
+}
+
+/// Borrowed lookup key for `ConcurrencyCounts.queues`.
+fn queue_lookup<'a>(key: &'a (&'a str, &'a str)) -> &'a (dyn QueueKeyParts + 'a) {
+    key
+}
+
 /// In-memory counts for concurrency holders.
 ///
 /// Backed by a `DashMap` so each call serializes only on its shard's lock
@@ -550,6 +597,14 @@ impl ConcurrencyCounts {
         tenant: &str,
         queue: &str,
     ) -> Result<(), Arc<slatedb::Error>> {
+        // Fast path: an already-hydrated queue needs no key and no write lock.
+        if self
+            .queues
+            .get(queue_lookup(&(tenant, queue)))
+            .is_some_and(|entry| matches!(entry.state, HydrationState::Hydrated))
+        {
+            return Ok(());
+        }
         let key = queue_key(tenant, queue);
 
         // Pick an action under the shard guard, then drop it before awaiting.
@@ -634,9 +689,14 @@ impl ConcurrencyCounts {
         limit: usize,
         job_id: &str,
     ) -> bool {
-        let key = queue_key(tenant, queue);
         let (reserved, holders_len_after) = {
-            let mut entry = self.queues.entry(key).or_insert_with(QueueEntry::new);
+            let mut entry = match self.queues.get_mut(queue_lookup(&(tenant, queue))) {
+                Some(entry) => entry,
+                None => self
+                    .queues
+                    .entry(queue_key(tenant, queue))
+                    .or_insert_with(QueueEntry::new),
+            };
 
             // Check if we're at capacity
             if entry.holders.len() >= limit {
@@ -664,12 +724,14 @@ impl ConcurrencyCounts {
                     "try_reserve_internal: reserved past limit (potential bug)"
                 );
             }
-            dst_events::emit(DstEvent::ConcurrencyTicketGranted {
-                tenant: tenant.to_string(),
-                queue: queue.to_string(),
-                task_id: task_id.to_string(),
-                job_id: job_id.to_string(),
-            });
+            if dst_events::ENABLED {
+                dst_events::emit(DstEvent::ConcurrencyTicketGranted {
+                    tenant: tenant.to_string(),
+                    queue: queue.to_string(),
+                    task_id: task_id.to_string(),
+                    job_id: job_id.to_string(),
+                });
+            }
         }
 
         reserved
@@ -700,8 +762,7 @@ impl ConcurrencyCounts {
 
     /// Release a reservation made by `try_reserve` if the DB write fails.
     pub fn release_reservation(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = queue_key(tenant, queue);
-        if let Some(mut entry) = self.queues.get_mut(&key) {
+        if let Some(mut entry) = self.queues.get_mut(queue_lookup(&(tenant, queue))) {
             entry.holders.remove(task_id);
         } // shard guard dropped here
     }
@@ -709,27 +770,27 @@ impl ConcurrencyCounts {
     /// Atomically release a task without granting to another.
     /// Used by callers post-commit after deleting a holder from the DB batch.
     pub fn atomic_release(&self, tenant: &str, queue: &str, task_id: &str) {
-        let key = queue_key(tenant, queue);
         {
-            if let Some(mut entry) = self.queues.get_mut(&key) {
+            if let Some(mut entry) = self.queues.get_mut(queue_lookup(&(tenant, queue))) {
                 entry.holders.remove(task_id);
             }
         } // shard guard dropped here
 
         // Emit DST event for instrumentation
-        dst_events::emit(DstEvent::ConcurrencyTicketReleased {
-            tenant: tenant.to_string(),
-            queue: queue.to_string(),
-            task_id: task_id.to_string(),
-        });
+        if dst_events::ENABLED {
+            dst_events::emit(DstEvent::ConcurrencyTicketReleased {
+                tenant: tenant.to_string(),
+                queue: queue.to_string(),
+                task_id: task_id.to_string(),
+            });
+        }
     }
 
     /// Get the current holder count for a queue.
     /// Useful for testing and debugging.
     pub fn holder_count(&self, tenant: &str, queue: &str) -> usize {
-        let key = queue_key(tenant, queue);
         self.queues
-            .get(&key)
+            .get(queue_lookup(&(tenant, queue)))
             .map(|entry| entry.holders.len())
             .unwrap_or(0)
     }
@@ -738,9 +799,8 @@ impl ConcurrencyCounts {
     /// `(tenant, queue)`. Used by the reconciler to compare against the
     /// durable holder row.
     pub fn contains_holder(&self, tenant: &str, queue: &str, task_id: &str) -> bool {
-        let key = queue_key(tenant, queue);
         self.queues
-            .get(&key)
+            .get(queue_lookup(&(tenant, queue)))
             .map(|entry| entry.holders.contains(task_id))
             .unwrap_or(false)
     }
@@ -811,8 +871,7 @@ impl ConcurrencyCounts {
     /// (empty/partial) against durable (unknown) is meaningless. The DashMap
     /// guard is dropped before the caller does any `.await`.
     pub fn holders_if_hydrated(&self, tenant: &str, queue: &str) -> Option<HashSet<String>> {
-        let key = queue_key(tenant, queue);
-        let entry = self.queues.get(&key)?;
+        let entry = self.queues.get(queue_lookup(&(tenant, queue)))?;
         if !matches!(entry.state, HydrationState::Hydrated) {
             return None;
         }
@@ -1283,6 +1342,13 @@ impl ConcurrencyManager {
     ) {
         let key = concurrency_counts_key(tenant, queue);
         let mut cache = self.limit_cache.lock().unwrap();
+        // The key is derived from (tenant, queue), so a cached entry already
+        // carries both; only the limit can change.
+        if let Some(cached) = cache.get_mut(&key) {
+            cached.max_concurrency = max_concurrency;
+            cached.limit_type = limit_type;
+            return;
+        }
         cache.insert(
             key,
             CachedQueueLimit {

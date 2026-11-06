@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use slatedb::WriteBatch;
+use slatedb::bytes::Bytes;
 
 use crate::instrumented_db::InstrumentedDb;
 use tokio::sync::Notify;
 
 use crate::codec::{DecodedTask, decode_task_validated};
-use crate::keys::{end_bound, parse_task_key, task_group_prefix, task_group_time_prefix};
+use crate::keys::{end_bound, parse_task_key_ref, task_group_prefix, task_group_time_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
 use tracing::debug;
@@ -23,10 +24,12 @@ use tracing::debug;
 ///
 /// Stores a pre-validated `DecodedTask` (wraps `Bytes`) instead of raw bytes.
 /// Validation happens once during scan; callers can access zero-copy
-/// FlatBuffer accessors without re-parsing.
+/// FlatBuffer accessors without re-parsing. The key is the `Bytes` the scan
+/// read, so the buffer, the in-flight set, and the ack tombstones share one
+/// copy of it.
 #[derive(Debug, Clone)]
 pub struct BrokerTask {
-    pub key: Vec<u8>,
+    pub key: Bytes,
     pub decoded: DecodedTask,
 }
 
@@ -61,12 +64,12 @@ pub struct TaskBroker {
     // The SlateDB database to read tasks from
     db: Arc<InstrumentedDb>,
     // The buffer of tasks read out of the DB and ready to be claimed by a dequeue-ing worker
-    buffer: Arc<SkipMap<Vec<u8>, BrokerTask>>,
+    buffer: Arc<SkipMap<Bytes, BrokerTask>>,
     // The set of tasks already read out of the DB and claimed by a worker but not yet durably leased. Required so that the scanner doesn't re-add tasks that are in the middle of being dequeued to the buffer.
-    inflight: Arc<Mutex<HashSet<Vec<u8>>>>,
+    inflight: Arc<Mutex<HashSet<Bytes>>>,
     // Tombstones for task keys that were durably acked, so a stale scan cannot
     // re-buffer a row the broker has already deleted.
-    ack_tombstones: Arc<Mutex<HashMap<Vec<u8>, AckTombstone>>>,
+    ack_tombstones: Arc<Mutex<HashMap<Bytes, AckTombstone>>>,
     // Scan generations a tombstone may keep suppressing a re-observed key
     // before the scanner point-reads the row to check the delete landed.
     tombstone_revive_after_generations: u64,
@@ -225,7 +228,7 @@ impl TaskBroker {
         };
 
         // Collect keys to delete for defunct tasks (outside shard range)
-        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
+        let mut defunct_keys: Vec<Bytes> = Vec::new();
 
         let mut inserted = 0;
         let mut total_read = 0u64;
@@ -257,7 +260,7 @@ impl TaskBroker {
             total_read += 1;
 
             // Parse the task key to extract timestamp
-            let Some(parsed_key) = parse_task_key(&kv.key) else {
+            let Some(parsed_key) = parse_task_key_ref(&kv.key) else {
                 continue;
             };
 
@@ -278,10 +281,13 @@ impl TaskBroker {
             // defunct, or malformed. A later scan need not read it again.
             consumed_through_ms = Some(parsed_key.start_time_ms as i64);
 
-            let key_bytes = kv.key.to_vec();
+            // Most rows a scan reads are already buffered or in flight, so
+            // every check below borrows the key; it is only cloned (a
+            // refcount bump) when the row is buffered or marked defunct.
+            let key: &[u8] = &kv.key;
 
             // [SILO-SCAN-3] Skip inflight tasks
-            if self.inflight.lock().unwrap().contains(&key_bytes) {
+            if self.inflight.lock().unwrap().contains(key) {
                 skipped_inflight += 1;
                 continue;
             }
@@ -290,7 +296,7 @@ impl TaskBroker {
             // Refresh last_seen so persistent stale observations extend suppression.
             let tombstone_age = {
                 let mut tombstones = self.ack_tombstones.lock().unwrap();
-                tombstones.get_mut(&key_bytes).map(|tombstone| {
+                tombstones.get_mut(key).map(|tombstone| {
                     tombstone.last_seen = generation;
                     generation.saturating_sub(tombstone.inserted_at)
                 })
@@ -305,9 +311,9 @@ impl TaskBroker {
                 // row rewritten under the same key after the delete. A point get
                 // sees a fresher view than the range scan that yielded the key;
                 // the guard is not held across it.
-                match self.db.get(&key_bytes).await {
+                match self.db.get(key).await {
                     Ok(Some(durable)) => {
-                        self.ack_tombstones.lock().unwrap().remove(&key_bytes);
+                        self.ack_tombstones.lock().unwrap().remove(key);
                         revived += 1;
                         value = durable;
                     }
@@ -315,9 +321,7 @@ impl TaskBroker {
                         // The delete is confirmed. Re-arm the bound so a stale
                         // scan costs one point read per bound window, not one
                         // per generation.
-                        if let Some(tombstone) =
-                            self.ack_tombstones.lock().unwrap().get_mut(&key_bytes)
-                        {
+                        if let Some(tombstone) = self.ack_tombstones.lock().unwrap().get_mut(key) {
                             tombstone.inserted_at = generation;
                         }
                         skipped_tombstone += 1;
@@ -341,7 +345,7 @@ impl TaskBroker {
 
             if !self.range.contains_tenant(task_tenant) {
                 // Task is for a tenant outside our range - mark for deletion
-                defunct_keys.push(kv.key.to_vec());
+                defunct_keys.push(kv.key.clone());
                 skipped_defunct += 1;
                 debug!(
                     task_group = %parsed_key.task_group,
@@ -353,14 +357,13 @@ impl TaskBroker {
                 continue;
             }
 
-            let entry = BrokerTask {
-                key: key_bytes.clone(),
-                decoded,
-            };
-
             // [SILO-SCAN-2] Insert into buffer if not already present
-            if self.buffer.get(&key_bytes).is_none() {
-                self.buffer.insert(key_bytes, entry);
+            if !self.buffer.contains_key(key) {
+                let entry = BrokerTask {
+                    key: kv.key.clone(),
+                    decoded,
+                };
+                self.buffer.insert(kv.key.clone(), entry);
                 inserted += 1;
                 if cleared_floor_ms
                     .is_some_and(|cleared_ms| (parsed_key.start_time_ms as i64) < cleared_ms)
@@ -582,9 +585,13 @@ impl TaskBroker {
     ///
     /// Since each broker is scoped to a single task group, no prefix filtering is needed.
     fn claim_ready(&self, max: usize) -> Vec<BrokerTask> {
-        let candidate_keys: Vec<Vec<u8>> = {
+        // Idle polls land here repeatedly; skip the lock and the allocations.
+        if max == 0 || self.buffer.is_empty() {
+            return Vec::new();
+        }
+        let candidate_keys: Vec<Bytes> = {
             let mut inflight = self.inflight.lock().unwrap();
-            let mut keys = Vec::with_capacity(max);
+            let mut keys = Vec::with_capacity(max.min(self.buffer.len()));
             for entry in self.buffer.iter() {
                 if keys.len() >= max {
                     break;
@@ -672,11 +679,11 @@ impl TaskBroker {
     /// deleted in the same batch (not re-added → no double-processing), while an
     /// uncommitted task still has its key (re-scanned → processed exactly once,
     /// un-stranded).
-    fn release_inflight(&self, keys: &[Vec<u8>]) {
+    fn release_inflight<K: AsRef<[u8]>>(&self, keys: &[K]) {
         {
             let mut inflight = self.inflight.lock().unwrap();
             for k in keys {
-                inflight.remove(k);
+                inflight.remove(k.as_ref());
             }
         }
         // The rows may still be durable and were skipped as in-flight by any
@@ -684,7 +691,7 @@ impl TaskBroker {
         // so the next nudge must scan again from no later than their start
         // times.
         for k in keys {
-            if let Some(parsed) = parse_task_key(k) {
+            if let Some(parsed) = parse_task_key_ref(k.as_ref()) {
                 self.note_task_written(parsed.start_time_ms as i64);
             }
         }
@@ -695,7 +702,7 @@ impl TaskBroker {
     /// - `release_keys`: keys to release from in-flight tracking.
     /// - `tombstone_keys`: subset of keys that were durably deleted and should be
     ///   protected from stale-scan re-inserts.
-    fn ack_durable(&self, release_keys: &[Vec<u8>], tombstone_keys: &[Vec<u8>]) {
+    fn ack_durable(&self, release_keys: &[Bytes], tombstone_keys: &[Bytes]) {
         let mut inflight = self.inflight.lock().unwrap();
         let mut tombstones = self.ack_tombstones.lock().unwrap();
         let generation = self.scan_generation_started.load(Ordering::SeqCst);
@@ -714,9 +721,9 @@ impl TaskBroker {
     }
 
     /// Remove any buffered entries that match the provided keys.
-    fn evict_keys(&self, keys: &[Vec<u8>]) {
+    fn evict_keys<K: AsRef<[u8]>>(&self, keys: &[K]) {
         for k in keys {
-            self.buffer.remove(k);
+            self.buffer.remove(k.as_ref());
         }
     }
 
@@ -1064,22 +1071,17 @@ impl TaskBrokerRegistry {
     }
 
     /// Acknowledge durable dequeue outcomes for a specific task group.
-    pub fn ack_durable(
-        &self,
-        task_group: &str,
-        release_keys: &[Vec<u8>],
-        tombstone_keys: &[Vec<u8>],
-    ) {
+    pub fn ack_durable(&self, task_group: &str, release_keys: &[Bytes], tombstone_keys: &[Bytes]) {
         self.get_or_create(task_group)
             .ack_durable(release_keys, tombstone_keys);
     }
 
     /// Remove any buffered entries that match the provided keys.
     /// Keys may belong to different task groups; only evicts from brokers that already exist.
-    pub fn evict_keys(&self, keys: &[Vec<u8>]) {
+    pub fn evict_keys<K: AsRef<[u8]>>(&self, keys: &[K]) {
         for k in keys {
-            if let Some(parsed) = parse_task_key(k)
-                && let Some(broker) = self.brokers.get(&parsed.task_group)
+            if let Some(parsed) = parse_task_key_ref(k.as_ref())
+                && let Some(broker) = self.brokers.get(parsed.task_group.as_ref())
             {
                 broker.evict_keys(std::slice::from_ref(k));
             }
@@ -1089,10 +1091,10 @@ impl TaskBrokerRegistry {
     /// Release claimed keys from in-flight tracking without re-buffering them.
     /// Keys may belong to different task groups; only touches brokers that
     /// already exist. See [`TaskBroker::release_inflight`].
-    pub fn release_inflight(&self, keys: &[Vec<u8>]) {
+    pub fn release_inflight<K: AsRef<[u8]>>(&self, keys: &[K]) {
         for k in keys {
-            if let Some(parsed) = parse_task_key(k)
-                && let Some(broker) = self.brokers.get(&parsed.task_group)
+            if let Some(parsed) = parse_task_key_ref(k.as_ref())
+                && let Some(broker) = self.brokers.get(parsed.task_group.as_ref())
             {
                 broker.release_inflight(std::slice::from_ref(k));
             }
@@ -1137,7 +1139,7 @@ impl TaskBrokerRegistry {
     /// paths without standing up a scanner + DB write round-trip just to drive
     /// the same state.
     #[cfg(test)]
-    pub(crate) fn seed_inflight_for_test(&self, task_group: &str, keys: Vec<Vec<u8>>) {
+    pub(crate) fn seed_inflight_for_test(&self, task_group: &str, keys: Vec<Bytes>) {
         let broker = self.get_or_create(task_group);
         let mut inflight = broker.inflight.lock().unwrap();
         for k in keys {
@@ -1233,7 +1235,7 @@ mod inflight_release_tests {
             held_queues: vec![],
             task_group: "tg".to_string(),
         };
-        let key = crate::keys::task_key("tg", 1, 0, job_id, 1, 1);
+        let key = crate::keys::task_key("tg", 1, 0, job_id, 1, 1).into();
         let decoded = decode_task_validated(encode_task(&task)).expect("decode task");
         BrokerTask { key, decoded }
     }

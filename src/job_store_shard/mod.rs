@@ -296,9 +296,11 @@ pub struct JobStoreShard {
     /// Metrics recorder for SlateDB, passed to DbBuilder and used for stats collection.
     slatedb_metrics_recorder: Arc<DefaultMetricsRecorder>,
     /// Sparse in-memory counters for background action queue metrics.
-    /// Keyed by `(tenant, task_group, status_bucket, queue_kind, queue)`.
+    /// Keyed by `(tenant, task_group, status_bucket, queue_kind, queue)`;
+    /// the bucket and kind are always one of the `BACKGROUND_ACTION_*`
+    /// constants.
     pub(crate) background_action_queue_counts:
-        DashMap<(String, String, String, String, String), i64>,
+        DashMap<(String, String, &'static str, &'static str, String), i64>,
     /// TTL (seconds) applied to Succeeded jobs' associated records. `None`
     /// disables the feature for successful jobs.
     pub(crate) completed_job_expire_s: Option<u64>,
@@ -1683,7 +1685,10 @@ impl JobStoreShard {
             };
             let decoded = decode_task_validated(raw)
                 .map_err(|e| JobStoreShardError::Codec(format!("force_buffer decode: {e}")))?;
-            tasks.push(BrokerTask { key, decoded });
+            tasks.push(BrokerTask {
+                key: key.into(),
+                decoded,
+            });
         }
         let count = tasks.len();
         self.brokers.requeue(tasks);

@@ -2,11 +2,16 @@ use silo::codec::{
     decode_attempt, decode_cancellation_at_ms, decode_concurrency_action,
     decode_floating_limit_state, decode_holder, decode_holder_granted_at_ms, decode_job_info,
     decode_job_status_owned, decode_lease, decode_task, decode_task_validated, encode_attempt,
-    encode_concurrency_action, encode_floating_limit_state, encode_holder, encode_job_cancellation,
-    encode_job_info, encode_job_status, encode_lease, encode_refresh_index_row, encode_task,
+    encode_attempt_parts, encode_concurrency_action, encode_floating_limit_state, encode_holder,
+    encode_job_cancellation, encode_job_info, encode_job_info_parts, encode_job_status,
+    encode_lease, encode_lease_parts, encode_refresh_index_row, encode_run_attempt,
+    encode_run_attempt_lease, encode_task,
 };
-use silo::job::{FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind};
+use silo::job::{
+    ConcurrencyLimit, FloatingLimitState, JobCancellation, JobInfo, JobStatus, JobStatusKind, Limit,
+};
 use silo::job_attempt::{AttemptStatus, JobAttempt};
+use silo::retry::RetryPolicy;
 use silo::task::{ConcurrencyAction, GubernatorRateLimitData, HolderRecord, LeaseRecord, Task};
 
 #[silo::test]
@@ -869,4 +874,163 @@ fn test_refresh_index_row_zero_not_before_is_distinct_from_absent() {
     assert_eq!(zero.not_before_ms(), Some(0));
     let absent = decode_task_validated(encode_refresh_index_row(&task, None)).unwrap();
     assert_eq!(absent.not_before_ms(), None);
+}
+
+fn sample_run_attempt(held_queues: Vec<String>) -> Task {
+    Task::RunAttempt {
+        id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(),
+        tenant: "tenant-1".to_string(),
+        job_id: "0f8fad5b-d9cb-469f-a165-70867728950e".to_string(),
+        attempt_number: 3,
+        relative_attempt_number: 2,
+        held_queues,
+        task_group: "default".to_string(),
+    }
+}
+
+/// The borrowed-field `RunAttempt` encoder writes the same bytes as
+/// `encode_task` of the owned task.
+#[silo::test]
+fn encode_run_attempt_matches_encode_task() {
+    for held_queues in [vec![], vec!["q1".to_string(), "q2".to_string()]] {
+        let task = sample_run_attempt(held_queues.clone());
+        let Task::RunAttempt {
+            id,
+            tenant,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            task_group,
+            ..
+        } = &task
+        else {
+            unreachable!()
+        };
+        let borrowed = encode_run_attempt(
+            id,
+            tenant,
+            job_id,
+            *attempt_number,
+            *relative_attempt_number,
+            &held_queues,
+            task_group,
+        );
+        assert_eq!(borrowed, encode_task(&task));
+    }
+}
+
+/// A lease copied straight from a `RunAttempt` table writes the same bytes
+/// as one encoded from the owned task, and both match `encode_lease`.
+#[silo::test]
+fn encode_run_attempt_lease_matches_owned_lease() {
+    for held_queues in [vec![], vec!["q1".to_string()]] {
+        let task = sample_run_attempt(held_queues);
+        let record = LeaseRecord {
+            worker_id: "worker-1".to_string(),
+            task: task.clone(),
+            expiry_ms: 1_700_000_030_000,
+            started_at_ms: 1_700_000_000_000,
+        };
+        let owned = encode_lease(&record);
+        assert_eq!(
+            encode_lease_parts("worker-1", &task, record.expiry_ms, record.started_at_ms),
+            owned
+        );
+        let decoded = decode_task_validated(encode_task(&task)).unwrap();
+        let ra = decoded.as_run_attempt().expect("run attempt");
+        assert_eq!(
+            encode_run_attempt_lease("worker-1", ra, record.expiry_ms, record.started_at_ms),
+            owned
+        );
+        // Renewing a lease copies the task out of the stored lease itself.
+        let lease = decode_lease(owned.clone()).unwrap();
+        let ra = lease.fb().task_as_run_attempt().expect("run attempt");
+        assert_eq!(
+            encode_run_attempt_lease("worker-1", ra, record.expiry_ms, record.started_at_ms),
+            owned
+        );
+    }
+}
+
+#[silo::test]
+fn encode_attempt_parts_matches_encode_attempt() {
+    for status in [
+        AttemptStatus::Running,
+        AttemptStatus::Succeeded {
+            finished_at_ms: 5,
+            result: vec![1, 2, 3],
+        },
+        AttemptStatus::Failed {
+            finished_at_ms: 6,
+            error_code: "E_BOOM".to_string(),
+            error: vec![9; 40],
+        },
+        AttemptStatus::Cancelled { finished_at_ms: 7 },
+    ] {
+        let attempt = JobAttempt {
+            job_id: "job-1".to_string(),
+            attempt_number: 2,
+            relative_attempt_number: 1,
+            task_id: "task-1".to_string(),
+            started_at_ms: 4,
+            status,
+        };
+        assert_eq!(
+            encode_attempt_parts(
+                &attempt.job_id,
+                attempt.attempt_number,
+                attempt.relative_attempt_number,
+                &attempt.task_id,
+                attempt.started_at_ms,
+                &attempt.status,
+            ),
+            encode_attempt(&attempt)
+        );
+    }
+}
+
+/// Builders are sized from the payload up front; a payload far larger than
+/// the old fixed capacity still encodes the same bytes and round-trips.
+#[silo::test]
+fn encode_job_info_parts_matches_encode_job_info() {
+    for payload_len in [0, 100, 70_000] {
+        let job = JobInfo {
+            id: "job-1".to_string(),
+            priority: 10,
+            enqueue_time_ms: 1_700_000_000_000,
+            payload: (0..payload_len).map(|i| i as u8).collect(),
+            retry_policy: Some(RetryPolicy {
+                retry_count: 3,
+                initial_interval_ms: 100,
+                max_interval_ms: 1000,
+                randomize_interval: false,
+                backoff_factor: 2.0,
+            }),
+            metadata: vec![("queue".to_string(), "emails".to_string())],
+            limits: vec![Limit::Concurrency(ConcurrencyLimit {
+                key: "ck".to_string(),
+                max_concurrency: 4,
+            })],
+            task_group: "default".to_string(),
+        };
+        let encoded = encode_job_info(&job);
+        assert_eq!(
+            encode_job_info_parts(
+                &job.id,
+                job.priority,
+                job.enqueue_time_ms,
+                &job.payload,
+                job.retry_policy.as_ref(),
+                &job.metadata,
+                &job.limits,
+                &job.task_group,
+            ),
+            encoded
+        );
+        let view = decode_job_info(encoded).unwrap();
+        assert_eq!(
+            view.fb().payload().map(|p| p.bytes().to_vec()),
+            Some(job.payload.clone())
+        );
+    }
 }
