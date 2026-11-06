@@ -206,6 +206,11 @@ pub(crate) fn background_action_queue_counter_transition_is_relevant(
         || background_action_status_bucket(new_status).is_some()
 }
 
+/// Metadata key naming a background action's user-chosen queue.
+const BACKGROUND_ACTION_EXPLICIT_QUEUE_METADATA_KEY: &str = "queue";
+/// Metadata key naming a background action's platform concurrency queue.
+const BACKGROUND_ACTION_IMPLICIT_QUEUE_METADATA_KEY: &str = "platformConcurrencyQueue";
+
 fn background_action_metadata_value<'a>(
     metadata: &'a [(String, String)],
     key: &str,
@@ -213,6 +218,22 @@ fn background_action_metadata_value<'a>(
     metadata
         .iter()
         .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+}
+
+/// The metadata pairs the background-action queue gauges read, in record
+/// order. Every gauge lookup returns the same value against this subset as
+/// against the full metadata, so a transition carries only these.
+pub(crate) fn background_action_metadata<'a>(
+    metadata: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    metadata
+        .into_iter()
+        .filter(|(k, _)| {
+            *k == BACKGROUND_ACTION_EXPLICIT_QUEUE_METADATA_KEY
+                || *k == BACKGROUND_ACTION_IMPLICIT_QUEUE_METADATA_KEY
+        })
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 impl JobStoreShard {
@@ -292,7 +313,10 @@ impl JobStoreShard {
             return;
         };
 
-        if let Some(queue) = background_action_metadata_value(metadata, "queue") {
+        if let Some(queue) = background_action_metadata_value(
+            metadata,
+            BACKGROUND_ACTION_EXPLICIT_QUEUE_METADATA_KEY,
+        ) {
             self.apply_background_action_queue_counter_delta_for_key(
                 tenant,
                 task_group,
@@ -303,8 +327,10 @@ impl JobStoreShard {
             );
         }
 
-        if let Some(queue) = background_action_metadata_value(metadata, "platformConcurrencyQueue")
-        {
+        if let Some(queue) = background_action_metadata_value(
+            metadata,
+            BACKGROUND_ACTION_IMPLICIT_QUEUE_METADATA_KEY,
+        ) {
             self.apply_background_action_queue_counter_delta_for_key(
                 tenant,
                 task_group,
@@ -394,27 +420,36 @@ impl JobStoreShard {
         &self,
         tenant: &str,
         task_group: &str,
-        status_bucket: &str,
-        queue_kind: &str,
+        status_bucket: &'static str,
+        queue_kind: &'static str,
         queue: &str,
         delta: i64,
     ) {
+        use dashmap::mapref::entry::Entry;
+
         let key = (
             tenant.to_string(),
             task_group.to_string(),
-            status_bucket.to_string(),
-            queue_kind.to_string(),
+            status_bucket,
+            queue_kind,
             queue.to_string(),
         );
-        let mut entry = self
-            .background_action_queue_counts
-            .entry(key.clone())
-            .or_insert(0);
-        *entry = entry.saturating_add(delta);
-        if *entry <= 0 {
-            drop(entry);
-            self.background_action_queue_counts
-                .remove_if(&key, |_, value| *value <= 0);
+        // A count that reaches zero leaves the map under the same entry lock
+        // that changed it, so the map stays sparse.
+        match self.background_action_queue_counts.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let count = entry.get().saturating_add(delta);
+                if count <= 0 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() = count;
+                }
+            }
+            Entry::Vacant(entry) => {
+                if delta > 0 {
+                    entry.insert(delta);
+                }
+            }
         }
     }
 
@@ -438,8 +473,8 @@ impl JobStoreShard {
             results.push(BackgroundActionQueueCounter {
                 tenant: tenant.clone(),
                 task_group: task_group.clone(),
-                status_bucket: status_bucket.clone(),
-                queue_kind: queue_kind.clone(),
+                status_bucket: status_bucket.to_string(),
+                queue_kind: queue_kind.to_string(),
                 queue: queue.clone(),
                 count,
             });

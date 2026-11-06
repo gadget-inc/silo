@@ -8,7 +8,10 @@
 //! - Integers use big-endian encoding for correct lexicographic ordering
 //! - Tuples encode each field sequentially
 
-use storekey::{decode, encode_vec};
+use std::borrow::Cow;
+use std::io;
+
+use storekey::{BorrowDecode, Encode, decode_borrow, encode};
 
 use crate::job::{JobStatus, JobStatusKind, ListingSegment};
 
@@ -41,12 +44,46 @@ pub mod prefix {
     pub const ENQUEUE_TIME_INDEX_BACKFILL_COMPLETE: u8 = 0xFC;
 }
 
-/// Encode a key with its namespace prefix.
-fn encode_with_prefix<T: storekey::Encode>(prefix: u8, data: &T) -> Vec<u8> {
-    let mut buf = vec![prefix];
-    let encoded = encode_vec(data).expect("storekey encoding should not fail for valid data");
-    buf.extend(encoded);
+/// A writer that only counts the bytes written to it.
+struct EncodedLen(usize);
+
+impl io::Write for EncodedLen {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0 += buf.len();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encode `data`, after `prefix` when given, into a buffer allocated once at
+/// the exact encoded length. A first pass counts the bytes, so the buffer
+/// never grows and never carries spare capacity.
+fn encode_exact<T: Encode>(prefix: Option<u8>, data: &T) -> Vec<u8> {
+    let mut len = EncodedLen(usize::from(prefix.is_some()));
+    encode(&mut len, data).expect("storekey encoding should not fail for valid data");
+    let mut buf = Vec::with_capacity(len.0);
+    buf.extend(prefix);
+    encode(&mut buf, data).expect("storekey encoding should not fail for valid data");
     buf
+}
+
+/// Encode a key with its namespace prefix.
+fn encode_with_prefix<T: Encode>(prefix: u8, data: &T) -> Vec<u8> {
+    encode_exact(Some(prefix), data)
+}
+
+/// Decode the fields of a key after its namespace prefix. String fields
+/// decoded as `Cow<str>` borrow from `key` unless they hold escaped bytes.
+fn decode_after_prefix<'a, T: BorrowDecode<'a>>(key: &'a [u8], prefix: u8) -> Option<T> {
+    decode_borrow(key.strip_prefix(&[prefix])?).ok()
 }
 
 /// The KV store key for a given job's info by id.
@@ -73,11 +110,11 @@ pub struct ParsedJobInfoKey {
 
 /// Parse a job info key back to its components.
 pub fn parse_job_info_key(key: &[u8]) -> Option<ParsedJobInfoKey> {
-    if key.first() != Some(&prefix::JOB_INFO) {
-        return None;
-    }
-    let (tenant, job_id): (String, String) = decode(&key[1..]).ok()?;
-    Some(ParsedJobInfoKey { tenant, job_id })
+    let (tenant, job_id): (Cow<str>, Cow<str>) = decode_after_prefix(key, prefix::JOB_INFO)?;
+    Some(ParsedJobInfoKey {
+        tenant: tenant.into_owned(),
+        job_id: job_id.into_owned(),
+    })
 }
 
 /// The KV store key for a given job's status.
@@ -104,11 +141,11 @@ pub struct ParsedJobStatusKey {
 
 /// Parse a job status key back to its components.
 pub fn parse_job_status_key(key: &[u8]) -> Option<ParsedJobStatusKey> {
-    if key.first() != Some(&prefix::JOB_STATUS) {
-        return None;
-    }
-    let (tenant, job_id): (String, String) = decode(&key[1..]).ok()?;
-    Some(ParsedJobStatusKey { tenant, job_id })
+    let (tenant, job_id): (Cow<str>, Cow<str>) = decode_after_prefix(key, prefix::JOB_STATUS)?;
+    Some(ParsedJobStatusKey {
+        tenant: tenant.into_owned(),
+        job_id: job_id.into_owned(),
+    })
 }
 
 /// Index: time-ordered by status, newest-first using inverted timestamp.
@@ -168,16 +205,13 @@ impl ParsedStatusTimeIndexKey {
 
 /// Parse a status/time index key back to its components.
 pub fn parse_status_time_index_key(key: &[u8]) -> Option<ParsedStatusTimeIndexKey> {
-    if key.first() != Some(&prefix::IDX_STATUS_TIME) {
-        return None;
-    }
-    let (tenant, status, inverted_timestamp, job_id): (String, String, u64, String) =
-        decode(&key[1..]).ok()?;
+    let (tenant, status, inverted_timestamp, job_id): (Cow<str>, Cow<str>, u64, Cow<str>) =
+        decode_after_prefix(key, prefix::IDX_STATUS_TIME)?;
     Some(ParsedStatusTimeIndexKey {
-        tenant,
-        status,
+        tenant: tenant.into_owned(),
+        status: status.into_owned(),
         inverted_timestamp,
-        job_id,
+        job_id: job_id.into_owned(),
     })
 }
 
@@ -238,14 +272,12 @@ impl ParsedEnqueueTimeIndexKey {
 
 /// Parse an enqueue-time index key back to its components.
 pub fn parse_enqueue_time_index_key(key: &[u8]) -> Option<ParsedEnqueueTimeIndexKey> {
-    if key.first() != Some(&prefix::IDX_ENQUEUE_TIME) {
-        return None;
-    }
-    let (tenant, inverted_enqueue_time, job_id): (String, u64, String) = decode(&key[1..]).ok()?;
+    let (tenant, inverted_enqueue_time, job_id): (Cow<str>, u64, Cow<str>) =
+        decode_after_prefix(key, prefix::IDX_ENQUEUE_TIME)?;
     Some(ParsedEnqueueTimeIndexKey {
-        tenant,
+        tenant: tenant.into_owned(),
         inverted_enqueue_time,
-        job_id,
+        job_id: job_id.into_owned(),
     })
 }
 
@@ -327,18 +359,61 @@ impl ParsedStatusEnqueueTimeIndexKey {
 
 /// Parse a status-segmented enqueue-time index key back to its components.
 pub fn parse_status_enqueue_time_index_key(key: &[u8]) -> Option<ParsedStatusEnqueueTimeIndexKey> {
-    if key.first() != Some(&prefix::IDX_STATUS_ENQUEUE_TIME) {
-        return None;
-    }
-    let (tenant, segment, priority, inverted_enqueue_time, job_id): (String, u8, u8, u64, String) =
-        decode(&key[1..]).ok()?;
+    let (tenant, segment, priority, inverted_enqueue_time, job_id): (
+        Cow<str>,
+        u8,
+        u8,
+        u64,
+        Cow<str>,
+    ) = decode_after_prefix(key, prefix::IDX_STATUS_ENQUEUE_TIME)?;
     Some(ParsedStatusEnqueueTimeIndexKey {
-        tenant,
+        tenant: tenant.into_owned(),
         segment: ListingSegment::from_u8(segment)?,
         priority,
         inverted_enqueue_time,
-        job_id,
+        job_id: job_id.into_owned(),
     })
+}
+
+/// An encoded index value: empty, or one big-endian `i64`. Held inline, so
+/// encoding one does not allocate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedIndexValue {
+    bytes: [u8; 8],
+    len: usize,
+}
+
+impl EncodedIndexValue {
+    fn new(ms: Option<i64>) -> Self {
+        match ms {
+            Some(ms) => Self {
+                bytes: ms.to_be_bytes(),
+                len: 8,
+            },
+            None => Self {
+                bytes: [0; 8],
+                len: 0,
+            },
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl std::ops::Deref for EncodedIndexValue {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for EncodedIndexValue {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
 }
 
 /// The value stored under a status-segmented enqueue-time index key: the
@@ -360,10 +435,8 @@ impl StatusEnqueueTimeIndexValue {
         }
     }
 
-    pub fn encode(self) -> Vec<u8> {
-        self.next_attempt_starts_after_ms
-            .map(|ms| ms.to_be_bytes().to_vec())
-            .unwrap_or_default()
+    pub fn encode(self) -> EncodedIndexValue {
+        EncodedIndexValue::new(self.next_attempt_starts_after_ms)
     }
 
     pub fn decode(value: &[u8]) -> Option<Self> {
@@ -400,10 +473,8 @@ impl MetadataIndexValue {
         }
     }
 
-    pub fn encode(self) -> Vec<u8> {
-        self.enqueue_time_ms
-            .map(|ms| ms.to_be_bytes().to_vec())
-            .unwrap_or_default()
+    pub fn encode(self) -> EncodedIndexValue {
+        EncodedIndexValue::new(self.enqueue_time_ms)
     }
 
     pub fn decode(value: &[u8]) -> Option<Self> {
@@ -442,15 +513,13 @@ pub struct ParsedMetadataIndexKey {
 
 /// Parse a metadata index key back to its components.
 pub fn parse_metadata_index_key(key: &[u8]) -> Option<ParsedMetadataIndexKey> {
-    if key.first() != Some(&prefix::IDX_METADATA) {
-        return None;
-    }
-    let (tenant, k, value, job_id): (String, String, String, String) = decode(&key[1..]).ok()?;
+    let (tenant, k, value, job_id): (Cow<str>, Cow<str>, Cow<str>, Cow<str>) =
+        decode_after_prefix(key, prefix::IDX_METADATA)?;
     Some(ParsedMetadataIndexKey {
-        tenant,
-        key: k,
-        value,
-        job_id,
+        tenant: tenant.into_owned(),
+        key: k.into_owned(),
+        value: value.into_owned(),
+        job_id: job_id.into_owned(),
     })
 }
 
@@ -535,20 +604,38 @@ pub struct ParsedTaskKey {
     pub epoch_ms: u64,
 }
 
-/// Parse a task key back to its components.
-pub fn parse_task_key(key: &[u8]) -> Option<ParsedTaskKey> {
-    if key.first() != Some(&prefix::TASK) {
-        return None;
+/// Task key components borrowed from the key bytes. String fields borrow
+/// unless they hold escaped bytes, so parsing allocates nothing for the keys
+/// silo writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTaskKeyRef<'a> {
+    pub task_group: Cow<'a, str>,
+    pub start_time_ms: u64,
+    pub priority: u8,
+    pub job_id: Cow<'a, str>,
+    pub attempt: u32,
+    /// Write-time disambiguator; see [`task_key`]. Not part of task identity.
+    pub epoch_ms: u64,
+}
+
+impl ParsedTaskKeyRef<'_> {
+    pub fn into_owned(self) -> ParsedTaskKey {
+        ParsedTaskKey {
+            task_group: self.task_group.into_owned(),
+            start_time_ms: self.start_time_ms,
+            priority: self.priority,
+            job_id: self.job_id.into_owned(),
+            attempt: self.attempt,
+            epoch_ms: self.epoch_ms,
+        }
     }
-    let (task_group, start_time_ms, priority, job_id, attempt, epoch_ms): (
-        String,
-        u64,
-        u8,
-        String,
-        u32,
-        u64,
-    ) = decode(&key[1..]).ok()?;
-    Some(ParsedTaskKey {
+}
+
+/// Parse a task key back to its components, borrowing from `key`.
+pub fn parse_task_key_ref(key: &[u8]) -> Option<ParsedTaskKeyRef<'_>> {
+    let (task_group, start_time_ms, priority, job_id, attempt, epoch_ms) =
+        decode_after_prefix(key, prefix::TASK)?;
+    Some(ParsedTaskKeyRef {
         task_group,
         start_time_ms,
         priority,
@@ -556,6 +643,11 @@ pub fn parse_task_key(key: &[u8]) -> Option<ParsedTaskKey> {
         attempt,
         epoch_ms,
     })
+}
+
+/// Parse a task key back to its components.
+pub fn parse_task_key(key: &[u8]) -> Option<ParsedTaskKey> {
+    parse_task_key_ref(key).map(ParsedTaskKeyRef::into_owned)
 }
 
 /// Construct the key for a leased task by task id.
@@ -576,11 +668,10 @@ pub struct ParsedLeaseKey {
 
 /// Parse a lease key back to its components.
 pub fn parse_lease_key(key: &[u8]) -> Option<ParsedLeaseKey> {
-    if key.first() != Some(&prefix::LEASE) {
-        return None;
-    }
-    let (task_id,): (String,) = decode(&key[1..]).ok()?;
-    Some(ParsedLeaseKey { task_id })
+    let (task_id,): (Cow<str>,) = decode_after_prefix(key, prefix::LEASE)?;
+    Some(ParsedLeaseKey {
+        task_id: task_id.into_owned(),
+    })
 }
 
 /// Construct the key for an attempt record.
@@ -603,13 +694,11 @@ pub struct ParsedAttemptKey {
 
 /// Parse an attempt key back to its components.
 pub fn parse_attempt_key(key: &[u8]) -> Option<ParsedAttemptKey> {
-    if key.first() != Some(&prefix::ATTEMPT) {
-        return None;
-    }
-    let (tenant, job_id, attempt): (String, String, u32) = decode(&key[1..]).ok()?;
+    let (tenant, job_id, attempt): (Cow<str>, Cow<str>, u32) =
+        decode_after_prefix(key, prefix::ATTEMPT)?;
     Some(ParsedAttemptKey {
-        tenant,
-        job_id,
+        tenant: tenant.into_owned(),
+        job_id: job_id.into_owned(),
         attempt,
     })
 }
@@ -701,21 +790,18 @@ impl ParsedConcurrencyRequestKey {
 /// but nested tuples encode identically to flat tuples since encoding is sequential).
 #[allow(clippy::type_complexity)]
 pub fn parse_concurrency_request_key(key: &[u8]) -> Option<ParsedConcurrencyRequestKey> {
-    if key.first() != Some(&prefix::CONCURRENCY_REQUEST) {
-        return None;
-    }
     let ((tenant, queue, start_time_ms, priority), (job_id, attempt_number, suffix)): (
-        (String, String, u64, u8),
-        (String, u32, String),
-    ) = decode(&key[1..]).ok()?;
+        (Cow<str>, Cow<str>, u64, u8),
+        (Cow<str>, u32, Cow<str>),
+    ) = decode_after_prefix(key, prefix::CONCURRENCY_REQUEST)?;
     Some(ParsedConcurrencyRequestKey {
-        tenant,
-        queue,
+        tenant: tenant.into_owned(),
+        queue: queue.into_owned(),
         start_time_ms,
         priority,
-        job_id,
+        job_id: job_id.into_owned(),
         attempt_number,
-        suffix,
+        suffix: suffix.into_owned(),
     })
 }
 
@@ -749,14 +835,12 @@ pub struct ParsedConcurrencyHolderKey {
 
 /// Parse a concurrency holder key back to its components.
 pub fn parse_concurrency_holder_key(key: &[u8]) -> Option<ParsedConcurrencyHolderKey> {
-    if key.first() != Some(&prefix::CONCURRENCY_HOLDER) {
-        return None;
-    }
-    let (tenant, queue, task_id): (String, String, String) = decode(&key[1..]).ok()?;
+    let (tenant, queue, task_id): (Cow<str>, Cow<str>, Cow<str>) =
+        decode_after_prefix(key, prefix::CONCURRENCY_HOLDER)?;
     Some(ParsedConcurrencyHolderKey {
-        tenant,
-        queue,
-        task_id,
+        tenant: tenant.into_owned(),
+        queue: queue.into_owned(),
+        task_id: task_id.into_owned(),
     })
 }
 
@@ -775,11 +859,11 @@ pub struct ParsedJobCancelledKey {
 
 /// Parse a job cancelled key back to its components.
 pub fn parse_job_cancelled_key(key: &[u8]) -> Option<ParsedJobCancelledKey> {
-    if key.first() != Some(&prefix::JOB_CANCELLED) {
-        return None;
-    }
-    let (tenant, job_id): (String, String) = decode(&key[1..]).ok()?;
-    Some(ParsedJobCancelledKey { tenant, job_id })
+    let (tenant, job_id): (Cow<str>, Cow<str>) = decode_after_prefix(key, prefix::JOB_CANCELLED)?;
+    Some(ParsedJobCancelledKey {
+        tenant: tenant.into_owned(),
+        job_id: job_id.into_owned(),
+    })
 }
 
 /// The KV store key for a floating concurrency limit's state.
@@ -797,11 +881,12 @@ pub struct ParsedFloatingLimitKey {
 
 /// Parse a floating limit state key back to its components.
 pub fn parse_floating_limit_key(key: &[u8]) -> Option<ParsedFloatingLimitKey> {
-    if key.first() != Some(&prefix::FLOATING_LIMIT) {
-        return None;
-    }
-    let (tenant, queue_key): (String, String) = decode(&key[1..]).ok()?;
-    Some(ParsedFloatingLimitKey { tenant, queue_key })
+    let (tenant, queue_key): (Cow<str>, Cow<str>) =
+        decode_after_prefix(key, prefix::FLOATING_LIMIT)?;
+    Some(ParsedFloatingLimitKey {
+        tenant: tenant.into_owned(),
+        queue_key: queue_key.into_owned(),
+    })
 }
 
 /// The refresh index row for a floating queue's pending refresh task. One
@@ -838,14 +923,12 @@ pub struct ParsedRefreshTaskKey {
 
 /// Parse a refresh index key back to its components.
 pub fn parse_refresh_task_key(key: &[u8]) -> Option<ParsedRefreshTaskKey> {
-    if key.first() != Some(&prefix::REFRESH_TASK) {
-        return None;
-    }
-    let (task_group, tenant, queue_key): (String, String, String) = decode(&key[1..]).ok()?;
+    let (task_group, tenant, queue_key): (Cow<str>, Cow<str>, Cow<str>) =
+        decode_after_prefix(key, prefix::REFRESH_TASK)?;
     Some(ParsedRefreshTaskKey {
-        task_group,
-        tenant,
-        queue_key,
+        task_group: task_group.into_owned(),
+        tenant: tenant.into_owned(),
+        queue_key: queue_key.into_owned(),
     })
 }
 
@@ -928,17 +1011,18 @@ pub struct ParsedConcurrencyRequesterCounterKey {
 pub fn parse_concurrency_requester_counter_key(
     key: &[u8],
 ) -> Option<ParsedConcurrencyRequesterCounterKey> {
-    if key.first() != Some(&prefix::COUNTER_CONCURRENCY_REQUESTERS) {
-        return None;
-    }
-    let (tenant, queue): (String, String) = decode(&key[1..]).ok()?;
-    Some(ParsedConcurrencyRequesterCounterKey { tenant, queue })
+    let (tenant, queue): (Cow<str>, Cow<str>) =
+        decode_after_prefix(key, prefix::COUNTER_CONCURRENCY_REQUESTERS)?;
+    Some(ParsedConcurrencyRequesterCounterKey {
+        tenant: tenant.into_owned(),
+        queue: queue.into_owned(),
+    })
 }
 
 /// Construct a composite key for in-memory concurrency queue tracking.
 /// Uses storekey encoding for collision-safe (tenant, queue) pairing.
 pub fn concurrency_counts_key(tenant: &str, queue: &str) -> Vec<u8> {
-    encode_vec(&(tenant, queue)).expect("storekey encoding should not fail")
+    encode_exact(None, &(tenant, queue))
 }
 
 /// Key for a per-tenant, per-status counter.
@@ -966,13 +1050,11 @@ pub struct ParsedTenantStatusCounterKey {
 
 /// Parse a tenant status counter key back to its components.
 pub fn parse_tenant_status_counter_key(key: &[u8]) -> Option<ParsedTenantStatusCounterKey> {
-    if key.first() != Some(&prefix::COUNTER_TENANT_STATUS) {
-        return None;
-    }
-    let (tenant, status_kind): (String, String) = decode(&key[1..]).ok()?;
+    let (tenant, status_kind): (Cow<str>, Cow<str>) =
+        decode_after_prefix(key, prefix::COUNTER_TENANT_STATUS)?;
     Some(ParsedTenantStatusCounterKey {
-        tenant,
-        status_kind,
+        tenant: tenant.into_owned(),
+        status_kind: status_kind.into_owned(),
     })
 }
 

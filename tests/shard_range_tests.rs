@@ -1,5 +1,5 @@
 use silo::coordination::MemberInfo;
-use silo::shard_range::{ShardId, ShardInfo, ShardMap, ShardMapError, ShardRange};
+use silo::shard_range::{ShardId, ShardInfo, ShardMap, ShardMapError, ShardRange, hash_tenant};
 
 #[silo::test]
 fn test_shard_id_creation() {
@@ -44,6 +44,38 @@ fn test_shard_range_contains() {
     assert!(!unbounded_end.contains("a"));
     assert!(unbounded_end.contains("m"));
     assert!(unbounded_end.contains("z"));
+}
+
+/// `contains_tenant` compares the tenant's hash without building the
+/// `hash_tenant` string; it must agree with `contains(&hash_tenant(..))`,
+/// including for ranges bounded exactly at a tenant's hash.
+#[silo::test]
+fn test_shard_range_contains_tenant_matches_hash_string() {
+    let tenants: Vec<String> = (0..2000)
+        .map(|i| format!("tenant-{i}"))
+        .chain(["", "-", "env-1", "\u{1F600}"].map(String::from))
+        .collect();
+    let mut ranges = vec![
+        ShardRange::full(),
+        ShardRange::new("", "8000000000000000"),
+        ShardRange::new("8000000000000000", ""),
+        ShardRange::new("4", "c"),
+        ShardRange::new("0000000000000000", "ffffffffffffffff"),
+    ];
+    for t in tenants.iter().take(50) {
+        let hash = hash_tenant(t);
+        ranges.push(ShardRange::new(hash.clone(), ""));
+        ranges.push(ShardRange::new("", hash));
+    }
+    for range in &ranges {
+        for tenant in &tenants {
+            assert_eq!(
+                range.contains_tenant(tenant),
+                range.contains(&hash_tenant(tenant)),
+                "tenant {tenant:?} in {range}",
+            );
+        }
+    }
 }
 
 #[silo::test]

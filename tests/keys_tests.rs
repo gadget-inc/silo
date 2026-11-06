@@ -365,8 +365,9 @@ fn metadata_index_value_roundtrips_and_reads_an_empty_value_as_absent() {
         MetadataIndexValue {
             enqueue_time_ms: None
         }
-        .encode(),
-        Vec::<u8>::new()
+        .encode()
+        .as_slice(),
+        b""
     );
     assert_eq!(MetadataIndexValue::decode(&[1, 2, 3]), None);
 }
