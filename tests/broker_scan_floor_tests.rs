@@ -241,8 +241,34 @@ async fn grant_scanner_resume_below_the_floor_is_leased() {
     );
 }
 
+/// An immediate enqueue (start time 0) tells the broker the time its row is
+/// keyed at, so the floor stays there instead of dropping to the head of
+/// the range.
+#[silo::test]
+async fn immediate_enqueue_keeps_the_floor_at_the_time_written() {
+    let (_tmp, shard) = open_temp_shard().await;
+    enqueue_at(&shard, "head", now_ms(), vec![]).await;
+    let (ids, _) = lease_within(&shard, "default", Duration::from_secs(5)).await;
+    assert_eq!(ids.len(), 1);
+    settle(&shard, "default").await;
+
+    // The row is keyed at the current time, at or above the floor, so the
+    // note has nothing to lower; a raw start time of 0 would drop it to 0.
+    let floor_before_ms = scan_floor_ms(&shard, "default");
+    enqueue_at(&shard, "immediate", 0, vec![]).await;
+    let floor_ms = scan_floor_ms(&shard, "default");
+    assert!(
+        floor_ms >= floor_before_ms,
+        "floor dropped from {floor_before_ms} to {floor_ms} for an immediate enqueue"
+    );
+
+    let (ids, _) = lease_within(&shard, "default", Duration::from_secs(5)).await;
+    assert_eq!(ids.len(), 1);
+}
+
 /// The periodic full rescan runs on schedule and, with every writer noting
-/// its rows, buffers nothing.
+/// its rows, counts nothing as found below the floor, even while rows keep
+/// arriving.
 #[silo::test]
 async fn full_rescan_runs_on_schedule_and_buffers_nothing() {
     let (_tmp, shard, metrics) =

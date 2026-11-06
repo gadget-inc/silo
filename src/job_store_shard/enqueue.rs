@@ -304,21 +304,22 @@ impl JobStoreShard {
         let mut scheduled_refreshes = ScheduledRefreshes::default();
         let background_action_metadata = metadata.clone().unwrap_or_default();
         let mut grant_guard = PendingEnqueueGrantGuard::new(&self.concurrency, tenant);
-        self.write_enqueue_data(
-            &mut DbWriteBatcher::new(&self.db, &mut batch),
-            &mut scheduled_refreshes,
-            grant_guard.grants_mut(),
-            tenant,
-            job_id,
-            priority,
-            start_at_ms,
-            retry_policy,
-            payload,
-            limits,
-            metadata,
-            task_group,
-        )
-        .await?;
+        let effective_start_at_ms = self
+            .write_enqueue_data(
+                &mut DbWriteBatcher::new(&self.db, &mut batch),
+                &mut scheduled_refreshes,
+                grant_guard.grants_mut(),
+                tenant,
+                job_id,
+                priority,
+                start_at_ms,
+                retry_policy,
+                payload,
+                limits,
+                metadata,
+                task_group,
+            )
+            .await?;
 
         // Include counter in the same batch for efficiency
         if let Err(e) =
@@ -348,7 +349,8 @@ impl JobStoreShard {
 
         // The task row becomes visible to broker scans before the write is
         // durable; lower the scan floor first so such a scan buffers it.
-        self.brokers.expect_task_written(task_group, start_at_ms);
+        self.brokers
+            .expect_task_written(task_group, effective_start_at_ms);
         if let Err(e) = self
             .db
             .write_with_options(
@@ -375,7 +377,7 @@ impl JobStoreShard {
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
-        self.finish_enqueue(tenant, job_id, task_group, start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, effective_start_at_ms, &grants)
             .await
     }
 
@@ -437,21 +439,22 @@ impl JobStoreShard {
 
         let mut scheduled_refreshes = ScheduledRefreshes::default();
         let mut grant_guard = PendingEnqueueGrantGuard::new(&self.concurrency, tenant);
-        self.write_enqueue_data(
-            &mut TxnWriter(&txn),
-            &mut scheduled_refreshes,
-            grant_guard.grants_mut(),
-            tenant,
-            job_id,
-            priority,
-            start_at_ms,
-            retry_policy,
-            payload,
-            limits,
-            metadata,
-            task_group,
-        )
-        .await?;
+        let effective_start_at_ms = self
+            .write_enqueue_data(
+                &mut TxnWriter(&txn),
+                &mut scheduled_refreshes,
+                grant_guard.grants_mut(),
+                tenant,
+                job_id,
+                priority,
+                start_at_ms,
+                retry_policy,
+                payload,
+                limits,
+                metadata,
+                task_group,
+            )
+            .await?;
 
         // Include counter in the transaction (unmark_write excludes it from conflict detection)
         if let Err(e) = self.increment_total_jobs_counter(&mut TxnWriter(&txn)) {
@@ -481,7 +484,8 @@ impl JobStoreShard {
         // until the WAL is flushed to object storage, so no separate flush is needed.
         // The task row becomes visible to broker scans before that; lower the
         // scan floor first so such a scan buffers it.
-        self.brokers.expect_task_written(task_group, start_at_ms);
+        self.brokers
+            .expect_task_written(task_group, effective_start_at_ms);
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
@@ -504,7 +508,7 @@ impl JobStoreShard {
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
 
-        self.finish_enqueue(tenant, job_id, task_group, start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, effective_start_at_ms, &grants)
             .await
     }
 
@@ -515,6 +519,10 @@ impl JobStoreShard {
     /// `grants` as they happen, so the caller's `PendingEnqueueGrantGuard`
     /// sees every reservation the moment it exists. On `Err` the chain has
     /// already rolled back its own grants and `grants` is unchanged.
+    ///
+    /// Returns the start time the task row is keyed at: `start_at_ms`, or
+    /// the current time for an immediate enqueue (`start_at_ms <= 0`). This
+    /// is the time to tell the broker, not the raw `start_at_ms`.
     #[allow(clippy::too_many_arguments)]
     async fn write_enqueue_data<W: WriteBatcher>(
         &self,
@@ -530,7 +538,7 @@ impl JobStoreShard {
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
         task_group: &str,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<i64, JobStoreShardError> {
         let now_ms = now_epoch_ms();
 
         let job = JobInfo {
@@ -609,13 +617,14 @@ impl JobStoreShard {
             job_status_kind,
             &job.metadata,
         );
-        Ok(())
+        Ok(effective_start_at_ms)
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
     /// Confirms and logs grants and tells the broker for the given task group
     /// about the written task: a due task wakes it, a future-dated one lowers
-    /// its recorded next-ready time.
+    /// its recorded next-ready time. `start_at_ms` is the time the task row
+    /// is keyed at, never the raw immediate-enqueue `0`.
     pub(crate) async fn finish_enqueue(
         &self,
         tenant: &str,
