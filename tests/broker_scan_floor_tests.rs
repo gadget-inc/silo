@@ -286,9 +286,67 @@ async fn full_rescan_runs_on_schedule_and_buffers_nothing() {
     )
     .await;
     assert!(rescans >= 1.0);
+
+    // Keep writing through the next rescans: the rows a rescan happens to
+    // buffer were noted by their writers, so none counts as found below the
+    // floor.
+    for i in 0..8 {
+        enqueue_at(&shard, &format!("steady-{i}"), 0, vec![]).await;
+        let (ids, _) = lease_within(&shard, "default", Duration::from_secs(5)).await;
+        assert_eq!(ids.len(), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    let rescans_after = poll_until(
+        || async { read_full_rescans_total(&metrics) },
+        |after| *after >= rescans + 1.0,
+        10_000,
+    )
+    .await;
+    assert!(rescans_after > rescans);
     assert_eq!(
         read_full_rescan_inserted_total(&metrics),
         0.0,
-        "a full rescan found a row below the floor"
+        "a full rescan counted a noted row as found below the floor"
+    );
+}
+
+/// A task row written behind the broker's back below the floor is found by
+/// the next full rescan and counted, since no writer noted it.
+#[silo::test]
+async fn full_rescan_counts_a_row_written_behind_the_brokers_back() {
+    let (_tmp, shard, metrics) =
+        open_temp_shard_with_metrics_and_config(|cfg| cfg.broker_full_rescan_interval_ms = 200)
+            .await;
+    enqueue_at(&shard, "head", now_ms(), vec![]).await;
+    let (ids, _) = lease_within(&shard, "default", Duration::from_secs(5)).await;
+    assert_eq!(ids.len(), 1);
+    settle(&shard, "default").await;
+
+    let hidden_start_ms = scan_floor_ms(&shard, "default") - 10_000;
+    let hidden = silo::task::Task::RunAttempt {
+        id: "hidden-task".to_string(),
+        tenant: "-".to_string(),
+        job_id: "hidden".to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        held_queues: vec![],
+        task_group: "default".to_string(),
+    };
+    let key = silo::keys::task_key("default", hidden_start_ms, 10, "hidden", 1, hidden_start_ms);
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(&key, &silo::codec::encode_task(&hidden));
+    shard.db().write(batch).await.expect("write hidden row");
+
+    let found = poll_until(
+        || async { read_full_rescan_inserted_total(&metrics) },
+        |found| *found >= 1.0,
+        10_000,
+    )
+    .await;
+    assert_eq!(found, 1.0, "the rescan counts the hidden row once");
+    assert_eq!(
+        shard.broker_buffer_len(),
+        1,
+        "the rescan buffered the hidden row"
     );
 }

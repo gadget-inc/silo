@@ -649,16 +649,21 @@ impl Metrics {
     }
 
     /// Record a periodic full-range broker scan (one that ignored the scan
-    /// floor) and how many tasks it buffered. A full rescan that buffers
-    /// tasks found rows below the floor, which means a writer of task rows
-    /// did not tell the broker about them.
-    pub fn record_broker_full_rescan(&self, shard: &str, task_group: &str, inserted: u64) {
+    /// floor) and how many tasks it buffered from below the floor it cleared.
+    /// Such a task would not have been read by a floor-bounded scan, which
+    /// means a writer of task rows did not tell the broker about it.
+    pub fn record_broker_full_rescan(
+        &self,
+        shard: &str,
+        task_group: &str,
+        inserted_below_floor: u64,
+    ) {
         self.broker_full_rescans_total
             .with_label_values(&[shard, task_group])
             .inc();
         self.broker_full_rescan_inserted_total
             .with_label_values(&[shard, task_group])
-            .inc_by(inserted as f64);
+            .inc_by(inserted_below_floor as f64);
     }
 
     /// Update the number of ack tombstones for a shard and task group.
@@ -2347,7 +2352,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         CounterVec::new(
             Opts::new(
                 "silo_broker_full_rescan_inserted_total",
-                "Tasks buffered by full-range broker scans; non-zero means a task row was written without telling the broker",
+                "Tasks buffered by full-range broker scans from below the scan floor they cleared; non-zero means a task row was written without telling the broker",
             ),
             &["shard", "task_group"],
         )?,

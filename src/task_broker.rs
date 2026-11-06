@@ -200,7 +200,12 @@ impl TaskBroker {
         // iterator's view does not include, so it must set `dirty` again
         // (forcing one more pass) or survive this scan's result.
         self.dirty.store(false, Ordering::SeqCst);
-        let (floor_ms, notes_before, full_rescan) = self.begin_scan_cursor();
+        let ScanStart {
+            floor_ms,
+            notes_before,
+            full_rescan,
+            cleared_floor_ms,
+        } = self.begin_scan_cursor();
 
         // [SILO-SCAN-1] Scan only this task group's key range, from the floor
         let prefix = task_group_prefix(&self.task_group);
@@ -230,6 +235,10 @@ impl TaskBroker {
         let mut skipped_already_buffered = 0u64;
         let mut skipped_defunct = 0u64;
         let mut revived = 0u64;
+        // Rows a full rescan buffered from below the floor it cleared: rows
+        // a floor-bounded scan would not have read, so a writer did not tell
+        // the broker about them.
+        let mut inserted_below_floor = 0u64;
         // Start time of the last row this scan dealt with. Rows sort by start
         // time, so no row below it is left for a later scan to find.
         let mut consumed_through_ms: Option<i64> = None;
@@ -353,6 +362,11 @@ impl TaskBroker {
             if self.buffer.get(&key_bytes).is_none() {
                 self.buffer.insert(key_bytes, entry);
                 inserted += 1;
+                if cleared_floor_ms
+                    .is_some_and(|cleared_ms| (parsed_key.start_time_ms as i64) < cleared_ms)
+                {
+                    inserted_below_floor += 1;
+                }
 
                 // Yield periodically to avoid starving other tasks
                 if inserted % 16 == 0 {
@@ -416,27 +430,34 @@ impl TaskBroker {
                 );
             }
             if full_rescan {
-                m.record_broker_full_rescan(&self.shard_name, &self.task_group, inserted as u64);
+                m.record_broker_full_rescan(
+                    &self.shard_name,
+                    &self.task_group,
+                    inserted_below_floor,
+                );
             }
         }
 
         inserted
     }
 
-    /// Take the cursor for a scan that is about to create its iterator:
-    /// the floor to read from (`None` for the whole range), the note
-    /// generation to compare against when the scan records its result, and
-    /// whether this scan is a periodic full rescan. A full rescan clears the
-    /// floor, so a row that a writer failed to note is found within one
-    /// interval.
-    fn begin_scan_cursor(&self) -> (Option<i64>, u64, bool) {
+    /// Take the cursor for a scan that is about to create its iterator. A
+    /// periodic full rescan clears the floor, so a row that a writer failed
+    /// to note is found within one interval.
+    fn begin_scan_cursor(&self) -> ScanStart {
         let mut cursor = self.cursor.lock().unwrap();
         let full_rescan = cursor.last_full_scan.elapsed() >= self.full_rescan_interval;
+        let mut cleared_floor_ms = None;
         if full_rescan {
-            cursor.floor_ms = None;
+            cleared_floor_ms = cursor.floor_ms.take();
             cursor.last_full_scan = Instant::now();
         }
-        (cursor.floor_ms, cursor.note_generation, full_rescan)
+        ScanStart {
+            floor_ms: cursor.floor_ms,
+            notes_before: cursor.note_generation,
+            full_rescan,
+            cleared_floor_ms,
+        }
     }
 
     /// Start the background scanning loop.
@@ -828,6 +849,20 @@ struct ScanCursor {
     pending_floor_ms: Option<i64>,
     /// When the floor was last cleared for a full-range scan.
     last_full_scan: Instant,
+}
+
+/// What a scan starts from, taken from the cursor as its iterator is created.
+struct ScanStart {
+    /// The start time to read from; `None` reads the whole range.
+    floor_ms: Option<i64>,
+    /// The note generation to compare against when the scan records its
+    /// result.
+    notes_before: u64,
+    /// Whether this scan is a periodic full rescan.
+    full_rescan: bool,
+    /// The floor a full rescan cleared, if one was set: a row it buffers
+    /// from below that time is one a floor-bounded scan would have missed.
+    cleared_floor_ms: Option<i64>,
 }
 
 impl ScanCursor {
@@ -1619,16 +1654,16 @@ mod scan_gating_tests {
         let now_ms = now_epoch_ms();
         assert_eq!(scan(&broker, now_ms).await, 0);
 
-        let (_, notes_before, _) = broker.begin_scan_cursor();
+        let notes_before = broker.begin_scan_cursor().notes_before;
         broker.note_task_written(now_ms - 500);
         broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, Some(now_ms));
         assert_eq!(broker.scan_floor_ms(), Some(now_ms - 500));
 
-        let (_, notes_before, _) = broker.begin_scan_cursor();
+        let notes_before = broker.begin_scan_cursor().notes_before;
         broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, Some(now_ms));
         assert_eq!(broker.scan_floor_ms(), Some(now_ms - 500));
 
-        let (_, notes_before, _) = broker.begin_scan_cursor();
+        let notes_before = broker.begin_scan_cursor().notes_before;
         broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, Some(now_ms));
         assert_eq!(broker.scan_floor_ms(), Some(now_ms));
     }
