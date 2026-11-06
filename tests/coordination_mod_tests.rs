@@ -10,6 +10,9 @@ use silo::coordination::{
     ShardOwnerMap, ShardPhase,
 };
 use silo::factory::ShardFactory;
+use silo::gubernator::NullGubernatorClient;
+use silo::metrics::{self, Metrics};
+use silo::settings::DatabaseTemplate;
 use silo::shard_range::{ShardId, ShardMap};
 
 // --- ShardGuardState tests ---
@@ -341,8 +344,53 @@ fn last_membership_renewal_is_none_until_one_is_recorded() {
         "recorded {recorded_ms}, expected a time between {before_ms} and {after_ms}"
     );
 
-    // The placement metrics sampler reads through a clone of the base.
+    // Clones of the base share the recorded time.
     assert_eq!(base.clone().last_membership_renewal_ms(), Some(recorded_ms));
+}
+
+/// The renewal gauge's current value, read back from the registry.
+fn renewal_gauge_seconds(metrics: &Metrics) -> f64 {
+    let family = metrics
+        .registry()
+        .gather()
+        .into_iter()
+        .find(|f| f.get_name() == "silo_coordination_membership_last_renewal_timestamp_seconds")
+        .expect("the renewal gauge is registered");
+    family.get_metric()[0].get_gauge().get_value()
+}
+
+/// The renewal gauge must move with the renewal itself. It used to be copied by
+/// the placement sampler after that task awaited the `shard_map` lock, so a
+/// convoy on the lock froze the gauge while renewals kept succeeding, and the
+/// renewal-stalled alert fired for a pod whose peers never dropped it.
+#[silo::test]
+async fn membership_renewal_sets_the_gauge_while_the_shard_map_is_locked() {
+    let metrics = metrics::init().expect("init metrics");
+    let factory = Arc::new(ShardFactory::new(
+        DatabaseTemplate {
+            path: format!("noop-{}/%shard%", ShardId::new()),
+            ..Default::default()
+        },
+        NullGubernatorClient::new(),
+        Some(metrics.clone()),
+    ));
+    let base = CoordinatorBase::new(
+        "node-1",
+        "http://localhost:9910",
+        ShardMap::create_initial(2).expect("create shard map"),
+        factory,
+        Vec::new(),
+    );
+    assert_eq!(renewal_gauge_seconds(&metrics), 0.0);
+
+    // Hold the lock the sampler waited on, as a convoy of RPCs would.
+    let _shard_map = base.shard_map.lock().await;
+    base.record_membership_renewal();
+
+    let recorded_ms = base
+        .last_membership_renewal_ms()
+        .expect("a recorded renewal is reported");
+    assert_eq!(renewal_gauge_seconds(&metrics), recorded_ms as f64 / 1000.0);
 }
 
 #[silo::test]

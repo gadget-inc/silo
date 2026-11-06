@@ -531,7 +531,7 @@ pub struct CoordinatorBase {
     paused_shards: Arc<std::sync::RwLock<HashSet<ShardId>>>,
     /// Unix timestamp in milliseconds of this node's last successful
     /// membership renewal, 0 until the backend records one. Written by the
-    /// backend's renewal path and read by the placement metrics sampler.
+    /// backend's renewal path, which sets the renewal gauge at the same time.
     last_membership_renewal_ms: Arc<AtomicI64>,
 }
 
@@ -630,6 +630,12 @@ impl CoordinatorBase {
     }
 
     /// Note that this node's membership was renewed just now.
+    ///
+    /// Sets `silo_coordination_membership_last_renewal_timestamp_seconds` here
+    /// rather than leaving it to a periodic copier. The placement sampler used
+    /// to copy it after awaiting the `shard_map` lock, and on a saturated
+    /// runtime that wait ran to minutes, so the gauge reported a renewal
+    /// stall while renewals were succeeding.
     pub fn record_membership_renewal(&self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -637,6 +643,9 @@ impl CoordinatorBase {
             .unwrap_or(0);
         self.last_membership_renewal_ms
             .store(now_ms, Ordering::Relaxed);
+        if let Some(metrics) = self.factory.metrics() {
+            metrics.set_membership_last_renewal_timestamp(now_ms);
+        }
     }
 
     /// When this node's membership was last renewed, as a Unix timestamp in
