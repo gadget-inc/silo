@@ -13,7 +13,7 @@ use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 use crate::coordination::{
     AbortOnDrop, CoordinationError, Coordinator, CoordinatorBase, MemberInfo, OpenShardError,
-    OwnershipCheck, ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase,
+    OwnershipCheck, ShardGuardContext, ShardGuardState, ShardMapCell, ShardOwnerMap, ShardPhase,
     SplitStorageBackend, get_hostname, keys,
 };
 
@@ -409,9 +409,9 @@ impl EtcdCoordinator {
         let mut opened_count = 0u32;
 
         for shard_id in &reclaimed {
-            // Look up range and parent from shard map (short-lived lock)
+            // Look up range and parent from shard map
             let (range, parent_shard_id) = {
-                let shard_map = self.base.shard_map.lock().await;
+                let shard_map = self.base.shard_map.load();
                 match shard_map.get_shard(shard_id) {
                     Some(info) => (info.range.clone(), info.parent_shard_id),
                     None => {
@@ -557,7 +557,7 @@ impl EtcdCoordinator {
             let shard_map: ShardMap = serde_json::from_str(&value).map_err(|e| {
                 CoordinationError::BackendError(format!("invalid shard map JSON: {}", e))
             })?;
-            *self.base.shard_map.lock().await = shard_map;
+            self.base.shard_map.store(shard_map);
         }
         Ok(())
     }
@@ -624,7 +624,7 @@ impl EtcdCoordinator {
         }
 
         // Update local shard map
-        *self.base.shard_map.lock().await = shard_map;
+        self.base.shard_map.store(shard_map);
 
         info!(
             parent_shard_id = %split.parent_shard_id,
@@ -700,7 +700,7 @@ impl EtcdCoordinator {
         }
 
         // Update local shard map cache
-        *self.base.shard_map.lock().await = shard_map;
+        self.base.shard_map.store(shard_map);
 
         Ok((previous, new_ring))
     }
@@ -1114,10 +1114,10 @@ impl EtcdShardGuard {
     async fn open_shard(
         &self,
         factory: &ShardFactory,
-        shard_map: &Mutex<ShardMap>,
+        shard_map: &ShardMapCell,
     ) -> Result<(), OpenShardError> {
         let (range, parent_shard_id) = {
-            let map = shard_map.lock().await;
+            let map = shard_map.load();
             let info = map
                 .get_shard(&self.ctx.shard_id)
                 .ok_or(OpenShardError::NotInShardMap)?;
@@ -1200,7 +1200,7 @@ impl EtcdShardGuard {
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
-        shard_map: Arc<Mutex<ShardMap>>,
+        shard_map: Arc<ShardMapCell>,
         _coordinator: Arc<dyn Coordinator>,
     ) {
         use tracing::{Instrument, info_span};

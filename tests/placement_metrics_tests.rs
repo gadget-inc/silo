@@ -4,11 +4,16 @@
 //! when a strand is logged.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
 
-use silo::coordination::ShardOwnerMap;
+use silo::coordination::{
+    CoordinationError, Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, SplitStorageBackend,
+};
+use silo::factory::ShardFactory;
 use silo::metrics::{self, Metrics};
 use silo::placement_metrics::{self, UnassignedShards, UnassignedTransitions};
-use silo::shard_range::{ShardId, ShardMap};
+use silo::shard_range::{ShardId, ShardMap, SplitInProgress};
 
 /// Read a gauge back out of the metrics registry, matching `labels` exactly
 /// (an empty slice selects an unlabelled gauge). `None` when no sample with
@@ -248,4 +253,125 @@ fn unassigned_transitions_fire_only_on_changes() {
         let got = placement_metrics::unassigned_transitions(&case.previous, &case.current);
         assert_eq!(got, case.want, "case `{}`", case.name);
     }
+}
+
+/// Coordinator whose owner-map read never returns, like one waiting on a hung
+/// backend call or a lock convoy.
+struct HangingOwnerMapCoordinator {
+    base: CoordinatorBase,
+}
+
+#[async_trait::async_trait]
+impl Coordinator for HangingOwnerMapCoordinator {
+    fn base(&self) -> &CoordinatorBase {
+        &self.base
+    }
+
+    async fn shutdown(&self) -> Result<(), CoordinationError> {
+        Ok(())
+    }
+
+    async fn wait_converged(&self, _timeout: Duration) -> bool {
+        true
+    }
+
+    async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
+        Ok(vec![])
+    }
+
+    async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
+        std::future::pending().await
+    }
+
+    async fn update_shard_placement_ring(
+        &self,
+        _shard_id: &ShardId,
+        _ring: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>), CoordinationError> {
+        Err(CoordinationError::NotSupported)
+    }
+
+    async fn force_release_shard_lease(
+        &self,
+        _shard_id: &ShardId,
+    ) -> Result<(), CoordinationError> {
+        Ok(())
+    }
+
+    async fn reclaim_existing_leases(&self) -> Result<Vec<ShardId>, CoordinationError> {
+        Ok(vec![])
+    }
+}
+
+#[async_trait::async_trait]
+impl SplitStorageBackend for HangingOwnerMapCoordinator {
+    async fn load_split(
+        &self,
+        _parent_shard_id: &ShardId,
+    ) -> Result<Option<SplitInProgress>, CoordinationError> {
+        Ok(None)
+    }
+
+    async fn store_split(&self, _split: &SplitInProgress) -> Result<(), CoordinationError> {
+        Err(CoordinationError::NotSupported)
+    }
+
+    async fn delete_split(&self, _parent_shard_id: &ShardId) -> Result<(), CoordinationError> {
+        Err(CoordinationError::NotSupported)
+    }
+
+    async fn update_shard_map_for_split(
+        &self,
+        _split: &SplitInProgress,
+    ) -> Result<(), CoordinationError> {
+        Err(CoordinationError::NotSupported)
+    }
+
+    async fn reload_shard_map(&self) -> Result<(), CoordinationError> {
+        Ok(())
+    }
+
+    async fn list_all_splits(&self) -> Result<Vec<SplitInProgress>, CoordinationError> {
+        Ok(vec![])
+    }
+}
+
+/// A hung owner-map read used to stop the sampler loop, so `silo_shards_owned`
+/// was never set. With each read bounded by one interval, the pass times out
+/// the owner map and still sets the owned gauge.
+#[silo::test]
+async fn sampler_sets_shards_owned_while_the_owner_map_read_hangs() {
+    let metrics = metrics::init().expect("init metrics");
+    let shard_map = ShardMap::create_initial(3).expect("create shard map");
+    let base = CoordinatorBase::new(
+        "node-1",
+        "http://localhost:7450",
+        shard_map.clone(),
+        Arc::new(ShardFactory::new_noop()),
+        Vec::new(),
+    );
+    base.owned.lock().await.extend(shard_map.shard_ids());
+    let coordinator: Arc<dyn Coordinator> = Arc::new(HangingOwnerMapCoordinator { base });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let sampler = tokio::spawn(placement_metrics::run_sampler(
+        coordinator,
+        metrics.clone(),
+        shutdown_rx,
+    ));
+
+    // The unlabelled gauge exports 0 until the first pass sets it.
+    let deadline = tokio::time::Instant::now() + metrics::PLACEMENT_SAMPLE_INTERVAL * 3;
+    let mut owned = gauge_value(&metrics, "silo_shards_owned", &[]);
+    while owned != Some(3.0) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        owned = gauge_value(&metrics, "silo_shards_owned", &[]);
+    }
+
+    assert_eq!(
+        owned,
+        Some(3.0),
+        "silo_shards_owned is set within one interval of the owner-map read hanging"
+    );
+    shutdown_tx.send(()).expect("signal shutdown");
+    sampler.await.expect("sampler exits on shutdown");
 }

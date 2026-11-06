@@ -20,8 +20,9 @@ use crate::coordination::k8s_backend::{
 };
 use crate::coordination::{
     AbortOnDrop, CoordinationError, Coordinator, CoordinatorBase, K8sOwnershipToken, MemberInfo,
-    OpenShardError, OwnershipCheck, ShardGuardContext, ShardGuardState, ShardOwnerMap, ShardPhase,
-    SplitStorageBackend, compute_desired_shards_for_node, get_hostname, keys,
+    OpenShardError, OwnershipCheck, ShardGuardContext, ShardGuardState, ShardMapCell,
+    ShardOwnerMap, ShardPhase, SplitStorageBackend, compute_desired_shards_for_node, get_hostname,
+    keys,
 };
 
 /// Format a chrono DateTime for K8S MicroTime (RFC3339 with microseconds and Z suffix)
@@ -1159,7 +1160,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let shard_map: ShardMap = serde_json::from_str(data)
             .map_err(|e| CoordinationError::BackendError(format!("invalid shard map: {}", e)))?;
 
-        *self.base.shard_map.lock().await = shard_map;
+        self.base.shard_map.store(shard_map);
         Ok(())
     }
 
@@ -1229,7 +1230,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         {
             Ok(_) => {
                 // Update local shard map cache
-                *self.base.shard_map.lock().await = shard_map;
+                self.base.shard_map.store(shard_map);
                 Ok(result)
             }
             Err(e) => {
@@ -1339,9 +1340,9 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         let mut opened_count = 0u32;
 
         for (shard_id, rv, uid) in &reclaimed {
-            // Look up range and parent from shard map (short-lived lock)
+            // Look up range and parent from shard map
             let (range, parent_shard_id) = {
-                let shard_map = self.base.shard_map.lock().await;
+                let shard_map = self.base.shard_map.load();
                 match shard_map.get_shard(shard_id) {
                     Some(info) => (info.range.clone(), info.parent_shard_id),
                     None => {
@@ -1641,11 +1642,10 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let shard_map = self.base.shard_map.lock().await;
+            let shard_map = self.base.shard_map.load();
             let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
             let desired: HashSet<ShardId> =
                 compute_desired_shards_for_node(&shards, &self.base.node_id, &members);
-            drop(shard_map);
             let owned_now: HashSet<ShardId> = {
                 let guard = self.base.owned.lock().await;
                 if *guard == desired {
@@ -1676,11 +1676,10 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
             cache.clone()
         };
         let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
-        let shard_map = self.base.shard_map.lock().await;
+        let shard_map = self.base.shard_map.load();
         let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
         let desired: HashSet<ShardId> =
             compute_desired_shards_for_node(&shards, &self.base.node_id, &members);
-        drop(shard_map);
         let owned_now: HashSet<ShardId> = {
             let g = self.base.owned.lock().await;
             g.clone()
@@ -1891,7 +1890,7 @@ impl<B: K8sBackend> K8sShardGuard<B> {
         self: Arc<Self>,
         owned_arc: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
-        shard_map: Arc<Mutex<ShardMap>>,
+        shard_map: Arc<ShardMapCell>,
         _coordinator: Arc<dyn Coordinator>,
     ) {
         let lease_name = self.lease_name();
@@ -2330,10 +2329,10 @@ impl<B: K8sBackend> K8sShardGuard<B> {
     async fn open_shard(
         &self,
         factory: &ShardFactory,
-        shard_map: &Mutex<ShardMap>,
+        shard_map: &ShardMapCell,
     ) -> Result<(), OpenShardError> {
         let (range, parent_shard_id) = {
-            let map = shard_map.lock().await;
+            let map = shard_map.load();
             let info = map
                 .get_shard(&self.ctx.shard_id)
                 .ok_or(OpenShardError::NotInShardMap)?;
