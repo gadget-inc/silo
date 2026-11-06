@@ -188,7 +188,10 @@ impl JobStoreShard {
             )
             .await?;
 
-        // Commit the transaction
+        // Commit the transaction. The new task row becomes visible to broker
+        // scans before the commit returns; lower the scan floor first so such
+        // a scan buffers it.
+        self.brokers.expect_task_written(&task_group, now_ms);
         if let Err(e) = txn.commit().await {
             if let Some(transition) = &background_action_transition {
                 self.rollback_background_action_metric_gauge_transition(transition);
@@ -196,8 +199,8 @@ impl JobStoreShard {
             return Err(e.into());
         }
 
-        // Wake the broker to pick up the expedited task promptly
-        self.brokers.wakeup(&task_group);
+        // Tell the broker about the row so it is scanned for promptly
+        self.brokers.notify_task_written(&task_group, now_ms);
 
         Ok(())
     }

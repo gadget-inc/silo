@@ -806,6 +806,7 @@ pub async fn clone_golden_shard_with_metrics(
             floating_refresh_stale_max_ms: silo::settings::DEFAULT_FLOATING_REFRESH_STALE_MAX_MS,
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+            broker_full_rescan_interval_ms: silo::settings::DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS,
             enqueue_time_index_backfill: Default::default(),
             grant_scanner: silo::concurrency::GrantScannerConfig::default(),
             concurrency_reconcile_scan_slice:

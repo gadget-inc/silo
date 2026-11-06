@@ -117,9 +117,15 @@ impl LimitChainResumer for ShardChainResumer {
         Ok(result.grants)
     }
 
-    fn wakeup_task_groups(&self, groups: &[String]) {
+    fn tasks_written(&self, written: &[(String, i64)]) {
         if let Some(shard) = self.shard.upgrade() {
-            shard.brokers.wakeup_groups(groups);
+            shard.brokers.notify_tasks_written(written);
+        }
+    }
+
+    fn expect_tasks(&self, written: &[(String, i64)]) {
+        if let Some(shard) = self.shard.upgrade() {
+            shard.brokers.expect_tasks_written(written);
         }
     }
 

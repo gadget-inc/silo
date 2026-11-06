@@ -522,6 +522,7 @@ impl ShardFactory {
                         floating_refresh_stale_max_ms: template.floating_refresh_stale_max_ms,
                         broker_tombstone_revive_after_generations: template
                             .broker_tombstone_revive_after_generations,
+                        broker_full_rescan_interval_ms: template.broker_full_rescan_interval_ms,
                         enqueue_time_index_backfill: template.enqueue_time_index_backfill.clone(),
                     },
                     range.clone(),
@@ -1551,6 +1552,7 @@ impl ShardFactory {
                 broker_tombstone_revive_after_generations: self
                     .template
                     .broker_tombstone_revive_after_generations,
+                broker_full_rescan_interval_ms: self.template.broker_full_rescan_interval_ms,
                 // A pre-commit open of a closed shard runs no background
                 // sweeps, like `counter_reconciliation_seconds` above.
                 enqueue_time_index_backfill: Default::default(),

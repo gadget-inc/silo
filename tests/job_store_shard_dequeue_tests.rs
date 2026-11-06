@@ -778,10 +778,16 @@ async fn dequeue_drops_duplicate_row_when_other_worker_holds_live_lease() {
 /// twice in one claim, so the repeat is always a second row: it is dropped --
 /// deleted, acknowledged, never delivered -- and counted under
 /// source="batch" in both the detection and drop counters.
+///
+/// The second row is hand-written behind the broker's back, so it sorts
+/// below the broker's scan floor and only a periodic full rescan reads it:
+/// the rescan interval is kept short.
 #[silo::test]
 async fn dequeue_drops_in_batch_repeat_of_a_task_id() {
     with_timeout!(20000, {
-        let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+        let (_tmp, shard, metrics) =
+            open_temp_shard_with_metrics_and_config(|cfg| cfg.broker_full_rescan_interval_ms = 100)
+                .await;
         let payload = msgpack_payload(&serde_json::json!({"k": "v"}));
         let now = now_ms();
 

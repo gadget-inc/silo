@@ -159,6 +159,10 @@ pub struct OpenShardOptions {
     /// task key before the broker point-reads the row. Populated from
     /// `DatabaseConfig::broker_tombstone_revive_after_generations`.
     pub broker_tombstone_revive_after_generations: u64,
+    /// How often a broker scan reads its whole task group range instead of
+    /// starting at the scan floor. Populated from
+    /// `DatabaseConfig::broker_full_rescan_interval_ms`.
+    pub broker_full_rescan_interval_ms: u64,
     /// One-shot backfill of the enqueue-time index for pre-existing jobs.
     /// Populated from `DatabaseConfig::enqueue_time_index_backfill`; the
     /// default leaves the sweep disabled.
@@ -534,6 +538,7 @@ impl JobStoreShard {
                 floating_refresh_stale_max_ms: cfg.floating_refresh_stale_max_ms,
                 broker_tombstone_revive_after_generations: cfg
                     .broker_tombstone_revive_after_generations,
+                broker_full_rescan_interval_ms: cfg.broker_full_rescan_interval_ms,
                 enqueue_time_index_backfill: cfg.enqueue_time_index_backfill.clone(),
             },
             range,
@@ -585,6 +590,7 @@ impl JobStoreShard {
             floating_refresh_stale_ms,
             floating_refresh_stale_max_ms,
             broker_tombstone_revive_after_generations,
+            broker_full_rescan_interval_ms,
             enqueue_time_index_backfill,
         } = options;
 
@@ -680,6 +686,7 @@ impl JobStoreShard {
             metrics.clone(),
             range.clone(),
             broker_tombstone_revive_after_generations,
+            std::time::Duration::from_millis(broker_full_rescan_interval_ms),
         );
 
         let shard = Arc::new(Self {
@@ -1330,6 +1337,13 @@ impl JobStoreShard {
         self.brokers.group_next_ready_at_ms(task_group)
     }
 
+    /// The scan floor of a task group's broker, if one exists: the start time
+    /// its next scan reads from, or `None` for the whole range. See
+    /// [`TaskBrokerRegistry::group_scan_floor_ms`].
+    pub fn broker_scan_floor_ms(&self, task_group: &str) -> Option<Option<i64>> {
+        self.brokers.group_scan_floor_ms(task_group)
+    }
+
     /// Number of tasks currently held in the broker's in-flight set for a task
     /// group (claimed by a worker but not yet durably acked). Exposed for
     /// observability and for tests that assert the dequeue drop-guard releases
@@ -1595,6 +1609,9 @@ impl JobStoreShard {
         self.concurrency
             .process_grants(&self.db, &range, tenant, queue, count)
             .await
+            .into_iter()
+            .map(|(task_group, _)| task_group)
+            .collect()
     }
 
     /// Test-only: install or clear the grant scanner's per-batch hook. See
