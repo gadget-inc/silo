@@ -27,14 +27,19 @@ fn read_revived_total(metrics: &silo::metrics::Metrics) -> f64 {
 }
 
 /// A RunAttempt row the broker acked and tombstoned is still durable under
-/// the same bytes. With a revive bound of one scan generation, driving scans
-/// through dequeue wakeups must lease it again without a process restart.
-/// The same worker leases both times: a still-live lease held by the same
-/// worker is re-delivered by overwrite, the requeue-after-ambiguous-commit
-/// recovery.
+/// the same bytes. With a revive bound of one scan generation, the broker's
+/// scans must lease it again without a process restart. The row is put back
+/// behind the broker's back, so it sorts below the scan floor and only a
+/// periodic full rescan reads it: the rescan interval is kept short. The same
+/// worker leases both times: a still-live lease held by the same worker is
+/// re-delivered by overwrite, the requeue-after-ambiguous-commit recovery.
 #[silo::test]
 async fn tombstoned_task_row_still_durable_is_revived_and_leased() {
-    let (_tmp, shard, metrics) = open_temp_shard_with_tombstone_revive_after_generations(1).await;
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics_and_config(|cfg| {
+        cfg.broker_tombstone_revive_after_generations = 1;
+        cfg.broker_full_rescan_interval_ms = 100;
+    })
+    .await;
 
     shard
         .enqueue(

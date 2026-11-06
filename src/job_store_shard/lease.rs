@@ -455,6 +455,11 @@ impl JobStoreShard {
 
         // Commit durable state — write_with_options with await_durable:true blocks
         // until the WAL is flushed to object storage, so no separate flush is needed.
+        // A follow-up task row becomes visible to broker scans before that;
+        // lower the scan floor first so such a scan buffers it.
+        if let Some(nt) = followup_next_time {
+            self.brokers.expect_task_written(&task_group, nt);
+        }
         if let Err(e) = self
             .db
             .write_with_options(

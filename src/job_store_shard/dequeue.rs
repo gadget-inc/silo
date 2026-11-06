@@ -447,6 +447,11 @@ impl JobStoreShard {
 
             // Commit durable state — write_with_options with await_durable:true blocks
             // until the WAL is flushed to object storage, so no separate flush is needed.
+            // A follow-up task row becomes visible to broker scans before
+            // that; lower the scan floor first so such a scan buffers it.
+            if let Some(start_ms) = state.followup_task_start_ms {
+                self.brokers.expect_task_written(task_group, start_ms);
+            }
             if !state.batch.is_empty()
                 && let Err(e) = self
                     .db
@@ -1728,6 +1733,9 @@ mod claimed_inflight_guard_tests {
             None,
             ShardRange::full(),
             crate::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+            std::time::Duration::from_millis(
+                crate::settings::DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS,
+            ),
         )
     }
 

@@ -700,6 +700,26 @@ fn test_task_key_lookup_prefix_matches_any_epoch() {
 }
 
 #[test]
+fn test_task_group_time_prefix_bounds_start_times() {
+    use silo::keys::{end_bound, task_group_prefix, task_group_time_prefix};
+    // The time prefix is a prefix of every key in the group at that start
+    // time and sorts after every key with an earlier one, so a scan from it
+    // reads exactly the rows at or after that time.
+    let at = task_group_time_prefix("group1", 1000);
+    assert!(at >= task_group_prefix("group1"));
+    assert!(at < end_bound(&task_group_prefix("group1")));
+    assert!(task_key("group1", 1000, 0, "", 0, 0).starts_with(&at));
+    assert!(task_key("group1", 1000, 255, "zzz", u32::MAX, i64::MAX).starts_with(&at));
+    assert!(task_key("group1", 999, 255, "zzz", u32::MAX, i64::MAX) < at);
+    assert!(task_key("group1", 1001, 0, "", 0, 0) > at);
+    assert!(!task_key("group2", 1000, 0, "a", 1, 0).starts_with(&at));
+    assert_eq!(
+        task_group_time_prefix("group1", -5),
+        task_group_time_prefix("group1", 0)
+    );
+}
+
+#[test]
 fn test_refresh_task_key_roundtrip_and_prefixes() {
     use silo::keys::{
         parse_refresh_task_key, refresh_task_group_prefix, refresh_task_key,

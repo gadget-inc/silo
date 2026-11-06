@@ -315,6 +315,16 @@ fn default_broker_tombstone_revive_after_generations() -> u64 {
     DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS
 }
 
+/// Default for `broker_full_rescan_interval_ms`: how often a broker scan
+/// ignores its scan floor and reads the whole task group range. Every writer
+/// of a task row lowers the floor to the row's start time; the full rescan
+/// bounds how long a row a writer failed to note can go unnoticed.
+pub const DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS: u64 = 60_000;
+
+fn default_broker_full_rescan_interval_ms() -> u64 {
+    DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS
+}
+
 /// Default for `grant_scanner_commit_chunk_size`: max grants a
 /// `process_grants` pass accumulates before committing their edits durably
 /// and waking the granted task groups' brokers. Smaller chunks stream grants
@@ -461,6 +471,12 @@ pub struct DatabaseTemplate {
     /// revives it if it is still durable. Defaults to 64.
     #[serde(default = "default_broker_tombstone_revive_after_generations")]
     pub broker_tombstone_revive_after_generations: u64,
+    /// How often (ms) a broker scan reads its whole task group range instead
+    /// of starting at the scan floor, the start time below which every task
+    /// row has already been dealt with. Bounds how long a task row written
+    /// without telling the broker can wait. Defaults to 60000.
+    #[serde(default = "default_broker_full_rescan_interval_ms")]
+    pub broker_full_rescan_interval_ms: u64,
     /// When set, jobs that finished successfully (Succeeded) have all of their
     /// associated KV records re-put with a SlateDB row TTL expiring this many
     /// seconds in the future. `None` (the default) disables the behaviour for
@@ -569,6 +585,7 @@ impl Default for DatabaseTemplate {
             floating_refresh_stale_max_ms: default_floating_refresh_stale_max_ms(),
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
+            broker_full_rescan_interval_ms: default_broker_full_rescan_interval_ms(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
@@ -1035,6 +1052,11 @@ pub struct DatabaseConfig {
     /// details. Defaults to 64.
     #[serde(default = "default_broker_tombstone_revive_after_generations")]
     pub broker_tombstone_revive_after_generations: u64,
+    /// How often (ms) a broker scan reads its whole task group range. See
+    /// `DatabaseTemplate::broker_full_rescan_interval_ms` for details.
+    /// Defaults to 60000.
+    #[serde(default = "default_broker_full_rescan_interval_ms")]
+    pub broker_full_rescan_interval_ms: u64,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
     /// `DatabaseTemplate::completed_job_expire_s` for details.
     #[serde(default)]
@@ -1097,6 +1119,7 @@ impl Default for DatabaseConfig {
             floating_refresh_stale_max_ms: default_floating_refresh_stale_max_ms(),
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
+            broker_full_rescan_interval_ms: default_broker_full_rescan_interval_ms(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: default_count_from_status_counters(),
@@ -1388,6 +1411,7 @@ mod tests {
         assert_eq!(template.floating_refresh_stale_ms, 60_000);
         assert_eq!(template.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(template.broker_tombstone_revive_after_generations, 64);
+        assert_eq!(template.broker_full_rescan_interval_ms, 60_000);
 
         let config: DatabaseConfig = toml::from_str(
             r#"
@@ -1400,5 +1424,6 @@ mod tests {
         assert_eq!(config.floating_refresh_stale_ms, 60_000);
         assert_eq!(config.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(config.broker_tombstone_revive_after_generations, 64);
+        assert_eq!(config.broker_full_rescan_interval_ms, 60_000);
     }
 }

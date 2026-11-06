@@ -205,6 +205,8 @@ pub struct Metrics {
     broker_scans_total: CounterVec,
     broker_scan_tasks_read: CounterVec,
     broker_tombstone_count: GaugeVec,
+    broker_full_rescans_total: CounterVec,
+    broker_full_rescan_inserted_total: CounterVec,
 
     // Poll metrics
     polls_total: CounterVec,
@@ -644,6 +646,19 @@ impl Metrics {
                 .with_label_values(&[shard, task_group, outcome])
                 .inc_by(count as f64);
         }
+    }
+
+    /// Record a periodic full-range broker scan (one that ignored the scan
+    /// floor) and how many tasks it buffered. A full rescan that buffers
+    /// tasks found rows below the floor, which means a writer of task rows
+    /// did not tell the broker about them.
+    pub fn record_broker_full_rescan(&self, shard: &str, task_group: &str, inserted: u64) {
+        self.broker_full_rescans_total
+            .with_label_values(&[shard, task_group])
+            .inc();
+        self.broker_full_rescan_inserted_total
+            .with_label_values(&[shard, task_group])
+            .inc_by(inserted as f64);
     }
 
     /// Update the number of ack tombstones for a shard and task group.
@@ -2316,6 +2331,28 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let broker_full_rescans_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_broker_full_rescans_total",
+                "Broker scans that read the whole task group range instead of starting at the scan floor",
+            ),
+            &["shard", "task_group"],
+        )?,
+    );
+
+    let broker_full_rescan_inserted_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_broker_full_rescan_inserted_total",
+                "Tasks buffered by full-range broker scans; non-zero means a task row was written without telling the broker",
+            ),
+            &["shard", "task_group"],
+        )?,
+    );
+
     // Poll metrics
     let polls_total = register(
         &registry,
@@ -2768,6 +2805,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_scans_total,
         broker_scan_tasks_read,
         broker_tombstone_count,
+        broker_full_rescans_total,
+        broker_full_rescan_inserted_total,
         polls_total,
         poll_duration,
         task_leases_active,

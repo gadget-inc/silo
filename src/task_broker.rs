@@ -4,7 +4,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
@@ -14,7 +14,7 @@ use crate::instrumented_db::InstrumentedDb;
 use tokio::sync::Notify;
 
 use crate::codec::{DecodedTask, decode_task_validated};
-use crate::keys::{end_bound, parse_task_key, task_group_prefix};
+use crate::keys::{end_bound, parse_task_key, task_group_prefix, task_group_time_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
 use tracing::debug;
@@ -50,6 +50,11 @@ struct AckTombstone {
 ///   readied a task, when the earliest future-dated row becomes due, or when
 ///   the last scan stopped with ready rows remaining. An empty poll on its own
 ///   never triggers a scan.
+/// - Starts each scan at the scan floor: the start time below which every
+///   row has already been dealt with, so the SlateDB tombstones of dequeued
+///   and cancelled tasks at the head of the range are not walked again.
+///   Every writer of a task row lowers the floor to the row's start time, and
+///   a periodic full-range scan bounds the cost of a writer that did not.
 pub struct TaskBroker {
     // The task group this broker is responsible for
     task_group: String,
@@ -77,9 +82,12 @@ pub struct TaskBroker {
     // Set by a write that may have made a task ready; cleared when a scan
     // begins, so a write that lands mid-scan forces one more pass.
     dirty: AtomicBool,
-    // When a scan could next find a task to buffer. One lock covers the time
-    // and the note generation so a note and a scan's result never interleave.
-    next_ready: Mutex<NextReady>,
+    // Where and when the next scan reads. One lock covers the floor, the
+    // next-ready time and the note generation so a note and a scan's result
+    // never interleave.
+    cursor: Mutex<ScanCursor>,
+    // How often a scan ignores the floor and reads the whole range.
+    full_rescan_interval: Duration,
     // The target buffer size
     target_buffer: usize,
     // The batch size for the background scanner to read out of the DB
@@ -97,6 +105,7 @@ impl TaskBroker {
     // refresh `last_seen` whenever a stale key is observed again.
     const ACK_TOMBSTONE_RETAIN_GENERATIONS: u64 = 64;
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         task_group: String,
         db: Arc<InstrumentedDb>,
@@ -104,6 +113,7 @@ impl TaskBroker {
         metrics: Option<Metrics>,
         range: ShardRange,
         tombstone_revive_after_generations: u64,
+        full_rescan_interval: Duration,
     ) -> Arc<Self> {
         // scan_batch must be >= target_buffer / 2 (the low watermark) so that
         // a single scan pass can refill from low-watermark to target. With a
@@ -117,6 +127,7 @@ impl TaskBroker {
             metrics,
             range,
             tombstone_revive_after_generations,
+            full_rescan_interval,
             8192,
             4096,
         )
@@ -130,6 +141,7 @@ impl TaskBroker {
         metrics: Option<Metrics>,
         range: ShardRange,
         tombstone_revive_after_generations: u64,
+        full_rescan_interval: Duration,
         target_buffer: usize,
         scan_batch: usize,
     ) -> Arc<Self> {
@@ -145,7 +157,8 @@ impl TaskBroker {
             notify: Arc::new(Notify::new()),
             scan_requested: Arc::new(AtomicBool::new(false)),
             dirty: AtomicBool::new(false),
-            next_ready: Mutex::new(NextReady::default()),
+            cursor: Mutex::new(ScanCursor::new()),
+            full_rescan_interval,
             target_buffer,
             scan_batch,
             shard_name,
@@ -178,26 +191,31 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     ///
-    /// Records in `next_ready` why the scan stopped, which gates the nudges
-    /// that empty polls send (see `nudge`).
+    /// Reads from the scan floor unless a full rescan is due, and records in
+    /// the cursor why the scan stopped (which gates the nudges that empty
+    /// polls send, see `nudge`) and the new floor.
     async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
-        // Clear `dirty` and read the note generation before the iterator is
-        // created: a write or note that lands after this point may describe a
-        // row the iterator's view does not include, so it must set `dirty`
-        // again (forcing one more pass) or survive this scan's result.
+        // Clear `dirty` and read the cursor before the iterator is created: a
+        // write or note that lands after this point may describe a row the
+        // iterator's view does not include, so it must set `dirty` again
+        // (forcing one more pass) or survive this scan's result.
         self.dirty.store(false, Ordering::SeqCst);
-        let notes_before = self.next_ready.lock().unwrap().note_generation;
+        let (floor_ms, notes_before, full_rescan) = self.begin_scan_cursor();
 
-        // [SILO-SCAN-1] Scan only this task group's key range
-        let start = task_group_prefix(&self.task_group);
-        let end = end_bound(&start);
+        // [SILO-SCAN-1] Scan only this task group's key range, from the floor
+        let prefix = task_group_prefix(&self.task_group);
+        let end = end_bound(&prefix);
+        let start = match floor_ms {
+            Some(floor_ms) => task_group_time_prefix(&self.task_group, floor_ms),
+            None => prefix,
+        };
 
         let Ok(mut iter) = self
             .db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await
         else {
-            self.record_scan_stop(ScanStop::MoreReady, 0, notes_before);
+            self.record_scan_stop(ScanStop::MoreReady, 0, notes_before, floor_ms);
             return 0;
         };
 
@@ -212,6 +230,9 @@ impl TaskBroker {
         let mut skipped_already_buffered = 0u64;
         let mut skipped_defunct = 0u64;
         let mut revived = 0u64;
+        // Start time of the last row this scan dealt with. Rows sort by start
+        // time, so no row below it is left for a later scan to find.
+        let mut consumed_through_ms: Option<i64> = None;
         // Leaving the loop through its condition means the batch or buffer
         // limit was hit with ready rows possibly remaining.
         let mut stop = ScanStop::MoreReady;
@@ -242,6 +263,11 @@ impl TaskBroker {
                 };
                 break;
             }
+
+            // Every path from here deals with the row for good: it is
+            // buffered, in flight, suppressed by an ack tombstone, deleted as
+            // defunct, or malformed. A later scan need not read it again.
+            consumed_through_ms = Some(parsed_key.start_time_ms as i64);
 
             let key_bytes = kv.key.to_vec();
 
@@ -337,30 +363,9 @@ impl TaskBroker {
             }
         }
 
-        self.record_scan_stop(stop, skipped_tombstone, notes_before);
-
-        if total_read > 0
-            && let Some(ref m) = self.metrics
-        {
-            m.record_broker_scan_tasks(
-                &self.shard_name,
-                &self.task_group,
-                inserted as u64,
-                skipped_future,
-                skipped_inflight,
-                skipped_tombstone,
-                skipped_already_buffered,
-                skipped_defunct,
-                revived,
-            );
-            m.set_broker_tombstone_count(
-                &self.shard_name,
-                &self.task_group,
-                self.ack_tombstones.lock().unwrap().len() as u64,
-            );
-        }
-
-        // Delete defunct tasks from the database
+        // Delete defunct tasks from the database. Until they are gone they
+        // still have to be read, so a failed delete leaves the floor alone.
+        let mut defunct_deleted = true;
         if !defunct_keys.is_empty() {
             let mut batch = WriteBatch::new();
             for key in &defunct_keys {
@@ -368,6 +373,7 @@ impl TaskBroker {
             }
             if let Err(e) = self.db.write(batch).await {
                 debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct tasks");
+                defunct_deleted = false;
             } else {
                 debug!(
                     count = defunct_keys.len(),
@@ -376,7 +382,61 @@ impl TaskBroker {
             }
         }
 
+        // The new floor. Reading the whole remaining range (to its end or to
+        // the first future-dated row) proves no row at or before `now_ms` is
+        // left, so the floor moves to `now_ms` even when nothing was read;
+        // stopping early moves it only as far as the rows actually read.
+        let new_floor_ms = if !defunct_deleted {
+            floor_ms
+        } else {
+            match stop {
+                ScanStop::EndOfRange | ScanStop::Future { .. } => Some(now_ms),
+                ScanStop::MoreReady => consumed_through_ms.or(floor_ms),
+            }
+        };
+        self.record_scan_stop(stop, skipped_tombstone, notes_before, new_floor_ms);
+
+        if let Some(ref m) = self.metrics {
+            if total_read > 0 {
+                m.record_broker_scan_tasks(
+                    &self.shard_name,
+                    &self.task_group,
+                    inserted as u64,
+                    skipped_future,
+                    skipped_inflight,
+                    skipped_tombstone,
+                    skipped_already_buffered,
+                    skipped_defunct,
+                    revived,
+                );
+                m.set_broker_tombstone_count(
+                    &self.shard_name,
+                    &self.task_group,
+                    self.ack_tombstones.lock().unwrap().len() as u64,
+                );
+            }
+            if full_rescan {
+                m.record_broker_full_rescan(&self.shard_name, &self.task_group, inserted as u64);
+            }
+        }
+
         inserted
+    }
+
+    /// Take the cursor for a scan that is about to create its iterator:
+    /// the floor to read from (`None` for the whole range), the note
+    /// generation to compare against when the scan records its result, and
+    /// whether this scan is a periodic full rescan. A full rescan clears the
+    /// floor, so a row that a writer failed to note is found within one
+    /// interval.
+    fn begin_scan_cursor(&self) -> (Option<i64>, u64, bool) {
+        let mut cursor = self.cursor.lock().unwrap();
+        let full_rescan = cursor.last_full_scan.elapsed() >= self.full_rescan_interval;
+        if full_rescan {
+            cursor.floor_ms = None;
+            cursor.last_full_scan = Instant::now();
+        }
+        (cursor.floor_ms, cursor.note_generation, full_rescan)
     }
 
     /// Start the background scanning loop.
@@ -592,12 +652,21 @@ impl TaskBroker {
     /// uncommitted task still has its key (re-scanned → processed exactly once,
     /// un-stranded).
     fn release_inflight(&self, keys: &[Vec<u8>]) {
-        let mut inflight = self.inflight.lock().unwrap();
-        for k in keys {
-            inflight.remove(k);
+        {
+            let mut inflight = self.inflight.lock().unwrap();
+            for k in keys {
+                inflight.remove(k);
+            }
         }
         // The rows may still be durable and were skipped as in-flight by any
-        // scan that ran meanwhile, so the next nudge must scan again.
+        // scan that ran meanwhile, which may have moved the floor past them,
+        // so the next nudge must scan again from no later than their start
+        // times.
+        for k in keys {
+            if let Some(parsed) = parse_task_key(k) {
+                self.note_task_written(parsed.start_time_ms as i64);
+            }
+        }
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -652,19 +721,36 @@ impl TaskBroker {
         }
     }
 
-    /// Record that a task row with `start_time_ms` was written, without
-    /// waking the scanner. Lowers the recorded next-ready time so a nudge or
-    /// the scanner's own timer fires when the row becomes due even if it
-    /// sorts before the row the last scan stopped at.
-    fn note_scheduled(&self, start_time_ms: i64) {
-        let mut next_ready = self.next_ready.lock().unwrap();
-        next_ready.note_generation += 1;
-        next_ready.at_ms = next_ready.at_ms.min(start_time_ms);
+    /// Record that a durable task row with `start_time_ms` exists, without
+    /// waking the scanner: the next scan reads from no later than that time.
+    fn note_task_written(&self, start_time_ms: i64) {
+        self.cursor.lock().unwrap().note_task_written(start_time_ms);
     }
 
-    /// Store why a scan stopped. A scan that overlapped a `note_scheduled`
-    /// may have missed the noted row, so it only lowers the recorded time.
-    fn record_scan_stop(&self, stop: ScanStop, skipped_tombstone: u64, notes_before: u64) {
+    /// Record that a future-dated task row with `start_time_ms` was written,
+    /// without waking the scanner. Lowers the floor and the recorded
+    /// next-ready time so a nudge or the scanner's own timer fires when the
+    /// row becomes due even if it sorts before the row the last scan stopped
+    /// at.
+    fn note_scheduled(&self, start_time_ms: i64) {
+        let mut cursor = self.cursor.lock().unwrap();
+        cursor.note_task_written(start_time_ms);
+        cursor.at_ms = cursor.at_ms.min(start_time_ms);
+    }
+
+    /// Store why a scan stopped and the floor it established. A scan that
+    /// overlapped a note may have missed the noted row, so it only lowers the
+    /// recorded next-ready time. The floor is capped at the lowest time noted
+    /// since the last scan that no note overlapped, because a noted row may
+    /// not have been visible to this scan either (see
+    /// [`ScanCursor::pending_floor_ms`]).
+    fn record_scan_stop(
+        &self,
+        stop: ScanStop,
+        skipped_tombstone: u64,
+        notes_before: u64,
+        floor_ms: Option<i64>,
+    ) {
         let next_ready_at_ms = match stop {
             // A key suppressed by an ack tombstone is point-read once its
             // tombstone ages past the revive bound, which takes further scan
@@ -674,12 +760,26 @@ impl TaskBroker {
             ScanStop::EndOfRange => i64::MAX,
             ScanStop::Future { start_time_ms } => start_time_ms,
         };
-        let mut next_ready = self.next_ready.lock().unwrap();
-        if next_ready.note_generation == notes_before {
-            next_ready.at_ms = next_ready_at_ms;
+        let mut cursor = self.cursor.lock().unwrap();
+        cursor.floor_ms = match (floor_ms, cursor.pending_floor_ms) {
+            (Some(floor_ms), Some(pending_ms)) => Some(floor_ms.min(pending_ms)),
+            (floor_ms, None) => floor_ms,
+            (None, Some(_)) => None,
+        };
+        if cursor.note_generation == notes_before {
+            cursor.at_ms = next_ready_at_ms;
+            // Every row noted before this scan began was either read by it
+            // or is capped into the floor just set.
+            cursor.pending_floor_ms = None;
         } else {
-            next_ready.at_ms = next_ready.at_ms.min(next_ready_at_ms);
+            cursor.at_ms = cursor.at_ms.min(next_ready_at_ms);
         }
+    }
+
+    /// The start time the next scan reads from, or `None` when it reads the
+    /// whole range. See [`ScanCursor::floor_ms`].
+    fn scan_floor_ms(&self) -> Option<i64> {
+        self.cursor.lock().unwrap().floor_ms
     }
 
     /// The scanner's idle delay: the backoff, shortened to the time until the
@@ -699,20 +799,58 @@ impl TaskBroker {
     /// stopped with ready rows possibly remaining, otherwise the start time of
     /// the first future-dated row the last scan stopped at.
     fn next_ready_at_ms(&self) -> i64 {
-        self.next_ready.lock().unwrap().at_ms
+        self.cursor.lock().unwrap().at_ms
     }
 }
 
-/// When a scan could next find a task to buffer. See
-/// [`TaskBroker::next_ready_at_ms`] for the meaning of `at_ms`. The default
-/// (`at_ms` of 0) means nothing is known about the range yet, so the first
-/// nudge scans.
-#[derive(Debug, Clone, Copy, Default)]
-struct NextReady {
+/// Where and when the next scan reads. A new cursor (`at_ms` of 0, no floor)
+/// knows nothing about the range, so the first nudge scans all of it.
+#[derive(Debug, Clone, Copy)]
+struct ScanCursor {
+    /// When a scan could next find a task to buffer. See
+    /// [`TaskBroker::next_ready_at_ms`].
     at_ms: i64,
-    /// Bumped by every `note_scheduled`. A scan that overlapped a note keeps
-    /// the lower of its own result and the noted time instead of overwriting.
+    /// Bumped by every note. A scan that overlapped a note keeps the lower of
+    /// its own result and the noted time instead of overwriting.
     note_generation: u64,
+    /// Start time below which no task row is waiting to be buffered: a scan
+    /// dealt with every row there (buffered it, saw it in flight or under an
+    /// ack tombstone, deleted it as defunct, or found it malformed) and every
+    /// row written since was noted. Scans read from here, inclusive, so rows
+    /// that share the floor's millisecond are read again. `None` reads the
+    /// whole range.
+    floor_ms: Option<i64>,
+    /// Lowest start time noted since the last scan that no note overlapped
+    /// ended. A row is noted before its write is issued and again once it is
+    /// durable, and becomes visible to scans somewhere in between, so a scan
+    /// that began after a note may still not have seen the row: the floor a
+    /// scan establishes is capped at this time.
+    pending_floor_ms: Option<i64>,
+    /// When the floor was last cleared for a full-range scan.
+    last_full_scan: Instant,
+}
+
+impl ScanCursor {
+    fn new() -> Self {
+        Self {
+            at_ms: 0,
+            note_generation: 0,
+            floor_ms: None,
+            pending_floor_ms: None,
+            last_full_scan: Instant::now(),
+        }
+    }
+
+    /// A task row with `start_time_ms` exists or is about to: the floor can
+    /// be no higher than that.
+    fn note_task_written(&mut self, start_time_ms: i64) {
+        self.note_generation += 1;
+        self.floor_ms = self.floor_ms.map(|floor_ms| floor_ms.min(start_time_ms));
+        self.pending_floor_ms = Some(
+            self.pending_floor_ms
+                .map_or(start_time_ms, |pending_ms| pending_ms.min(start_time_ms)),
+        );
+    }
 }
 
 /// Why a scan stopped reading the task line.
@@ -741,6 +879,7 @@ pub struct TaskBrokerRegistry {
     metrics: Option<Metrics>,
     range: ShardRange,
     tombstone_revive_after_generations: u64,
+    full_rescan_interval: Duration,
     brokers: DashMap<String, Arc<TaskBroker>>,
 }
 
@@ -751,6 +890,7 @@ impl TaskBrokerRegistry {
         metrics: Option<Metrics>,
         range: ShardRange,
         tombstone_revive_after_generations: u64,
+        full_rescan_interval: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -758,6 +898,7 @@ impl TaskBrokerRegistry {
             metrics,
             range,
             tombstone_revive_after_generations,
+            full_rescan_interval,
             brokers: DashMap::new(),
         })
     }
@@ -780,6 +921,7 @@ impl TaskBrokerRegistry {
                     self.metrics.clone(),
                     self.range.clone(),
                     self.tombstone_revive_after_generations,
+                    self.full_rescan_interval,
                 );
                 b.start();
                 b
@@ -805,29 +947,62 @@ impl TaskBrokerRegistry {
         self.get_or_create(task_group).wakeup();
     }
 
-    /// Wake specific task group brokers that already exist.
-    /// Does not create brokers — only wakes groups that have an active scanner.
-    pub fn wakeup_groups(&self, task_groups: &[String]) {
-        for group in task_groups {
-            if let Some(broker) = self.brokers.get(group.as_str()) {
-                broker.wakeup();
-            }
-        }
-    }
-
-    /// Record a committed task row with `start_time_ms`: wake the scanner
-    /// when the row is due now, otherwise lower the broker's recorded
-    /// next-ready time so the row is scanned for once it becomes due.
+    /// Record a committed task row with `start_time_ms`: lower the broker's
+    /// scan floor to it, then wake the scanner when the row is due now or
+    /// lower the broker's recorded next-ready time so the row is scanned for
+    /// once it becomes due.
     ///
-    /// Call after the write is durable. A broker created later starts with
-    /// nothing known about its range and scans on its first nudge, so a
-    /// future-dated row only needs noting on a broker that already exists.
+    /// Call after the write is durable, from every path that writes a task
+    /// row. A broker created later starts with nothing known about its range
+    /// and scans all of it on its first nudge, so a future-dated row only
+    /// needs noting on a broker that already exists.
     pub fn notify_task_written(&self, task_group: &str, start_time_ms: i64) {
         if start_time_ms <= crate::job_store_shard::now_epoch_ms() {
-            self.wakeup(task_group);
+            let broker = self.get_or_create(task_group);
+            broker.note_task_written(start_time_ms);
+            broker.wakeup();
         } else if let Some(broker) = self.brokers.get(task_group) {
             broker.note_scheduled(start_time_ms);
         }
+    }
+
+    /// [`Self::notify_task_written`] for several task groups at once, each
+    /// with the earliest start time written under it.
+    pub fn notify_tasks_written(&self, written: &[(String, i64)]) {
+        for (task_group, start_time_ms) in written {
+            self.notify_task_written(task_group, *start_time_ms);
+        }
+    }
+
+    /// Record that a task row with `start_time_ms` is about to be written
+    /// under `task_group`: lower the broker's scan floor to it, so a scan that
+    /// sees the row while its write awaits durability buffers it instead of
+    /// starting above it.
+    ///
+    /// Call before the write is issued; [`Self::notify_task_written`] still
+    /// follows once the write is durable. A write that fails leaves the floor
+    /// lowered, which costs one scan a few extra reads. A broker that does
+    /// not exist yet has no floor to lower.
+    pub fn expect_task_written(&self, task_group: &str, start_time_ms: i64) {
+        if let Some(broker) = self.brokers.get(task_group) {
+            broker.note_task_written(start_time_ms);
+        }
+    }
+
+    /// [`Self::expect_task_written`] for several task groups at once, each
+    /// with the earliest start time about to be written under it.
+    pub fn expect_tasks_written(&self, written: &[(String, i64)]) {
+        for (task_group, start_time_ms) in written {
+            self.expect_task_written(task_group, *start_time_ms);
+        }
+    }
+
+    /// The scan floor of a task group's broker, if one exists: the start time
+    /// its next scan reads from, or `None` for the whole range.
+    pub fn group_scan_floor_ms(&self, task_group: &str) -> Option<Option<i64>> {
+        self.brokers
+            .get(task_group)
+            .map(|e| e.value().scan_floor_ms())
     }
 
     /// The next-ready time recorded by a task group's broker, if one exists:
@@ -948,6 +1123,9 @@ mod inflight_release_tests {
         broker_with_revive_bound(TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS).await
     }
 
+    /// Every scan reads the whole range (a zero full-rescan interval): the
+    /// tombstone tests leave a row durable under an acked key, which the scan
+    /// floor would otherwise hide until the next full rescan.
     async fn broker_with_revive_bound(bound: u64) -> Arc<TaskBroker> {
         let store = Arc::new(slatedb::object_store::memory::InMemory::new());
         let db = slatedb::DbBuilder::new("test", store)
@@ -962,6 +1140,7 @@ mod inflight_release_tests {
             None,
             ShardRange::full(),
             bound,
+            Duration::ZERO,
         )
     }
 
@@ -1097,6 +1276,7 @@ mod scan_gating_tests {
             None,
             ShardRange::full(),
             TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+            Duration::from_secs(60),
             8192,
             scan_batch,
         )
@@ -1203,14 +1383,14 @@ mod scan_gating_tests {
         assert_eq!(scan(&broker, now_ms).await, 0);
         assert_eq!(broker.next_ready_at_ms(), i64::MAX);
 
-        let notes_before = broker.next_ready.lock().unwrap().note_generation;
+        let notes_before = broker.cursor.lock().unwrap().note_generation;
 
         broker.note_scheduled(now_ms + 700);
-        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before);
+        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, None);
         assert_eq!(broker.next_ready_at_ms(), now_ms + 700);
 
-        let notes_before = broker.next_ready.lock().unwrap().note_generation;
-        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before);
+        let notes_before = broker.cursor.lock().unwrap().note_generation;
+        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, None);
         assert_eq!(broker.next_ready_at_ms(), i64::MAX);
     }
 
@@ -1306,6 +1486,212 @@ mod scan_gating_tests {
             broker.delay_until_next_ready_ms(2_000),
             2_000,
             "an already-due time keeps the backoff"
+        );
+    }
+
+    async fn broker_with_full_rescan_interval(interval: Duration) -> Arc<TaskBroker> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::DbBuilder::new("test", store)
+            .build()
+            .await
+            .expect("open in-memory db");
+        let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
+        TaskBroker::new(
+            "tg".to_string(),
+            db,
+            "shard".to_string(),
+            None,
+            ShardRange::full(),
+            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+            interval,
+        )
+    }
+
+    /// A scan that reads to the end of the range moves the floor to its
+    /// `now_ms`; a later scan starts there, so a row written below the floor
+    /// behind the broker's back is not read until the row is noted.
+    #[tokio::test]
+    async fn scan_starts_at_the_floor_and_a_note_lowers_it() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(
+            broker.scan_floor_ms(),
+            None,
+            "a new broker reads the whole range"
+        );
+
+        put_run_attempt(&broker, "head", now_ms - 10).await;
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+
+        put_run_attempt(&broker, "below", now_ms - 20).await;
+        assert_eq!(
+            scan(&broker, now_ms).await,
+            0,
+            "a row below the floor is not read"
+        );
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+
+        broker.note_task_written(now_ms - 20);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 20));
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(
+            broker.scan_floor_ms(),
+            Some(now_ms - 20),
+            "the note caps the floor of the scan that follows it"
+        );
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(broker.claim_ready(10).len(), 2);
+    }
+
+    /// A note never raises the floor.
+    #[tokio::test]
+    async fn note_only_lowers_the_floor() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+
+        broker.note_task_written(now_ms + 1_000);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+        broker.note_task_written(now_ms - 1_000);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 1_000));
+        broker.note_scheduled(now_ms - 2_000);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 2_000));
+    }
+
+    /// A scan that stops at its batch limit moves the floor only through the
+    /// rows it read; the next scan continues from there.
+    #[tokio::test]
+    async fn scan_stopping_at_the_batch_limit_moves_the_floor_through_the_rows_read() {
+        let broker = broker_with_scan_batch(2).await;
+        let now_ms = now_epoch_ms();
+        put_run_attempt(&broker, "a", now_ms - 30).await;
+        put_run_attempt(&broker, "b", now_ms - 20).await;
+        put_run_attempt(&broker, "c", now_ms - 10).await;
+
+        assert_eq!(scan(&broker, now_ms).await, 2);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 20));
+
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(broker.claim_ready(10).len(), 3);
+    }
+
+    /// The floor is inclusive: rows that share the floor's millisecond but
+    /// were not read by the scan that set it are read by the next one.
+    #[tokio::test]
+    async fn rows_sharing_the_floor_millisecond_are_read_again() {
+        let broker = broker_with_scan_batch(1).await;
+        let now_ms = now_epoch_ms();
+        put_run_attempt(&broker, "a", now_ms - 10).await;
+        put_run_attempt(&broker, "b", now_ms - 10).await;
+
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 10));
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.claim_ready(10).len(), 2);
+    }
+
+    /// A scan that stops at a future-dated row moves the floor to its
+    /// `now_ms`, below that row, so the row is read once it is due.
+    #[tokio::test]
+    async fn scan_stopping_at_a_future_row_moves_the_floor_to_now() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        let due_ms = now_ms + 5_000;
+        put_run_attempt(&broker, "future", due_ms).await;
+
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(scan(&broker, due_ms).await, 1);
+        assert_eq!(broker.scan_floor_ms(), Some(due_ms));
+    }
+
+    /// A scan that overlaps a note caps its floor at the noted time, since
+    /// its view may predate the noted row. The cap persists through the next
+    /// scan too (the row may still not have been visible to it) and is
+    /// dropped by a scan that no note overlapped.
+    #[tokio::test]
+    async fn note_during_a_scan_caps_the_floor() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(scan(&broker, now_ms).await, 0);
+
+        let (_, notes_before, _) = broker.begin_scan_cursor();
+        broker.note_task_written(now_ms - 500);
+        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, Some(now_ms));
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 500));
+
+        let (_, notes_before, _) = broker.begin_scan_cursor();
+        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, Some(now_ms));
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 500));
+
+        let (_, notes_before, _) = broker.begin_scan_cursor();
+        broker.record_scan_stop(ScanStop::EndOfRange, 0, notes_before, Some(now_ms));
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+    }
+
+    /// A row noted before a broker's first scan (its write may still be in
+    /// flight) caps that scan's floor, so the row is read once it lands.
+    #[tokio::test]
+    async fn note_before_the_first_scan_caps_its_floor() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        broker.note_task_written(now_ms - 500);
+        assert_eq!(broker.scan_floor_ms(), None);
+
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 500));
+
+        put_run_attempt(&broker, "landed", now_ms - 500).await;
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+    }
+
+    /// Releasing in-flight keys lowers the floor to their start times, so a
+    /// scan that moved past them while they were in flight is not final.
+    #[tokio::test]
+    async fn release_inflight_lowers_the_floor() {
+        let broker = empty_broker().await;
+        let now_ms = now_epoch_ms();
+        let key = put_run_attempt(&broker, "stranded", now_ms - 10).await;
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.claim_ready(1).len(), 1);
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+
+        broker.release_inflight(std::slice::from_ref(&key));
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms - 10));
+        assert_eq!(scan(&broker, now_ms).await, 1);
+    }
+
+    /// Once the full-rescan interval has passed, a scan ignores the floor and
+    /// reads the whole range, finding a row written below the floor behind
+    /// the broker's back.
+    #[tokio::test]
+    async fn full_rescan_clears_the_floor_on_schedule() {
+        let broker = broker_with_full_rescan_interval(Duration::from_millis(50)).await;
+        let now_ms = now_epoch_ms();
+        put_run_attempt(&broker, "head", now_ms - 10).await;
+        assert_eq!(scan(&broker, now_ms).await, 1);
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+
+        put_run_attempt(&broker, "below", now_ms - 20).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            scan(&broker, now_ms).await,
+            1,
+            "the full rescan reads below the floor"
+        );
+        assert_eq!(broker.scan_floor_ms(), Some(now_ms));
+
+        put_run_attempt(&broker, "below-again", now_ms - 30).await;
+        assert_eq!(
+            scan(&broker, now_ms).await,
+            0,
+            "within the interval the floor is honoured"
         );
     }
 }

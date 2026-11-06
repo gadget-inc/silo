@@ -511,6 +511,13 @@ pub fn task_group_prefix(task_group: &str) -> Vec<u8> {
     encode_with_prefix(prefix::TASK, &(task_group,))
 }
 
+/// Start key for scanning a task group's tasks whose `start_time_ms` is at
+/// least the given time: a prefix of every [`task_key`] in the group with that
+/// start time, sorting after every key with an earlier one.
+pub fn task_group_time_prefix(task_group: &str, start_time_ms: i64) -> Vec<u8> {
+    encode_with_prefix(prefix::TASK, &(task_group, start_time_ms.max(0) as u64))
+}
+
 /// Get the prefix for scanning all task groups.
 pub fn tasks_prefix() -> Vec<u8> {
     vec![prefix::TASK]

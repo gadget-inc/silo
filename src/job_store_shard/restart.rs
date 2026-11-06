@@ -212,7 +212,10 @@ impl JobStoreShard {
             return Err(e);
         }
 
-        // Commit the transaction
+        // Commit the transaction. The task row becomes visible to broker
+        // scans before the commit returns; lower the scan floor first so such
+        // a scan buffers it.
+        self.brokers.expect_task_written(&task_group, start_at_ms);
         match txn.commit().await {
             Ok(_) => dst_events::confirm_write(write_op),
             Err(e) => {

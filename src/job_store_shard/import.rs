@@ -337,6 +337,13 @@ impl JobStoreShard {
             None
         };
 
+        // A non-terminal import's task row becomes visible to broker scans
+        // before the commit is durable; lower the scan floor first so such a
+        // scan buffers it.
+        if !is_terminal {
+            self.brokers
+                .expect_task_written(&params.task_group, effective_start_at_ms);
+        }
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
@@ -830,6 +837,13 @@ impl JobStoreShard {
             None
         };
 
+        // A non-terminal reimport's task row becomes visible to broker scans
+        // before the commit is durable; lower the scan floor first so such a
+        // scan buffers it.
+        if !is_terminal {
+            self.brokers
+                .expect_task_written(&task_group, effective_start_at_ms);
+        }
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
