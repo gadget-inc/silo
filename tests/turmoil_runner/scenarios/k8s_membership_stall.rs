@@ -1,35 +1,46 @@
-//! K8s membership stall scenario: one Kubernetes call made by a healthy node
-//! hangs for longer than the membership lease TTL.
+//! K8s membership stall scenario: Kubernetes calls hang for longer than the
+//! membership lease TTL.
 //!
-//! This is what production saw several times a day: a pod stopped renewing its
-//! membership lease for one kube-rs watch period (290s) because a single API
-//! call never returned, while the pod itself stayed up and kept its shards.
+//! This is what production saw: a pod stopped renewing its membership lease
+//! for one kube-rs watch period (290s) because a single API call never
+//! returned, while the pod itself stayed up and kept its shards; and, on
+//! other days, the control plane stopped answering every pod at once for
+//! about 25s, so every lease went stale and every pod's listings failed
+//! until the moment the control plane answered again.
 //!
-//! The scenario runs the stall twice against the same three-node cluster, once
-//! per call the coordinator makes on a timer:
+//! The scenario runs three stalls against the same three-node cluster:
 //!
-//! 1. **renewal write**: the `replace_lease` that renews the membership lease
-//!    hangs. One call hangs and the next one would be answered normally.
-//! 2. **safety-reconcile list**: `list_leases` of the member leases hangs.
-//!    Every list the node starts inside the window hangs, which includes the
-//!    one the 5s safety reconcile makes.
+//! 1. **renewal write**: the `replace_lease` that renews one healthy node's
+//!    membership lease hangs. One call hangs and the next one would be
+//!    answered normally.
+//! 2. **safety-reconcile list**: `list_leases` of the member leases hangs on
+//!    one healthy node. Every list the node starts inside the window hangs,
+//!    which includes the one the 5s safety reconcile makes.
+//! 3. **fleet-wide**: every node's membership renewals (write and read) and
+//!    member lease listings hang at once, for longer than the TTL, so every
+//!    lease is stale by the time the calls are answered again. The listings
+//!    are answered first and the renewals two seconds later, the order
+//!    production's control plane recovered in, so every node lists every
+//!    lease stale before anyone has renewed.
 //!
 //! Each hung call sleeps for the stall and then returns successfully, the way
 //! the production call did. The hang lasts well past the lease TTL.
 //!
 //! What a stall must not do, and what the scenario asserts for each phase:
-//! - **membershipKept**: no healthy peer ever drops the stalled node from its
-//!   member list
-//! - **shardsServed**: every enqueue for one of the stalled node's shards, sent
-//!   to whichever node a healthy peer computes as the owner, is accepted. None
-//!   is answered `UNAVAILABLE` "shard not ready"
-//! - **faultInjected**: at least one call really did hang, so the phase cannot
-//!   pass without exercising the stall
+//! - **membershipKept**: no node ever drops a live node from its member list
+//! - **shardsServed**: every enqueue sent to whichever node a peer computes
+//!   as a shard's owner is accepted. None is answered `UNAVAILABLE` "shard
+//!   not ready"
+//! - **faultInjected**: the planted calls really did hang, so the phase
+//!   cannot pass without exercising the stall
 //!
-//! When the invariants fail the panic message carries the timeline: when the
-//! node was dropped, for how long, how many enqueues were refused, and whether
-//! the new computed owner sat in `Acquiring` behind the stalled node's
-//! permanent shard lease.
+//! and, for the fleet-wide stall, that no shard lease changes holder and no
+//! node reconciles on a membership change.
+//!
+//! When the invariants fail the panic message carries the timeline: when a
+//! node was dropped and by whom, for how long, how many enqueues were
+//! refused, and whether a new computed owner sat in `Acquiring` behind the
+//! stalled node's permanent shard lease.
 //!
 //! `DST_MEMBERSHIP_STALL_SECS` overrides the stall length (default 30s) to
 //! replay production's 290s.
@@ -38,7 +49,7 @@ use crate::helpers::{
     EnqueueRequest, HashMap, SerializedBytes, SiloClient, create_turmoil_client,
     dst_turmoilfs_database_template, get_seed, run_scenario_impl, serialized_bytes, turmoil,
 };
-use crate::mock_k8s::{K8sCall, MockK8sBackend, MockK8sState};
+use crate::mock_k8s::{K8sCall, MockK8sBackend, MockK8sState, StallWindow};
 use silo::cluster_client::ClientConfig;
 use silo::coordination::{Coordinator, K8sCoordinator, ShardPhase};
 use silo::factory::ShardFactory;
@@ -74,6 +85,11 @@ const DEFAULT_STALL: Duration = Duration::from_secs(30);
 /// How long a phase keeps observing after the stall ends, so a recovery is
 /// seen as well as an outage.
 const RECOVERY_WINDOW: Duration = Duration::from_secs(15);
+
+/// In the fleet-wide stall, how long after the listings are answered again
+/// the renewals are. Production's control plane answered the listings that
+/// dropped a pod about two seconds before that pod's renewal landed.
+const RENEWAL_LAG: Duration = Duration::from_secs(2);
 
 /// How often membership is sampled and the stalled node's shards are probed.
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
@@ -608,12 +624,250 @@ async fn run_phase(
     observation
 }
 
+/// What the fleet-wide stall observed.
+#[derive(Debug)]
+struct FleetStallObservation {
+    /// Calls that stalled, per node.
+    stalled_calls: Vec<u64>,
+    /// When a node's member list was missing a node: (observer, missing) to
+    /// the span it was missing for.
+    dropped: BTreeMap<(String, String), Span>,
+    /// Membership-change reconciles each node ran, in all.
+    reconciles: u64,
+    /// Whether any shard lease changed holder.
+    lease_moved: bool,
+    /// Whether any node's computed placement changed.
+    placement_changed: bool,
+    routed_probes: u32,
+    routed_accepted: u32,
+    not_ready: Option<Span>,
+    not_ready_count: u32,
+    other_errors: Vec<String>,
+}
+
+impl FleetStallObservation {
+    fn name() -> &'static str {
+        "fleet-wide renewals and listings"
+    }
+
+    fn describe(&self) -> String {
+        let span = |span: &Span| {
+            format!(
+                "from {:.1}s to {:.1}s after the stall began",
+                span.from.as_secs_f64(),
+                span.until.as_secs_f64()
+            )
+        };
+        let dropped: Vec<String> = self
+            .dropped
+            .iter()
+            .map(|((observer, missing), when)| {
+                format!("{observer} dropped {missing} {}", span(when))
+            })
+            .collect();
+        format!(
+            "[{}] calls stalled per node: {:?}; dropped: {}; reconciles on membership change: {}; \
+             shard leases moved: {}; placement changed: {}; \
+             routed enqueues: {} sent, {} accepted, {} refused \"shard not ready\" ({}); other errors: {:?}",
+            Self::name(),
+            self.stalled_calls,
+            if dropped.is_empty() {
+                "never".to_string()
+            } else {
+                dropped.join("; ")
+            },
+            self.reconciles,
+            self.lease_moved,
+            self.placement_changed,
+            self.routed_probes,
+            self.routed_accepted,
+            self.not_ready_count,
+            self.not_ready
+                .as_ref()
+                .map(span)
+                .unwrap_or("never".to_string()),
+            self.other_errors,
+        )
+    }
+
+    fn violations(&self) -> Vec<String> {
+        let mut violations = Vec::new();
+        if self.stalled_calls.iter().any(|&calls| calls == 0) {
+            violations.push("faultInjected: some node had no call stall".to_string());
+        }
+        if !self.dropped.is_empty() {
+            violations.push("membershipKept: a node dropped a live peer".to_string());
+        }
+        if self.reconciles > 0 {
+            violations.push(format!(
+                "noReconcile: {} membership-change reconciles ran",
+                self.reconciles
+            ));
+        }
+        if self.lease_moved || self.placement_changed {
+            violations.push("shardsStayed: a shard moved".to_string());
+        }
+        if self.routed_accepted != self.routed_probes {
+            violations.push(format!(
+                "shardsServed: {} of {} routed enqueues were not accepted",
+                self.routed_probes - self.routed_accepted,
+                self.routed_probes
+            ));
+        }
+        violations
+    }
+}
+
+/// Stall every node's renewals and listings at once and watch the cluster
+/// through it and its recovery.
+async fn run_fleet_stall_phase(
+    stall: Duration,
+    backends: &[MockK8sBackend],
+    registry: &NodeRegistry,
+    k8s_state: &MockK8sState,
+    prober: &mut Prober,
+) -> FleetStallObservation {
+    let (nodes, holders) = wait_for_settled_cluster(
+        registry,
+        k8s_state,
+        &format!("before {}", FleetStallObservation::name()),
+    )
+    .await;
+    let tenants = tenants_by_shard(&nodes[0]).await;
+    let placement = nodes[0]
+        .get_shard_owner_map()
+        .await
+        .expect("owner map")
+        .shard_to_node;
+    let reconciles_before: u64 = nodes
+        .iter()
+        .map(|node| node.membership_notify_count())
+        .sum();
+
+    // Plant the fault on every node and wait for each to walk into it.
+    let stalled_before: Vec<u64> = backends
+        .iter()
+        .map(|backend| backend.stalled_call_count())
+        .collect();
+    for backend in backends {
+        // One window per node, started by its first renewal to hang: its
+        // listings are answered `stall` later and its renewals after that.
+        let window = StallWindow::default();
+        backend.stall_calls_in_window(
+            &window,
+            K8sCall::ListLeases,
+            "silo.dev/type=member",
+            stall,
+            None,
+        );
+        for call in [K8sCall::ReplaceLease, K8sCall::GetLease] {
+            backend.stall_calls_in_window(&window, call, "-member-", stall + RENEWAL_LAG, None);
+        }
+    }
+    let plant_deadline = tokio::time::Instant::now() + STEP_DEADLINE;
+    while backends
+        .iter()
+        .zip(&stalled_before)
+        .any(|(backend, &before)| backend.stalled_call_count() == before)
+    {
+        assert!(
+            tokio::time::Instant::now() < plant_deadline,
+            "not every node had a call stall within {STEP_DEADLINE:?} of planting the fleet-wide stall"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stall_began = tokio::time::Instant::now();
+    tracing::info!(
+        phase = FleetStallObservation::name(),
+        stall_secs = stall.as_secs(),
+        "stall_began"
+    );
+
+    let mut observation = FleetStallObservation {
+        stalled_calls: Vec::new(),
+        dropped: BTreeMap::new(),
+        reconciles: 0,
+        lease_moved: false,
+        placement_changed: false,
+        routed_probes: 0,
+        routed_accepted: 0,
+        not_ready: None,
+        not_ready_count: 0,
+        other_errors: Vec::new(),
+    };
+
+    while stall_began.elapsed() < stall + RENEWAL_LAG + RECOVERY_WINDOW {
+        let at = stall_began.elapsed();
+
+        // Membership as every node sees it.
+        for observer in &nodes {
+            let members = observer.get_members().await.unwrap_or_default();
+            for node_num in 0..NUM_NODES {
+                let missing = node_id(node_num);
+                if !members.iter().any(|member| member.node_id == missing) {
+                    let mut span = observation
+                        .dropped
+                        .remove(&(observer.node_id().to_string(), missing.clone()));
+                    Span::extend(&mut span, at);
+                    if let Some(span) = span {
+                        observation
+                            .dropped
+                            .insert((observer.node_id().to_string(), missing), span);
+                    }
+                }
+            }
+        }
+
+        // Every shard, addressed to the owner a node computes for it.
+        if shard_holders(k8s_state).await != holders {
+            observation.lease_moved = true;
+        }
+        let owner_map = nodes[0].get_shard_owner_map().await.expect("owner map");
+        if owner_map.shard_to_node != placement {
+            observation.placement_changed = true;
+        }
+        for (shard_id, tenant) in &tenants {
+            let Some(owner) = owner_map.shard_to_node.get(shard_id) else {
+                observation
+                    .other_errors
+                    .push(format!("no computed owner for {shard_id}"));
+                continue;
+            };
+            let owner_num = node_num_of(owner).expect("node id");
+            observation.routed_probes += 1;
+            match prober.enqueue(owner_num, *shard_id, tenant).await {
+                ProbeOutcome::Accepted => observation.routed_accepted += 1,
+                ProbeOutcome::NotReady => {
+                    observation.not_ready_count += 1;
+                    Span::extend(&mut observation.not_ready, at);
+                }
+                ProbeOutcome::Other(error) => observation.other_errors.push(error),
+            }
+        }
+
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
+
+    observation.stalled_calls = backends
+        .iter()
+        .zip(&stalled_before)
+        .map(|(backend, &before)| backend.stalled_call_count() - before)
+        .collect();
+    observation.reconciles = nodes
+        .iter()
+        .map(|node| node.membership_notify_count())
+        .sum::<u64>()
+        - reconciles_before;
+    tracing::info!(summary = %observation.describe(), "stall_phase_done");
+    observation
+}
+
 pub fn run() {
     let seed = get_seed();
     let stall = stall_duration();
-    // Startup, then two phases of stall plus recovery, each preceded by a wait
-    // for the cluster to settle.
-    let sim_secs = 120 + 2 * (stall + RECOVERY_WINDOW + STEP_DEADLINE).as_secs();
+    // Startup, then three phases of stall plus recovery, each preceded by a
+    // wait for the cluster to settle.
+    let sim_secs = 120 + 3 * (stall + RECOVERY_WINDOW + STEP_DEADLINE).as_secs();
 
     run_scenario_impl("k8s_membership_stall", seed, sim_secs, |sim| {
         let k8s_state = MockK8sState::new();
@@ -646,33 +900,39 @@ pub fn run() {
         let stalled_backend = backends[STALLED_NODE as usize].clone();
         sim.client("controller", async move {
             let mut prober = Prober::new();
-            let mut observations = Vec::new();
+            let mut report = Vec::new();
+            let mut violations = Vec::new();
             for phase in [StallPhase::RenewalWrite, StallPhase::SafetyReconcileList] {
-                observations.push(
-                    run_phase(
-                        phase,
-                        stall,
-                        &stalled_backend,
-                        &registry,
-                        &k8s_state,
-                        &mut prober,
-                    )
-                    .await,
+                let observation = run_phase(
+                    phase,
+                    stall,
+                    &stalled_backend,
+                    &registry,
+                    &k8s_state,
+                    &mut prober,
+                )
+                .await;
+                report.push(observation.describe());
+                violations.extend(
+                    observation
+                        .violations()
+                        .into_iter()
+                        .map(|violation| format!("[{}] {violation}", phase.name())),
                 );
             }
+            let observation =
+                run_fleet_stall_phase(stall, &backends, &registry, &k8s_state, &mut prober).await;
+            report.push(observation.describe());
+            violations.extend(
+                observation
+                    .violations()
+                    .into_iter()
+                    .map(|violation| format!("[{}] {violation}", FleetStallObservation::name())),
+            );
 
-            let report: Vec<String> = observations.iter().map(|o| o.describe()).collect();
-            let violations: Vec<String> = observations
-                .iter()
-                .flat_map(|o| {
-                    o.violations()
-                        .into_iter()
-                        .map(|violation| format!("[{}] {violation}", o.phase.name()))
-                })
-                .collect();
             assert!(
                 violations.is_empty(),
-                "a {}s stall of one Kubernetes call cost a live node its membership \
+                "a {}s stall of Kubernetes calls cost a live node its membership \
                  (lease TTL {LEASE_DURATION_SECS}s).\nViolations:\n  {}\nObserved:\n  {}",
                 stall.as_secs(),
                 violations.join("\n  "),

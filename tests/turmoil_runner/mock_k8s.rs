@@ -1034,6 +1034,28 @@ struct CallFailure {
     remaining_calls: Option<u32>,
 }
 
+/// When a group of planted stalls began: the moment the first call of the
+/// group stalled, on the stalled node's clock. Stalls planted on one window
+/// measure their durations from the same moment, so hangs on different
+/// calls end together, or at chosen offsets from each other.
+#[derive(Clone, Default)]
+pub struct StallWindow(Arc<std::sync::Mutex<Option<tokio::time::Instant>>>);
+
+impl StallWindow {
+    /// When the window began, starting it now if no call has stalled yet.
+    fn started_at(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        *self.0.lock().unwrap().get_or_insert(now)
+    }
+
+    /// Whether the window began and `duration` has passed since.
+    fn is_over(&self, duration: Duration, now: tokio::time::Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .is_some_and(|started| started + duration <= now)
+    }
+}
+
 /// A planted hang: matching calls sleep until the stall's window ends and then
 /// run normally, like a request that is stuck and later answered.
 struct CallStall {
@@ -1041,13 +1063,14 @@ struct CallStall {
     /// Substring the lease name (get, replace) or label selector (list) must
     /// contain.
     target: String,
+    /// How long after the window began the stalled calls return.
     duration: Duration,
     /// How many more calls may join the stall. `None` is every matching call
     /// that starts inside the window.
     remaining_calls: Option<u32>,
-    /// When the stalled calls return. Set by the first call that stalls, on
-    /// that caller's clock, so the window starts when the fault first bites.
-    release_at: Option<tokio::time::Instant>,
+    /// When the stall began, shared with the stalls planted on the same
+    /// window. The first call to stall on any of them starts it.
+    window: StallWindow,
 }
 
 /// Wrapper around Arc<MockK8sState> that implements K8sBackend trait.
@@ -1089,12 +1112,27 @@ impl MockK8sBackend {
         duration: Duration,
         max_calls: Option<u32>,
     ) {
+        self.stall_calls_in_window(&StallWindow::default(), call, target, duration, max_calls);
+    }
+
+    /// As [`MockK8sBackend::stall_calls`], with `duration` measured from the
+    /// first call to stall on any stall planted on `window`, so that hangs
+    /// on several calls can be made to end together or a chosen interval
+    /// apart.
+    pub fn stall_calls_in_window(
+        &self,
+        window: &StallWindow,
+        call: K8sCall,
+        target: impl Into<String>,
+        duration: Duration,
+        max_calls: Option<u32>,
+    ) {
         self.stalls.lock().unwrap().push(CallStall {
             call,
             target: target.into(),
             duration,
             remaining_calls: max_calls,
-            release_at: None,
+            window: window.clone(),
         });
     }
 
@@ -1155,7 +1193,7 @@ impl MockK8sBackend {
         let release_at = {
             let mut stalls = self.stalls.lock().unwrap();
             let now = tokio::time::Instant::now();
-            stalls.retain(|stall| stall.release_at.is_none_or(|at| at > now));
+            stalls.retain(|stall| !stall.window.is_over(stall.duration, now));
             let Some(stall) = stalls.iter_mut().find(|stall| {
                 stall.call == call
                     && target.contains(&stall.target)
@@ -1166,7 +1204,7 @@ impl MockK8sBackend {
             if let Some(remaining) = stall.remaining_calls.as_mut() {
                 *remaining -= 1;
             }
-            *stall.release_at.get_or_insert(now + stall.duration)
+            stall.window.started_at(now) + stall.duration
         };
         self.stalled_calls.fetch_add(1, Ordering::SeqCst);
         trace!(?call, target, "mock: call stalled");

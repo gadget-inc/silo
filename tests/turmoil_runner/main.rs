@@ -21,6 +21,7 @@
 
 mod helpers;
 #[cfg(feature = "k8s")]
+#[allow(dead_code)]
 mod mock_k8s;
 mod scenarios;
 mod shard_ownership_tracker;

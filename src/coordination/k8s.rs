@@ -327,8 +327,9 @@ pub struct K8sCoordinator<B: K8sBackend> {
     cluster_prefix: String,
     lease_duration_secs: i32,
     shard_guards: Arc<Mutex<HashMap<ShardId, Arc<K8sShardGuard<B>>>>>,
-    /// Cache of active members, updated by the watcher
-    members_cache: Arc<Mutex<Vec<MemberInfo>>>,
+    /// The members as this node last listed them, with the record of its
+    /// own Kubernetes calls that deciding a member's expiry depends on.
+    members_cache: Arc<Mutex<MembersView>>,
     /// Notifier for membership changes (from watcher)
     membership_changed: Arc<Notify>,
     /// Notifier for shard map changes (from watcher)
@@ -342,6 +343,47 @@ pub struct K8sCoordinator<B: K8sBackend> {
     /// Per-shard notifiers for when a shard lease becomes available (holder released).
     /// Guards waiting to acquire a shard can subscribe to these instead of blind retrying.
     shard_available_notifiers: Arc<Mutex<HashMap<ShardId, Arc<Notify>>>>,
+}
+
+/// This node's view of the cluster's members.
+///
+/// A member whose lease has gone a TTL without a renewal is dropped only on
+/// evidence that is not explained by this node's own control-plane trouble,
+/// so the view also keeps the record of this node's own Kubernetes calls
+/// that [`K8sCoordinator::live_members`] decides by.
+struct MembersView {
+    /// The members as of the last listing that succeeded.
+    members: Vec<MemberInfo>,
+    /// When the current unbroken run of answered Kubernetes calls (member
+    /// lease listings and this node's own renewals) began. `None` after a
+    /// call failed, until the next one is answered.
+    calls_healthy_since: Option<tokio::time::Instant>,
+    /// Leases that were stale on the last listing and kept anyway, so that
+    /// keeping one is logged once rather than on every listing.
+    kept_stale: HashSet<String>,
+}
+
+impl MembersView {
+    fn new() -> Self {
+        Self {
+            members: Vec::new(),
+            calls_healthy_since: None,
+            kept_stale: HashSet::new(),
+        }
+    }
+
+    /// Record a call that was answered. Returns how long calls had been
+    /// answered without a failure before this one.
+    fn record_call_success(&mut self, now: tokio::time::Instant) -> Duration {
+        let since = *self.calls_healthy_since.get_or_insert(now);
+        now.saturating_duration_since(since)
+    }
+
+    /// Record a call that was not answered: it timed out, or the API server
+    /// could not be reached or could not serve it.
+    fn record_call_failure(&mut self) {
+        self.calls_healthy_since = None;
+    }
 }
 
 /// Convenience type alias for K8sCoordinator with the real Kubernetes backend.
@@ -409,7 +451,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         membership_renewer.create().await?;
         base.record_membership_renewal();
 
-        let members_cache = Arc::new(Mutex::new(Vec::new()));
+        let members_cache = Arc::new(Mutex::new(MembersView::new()));
         let membership_changed = Arc::new(Notify::new());
         let shard_map_changed = Arc::new(Notify::new());
         let shard_available_notifiers = Arc::new(Mutex::new(HashMap::new()));
@@ -886,6 +928,10 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                         Ok(()) => {
                             last_renewed = std::time::Instant::now();
                             self.base.record_membership_renewal();
+                            self.members_cache
+                                .lock()
+                                .await
+                                .record_call_success(tokio::time::Instant::now());
                             if elapsed >= slow_renewal {
                                 warn!(
                                     node_id = %self.base.node_id,
@@ -901,6 +947,13 @@ impl<B: K8sBackend> K8sCoordinator<B> {
                             // overtakes fails by design.
                             if *shutdown_rx.borrow() {
                                 break;
+                            }
+                            // A renewal the control plane could not serve
+                            // is this node's own trouble, and the member
+                            // leases it lists meanwhile may be stale for
+                            // the same reason.
+                            if e.is_transient() {
+                                self.members_cache.lock().await.record_call_failure();
                             }
                             warn!(
                                 node_id = %self.base.node_id,
@@ -978,11 +1031,34 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         }
     }
 
-    /// Refresh the members cache by listing all active member leases
+    /// Refresh the members cache by listing the member leases.
+    ///
+    /// A listing that fails is this node's own control-plane trouble: it is
+    /// recorded as such, and the cache keeps the members it had.
     async fn refresh_members_cache(&self) -> Result<(), CoordinationError> {
-        let members = self.list_active_members().await?;
+        let label_selector = format!(
+            "silo.dev/type=member,silo.dev/cluster={}",
+            self.cluster_prefix
+        );
+        let listing = with_k8s_timeout(
+            K8S_CALL_TIMEOUT,
+            "list member leases",
+            self.backend.list_leases(&self.namespace, &label_selector),
+        )
+        .await;
+
         let mut cache = self.members_cache.lock().await;
-        *cache = members;
+        let leases = match listing {
+            Ok(leases) => leases,
+            Err(e) => {
+                cache.record_call_failure();
+                return Err(e);
+            }
+        };
+        let calls_healthy_for = cache.record_call_success(tokio::time::Instant::now());
+        let (members, kept_stale) = self.live_members(leases, calls_healthy_for, &cache.kept_stale);
+        cache.members = members;
+        cache.kept_stale = kept_stale;
         Ok(())
     }
 
@@ -990,7 +1066,7 @@ impl<B: K8sBackend> K8sCoordinator<B> {
     /// This prevents lease renewals (which update renewTime but not membership)
     /// from triggering unnecessary reconciliation cycles.
     async fn notify_if_members_changed(&self) {
-        let current_members = self.members_cache.lock().await.clone();
+        let current_members = self.members_cache.lock().await.members.clone();
         let mut last = self.last_notified_members.lock().await;
         if *last != current_members {
             *last = current_members;
@@ -1004,41 +1080,62 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         }
     }
 
-    /// List all active (non-expired) members from K8s
-    async fn list_active_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
-        let label_selector = format!(
-            "silo.dev/type=member,silo.dev/cluster={}",
-            self.cluster_prefix
-        );
-
-        let lease_list = with_k8s_timeout(
-            K8S_CALL_TIMEOUT,
-            "list member leases",
-            self.backend.list_leases(&self.namespace, &label_selector),
-        )
-        .await?;
-
+    /// The members whose leases, as just listed, count as live.
+    ///
+    /// A lease whose renewTime is more than its leaseDurationSeconds old is
+    /// stale. A stale lease is evidence that its holder is gone only when
+    /// this node's own Kubernetes calls have been answered for at least that
+    /// TTL (`calls_healthy_for`): a control plane that was unreachable for
+    /// this node was likely unreachable for the holder too, and a listing
+    /// taken the moment it answers again shows the renewals the holder could
+    /// not make, not a holder that is gone. Until then the member is kept
+    /// and the next listing decides again, so a member that is really gone
+    /// is dropped one TTL after this node's calls recover. A deleted lease
+    /// is absent from the listing, so its member is gone at once.
+    ///
+    /// Returns the live members and the stale leases among them. Keeping a
+    /// stale lease is logged when it was not kept on the previous listing
+    /// (`previously_kept`).
+    fn live_members(
+        &self,
+        leases: Vec<Lease>,
+        calls_healthy_for: Duration,
+        previously_kept: &HashSet<String>,
+    ) -> (Vec<MemberInfo>, HashSet<String>) {
         let now = Utc::now();
         let mut members = Vec::new();
+        let mut kept_stale = HashSet::new();
 
-        for lease in lease_list {
+        for lease in leases {
             let spec = match &lease.spec {
                 Some(s) => s,
                 None => continue,
             };
 
-            // Check if lease is expired
-            let renew_time = spec
-                .renew_time
-                .as_ref()
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.0.to_rfc3339()).ok());
+            let renew_time = spec.renew_time.as_ref().map(|t| t.0);
             let duration_secs = spec.lease_duration_seconds.unwrap_or(10);
+            let lease_ttl = Duration::from_secs(duration_secs.max(0) as u64);
 
             if let Some(renew) = renew_time {
                 let expiry = renew + chrono::Duration::seconds(duration_secs as i64);
                 if now > expiry {
-                    // Lease is expired, skip this member
-                    continue;
+                    if calls_healthy_for >= lease_ttl {
+                        // Lease is expired, skip this member
+                        continue;
+                    }
+                    let lease_name = lease.metadata.name.clone().unwrap_or_default();
+                    if !previously_kept.contains(&lease_name) {
+                        let stale_for = (now - expiry).to_std().unwrap_or_default();
+                        info!(
+                            node_id = %self.base.node_id,
+                            member = %lease_name,
+                            stale_for_ms = stale_for.as_millis() as u64,
+                            lease_ttl_secs = duration_secs,
+                            calls_healthy_for_ms = calls_healthy_for.as_millis() as u64,
+                            "keeping a stale member lease: this node's own Kubernetes calls have not been answered for a full lease TTL"
+                        );
+                    }
+                    kept_stale.insert(lease_name);
                 }
             }
 
@@ -1052,15 +1149,12 @@ impl<B: K8sBackend> K8sCoordinator<B> {
         }
 
         members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        Ok(members)
+        (members, kept_stale)
     }
 
     async fn reconcile_shards(&self) -> Result<(), CoordinationError> {
         let started = std::time::Instant::now();
-        let members = {
-            let cache = self.members_cache.lock().await;
-            cache.clone()
-        };
+        let members = self.members_cache.lock().await.members.clone();
         let member_count = members.len();
 
         let guard_shard_ids: HashSet<ShardId> = {
@@ -1636,10 +1730,7 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
             self.membership_changed.notify_one();
 
             // Get full member info for ring-aware convergence check
-            let members = {
-                let cache = self.members_cache.lock().await;
-                cache.clone()
-            };
+            let members = self.members_cache.lock().await.members.clone();
             let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
             if members.is_empty() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1675,10 +1766,7 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
         }
 
         // Log diff on timeout
-        let members = {
-            let cache = self.members_cache.lock().await;
-            cache.clone()
-        };
+        let members = self.members_cache.lock().await.members.clone();
         let member_ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
         let shard_map = self.base.shard_map.lock().await;
         let shards: Vec<&crate::shard_range::ShardInfo> = shard_map.shards().iter().collect();
@@ -1702,8 +1790,7 @@ impl<B: K8sBackend> Coordinator for K8sCoordinator<B> {
     }
 
     async fn get_members(&self) -> Result<Vec<MemberInfo>, CoordinationError> {
-        let cache = self.members_cache.lock().await;
-        Ok(cache.clone())
+        Ok(self.members_cache.lock().await.members.clone())
     }
 
     async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
