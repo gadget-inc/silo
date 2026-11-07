@@ -78,9 +78,13 @@ async fn with_k8s_timeout<T>(
 /// resourceVersion.
 ///
 /// A renewal runs against a budget. Every call is bounded by the call
-/// timeout and by what is left of the budget, and a first attempt whose call
-/// times out with at least half a call timeout to spare is retried once, so a
-/// single slow Kubernetes call does not cost the renewal.
+/// timeout and by what is left of the budget, and a first attempt that fails
+/// transiently (a call that times out, a 5xx from the API server, or a
+/// connection that could not be made) with at least half a call timeout to
+/// spare is retried once, so a single slow or refused Kubernetes call does
+/// not cost the renewal. The retry writes against the copy the renewer
+/// holds: if the abandoned write landed after all, the CAS refuses the retry
+/// and the conflict path reads the lease back.
 pub struct MembershipLeaseRenewer<B: K8sBackend> {
     backend: B,
     namespace: String,
@@ -171,14 +175,13 @@ impl<B: K8sBackend> MembershipLeaseRenewer<B> {
             let result = self.renew_once(call_timeout, deadline).await;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match result {
-                Err(CoordinationError::Timeout { .. })
-                    if attempts == 1 && remaining >= call_timeout / 2 =>
-                {
+                Err(e) if e.is_transient() && attempts == 1 && remaining >= call_timeout / 2 => {
                     continue;
                 }
                 Err(e) => {
-                    // The write may have landed after it was abandoned, so
-                    // the copy here may be stale: read before the next write.
+                    // The write may have landed after it was abandoned or
+                    // refused, so the copy here may be stale: read before
+                    // the next write.
                     self.last_written = None;
                     return Renewal {
                         attempts,
@@ -847,8 +850,9 @@ impl<B: K8sBackend> K8sCoordinator<B> {
     /// therefore shares nothing with reconciliation: a slow reconcile cannot
     /// delay it. Each renewal is one Kubernetes write in the steady state,
     /// bounded well under the TTL and retried once within the renewal's
-    /// budget if it times out, so a slow call costs one attempt rather than
-    /// the renewal, and a renewal that fails leaves the next tick on schedule.
+    /// budget if it times out or the API server cannot serve it, so a slow
+    /// or refused call costs one attempt rather than the renewal, and a
+    /// renewal that fails leaves the next tick on schedule.
     async fn run_membership_renewal(
         &self,
         mut renewer: MembershipLeaseRenewer<B>,

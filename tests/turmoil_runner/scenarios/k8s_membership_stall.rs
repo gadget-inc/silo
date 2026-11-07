@@ -38,7 +38,7 @@ use crate::helpers::{
     EnqueueRequest, HashMap, SerializedBytes, SiloClient, create_turmoil_client,
     dst_turmoilfs_database_template, get_seed, run_scenario_impl, serialized_bytes, turmoil,
 };
-use crate::mock_k8s::{MockK8sBackend, MockK8sState, StalledCall};
+use crate::mock_k8s::{K8sCall, MockK8sBackend, MockK8sState};
 use silo::cluster_client::ClientConfig;
 use silo::coordination::{Coordinator, K8sCoordinator, ShardPhase};
 use silo::factory::ShardFactory;
@@ -127,13 +127,13 @@ impl StallPhase {
     fn plant(self, backend: &MockK8sBackend, stall: Duration) {
         match self {
             StallPhase::RenewalWrite => backend.stall_calls(
-                StalledCall::ReplaceLease,
+                K8sCall::ReplaceLease,
                 format!("-member-{}", node_id(STALLED_NODE)),
                 stall,
                 Some(1),
             ),
             StallPhase::SafetyReconcileList => {
-                backend.stall_calls(StalledCall::ListLeases, "silo.dev/type=member", stall, None)
+                backend.stall_calls(K8sCall::ListLeases, "silo.dev/type=member", stall, None)
             }
         }
     }
