@@ -61,7 +61,7 @@ pub use k8s::{K8sCoordinator, K8sCoordinatorConfig};
 #[cfg(feature = "k8s")]
 pub use k8s_backend::{
     ConfigMapWatchEvent, ConfigMapWatchStream, K8sBackend, KubeBackend, LeaseWatchEvent,
-    LeaseWatchStream,
+    LeaseWatchStream, map_kube_error,
 };
 pub use none::NoneCoordinator;
 
@@ -177,6 +177,11 @@ pub enum CoordinationError {
     /// taken effect.
     #[error("{call} timed out after {}ms", .limit.as_millis())]
     Timeout { call: &'static str, limit: Duration },
+    /// A call the backend could not serve just now: the API server answered
+    /// with a 5xx, or the connection to it could not be made or was lost.
+    /// Worth retrying; a write may still have taken effect.
+    #[error("backend unavailable: {0}")]
+    Unavailable(String),
     #[error("shutdown in progress")]
     ShuttingDown,
     #[error("not supported by this backend")]
@@ -193,6 +198,17 @@ pub enum CoordinationError {
     ShardPausedForSplit(ShardId),
     #[error("node does not own shard: {0}")]
     NotShardOwner(ShardId),
+}
+
+impl CoordinationError {
+    /// Whether the call that failed with this error may succeed if made
+    /// again right away: it timed out, or the backend was unavailable.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            CoordinationError::Timeout { .. } | CoordinationError::Unavailable(_)
+        )
+    }
 }
 
 /// Why a shard guard could not open its shard.

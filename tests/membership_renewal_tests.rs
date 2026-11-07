@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::coordination::v1::Lease;
-use mock_k8s::{MockK8sBackend, MockK8sState, StalledCall};
+use mock_k8s::{K8sCall, MockK8sBackend, MockK8sState, PlantedFailure};
 use silo::coordination::MemberInfo;
 use silo::coordination::k8s::MembershipLeaseRenewer;
+use silo::coordination::{CoordinationError, map_kube_error};
 
 const NAMESPACE: &str = "default";
 const CLUSTER_PREFIX: &str = "renewal-test";
@@ -112,7 +113,7 @@ async fn steady_state_renewal_writes_without_reading() {
     let mut node = Member::registered().await;
     let before = node.stored_lease().await;
     node.backend
-        .stall_calls(StalledCall::GetLease, node.renewer.lease_name(), HANG, None);
+        .stall_calls(K8sCall::GetLease, node.renewer.lease_name(), HANG, None);
 
     let renewal = node.renewer.renew(CALL_TIMEOUT, BUDGET).await;
 
@@ -157,7 +158,8 @@ async fn first_renewal_reads_a_lease_it_has_not_written() {
 
 /// Another client rewrote the lease without changing its holder, so the
 /// renewer's copy is stale. The conflicting write makes the renewal read the
-/// lease back and write again against its current resourceVersion.
+/// lease back and write again against its current resourceVersion, all
+/// within the one attempt: a conflict is not a retry.
 #[silo::test(start_paused = true)]
 async fn a_conflicting_write_is_recovered_by_reading_the_lease() {
     let mut node = Member::registered().await;
@@ -243,7 +245,7 @@ async fn a_timed_out_write_is_retried_once_within_the_budget() {
     let mut node = Member::registered().await;
     let before = node.stored_lease().await;
     node.backend.stall_calls(
-        StalledCall::ReplaceLease,
+        K8sCall::ReplaceLease,
         node.renewer.lease_name(),
         HANG,
         Some(1),
@@ -271,7 +273,7 @@ async fn two_timed_out_writes_fail_the_renewal() {
     let mut node = Member::registered().await;
     let before = node.stored_lease().await;
     node.backend.stall_calls(
-        StalledCall::ReplaceLease,
+        K8sCall::ReplaceLease,
         node.renewer.lease_name(),
         HANG,
         Some(2),
@@ -312,7 +314,7 @@ async fn two_timed_out_writes_fail_the_renewal() {
 async fn a_timeout_with_little_budget_left_is_not_retried() {
     let mut node = Member::registered().await;
     node.backend.stall_calls(
-        StalledCall::ReplaceLease,
+        K8sCall::ReplaceLease,
         node.renewer.lease_name(),
         HANG,
         Some(1),
@@ -324,6 +326,192 @@ async fn a_timeout_with_little_budget_left_is_not_retried() {
     renewal.result.expect_err("the renewal fails");
     assert_eq!(renewal.attempts, 1);
     assert_eq!(node.backend.stalled_call_count(), 1);
+}
+
+/// The API server refused the write with a 500. The renewal has budget to
+/// spare, so it writes again at once and the second write lands.
+#[silo::test(start_paused = true)]
+async fn a_write_refused_with_a_500_is_retried_once() {
+    let mut node = Member::registered().await;
+    let before = node.stored_lease().await;
+    node.backend.fail_calls(
+        K8sCall::ReplaceLease,
+        node.renewer.lease_name(),
+        PlantedFailure::HttpStatus(500),
+        Some(1),
+    );
+
+    let started = tokio::time::Instant::now();
+    let renewal = node.renewer.renew(CALL_TIMEOUT, BUDGET).await;
+
+    renewal.result.expect("the retry succeeds");
+    assert_eq!(renewal.attempts, 2);
+    assert_eq!(node.backend.failed_call_count(), 1);
+    assert!(
+        started.elapsed() < CALL_TIMEOUT / 2,
+        "the retry did not wait for anything: {:?}",
+        started.elapsed()
+    );
+    assert!(renew_time(&node.stored_lease().await) > renew_time(&before));
+}
+
+/// The write never reached the API server: the client's connection failed.
+/// That is as transient as a 500, and is retried the same way.
+#[silo::test(start_paused = true)]
+async fn a_write_lost_to_a_connection_error_is_retried_once() {
+    let mut node = Member::registered().await;
+    let before = node.stored_lease().await;
+    node.backend.fail_calls(
+        K8sCall::ReplaceLease,
+        node.renewer.lease_name(),
+        PlantedFailure::ConnectionError,
+        Some(1),
+    );
+
+    let renewal = node.renewer.renew(CALL_TIMEOUT, BUDGET).await;
+
+    renewal.result.expect("the retry succeeds");
+    assert_eq!(renewal.attempts, 2);
+    assert_eq!(node.backend.failed_call_count(), 1);
+    assert!(renew_time(&node.stored_lease().await) > renew_time(&before));
+}
+
+/// Both writes are refused with a 500. The renewal gives up after the retry,
+/// well inside its budget, and reports the error of the last attempt. The
+/// next renewal reads the lease back before writing, and succeeds.
+#[silo::test(start_paused = true)]
+async fn two_writes_refused_with_a_500_fail_the_renewal() {
+    let mut node = Member::registered().await;
+    let before = node.stored_lease().await;
+    node.backend.fail_calls(
+        K8sCall::ReplaceLease,
+        node.renewer.lease_name(),
+        PlantedFailure::HttpStatus(500),
+        Some(2),
+    );
+
+    let started = tokio::time::Instant::now();
+    let renewal = node.renewer.renew(CALL_TIMEOUT, BUDGET).await;
+
+    let error = renewal.result.expect_err("the renewal fails");
+    assert!(
+        matches!(error, CoordinationError::Unavailable(_)),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.to_string().contains("Internal error encountered"),
+        "the failure carries the API server's error text: {error}"
+    );
+    assert_eq!(renewal.attempts, 2);
+    assert_eq!(node.backend.failed_call_count(), 2);
+    assert!(
+        started.elapsed() < BUDGET,
+        "the renewal did not wait for anything: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        node.stored_lease().await.metadata.resource_version,
+        before.metadata.resource_version,
+        "neither write landed"
+    );
+
+    let next = node.renewer.renew(CALL_TIMEOUT, BUDGET).await;
+    next.result.expect("the next renewal succeeds");
+    assert_eq!(next.attempts, 1);
+    assert!(renew_time(&node.stored_lease().await) > renew_time(&before));
+}
+
+/// A write that is slow and then refused with a 500 is retried only while
+/// enough budget remains for the retry to be worth making: at least half a
+/// call timeout.
+#[silo::test(start_paused = true)]
+async fn a_500_with_little_budget_left_is_not_retried() {
+    let mut node = Member::registered().await;
+    // The write takes most of the budget before it is refused, so the 500
+    // arrives with less than half a call timeout to spare.
+    let tight_budget = CALL_TIMEOUT + CALL_TIMEOUT / 4;
+    node.backend.stall_calls(
+        K8sCall::ReplaceLease,
+        node.renewer.lease_name(),
+        tight_budget - CALL_TIMEOUT / 4,
+        Some(1),
+    );
+    node.backend.fail_calls(
+        K8sCall::ReplaceLease,
+        node.renewer.lease_name(),
+        PlantedFailure::HttpStatus(500),
+        Some(1),
+    );
+
+    let renewal = node.renewer.renew(CALL_TIMEOUT, tight_budget).await;
+
+    let error = renewal.result.expect_err("the renewal fails");
+    assert!(
+        matches!(error, CoordinationError::Unavailable(_)),
+        "unexpected error: {error}"
+    );
+    assert_eq!(renewal.attempts, 1);
+    assert_eq!(node.backend.failed_call_count(), 1);
+}
+
+/// A 403 is the API server's answer, not its trouble: the renewal fails on
+/// the first attempt and the next renewal reads the lease back.
+#[silo::test(start_paused = true)]
+async fn a_write_refused_with_a_403_is_not_retried() {
+    let mut node = Member::registered().await;
+    node.backend.fail_calls(
+        K8sCall::ReplaceLease,
+        node.renewer.lease_name(),
+        PlantedFailure::HttpStatus(403),
+        Some(1),
+    );
+
+    let renewal = node.renewer.renew(CALL_TIMEOUT, BUDGET).await;
+
+    let error = renewal.result.expect_err("the renewal fails");
+    assert!(
+        matches!(error, CoordinationError::BackendError(_)) && error.to_string().contains("403"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(renewal.attempts, 1);
+    assert_eq!(node.backend.failed_call_count(), 1);
+}
+
+/// What the real backend makes of the API server's replies and the client's
+/// own faults: a 5xx and a connection failure are transient, a 4xx is not.
+#[test]
+fn kube_errors_map_onto_transient_and_permanent_failures() {
+    let api_error = |code: u16| {
+        kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: format!("status {code}"),
+            reason: String::new(),
+            code,
+        })
+    };
+    for code in [500, 502, 503, 504] {
+        let mapped = map_kube_error(api_error(code));
+        assert!(
+            matches!(mapped, CoordinationError::Unavailable(_)) && mapped.is_transient(),
+            "HTTP {code} maps to {mapped:?}"
+        );
+    }
+    for code in [400, 401, 403, 404, 409, 410, 422, 429] {
+        let mapped = map_kube_error(api_error(code));
+        assert!(
+            matches!(mapped, CoordinationError::BackendError(_)) && !mapped.is_transient(),
+            "HTTP {code} maps to {mapped:?}"
+        );
+    }
+    let connection = map_kube_error(kube::Error::Service(Box::new(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "client error (SendRequest)",
+    ))));
+    assert!(
+        matches!(connection, CoordinationError::Unavailable(_)),
+        "a connection error maps to {connection:?}"
+    );
+    assert!(connection.to_string().contains("SendRequest"));
 }
 
 /// The renewal cadence, budget and call timeout all follow from the lease

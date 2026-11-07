@@ -21,7 +21,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use rand::Rng;
 use silo::coordination::{
     ConfigMapWatchEvent, ConfigMapWatchStream, CoordinationError, K8sBackend, LeaseWatchEvent,
-    LeaseWatchStream,
+    LeaseWatchStream, map_kube_error,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -981,28 +981,96 @@ fn match_configmap_labels(configmap: &StoredConfigMap, selector: Option<&str>) -
     true
 }
 
-/// A Kubernetes call that a test can make hang on one backend.
+/// A Kubernetes call that a test can make hang or fail on one backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StalledCall {
+pub enum K8sCall {
     GetLease,
     ReplaceLease,
     ListLeases,
 }
 
-/// A planted hang: matching calls sleep until the stall's window ends and then
-/// run normally, like a request that is stuck and later answered.
-struct CallStall {
-    call: StalledCall,
+/// How a planted failure answers a call: as the real backend reports the
+/// API server's reply or the client's own fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlantedFailure {
+    /// The API server answered with this HTTP status.
+    HttpStatus(u16),
+    /// The request could not be sent: the client's connection failed.
+    ConnectionError,
+}
+
+impl PlantedFailure {
+    fn error(self) -> CoordinationError {
+        let kube_error = match self {
+            PlantedFailure::HttpStatus(code) => kube::Error::Api(kube::core::ErrorResponse {
+                status: "Failure".to_string(),
+                message: match code {
+                    500 => {
+                        "rpc error: code = Internal desc = Internal error encountered.".to_string()
+                    }
+                    _ => format!("planted HTTP {code}"),
+                },
+                reason: String::new(),
+                code,
+            }),
+            PlantedFailure::ConnectionError => kube::Error::Service(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "client error (SendRequest)",
+            ))),
+        };
+        map_kube_error(kube_error)
+    }
+}
+
+/// A planted failure: matching calls fail with the planted error instead of
+/// running.
+struct CallFailure {
+    call: K8sCall,
     /// Substring the lease name (get, replace) or label selector (list) must
     /// contain.
     target: String,
+    failure: PlantedFailure,
+    /// How many more calls fail. `None` is every matching call.
+    remaining_calls: Option<u32>,
+}
+
+/// When a group of planted stalls began: the moment the first call of the
+/// group stalled, on the stalled node's clock. Stalls planted on one window
+/// measure their durations from the same moment, so hangs on different
+/// calls end together, or at chosen offsets from each other.
+#[derive(Clone, Default)]
+pub struct StallWindow(Arc<std::sync::Mutex<Option<tokio::time::Instant>>>);
+
+impl StallWindow {
+    /// When the window began, starting it now if no call has stalled yet.
+    fn started_at(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        *self.0.lock().unwrap().get_or_insert(now)
+    }
+
+    /// Whether the window began and `duration` has passed since.
+    fn is_over(&self, duration: Duration, now: tokio::time::Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .is_some_and(|started| started + duration <= now)
+    }
+}
+
+/// A planted hang: matching calls sleep until the stall's window ends and then
+/// run normally, like a request that is stuck and later answered.
+struct CallStall {
+    call: K8sCall,
+    /// Substring the lease name (get, replace) or label selector (list) must
+    /// contain.
+    target: String,
+    /// How long after the window began the stalled calls return.
     duration: Duration,
     /// How many more calls may join the stall. `None` is every matching call
     /// that starts inside the window.
     remaining_calls: Option<u32>,
-    /// When the stalled calls return. Set by the first call that stalls, on
-    /// that caller's clock, so the window starts when the fault first bites.
-    release_at: Option<tokio::time::Instant>,
+    /// When the stall began, shared with the stalls planted on the same
+    /// window. The first call to stall on any of them starts it.
+    window: StallWindow,
 }
 
 /// Wrapper around Arc<MockK8sState> that implements K8sBackend trait.
@@ -1016,6 +1084,8 @@ pub struct MockK8sBackend {
     pub state: Arc<MockK8sState>,
     stalls: Arc<std::sync::Mutex<Vec<CallStall>>>,
     stalled_calls: Arc<AtomicU64>,
+    failures: Arc<std::sync::Mutex<Vec<CallFailure>>>,
+    failed_calls: Arc<AtomicU64>,
 }
 
 impl MockK8sBackend {
@@ -1024,17 +1094,35 @@ impl MockK8sBackend {
             state,
             stalls: Arc::new(std::sync::Mutex::new(Vec::new())),
             stalled_calls: Arc::new(AtomicU64::new(0)),
+            failures: Arc::new(std::sync::Mutex::new(Vec::new())),
+            failed_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Make this backend's next matching calls hang for `duration`, measured
     /// from the first call that stalls. `target` is a substring of the lease
-    /// name for [`StalledCall::GetLease`] and [`StalledCall::ReplaceLease`],
-    /// and of the label selector for [`StalledCall::ListLeases`]. `max_calls` bounds how many calls stall;
-    /// `None` stalls every matching call that starts inside the window.
+    /// name for [`K8sCall::GetLease`] and [`K8sCall::ReplaceLease`], and of
+    /// the label selector for [`K8sCall::ListLeases`]. `max_calls` bounds how
+    /// many calls stall; `None` stalls every matching call that starts inside
+    /// the window.
     pub fn stall_calls(
         &self,
-        call: StalledCall,
+        call: K8sCall,
+        target: impl Into<String>,
+        duration: Duration,
+        max_calls: Option<u32>,
+    ) {
+        self.stall_calls_in_window(&StallWindow::default(), call, target, duration, max_calls);
+    }
+
+    /// As [`MockK8sBackend::stall_calls`], with `duration` measured from the
+    /// first call to stall on any stall planted on `window`, so that hangs
+    /// on several calls can be made to end together or a chosen interval
+    /// apart.
+    pub fn stall_calls_in_window(
+        &self,
+        window: &StallWindow,
+        call: K8sCall,
         target: impl Into<String>,
         duration: Duration,
         max_calls: Option<u32>,
@@ -1044,7 +1132,26 @@ impl MockK8sBackend {
             target: target.into(),
             duration,
             remaining_calls: max_calls,
-            release_at: None,
+            window: window.clone(),
+        });
+    }
+
+    /// Make this backend's next matching calls fail with `failure` instead
+    /// of running. `target` matches as for [`MockK8sBackend::stall_calls`].
+    /// `max_calls` bounds how many calls fail; `None` fails every matching
+    /// call. A call that both stalls and fails stalls first.
+    pub fn fail_calls(
+        &self,
+        call: K8sCall,
+        target: impl Into<String>,
+        failure: PlantedFailure,
+        max_calls: Option<u32>,
+    ) {
+        self.failures.lock().unwrap().push(CallFailure {
+            call,
+            target: target.into(),
+            failure,
+            remaining_calls: max_calls,
         });
     }
 
@@ -1054,12 +1161,39 @@ impl MockK8sBackend {
         self.stalled_calls.load(Ordering::SeqCst)
     }
 
+    /// How many calls on this backend have failed with a planted failure.
+    pub fn failed_call_count(&self) -> u64 {
+        self.failed_calls.load(Ordering::SeqCst)
+    }
+
+    /// Fail this call with a planted failure that matches it, if there is
+    /// one.
+    fn fail_if_planted(&self, call: K8sCall, target: &str) -> Result<(), CoordinationError> {
+        let failure = {
+            let mut failures = self.failures.lock().unwrap();
+            let Some(failure) = failures.iter_mut().find(|failure| {
+                failure.call == call
+                    && target.contains(&failure.target)
+                    && failure.remaining_calls != Some(0)
+            }) else {
+                return Ok(());
+            };
+            if let Some(remaining) = failure.remaining_calls.as_mut() {
+                *remaining -= 1;
+            }
+            failure.failure
+        };
+        self.failed_calls.fetch_add(1, Ordering::SeqCst);
+        trace!(?call, target, ?failure, "mock: call failed as planted");
+        Err(failure.error())
+    }
+
     /// Sleep through a planted stall that matches this call, if there is one.
-    async fn stall_if_planted(&self, call: StalledCall, target: &str) {
+    async fn stall_if_planted(&self, call: K8sCall, target: &str) {
         let release_at = {
             let mut stalls = self.stalls.lock().unwrap();
             let now = tokio::time::Instant::now();
-            stalls.retain(|stall| stall.release_at.is_none_or(|at| at > now));
+            stalls.retain(|stall| !stall.window.is_over(stall.duration, now));
             let Some(stall) = stalls.iter_mut().find(|stall| {
                 stall.call == call
                     && target.contains(&stall.target)
@@ -1070,7 +1204,7 @@ impl MockK8sBackend {
             if let Some(remaining) = stall.remaining_calls.as_mut() {
                 *remaining -= 1;
             }
-            *stall.release_at.get_or_insert(now + stall.duration)
+            stall.window.started_at(now) + stall.duration
         };
         self.stalled_calls.fetch_add(1, Ordering::SeqCst);
         trace!(?call, target, "mock: call stalled");
@@ -1086,7 +1220,8 @@ impl K8sBackend for MockK8sBackend {
         namespace: &str,
         name: &str,
     ) -> Result<Option<Lease>, CoordinationError> {
-        self.stall_if_planted(StalledCall::GetLease, name).await;
+        self.stall_if_planted(K8sCall::GetLease, name).await;
+        self.fail_if_planted(K8sCall::GetLease, name)?;
         let result = self.state.get_lease(namespace, name).await?;
         Ok(result.map(|stored| stored.lease))
     }
@@ -1106,7 +1241,8 @@ impl K8sBackend for MockK8sBackend {
         name: &str,
         lease: &Lease,
     ) -> Result<Lease, CoordinationError> {
-        self.stall_if_planted(StalledCall::ReplaceLease, name).await;
+        self.stall_if_planted(K8sCall::ReplaceLease, name).await;
+        self.fail_if_planted(K8sCall::ReplaceLease, name)?;
         let stored = self
             .state
             .replace_lease(namespace, name, lease.clone())
@@ -1119,8 +1255,9 @@ impl K8sBackend for MockK8sBackend {
         namespace: &str,
         label_selector: &str,
     ) -> Result<Vec<Lease>, CoordinationError> {
-        self.stall_if_planted(StalledCall::ListLeases, label_selector)
+        self.stall_if_planted(K8sCall::ListLeases, label_selector)
             .await;
+        self.fail_if_planted(K8sCall::ListLeases, label_selector)?;
         let selector = if label_selector.is_empty() {
             None
         } else {

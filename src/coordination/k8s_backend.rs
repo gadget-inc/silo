@@ -153,6 +153,26 @@ pub trait K8sBackend: Send + Sync + Clone + 'static {
     fn watch_configmap(&self, namespace: &str, name: &str) -> ConfigMapWatchStream;
 }
 
+/// Map a kube-rs error onto a [`CoordinationError`].
+///
+/// A 500, 502, 503 or 504 from the API server and a client-side connection
+/// failure (a request that could not be sent, or whose connection dropped)
+/// are [`CoordinationError::Unavailable`]: the call may succeed if made
+/// again. Every other error is a [`CoordinationError::BackendError`]
+/// carrying the error's text. Callers that give a 409 or 404 a meaning of
+/// its own match those before falling through to this.
+pub fn map_kube_error(error: kube::Error) -> CoordinationError {
+    match &error {
+        kube::Error::Api(response) if matches!(response.code, 500 | 502 | 503 | 504) => {
+            CoordinationError::Unavailable(error.to_string())
+        }
+        kube::Error::Service(_) | kube::Error::HyperError(_) => {
+            CoordinationError::Unavailable(error.to_string())
+        }
+        _ => CoordinationError::BackendError(error.to_string()),
+    }
+}
+
 /// Real Kubernetes backend using kube-rs client.
 #[derive(Clone)]
 pub struct KubeBackend {
@@ -185,7 +205,7 @@ impl K8sBackend for KubeBackend {
         match leases.get(name).await {
             Ok(lease) => Ok(Some(lease)),
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(map_kube_error(e)),
         }
     }
 
@@ -198,7 +218,7 @@ impl K8sBackend for KubeBackend {
         leases
             .create(&kube::api::PostParams::default(), lease)
             .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))
+            .map_err(map_kube_error)
     }
 
     async fn replace_lease(
@@ -219,7 +239,7 @@ impl K8sBackend for KubeBackend {
             Err(kube::Error::Api(e)) if e.code == 404 => {
                 Err(CoordinationError::NotFound(format!("lease {name}")))
             }
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(map_kube_error(e)),
         }
     }
 
@@ -230,10 +250,7 @@ impl K8sBackend for KubeBackend {
     ) -> Result<Vec<Lease>, CoordinationError> {
         let leases: kube::Api<Lease> = kube::Api::namespaced(self.client.clone(), namespace);
         let lp = kube::api::ListParams::default().labels(label_selector);
-        let list = leases
-            .list(&lp)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        let list = leases.list(&lp).await.map_err(map_kube_error)?;
         Ok(list.items)
     }
 
@@ -242,7 +259,7 @@ impl K8sBackend for KubeBackend {
         match leases.delete(name, &Default::default()).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()), // Already deleted
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(map_kube_error(e)),
         }
     }
 
@@ -260,7 +277,7 @@ impl K8sBackend for KubeBackend {
                 &kube::api::Patch::Apply(&lease_json),
             )
             .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))
+            .map_err(map_kube_error)
     }
 
     fn watch_leases(&self, namespace: &str, label_selector: &str) -> LeaseWatchStream {
@@ -295,7 +312,7 @@ impl K8sBackend for KubeBackend {
         match configmaps.get(name).await {
             Ok(cm) => Ok(Some(cm)),
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(map_kube_error(e)),
         }
     }
 
@@ -314,7 +331,7 @@ impl K8sBackend for KubeBackend {
             Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::BackendError(
                 "ConfigMap already exists (conflict)".into(),
             )),
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(map_kube_error(e)),
         }
     }
 
@@ -334,7 +351,7 @@ impl K8sBackend for KubeBackend {
             Err(kube::Error::Api(e)) if e.code == 409 => Err(CoordinationError::BackendError(
                 "CAS conflict: resourceVersion mismatch".into(),
             )),
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(map_kube_error(e)),
         }
     }
 
@@ -346,10 +363,7 @@ impl K8sBackend for KubeBackend {
         let configmaps: kube::Api<ConfigMap> =
             kube::Api::namespaced(self.client.clone(), namespace);
         let lp = kube::api::ListParams::default().labels(label_selector);
-        let list = configmaps
-            .list(&lp)
-            .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))?;
+        let list = configmaps.list(&lp).await.map_err(map_kube_error)?;
         Ok(list.items)
     }
 
@@ -359,7 +373,7 @@ impl K8sBackend for KubeBackend {
         match configmaps.delete(name, &Default::default()).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()), // Already deleted
-            Err(e) => Err(CoordinationError::BackendError(e.to_string())),
+            Err(e) => Err(map_kube_error(e)),
         }
     }
 
@@ -378,7 +392,7 @@ impl K8sBackend for KubeBackend {
                 &kube::api::Patch::Apply(&configmap_json),
             )
             .await
-            .map_err(|e| CoordinationError::BackendError(e.to_string()))
+            .map_err(map_kube_error)
     }
 
     fn watch_configmap(&self, namespace: &str, name: &str) -> ConfigMapWatchStream {
