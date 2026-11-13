@@ -349,7 +349,7 @@ pub(crate) async fn live_terminal_row_exists(
     job_id: &str,
     attempt: u32,
     start_times: &[i64],
-    exclude_keys: &[Vec<u8>],
+    exclude_keys: &[Bytes],
 ) -> Result<bool, slatedb::Error> {
     use crate::fb::silo::fb::TaskVariant;
 
@@ -365,7 +365,7 @@ pub(crate) async fn live_terminal_row_exists(
             .scan_with_options::<Vec<u8>, _>(prefix..end, &crate::scan_options())
             .await?;
         while let Some(kv) = iter.next().await? {
-            if exclude_keys.iter().any(|k| k.as_slice() == kv.key.as_ref()) {
+            if exclude_keys.contains(&kv.key) {
                 continue;
             }
             if let Ok(decoded) = crate::codec::decode_task_validated(kv.value.clone())

@@ -3,14 +3,18 @@
 use std::collections::HashSet;
 
 use slatedb::WriteBatch;
+use slatedb::bytes::Bytes;
 use slatedb::config::WriteOptions;
 
-use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_holder, encode_lease};
+use crate::codec::{
+    DecodedTask, decode_task, encode_attempt_parts, encode_holder, encode_lease_parts,
+    encode_run_attempt_lease,
+};
 use crate::concurrency::{ConcurrencyManager, append_request_edits};
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
-use crate::job_attempt::{AttemptStatus, JobAttempt, JobAttemptView};
+use crate::job_attempt::{AttemptStatus, JobAttemptView};
 use crate::job_store_shard::counters::BackgroundActionMetricTransition;
 use crate::job_store_shard::helpers::{
     DbWriteBatcher, decode_job_status_owned, live_terminal_row_exists, now_epoch_ms,
@@ -20,13 +24,11 @@ use crate::job_store_shard::{
     DequeueResult, JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
 };
 use crate::keys::{
-    ParsedTaskKey, attempt_key, concurrency_holder_key, job_info_key, job_status_key,
-    leased_task_key, parse_task_key,
+    ParsedTaskKeyRef, attempt_key, concurrency_holder_key, job_info_key, job_status_key,
+    leased_task_key, parse_task_key_ref,
 };
 use crate::shard_range::ShardRange;
-use crate::task::{
-    DEFAULT_LEASE_MS, HolderRecord, LeaseRecord, LeasedRefreshTask, LeasedTask, Task,
-};
+use crate::task::{DEFAULT_LEASE_MS, HolderRecord, LeasedRefreshTask, LeasedTask, Task};
 use crate::task_broker::{BrokerTask, TaskBrokerRegistry};
 
 /// Mutable accumulators for a single dequeue iteration.
@@ -34,8 +36,8 @@ use crate::task_broker::{BrokerTask, TaskBrokerRegistry};
 /// keeping handler signatures clean.
 struct DequeueIterationState {
     batch: WriteBatch,
-    release_keys: Vec<Vec<u8>>,
-    tombstone_keys: Vec<Vec<u8>>,
+    release_keys: Vec<Bytes>,
+    tombstone_keys: Vec<Bytes>,
     grants_to_rollback: Vec<(String, String, String)>,
     background_action_transitions: Vec<BackgroundActionMetricTransition>,
     leased_tasks_for_dst: Vec<(String, String, String)>,
@@ -101,9 +103,9 @@ impl DequeueIterationState {
         );
     }
 
-    fn ack_deleted(&mut self, key: &[u8]) {
-        self.release_keys.push(key.to_vec());
-        self.tombstone_keys.push(key.to_vec());
+    fn ack_deleted(&mut self, key: &Bytes) {
+        self.release_keys.push(key.clone());
+        self.tombstone_keys.push(key.clone());
     }
 }
 
@@ -156,7 +158,7 @@ impl Drop for ClaimedInflightGuard<'_> {
             if tasks.is_empty() {
                 return;
             }
-            let keys: Vec<Vec<u8>> = tasks.iter().map(|t| t.key.clone()).collect();
+            let keys: Vec<Bytes> = tasks.iter().map(|t| t.key.clone()).collect();
             tracing::warn!(
                 count = keys.len(),
                 "dequeue future dropped/panicked after claim; releasing in-flight tasks"
@@ -585,7 +587,8 @@ impl JobStoreShard {
         &self,
         batch: &mut WriteBatch,
         worker_id: &str,
-        task: &Task,
+        task: fb::RunAttempt<'_>,
+        lease_key: &[u8],
         task_id: &str,
         tenant: &str,
         job_id: &str,
@@ -596,15 +599,8 @@ impl JobStoreShard {
         job_metric_info: Option<&JobView>,
     ) -> Result<(Vec<u8>, Option<BackgroundActionMetricTransition>), JobStoreShardError> {
         // [SILO-DEQ-4] Create lease record
-        let lease_key = leased_task_key(task_id);
-        let record = LeaseRecord {
-            worker_id: worker_id.to_string(),
-            task: task.clone(),
-            expiry_ms,
-            started_at_ms: now_ms,
-        };
-        let leased_value = encode_lease(&record);
-        batch.put(&lease_key, &leased_value);
+        let leased_value = encode_run_attempt_lease(worker_id, task, expiry_ms, now_ms);
+        batch.put(lease_key, &leased_value);
 
         // [SILO-DEQ-6] Mark job as running
         let job_status = JobStatus::running(now_ms);
@@ -619,15 +615,14 @@ impl JobStoreShard {
             .await?;
 
         // [SILO-DEQ-5] Create attempt record
-        let attempt = JobAttempt {
-            job_id: job_id.to_string(),
+        let attempt_val = encode_attempt_parts(
+            job_id,
             attempt_number,
             relative_attempt_number,
-            task_id: task_id.to_string(),
-            started_at_ms: now_ms,
-            status: AttemptStatus::Running,
-        };
-        let attempt_val = encode_attempt(&attempt);
+            task_id,
+            now_ms,
+            &AttemptStatus::Running,
+        );
         let akey = attempt_key(tenant, job_id, attempt_number);
         batch.put(&akey, &attempt_val);
 
@@ -703,7 +698,7 @@ impl JobStoreShard {
     async fn handle_request_ticket(
         &self,
         state: &mut DequeueIterationState,
-        task_key: &[u8],
+        task_key: &Bytes,
         decoded: &DecodedTask,
         _shard_range: &ShardRange,
         _worker_id: &str,
@@ -790,7 +785,7 @@ impl JobStoreShard {
         // Duplicate-materialization guard: this ticket is a second grant
         // source for a chain that already materialized. Drop it WITHOUT
         // releasing holders, which the live chain owns under the same task id.
-        let parent = parse_task_key(task_key);
+        let parent = parse_task_key_ref(task_key);
         let parent_start_time_ms = parent
             .as_ref()
             .map(|p| p.start_time_ms as i64)
@@ -1021,7 +1016,7 @@ impl JobStoreShard {
                 crate::metrics::GrantPath::Scanned,
                 1,
             );
-            if let Some(parsed) = parse_task_key(task_key) {
+            if let Some(parsed) = parse_task_key_ref(task_key) {
                 let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
                 m.record_ready_to_start_latency_ms(self.name(), &req_task_group, latency_ms);
             }
@@ -1034,7 +1029,7 @@ impl JobStoreShard {
     async fn handle_check_rate_limit(
         &self,
         state: &mut DequeueIterationState,
-        task_key: &[u8],
+        task_key: &Bytes,
         decoded: &DecodedTask,
         now_ms: i64,
     ) -> Result<(), JobStoreShardError> {
@@ -1067,7 +1062,7 @@ impl JobStoreShard {
         // branches keep the parent's start_time (so the follow-up keeps its
         // broker-ordering position) and dodge the tombstone we just installed via
         // a fresh `epoch_ms` strictly past the parent's.
-        let parent = parse_task_key(task_key);
+        let parent = parse_task_key_ref(task_key);
         let parent_start_time_ms = parent
             .as_ref()
             .map(|p| p.start_time_ms as i64)
@@ -1347,7 +1342,7 @@ impl JobStoreShard {
         &self,
         state: &mut DequeueIterationState,
         refresh_out: &mut Vec<LeasedRefreshTask>,
-        task_key: &[u8],
+        task_key: &Bytes,
         decoded: &DecodedTask,
         worker_id: &str,
         expiry_ms: i64,
@@ -1360,13 +1355,8 @@ impl JobStoreShard {
         // Build lease from the task
         let lease_key = leased_task_key(task_id);
         let task = decoded.to_task()?;
-        let record = LeaseRecord {
-            worker_id: worker_id.to_string(),
-            task,
-            expiry_ms,
-            started_at_ms: 0, // not applicable for RefreshFloatingLimit tasks
-        };
-        let leased_value = encode_lease(&record);
+        // started_at_ms is not applicable for RefreshFloatingLimit tasks.
+        let leased_value = encode_lease_parts(worker_id, &task, expiry_ms, 0);
         state.batch.put(&lease_key, &leased_value);
         state.batch.delete(task_key);
 
@@ -1391,7 +1381,7 @@ impl JobStoreShard {
     async fn handle_run_attempt(
         &self,
         state: &mut DequeueIterationState,
-        task_key: &[u8],
+        task_key: &Bytes,
         decoded: &DecodedTask,
         worker_id: &str,
         now_ms: i64,
@@ -1468,6 +1458,7 @@ impl JobStoreShard {
         // duplicate-delivery dedup contains the case where the first copy did
         // arrive. Guard read/decode failures never turn into drops -- on any
         // uncertainty the dispatch delivers.
+        let lease_key = leased_task_key(task_id);
         let mut drop_source: Option<crate::metrics::LeaseOverwriteSource> = None;
         if state.leased_task_ids.contains(task_id) {
             tracing::warn!(
@@ -1481,7 +1472,7 @@ impl JobStoreShard {
             );
             drop_source = Some(crate::metrics::LeaseOverwriteSource::Batch);
         } else {
-            match self.db.get(&leased_task_key(task_id)).await {
+            match self.db.get(&lease_key).await {
                 Ok(Some(existing_bytes)) => match crate::codec::decode_lease(existing_bytes) {
                     Ok(existing) => {
                         let remaining_lease_ms = existing.expiry_ms() - now_ms;
@@ -1568,12 +1559,12 @@ impl JobStoreShard {
         // [SILO-DEQ-3] Delete task from task queue
         state.batch.delete(task_key);
 
-        let task = decoded.to_task()?;
         let (attempt_val, background_action_transition) = self
             .write_lease_and_attempt(
                 &mut state.batch,
                 worker_id,
-                &task,
+                ra,
+                &lease_key,
                 task_id,
                 tenant,
                 job_id,
@@ -1595,14 +1586,16 @@ impl JobStoreShard {
         state.ack_deleted(task_key);
 
         // Track for DST event emission after commit
-        state.leased_tasks_for_dst.push((
-            tenant.to_string(),
-            job_id.to_string(),
-            task_id.to_string(),
-        ));
+        if dst_events::ENABLED {
+            state.leased_tasks_for_dst.push((
+                tenant.to_string(),
+                job_id.to_string(),
+                task_id.to_string(),
+            ));
+        }
 
         // Record ready-to-start and leasable-to-start latency metrics
-        if let (Some(m), Some(parsed)) = (&self.metrics, parse_task_key(task_key)) {
+        if let (Some(m), Some(parsed)) = (&self.metrics, parse_task_key_ref(task_key)) {
             let latency_ms = (now_ms - parsed.start_time_ms as i64).max(0) as f64;
             m.record_ready_to_start_latency_ms(self.name(), decoded.task_group(), latency_ms);
             m.record_leasable_to_start_latency_ms(
@@ -1653,7 +1646,7 @@ impl JobStoreShard {
             };
 
             // Parse task key to extract timestamp for time cutoff
-            let Some(parsed_key) = crate::keys::parse_task_key(&kv.key) else {
+            let Some(parsed_key) = parse_task_key_ref(&kv.key) else {
                 continue;
             };
 
@@ -1684,7 +1677,7 @@ impl JobStoreShard {
 /// write time or later; `CheckRateLimit` keys may carry a back-dated
 /// `parent_epoch_ms + 1` via `rate_limit_retry_epoch_ms`, but those are never
 /// leased as `RunAttempt`.
-fn leasable_to_start_latency_ms(parsed: &ParsedTaskKey, now_ms: i64) -> f64 {
+fn leasable_to_start_latency_ms(parsed: &ParsedTaskKeyRef<'_>, now_ms: i64) -> f64 {
     let leasable_ms = parsed.start_time_ms.max(parsed.epoch_ms) as i64;
     (now_ms - leasable_ms).max(0) as f64
 }
@@ -1715,7 +1708,7 @@ mod claimed_inflight_guard_tests {
             held_queues: vec![],
             task_group: task_group.to_string(),
         };
-        let key = crate::keys::task_key(task_group, 1, 0, job_id, 1, 1);
+        let key = crate::keys::task_key(task_group, 1, 0, job_id, 1, 1).into();
         let decoded = decode_task_validated(encode_task(&task)).expect("decode task");
         BrokerTask { key, decoded }
     }
@@ -1805,14 +1798,14 @@ mod claimed_inflight_guard_tests {
 mod leasable_latency_tests {
     //! Unit tests for [`leasable_to_start_latency_ms`], pinning which task-key
     //! field the leasable moment is measured from for each key shape.
-    use crate::keys::ParsedTaskKey;
+    use crate::keys::ParsedTaskKeyRef;
 
-    fn parsed_key(start_time_ms: u64, epoch_ms: u64) -> ParsedTaskKey {
-        ParsedTaskKey {
-            task_group: "default".to_string(),
+    fn parsed_key(start_time_ms: u64, epoch_ms: u64) -> ParsedTaskKeyRef<'static> {
+        ParsedTaskKeyRef {
+            task_group: "default".into(),
             start_time_ms,
             priority: 0,
-            job_id: "job-1".to_string(),
+            job_id: "job-1".into(),
             attempt: 1,
             epoch_ms,
         }

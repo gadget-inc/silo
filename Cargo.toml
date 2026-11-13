@@ -173,6 +173,10 @@ harness = false
 name = "grant_latency"
 harness = false
 
+[[bench]]
+name = "alloc_counts"
+harness = false
+
 [[test]]
 name = "turmoil_runner"
 path = "tests/turmoil_runner/main.rs"

@@ -365,6 +365,11 @@ impl JobView {
         self.decoded.fb()
     }
 
+    /// The encoded `JOB_INFO` record this view reads.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.decoded.as_bytes()
+    }
+
     pub fn id(&self) -> &str {
         self.fb().id().unwrap_or_default()
     }
@@ -419,6 +424,16 @@ impl JobView {
     /// Return metadata as owned key/value string pairs
     pub fn metadata(&self) -> Vec<(String, String)> {
         fb_kv_pairs_to_owned(self.fb().metadata())
+    }
+
+    /// Iterate metadata key/value pairs borrowed from the record, in the same
+    /// order and with the same defaults as [`Self::metadata`].
+    pub fn metadata_iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.fb()
+            .metadata()
+            .into_iter()
+            .flatten()
+            .map(|kv| (kv.key().unwrap_or_default(), kv.value().unwrap_or_default()))
     }
 
     /// Return the ordered list of limits (concurrency, rate limits, and floating concurrency limits)

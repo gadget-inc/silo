@@ -5,15 +5,15 @@ use slatedb::{IsolationLevel, WriteBatch};
 use tracing::{debug, info_span};
 use uuid::Uuid;
 
-use crate::codec::{encode_job_info, encode_job_status};
+use crate::codec::{encode_job_info_parts, encode_job_status, encode_run_attempt};
 use crate::concurrency::{ConcurrencyManager, RequestTicketOutcome};
 use crate::dst_events::{self, DstEvent};
-use crate::job::{JobInfo, JobStatus, JobStatusKind, JobView, Limit, ListingSegment};
+use crate::job::{JobStatus, JobStatusKind, JobView, Limit, ListingSegment};
 use crate::job_store_shard::JobStoreShard;
 use crate::job_store_shard::JobStoreShardError;
 use crate::job_store_shard::counters::{
-    BackgroundActionMetricTransition, background_action_queue_counter_transition_is_relevant,
-    encode_counter,
+    BackgroundActionMetricTransition, background_action_metadata,
+    background_action_queue_counter_transition_is_relevant, encode_counter,
 };
 use crate::job_store_shard::helpers::{
     DbWriteBatcher, TxnWriter, WriteBatcher, decode_job_status_owned, now_epoch_ms, put_task,
@@ -22,7 +22,7 @@ use crate::job_store_shard::helpers::{
 use crate::keys::{
     MetadataIndexValue, StatusEnqueueTimeIndexValue, idx_enqueue_time_key, idx_metadata_key,
     idx_status_enqueue_time_key, idx_status_time_key, job_info_key, job_status_key,
-    status_index_timestamp, tenant_status_counter_key,
+    status_index_timestamp, task_key, tenant_status_counter_key,
 };
 use crate::metrics::FloatingWaiterProbeResult;
 use crate::retry::RetryPolicy;
@@ -301,9 +301,9 @@ impl JobStoreShard {
         metadata: Option<Vec<(String, String)>>,
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
+        let metadata = metadata.as_deref().unwrap_or_default();
         let mut batch = WriteBatch::new();
         let mut scheduled_refreshes = ScheduledRefreshes::default();
-        let background_action_metadata = metadata.clone().unwrap_or_default();
         let mut grant_guard = PendingEnqueueGrantGuard::new(&self.concurrency, tenant);
         let effective_start_at_ms = self
             .write_enqueue_data(
@@ -314,9 +314,9 @@ impl JobStoreShard {
                 job_id,
                 priority,
                 start_at_ms,
-                retry_policy,
-                payload,
-                limits,
+                retry_policy.as_ref(),
+                &payload,
+                &limits,
                 metadata,
                 task_group,
             )
@@ -332,7 +332,7 @@ impl JobStoreShard {
                 task_group,
                 None,
                 JobStatusKind::Scheduled,
-                &background_action_metadata,
+                metadata,
             );
             return Err(e);
         }
@@ -340,13 +340,15 @@ impl JobStoreShard {
         // Two-phase DST event: emit before write for correct causal ordering,
         // confirm after write succeeds, cancel if write fails.
         let write_op = dst_events::next_write_op();
-        dst_events::emit_pending(
-            DstEvent::JobEnqueued {
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-            },
-            write_op,
-        );
+        if dst_events::ENABLED {
+            dst_events::emit_pending(
+                DstEvent::JobEnqueued {
+                    tenant: tenant.to_string(),
+                    job_id: job_id.to_string(),
+                },
+                write_op,
+            );
+        }
 
         // The task row becomes visible to broker scans before the write is
         // durable; lower the scan floor first so such a scan buffers it.
@@ -370,7 +372,7 @@ impl JobStoreShard {
                 task_group,
                 None,
                 JobStatusKind::Scheduled,
-                &background_action_metadata,
+                metadata,
             );
             return Err(e.into());
         }
@@ -397,16 +399,18 @@ impl JobStoreShard {
         metadata: Option<Vec<(String, String)>>,
         task_group: &str,
     ) -> Result<String, JobStoreShardError> {
+        // Each attempt borrows the request's values; none is copied per retry.
+        let metadata = metadata.as_deref().unwrap_or_default();
         retry_on_txn_conflict("enqueue", || {
             self.enqueue_txn(
                 tenant,
                 &job_id,
                 priority,
                 start_at_ms,
-                retry_policy.clone(),
-                payload.clone(),
-                limits.clone(),
-                metadata.clone(),
+                retry_policy.as_ref(),
+                &payload,
+                &limits,
+                metadata,
                 task_group,
             )
         })
@@ -422,15 +426,14 @@ impl JobStoreShard {
         job_id: &str,
         priority: u8,
         start_at_ms: i64,
-        retry_policy: Option<RetryPolicy>,
-        payload: Vec<u8>,
-        limits: Vec<Limit>,
-        metadata: Option<Vec<(String, String)>>,
+        retry_policy: Option<&RetryPolicy>,
+        payload: &[u8],
+        limits: &[Limit],
+        metadata: &[(String, String)],
         task_group: &str,
     ) -> Result<(), JobStoreShardError> {
         // Start a transaction with SerializableSnapshot isolation for conflict detection
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
-        let background_action_metadata = metadata.clone().unwrap_or_default();
 
         // [SILO-ENQ-1] If caller provided an id, ensure it doesn't already exist
         let info_key = job_info_key(tenant, job_id);
@@ -465,7 +468,7 @@ impl JobStoreShard {
                 task_group,
                 None,
                 JobStatusKind::Scheduled,
-                &background_action_metadata,
+                metadata,
             );
             return Err(e);
         }
@@ -473,13 +476,15 @@ impl JobStoreShard {
         // Two-phase DST event: emit before commit for correct causal ordering,
         // confirm after commit succeeds, cancel if commit fails.
         let write_op = dst_events::next_write_op();
-        dst_events::emit_pending(
-            DstEvent::JobEnqueued {
-                tenant: tenant.to_string(),
-                job_id: job_id.to_string(),
-            },
-            write_op,
-        );
+        if dst_events::ENABLED {
+            dst_events::emit_pending(
+                DstEvent::JobEnqueued {
+                    tenant: tenant.to_string(),
+                    job_id: job_id.to_string(),
+                },
+                write_op,
+            );
+        }
 
         // Commit durable state — commit_with_options with await_durable:true blocks
         // until the WAL is flushed to object storage, so no separate flush is needed.
@@ -501,7 +506,7 @@ impl JobStoreShard {
                 task_group,
                 None,
                 JobStatusKind::Scheduled,
-                &background_action_metadata,
+                metadata,
             );
             return Err(e.into());
         }
@@ -534,25 +539,26 @@ impl JobStoreShard {
         job_id: &str,
         priority: u8,
         start_at_ms: i64,
-        retry_policy: Option<RetryPolicy>,
-        payload: Vec<u8>,
-        limits: Vec<Limit>,
-        metadata: Option<Vec<(String, String)>>,
+        retry_policy: Option<&RetryPolicy>,
+        payload: &[u8],
+        limits: &[Limit],
+        metadata: &[(String, String)],
         task_group: &str,
     ) -> Result<i64, JobStoreShardError> {
         let now_ms = now_epoch_ms();
 
-        let job = JobInfo {
-            id: job_id.to_string(),
+        // The job's enqueue time is the caller's raw `start_at_ms`.
+        let enqueue_time_ms = start_at_ms;
+        let job_value = encode_job_info_parts(
+            job_id,
             priority,
-            enqueue_time_ms: start_at_ms,
+            enqueue_time_ms,
             payload,
             retry_policy,
-            metadata: metadata.unwrap_or_default(),
+            metadata,
             limits,
-            task_group: task_group.to_string(),
-        };
-        let job_value = encode_job_info(&job);
+            task_group,
+        );
 
         let first_task_id = Uuid::new_v4().to_string();
         let effective_start_at_ms = if start_at_ms <= 0 {
@@ -563,18 +569,18 @@ impl JobStoreShard {
 
         // [SILO-ENQ-2] Create job with status Scheduled, with next attempt time
         let mut job_status = JobStatus::scheduled(now_ms, effective_start_at_ms, 1);
-        job_status.enqueue_time_ms = Some(job.enqueue_time_ms);
-        job_status.priority = Some(job.priority);
+        job_status.enqueue_time_ms = Some(enqueue_time_ms);
+        job_status.priority = Some(priority);
         let job_status_kind = job_status.kind;
 
         writer.put(job_info_key(tenant, job_id), &job_value)?;
         writer.put(idx_enqueue_time_key(tenant, start_at_ms, job_id), [])?;
 
         // Maintain metadata secondary index
-        let metadata_value = MetadataIndexValue::new(job.enqueue_time_ms).encode();
-        for (mk, mv) in &job.metadata {
+        let metadata_value = MetadataIndexValue::new(enqueue_time_ms).encode();
+        for (mk, mv) in metadata {
             let mkey = idx_metadata_key(tenant, mk, mv, job_id);
-            writer.put(&mkey, &metadata_value)?;
+            writer.put(&mkey, metadata_value)?;
         }
 
         Self::write_job_status_with_index_and_metadata(writer, tenant, job_id, job_status)?;
@@ -589,7 +595,7 @@ impl JobStoreShard {
                 attempt_number: 1,
                 relative_attempt_number: 1,
                 limit_index: 0,
-                limits: &job.limits,
+                limits,
                 priority,
                 // Fresh enqueue: the task_key starts at the job's schedule. If
                 // the job is future-scheduled (`start_at_ms > now_ms`) the
@@ -616,7 +622,7 @@ impl JobStoreShard {
             task_group,
             None,
             job_status_kind,
-            &job.metadata,
+            metadata,
         );
         Ok(effective_start_at_ms)
     }
@@ -775,23 +781,24 @@ impl JobStoreShard {
         loop {
             if current_index >= limits.len() {
                 // No more limits - enqueue RunAttempt
-                let run_task = Task::RunAttempt {
-                    id: current_task_id,
-                    tenant: tenant.to_string(),
-                    job_id: job_id.to_string(),
-                    attempt_number,
-                    relative_attempt_number,
-                    held_queues: current_held_queues,
-                    task_group: task_group.to_string(),
-                };
-                put_task(
-                    writer,
-                    task_group,
-                    scheduled_at_ms,
-                    priority,
+                let run_task = encode_run_attempt(
+                    &current_task_id,
+                    tenant,
                     job_id,
                     attempt_number,
-                    task_key_epoch_ms,
+                    relative_attempt_number,
+                    &current_held_queues,
+                    task_group,
+                );
+                writer.put(
+                    task_key(
+                        task_group,
+                        scheduled_at_ms,
+                        priority,
+                        job_id,
+                        attempt_number,
+                        task_key_epoch_ms,
+                    ),
                     &run_task,
                 )?;
                 return Ok(Some(scheduled_at_ms));
@@ -1099,34 +1106,35 @@ impl JobStoreShard {
             ))?;
         }
 
-        let derived_metric_info: Option<(String, Vec<(String, String)>)> =
-            if needs_background_action_counters {
-                job_view.map(|view| (view.task_group().to_string(), view.metadata()))
-            } else {
-                None
-            };
-        let background_action_transition =
-            derived_metric_info.as_ref().map(|(task_group, metadata)| {
-                BackgroundActionMetricTransition {
-                    tenant: tenant.to_string(),
-                    task_group: task_group.clone(),
-                    old_status: old_kind,
-                    new_status: new_kind,
-                    metadata: metadata.clone(),
-                }
+        let background_action_transition = job_view
+            .filter(|_| needs_background_action_counters)
+            .map(|view| BackgroundActionMetricTransition {
+                tenant: tenant.to_string(),
+                task_group: view.task_group().to_string(),
+                old_status: old_kind,
+                new_status: new_kind,
+                metadata: background_action_metadata(view.metadata_iter()),
             });
-        if let Some((task_group, metadata)) = derived_metric_info.as_ref() {
+        if let Some(transition) = &background_action_transition {
             self.apply_background_action_queue_counter_transition(
-                tenant, task_group, old_kind, new_kind, metadata,
+                tenant,
+                &transition.task_group,
+                old_kind,
+                new_kind,
+                &transition.metadata,
             );
         }
 
         if let Err(e) = Self::write_job_status_with_index_opts_and_metadata(
             writer, tenant, job_id, new_status, expire_ts,
         ) {
-            if let Some((task_group, metadata)) = derived_metric_info.as_ref() {
+            if let Some(transition) = &background_action_transition {
                 self.rollback_background_action_queue_counter_transition(
-                    tenant, task_group, old_kind, new_kind, metadata,
+                    tenant,
+                    &transition.task_group,
+                    old_kind,
+                    new_kind,
+                    &transition.metadata,
                 );
             }
             return Err(e);
@@ -1184,8 +1192,8 @@ impl JobStoreShard {
             );
             let entry_value = StatusEnqueueTimeIndexValue::for_status(&new_status).encode();
             match expire_ts {
-                Some(ets) => writer.put_with_expire(&entry_key, &entry_value, ets)?,
-                None => writer.put(&entry_key, &entry_value)?,
+                Some(ets) => writer.put_with_expire(&entry_key, entry_value, ets)?,
+                None => writer.put(&entry_key, entry_value)?,
             }
         }
 
