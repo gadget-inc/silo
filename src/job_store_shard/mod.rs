@@ -246,7 +246,7 @@ pub struct DequeueResult {
 
 /// Represents a single shard of the system. Owns the SlateDB instance.
 /// Test-only hook awaited by the enqueue chain between a floating limit's
-/// immediate grant and its waiter scan. See
+/// immediate grant and its waiter probe. See
 /// `JobStoreShard::set_floating_waiter_scan_hook_for_test`.
 pub type FloatingWaiterScanHook =
     Arc<dyn Fn() -> BoxFuture<'static, Result<(), JobStoreShardError>> + Send + Sync>;
@@ -279,7 +279,7 @@ pub struct JobStoreShard {
     /// Cursor and candidate state the orphan sweep carries between ticks.
     orphan_sweep: std::sync::Mutex<orphan_sweep::OrphanSweepPass>,
     /// Test-only hook the enqueue chain awaits before a floating limit's
-    /// waiter scan. See `set_floating_waiter_scan_hook_for_test`.
+    /// waiter probe. See `set_floating_waiter_scan_hook_for_test`.
     floating_waiter_scan_hook_for_test: std::sync::Mutex<Option<FloatingWaiterScanHook>>,
     /// Cancellation token for background tasks like cleanup.
     /// Signaled when the shard is closing.
@@ -1622,10 +1622,10 @@ impl JobStoreShard {
     }
 
     /// Test-only: install or clear a hook the enqueue chain awaits after a
-    /// floating limit's immediate grant and before its waiter scan. The hook
+    /// floating limit's immediate grant and before its waiter probe. The hook
     /// runs with the in-memory reservation held and nothing durable written,
-    /// which is the window a failing or abandoned scan sits in; an `Err` it
-    /// returns surfaces as the scan's error.
+    /// which is the window a failing or abandoned probe sits in; an `Err` it
+    /// returns surfaces as the probe's error.
     #[doc(hidden)]
     pub fn set_floating_waiter_scan_hook_for_test(&self, hook: Option<FloatingWaiterScanHook>) {
         *self

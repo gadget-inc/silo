@@ -10,11 +10,13 @@ use crate::codec::{
     encode_refresh_index_row,
 };
 use crate::job::{FloatingConcurrencyLimit, FloatingLimitState, JobView};
+use crate::job_store_shard::counters::decode_counter;
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, ScheduledRefreshes};
 use crate::keys::{
-    concurrency_request_prefix, end_bound, floating_limit_state_key, job_info_key, leased_task_key,
-    parse_refresh_task_key, refresh_task_group_prefix, refresh_task_key, refresh_tasks_prefix,
+    concurrency_request_prefix, concurrency_requester_counter_key, end_bound,
+    floating_limit_state_key, job_info_key, leased_task_key, parse_refresh_task_key,
+    refresh_task_group_prefix, refresh_task_key, refresh_tasks_prefix,
 };
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, Task};
 
@@ -327,15 +329,42 @@ impl JobStoreShard {
         !in_backoff
     }
 
+    /// Whether a request is waiting on `(tenant, queue_key)`, answered by one
+    /// point read of the queue's durable requester counter. The counter is
+    /// merged in the batch that writes or deletes each request row, so the
+    /// answer costs the same however many deleted rows the request range
+    /// still holds. A request row in an uncommitted batch is not counted;
+    /// a caller holding one supplies that waiter signal itself.
+    ///
+    /// The answer is as good as the counter, which can drift from the rows
+    /// until `recount_requester_counter` re-derives it on the counter
+    /// reconciliation cadence:
+    ///
+    /// - Positive with no live request: the queue reads as waited on, so a
+    ///   refresh is scheduled once per refresh interval for a queue nobody
+    ///   waits on. The extra work is bounded by the refresh rate.
+    /// - Zero or negative with live requests: the queue reads as idle, so a
+    ///   non-waiter enqueue schedules no refresh and a failed refresh
+    ///   schedules no retry. The queue's limit is still refreshed by the
+    ///   triggers that judge by a request of their own or by the rows: an
+    ///   enqueue or `RequestTicket` that lands as a waiter, and the grant
+    ///   scanner's at-capacity pass, which reads the head request row
+    ///   (`schedule_floating_refresh_from_scanner`). Scanner passes over a
+    ///   saturated queue come from release and ticket nudges and from the
+    ///   periodic requester sweep; the sweep seeds only queues whose counter
+    ///   is positive, so a saturated queue that no job joins and no holder
+    ///   leaves waits for the recount.
     pub(crate) async fn has_waiting_concurrency_requests(
         &self,
         tenant: &str,
         queue_key: &str,
     ) -> Result<bool, JobStoreShardError> {
-        let start = concurrency_request_prefix(tenant, queue_key);
-        let end = end_bound(&start);
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        Ok(iter.next().await?.is_some())
+        let counter_key = concurrency_requester_counter_key(tenant, queue_key);
+        let waiting = match self.db.get(&counter_key).await? {
+            Some(raw) => decode_counter(&raw),
+            None => 0,
+        };
+        Ok(waiting > 0)
     }
 
     /// Task group of the head waiting request on `(tenant, queue_key)`, the
