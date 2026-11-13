@@ -24,6 +24,7 @@ use crate::keys::{
     idx_status_enqueue_time_key, idx_status_time_key, job_info_key, job_status_key,
     status_index_timestamp, tenant_status_counter_key,
 };
+use crate::metrics::FloatingWaiterProbeResult;
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
 
@@ -910,7 +911,7 @@ impl JobStoreShard {
 
                     // The in-memory reservation `handle_enqueue` made is
                     // recorded in `grants` before any further await, so an
-                    // error or cancellation during the waiter scan below is
+                    // error or cancellation during the waiter probe below is
                     // rolled back or reconciled like any other chain exit.
                     let mut has_waiters =
                         matches!(outcome, Some(RequestTicketOutcome::TicketRequested { .. }));
@@ -925,12 +926,22 @@ impl JobStoreShard {
                     );
 
                     if refresh_ready && !has_waiters {
-                        if let Some(hook) = self.floating_waiter_scan_hook_for_test() {
-                            hook().await?;
+                        let probed = async {
+                            if let Some(hook) = self.floating_waiter_scan_hook_for_test() {
+                                hook().await?;
+                            }
+                            self.has_waiting_concurrency_requests(tenant, &fl.key).await
                         }
-                        has_waiters = self
-                            .has_waiting_concurrency_requests(tenant, &fl.key)
-                            .await?;
+                        .await;
+                        if let Some(m) = &self.metrics {
+                            let result = match &probed {
+                                Ok(true) => FloatingWaiterProbeResult::Waiters,
+                                Ok(false) => FloatingWaiterProbeResult::None,
+                                Err(_) => FloatingWaiterProbeResult::Error,
+                            };
+                            m.record_floating_waiter_probe(&self.name, result);
+                        }
+                        has_waiters = probed?;
                     }
                     if refresh_ready
                         && self.maybe_schedule_floating_limit_refresh(

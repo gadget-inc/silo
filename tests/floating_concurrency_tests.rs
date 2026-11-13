@@ -3922,3 +3922,426 @@ async fn floating_limit_new_queue_scheduled_in_one_batch_keeps_its_flag() {
     );
     assert_eq!(read_refresh_reset_total(&metrics), 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// The waiter probe reads the requester counter
+// ---------------------------------------------------------------------------
+
+/// Enqueue a job on `queue` that starts an hour from now. Its enqueue writes
+/// a `RequestTicket` task and no request row, so it reaches the waiter probe
+/// as a non-waiter whether or not the queue has a free slot.
+async fn enqueue_floating_starting_later(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    tag: u32,
+) {
+    shard
+        .enqueue(
+            "-",
+            Some(format!("{queue}-later-{tag}")),
+            10u8,
+            now_ms() + 3_600_000,
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"later": tag})),
+            vec![floating_limit(queue, REFRESH_INTERVAL_MS)],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue later-starting floating job");
+}
+
+/// Overwrite the durable requester counter for `queue` with `value`,
+/// leaving the request rows as they are.
+async fn write_requester_counter(
+    shard: &silo::job_store_shard::JobStoreShard,
+    queue: &str,
+    value: i64,
+) {
+    shard
+        .db()
+        .put(
+            &silo::keys::concurrency_requester_counter_key("-", queue),
+            value.to_le_bytes(),
+        )
+        .await
+        .expect("put requester counter");
+    assert_eq!(
+        shard
+            .get_concurrency_requester_count("-", queue)
+            .await
+            .expect("read requester counter"),
+        value
+    );
+}
+
+fn read_waiter_probes(metrics: &silo::metrics::Metrics, result: &str) -> f64 {
+    metric_value_or_zero(
+        &gather_metrics_text(metrics),
+        &[
+            "silo_floating_waiter_probes_total",
+            &format!("result=\"{result}\""),
+        ],
+    )
+}
+
+/// Scan requests SlateDB has served for the shard since it opened.
+fn read_slatedb_scan_requests(
+    shard: &silo::job_store_shard::JobStoreShard,
+    metrics: &silo::metrics::Metrics,
+) -> f64 {
+    metrics.update_slatedb_stats("test", shard.slatedb_metrics_recorder());
+    metric_value_or_zero(
+        &gather_metrics_text(metrics),
+        &["silo_slatedb_scan_requests_total", "shard=\"test\""],
+    )
+}
+
+const DRAINED_BACKLOG_JOBS: u32 = 2_000;
+
+/// Wait until SlateDB's scan request count for the shard holds still across
+/// a short pause, so a scan started by an earlier write has finished.
+async fn wait_for_scans_to_settle(
+    shard: &silo::job_store_shard::JobStoreShard,
+    metrics: &silo::metrics::Metrics,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let before = read_slatedb_scan_requests(shard, metrics);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if read_slatedb_scan_requests(shard, metrics) == before {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background scans never paused"
+        );
+    }
+}
+
+/// A backlog of requests is granted off a floating queue, leaving their
+/// deleted request rows in the LSM and no live one. A later enqueue that is
+/// granted immediately, with the refresh due, answers "is anyone waiting?"
+/// without opening a scan.
+///
+/// SlateDB's scan request count covers the whole shard, and the task
+/// broker scans on a timer and after each enqueue's wake. Each sample
+/// starts once those scans have settled, and a background scan can only
+/// add to a sample: a probe that scans shows in every sample, and one
+/// sample with no scan at all shows the probe opens none.
+#[silo::test]
+async fn floating_limit_waiter_probe_opens_no_scan_after_a_drained_backlog() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let queue = "fl-probe-cost-q";
+
+    // j1 holds the single slot and every later job waits behind it.
+    enqueue_floating(&shard, queue, 1).await;
+    let waiters: Vec<u32> = (2..=DRAINED_BACKLOG_JOBS).collect();
+    for chunk in waiters.chunks(250) {
+        futures::future::join_all(
+            chunk
+                .iter()
+                .map(|&tag| enqueue_floating(&shard, queue, tag)),
+        )
+        .await;
+    }
+    assert_eq!(
+        shard
+            .get_concurrency_requester_count("-", queue)
+            .await
+            .expect("requester count"),
+        i64::from(DRAINED_BACKLOG_JOBS) - 1
+    );
+
+    // Raising the cap has the grant scanner grant every waiter, deleting
+    // each request row, and leaves slots free for the enqueues below.
+    let leased =
+        dequeue_refresh_tasks_until(&shard, "worker-1", "default", 1, DEQUEUE_TIMEOUT).await;
+    shard
+        .report_refresh_success(&leased.refresh_tasks[0].task_id, DRAINED_BACKLOG_JOBS * 2)
+        .await
+        .expect("report refresh success");
+    let drained = poll_until(
+        || async {
+            shard
+                .get_concurrency_requester_count("-", queue)
+                .await
+                .expect("requester count")
+        },
+        |&count| count == 0,
+        120_000,
+    )
+    .await;
+    assert_eq!(drained, 0, "every waiter is granted");
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    shard.stop_grant_scanner();
+    backdate_last_refreshed(&shard, queue).await;
+
+    let probes_before = read_waiter_probes(&metrics, "none");
+    let mut fewest_scans = f64::MAX;
+    let mut samples = 0u32;
+    while samples < 10 && fewest_scans > 0.0 {
+        samples += 1;
+        wait_for_scans_to_settle(&shard, &metrics).await;
+        let scans_before = read_slatedb_scan_requests(&shard, &metrics);
+        enqueue_floating(&shard, queue, DRAINED_BACKLOG_JOBS + samples).await;
+        let scans = read_slatedb_scan_requests(&shard, &metrics) - scans_before;
+        fewest_scans = fewest_scans.min(scans);
+    }
+
+    assert_eq!(
+        read_waiter_probes(&metrics, "none") - probes_before,
+        f64::from(samples),
+        "each enqueue ran the probe and found no waiter"
+    );
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "each enqueue was granted immediately"
+    );
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert_eq!(
+        fewest_scans, 0.0,
+        "an enqueue that runs the waiter probe opens no scan"
+    );
+}
+
+/// With a request row queued and the refresh due, a non-waiter enqueue on
+/// the same queue schedules the refresh, once.
+#[silo::test]
+async fn floating_limit_non_waiter_enqueue_schedules_one_refresh_for_a_queued_waiter() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-probe-waiters-q";
+    settle_backlog_with_fresh_refresh(&shard, queue).await;
+    let probes_before = read_waiter_probes(&metrics, "waiters");
+
+    enqueue_floating_starting_later(&shard, queue, 1).await;
+
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    assert!(
+        read_floating_state(&shard, queue)
+            .await
+            .refresh_task_scheduled()
+    );
+    assert_eq!(read_waiter_probes(&metrics, "waiters") - probes_before, 1.0);
+
+    // The refresh is outstanding, so a second non-waiter neither probes nor
+    // schedules.
+    enqueue_floating_starting_later(&shard, queue, 2).await;
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 1);
+    assert_eq!(read_waiter_probes(&metrics, "waiters") - probes_before, 1.0);
+}
+
+/// With nobody waiting and the refresh due, a non-waiter enqueue schedules
+/// no refresh, and the next one probes again.
+#[silo::test]
+async fn floating_limit_non_waiter_enqueue_schedules_no_refresh_for_an_empty_queue() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-probe-none-q";
+
+    // j1 takes the single slot; its own enqueue is the first non-waiter.
+    enqueue_floating(&shard, queue, 1).await;
+    enqueue_floating_starting_later(&shard, queue, 1).await;
+    enqueue_floating_starting_later(&shard, queue, 2).await;
+
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    assert_eq!(count_refresh_tasks(&shard, queue).await, 0);
+    assert!(
+        !read_floating_state(&shard, queue)
+            .await
+            .refresh_task_scheduled()
+    );
+    assert_eq!(read_waiter_probes(&metrics, "none"), 3.0);
+    assert_eq!(read_waiter_probes(&metrics, "waiters"), 0.0);
+}
+
+/// A probe that fails is counted as an error and fails the enqueue.
+#[silo::test]
+async fn floating_limit_failed_waiter_probe_is_counted_as_an_error() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-probe-error-q";
+    shard.set_floating_waiter_scan_hook_for_test(Some(std::sync::Arc::new(|| {
+        Box::pin(async {
+            Err(silo::job_store_shard::JobStoreShardError::Codec(
+                "injected waiter probe failure".to_string(),
+            ))
+        })
+    })));
+
+    let result = shard
+        .enqueue(
+            "-",
+            Some("fl-probe-error-job".to_string()),
+            10u8,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({"j": 1})),
+            vec![floating_limit(queue, REFRESH_INTERVAL_MS)],
+            None,
+            "default",
+        )
+        .await;
+
+    assert!(result.is_err(), "the probe's error fails the enqueue");
+    assert_eq!(read_waiter_probes(&metrics, "error"), 1.0);
+    assert_eq!(read_waiter_probes(&metrics, "none"), 0.0);
+}
+
+/// The requester counter reads zero while a request row is live. The enqueue
+/// path takes the counter's answer and schedules nothing; the grant
+/// scanner's at-capacity pass judges by the head request row and schedules
+/// the refresh.
+#[silo::test]
+async fn floating_limit_scanner_refreshes_a_queue_whose_requester_counter_reads_zero() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-probe-undercount-q";
+    settle_backlog_with_fresh_refresh(&shard, queue).await;
+    write_requester_counter(&shard, queue, 0).await;
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+
+    enqueue_floating_starting_later(&shard, queue, 1).await;
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        0,
+        "the enqueue path answers from the counter"
+    );
+
+    shard.process_concurrency_grants("-", queue, 1).await;
+
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        1,
+        "the scanner pass schedules the refresh from the head request row"
+    );
+    assert!(
+        read_floating_state(&shard, queue)
+            .await
+            .refresh_task_scheduled()
+    );
+}
+
+/// The requester counter reads positive with no request row behind it. A
+/// non-waiter enqueue schedules a refresh on the counter's word; once the
+/// counter is recounted from the rows, the next due enqueue schedules none.
+#[silo::test]
+async fn floating_limit_overcounted_requester_counter_schedules_refreshes_until_recounted() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-probe-overcount-q";
+    enqueue_floating(&shard, queue, 1).await;
+    assert_eq!(count_concurrency_requests(shard.db()).await, 0);
+    write_requester_counter(&shard, queue, 3).await;
+
+    enqueue_floating_starting_later(&shard, queue, 1).await;
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        1,
+        "a positive counter schedules the refresh"
+    );
+
+    let leased =
+        dequeue_refresh_tasks_until(&shard, "worker-1", "default", 1, DEQUEUE_TIMEOUT).await;
+    shard
+        .report_refresh_success(&leased.refresh_tasks[0].task_id, 1)
+        .await
+        .expect("report refresh success");
+    backdate_last_refreshed(&shard, queue).await;
+
+    let delta = shard
+        .recount_requester_counter("-", queue)
+        .await
+        .expect("recount requester counter");
+    assert_eq!(delta, -3);
+
+    enqueue_floating_starting_later(&shard, queue, 2).await;
+    assert_eq!(
+        count_refresh_tasks(&shard, queue).await,
+        0,
+        "a recounted counter schedules nothing for an empty queue"
+    );
+    assert!(
+        !read_floating_state(&shard, queue)
+            .await
+            .refresh_task_scheduled()
+    );
+}
+
+/// A failed refresh keeps a retry outstanding when the requester counter is
+/// positive, here with no request row behind it.
+#[silo::test]
+async fn floating_limit_refresh_failure_retries_on_a_positive_requester_counter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let queue = "fl-failure-overcount-q";
+    let leased = schedule_and_lease_refresh(&shard, queue).await;
+    let task_id = leased.refresh_tasks[0].task_id.clone();
+
+    // Finish the holder so the waiter is granted and no request row remains.
+    for task in &leased.tasks {
+        shard
+            .report_attempt_outcome(
+                task.attempt().task_id(),
+                AttemptOutcome::Success { result: vec![] },
+            )
+            .await
+            .expect("finish holder");
+    }
+    let cleared = poll_until(
+        || async { first_concurrency_request_kv(shard.db()).await.is_none() },
+        |&is_none| is_none,
+        5000,
+    )
+    .await;
+    assert!(cleared, "waiting requests should be cleared");
+    shard.stop_grant_scanner();
+    write_requester_counter(&shard, queue, 2).await;
+
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+
+    let state = read_floating_state(&shard, queue).await;
+    assert!(state.refresh_task_scheduled());
+    assert_eq!(state.refresh_scheduled_at_ms(), state.next_retry_at_ms());
+    assert!(
+        read_refresh_index_row(&shard, queue, "default")
+            .await
+            .is_some(),
+        "the retry is pending in the refresh index"
+    );
+}
+
+/// A failed refresh schedules no retry when the requester counter reads
+/// zero, here with a request row still live.
+#[silo::test]
+async fn floating_limit_refresh_failure_skips_retry_on_a_zero_requester_counter() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let queue = "fl-failure-undercount-q";
+    let task_id = schedule_and_lease_refresh(&shard, queue)
+        .await
+        .refresh_tasks[0]
+        .task_id
+        .clone();
+    assert_eq!(count_concurrency_requests(shard.db()).await, 1);
+    write_requester_counter(&shard, queue, 0).await;
+
+    shard
+        .report_refresh_failure(&task_id, "boom", "upstream down")
+        .await
+        .expect("report failure");
+
+    let state = read_floating_state(&shard, queue).await;
+    assert!(!state.refresh_task_scheduled());
+    assert_eq!(state.refresh_scheduled_at_ms(), None);
+    assert!(
+        read_refresh_index_row(&shard, queue, "default")
+            .await
+            .is_none(),
+        "no retry is pending in the refresh index"
+    );
+}

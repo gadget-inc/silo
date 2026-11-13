@@ -118,6 +118,28 @@ impl LeaseOverwriteSource {
     }
 }
 
+/// Answer of one floating-queue waiter probe on the enqueue path, recorded
+/// as the `result` label on `silo_floating_waiter_probes_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatingWaiterProbeResult {
+    /// The queue's requester counter is positive.
+    Waiters,
+    /// Nobody is waiting on the queue.
+    None,
+    /// The probe failed; the enqueue fails with it.
+    Error,
+}
+
+impl FloatingWaiterProbeResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FloatingWaiterProbeResult::Waiters => "waiters",
+            FloatingWaiterProbeResult::None => "none",
+            FloatingWaiterProbeResult::Error => "error",
+        }
+    }
+}
+
 /// Result of one periodic full-compaction submission, recorded as the
 /// `outcome` label on `silo_periodic_full_compaction_submissions_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +286,9 @@ pub struct Metrics {
     /// Floating limit refreshes forced open after the outstanding-refresh flag
     /// was found stale, labelled by `reason`.
     floating_limit_refresh_resets: CounterVec,
+    /// Waiter probes run by non-waiter enqueues on floating queues whose
+    /// refresh was due, labelled by `result`.
+    floating_waiter_probes: CounterVec,
 
     // SlateDB watcher metrics (driven by Db::subscribe)
     slatedb_durable_seq: GaugeVec,
@@ -934,6 +959,14 @@ impl Metrics {
     pub fn record_floating_limit_refresh_reset(&self, shard: &str, reason: &str) {
         self.floating_limit_refresh_resets
             .with_label_values(&[shard, reason])
+            .inc();
+    }
+
+    /// Record one waiter probe run by an enqueue that was not itself a
+    /// waiter on a floating queue whose refresh was due.
+    pub fn record_floating_waiter_probe(&self, shard: &str, result: FloatingWaiterProbeResult) {
+        self.floating_waiter_probes
+            .with_label_values(&[shard, result.as_str()])
             .inc();
     }
 
@@ -2709,6 +2742,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let floating_waiter_probes = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_floating_waiter_probes_total",
+                "Waiter probes run by non-waiter enqueues on floating queues whose refresh was due, by result",
+            ),
+            &["shard", "result"],
+        )?,
+    );
+
     // SlateDB watcher metrics (driven by Db::subscribe)
     let slatedb_durable_seq = register(
         &registry,
@@ -2843,6 +2887,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_grant_next_hop_skips,
         concurrency_grant_vanished_requests,
         floating_limit_refresh_resets,
+        floating_waiter_probes,
         slatedb_durable_seq,
         slatedb_manifest_revisions,
         slatedb_manifest_last_l0_seq,
