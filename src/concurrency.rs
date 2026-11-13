@@ -1014,6 +1014,59 @@ struct ColdLane {
     pop_cursor: Option<Vec<u8>>,
 }
 
+/// Per-queue locks that order the grant scanner against the paths that
+/// delete a job's request rows: cancel and reimport.
+///
+/// A scanner pass decides from a job's status row that the job's request is
+/// grantable, and deletes the request row in a later write that carries no
+/// conflict detection. A cancel or reimport that commits in between rewrites
+/// the status and deletes the same row. Both sides would then decrement the
+/// queue's requester counter for one row, and the scanner would grant a slot
+/// to a job that no longer wants it.
+///
+/// The scanner holds a queue's lock exclusively from its status reads to its
+/// commit. Cancel and reimport hold it shared from before they look for the
+/// job's request rows until their transaction commits, so they run
+/// concurrently with one another and never inside a scanner pass. A cancel
+/// whose transaction began before a pass committed sees that pass's writes
+/// in its own request-row lookup, and its serializable commit conflicts on
+/// the task row or status the pass wrote, so it retries against the granted
+/// state.
+///
+/// An entry exists only while a guard or a waiter references it.
+#[derive(Default)]
+struct RequestRowLocks {
+    locks: DashMap<(String, String), Arc<tokio::sync::RwLock<()>>>,
+}
+
+impl RequestRowLocks {
+    fn lock_for(&self, key: &(String, String)) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(self.locks.entry(key.clone()).or_default().value())
+    }
+}
+
+/// Request-row locks held for one scanner pass or one cancel or reimport
+/// transaction. See [`RequestRowLocks`]. Dropping it releases the locks and
+/// removes the table entries nothing else references.
+pub(crate) struct RequestRowsGuard {
+    table: Arc<RequestRowLocks>,
+    keys: Vec<(String, String)>,
+    shared: Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
+    exclusive: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+impl Drop for RequestRowsGuard {
+    fn drop(&mut self) {
+        self.shared.clear();
+        self.exclusive = None;
+        for key in &self.keys {
+            self.table
+                .locks
+                .remove_if(key, |_, lock| Arc::strong_count(lock) == 1);
+        }
+    }
+}
+
 /// High-level concurrency manager with a background grant scanner.
 ///
 /// The grant scanner is a single background task that processes all pending grants.
@@ -1137,6 +1190,8 @@ pub struct ConcurrencyManager {
     /// State of the (possibly multi-tick) holder-drift pass. Maintained only
     /// by `report_holder_drift` (a single periodic task). See `DriftPass`.
     drift_pass: Mutex<DriftPass>,
+    /// Orders scanner passes against cancel and reimport per queue.
+    request_row_locks: Arc<RequestRowLocks>,
 }
 
 /// Memoized per-hop durable reads for `next_hop_should_skip`, keyed by the
@@ -1229,7 +1284,63 @@ impl ConcurrencyManager {
             },
             grant_scanner_commit_chunk_size: scanner.commit_chunk_size.max(1),
             drift_pass: Mutex::new(DriftPass::default()),
+            request_row_locks: Arc::new(RequestRowLocks::default()),
         }
+    }
+
+    /// Lock `(tenant, queue)`'s request rows for one grant-scanner pass.
+    /// See [`RequestRowLocks`].
+    async fn lock_request_rows_exclusive(&self, tenant: &str, queue: &str) -> RequestRowsGuard {
+        let key = (tenant.to_string(), queue.to_string());
+        let mut guard = RequestRowsGuard {
+            table: Arc::clone(&self.request_row_locks),
+            keys: vec![key.clone()],
+            shared: Vec::new(),
+            exclusive: None,
+        };
+        let lock = guard.table.lock_for(&key);
+        guard.exclusive = Some(lock.write_owned().await);
+        guard
+    }
+
+    /// Lock the request rows of every concurrency queue in `limits` for a
+    /// transaction that deletes a job's request rows. Take it before looking
+    /// the rows up and hold it until the transaction has committed. Queues
+    /// are locked in key order, so two callers never wait on each other.
+    /// See [`RequestRowLocks`].
+    pub(crate) async fn lock_request_rows_shared(
+        &self,
+        tenant: &str,
+        limits: &[Limit],
+    ) -> RequestRowsGuard {
+        let queues: BTreeSet<&str> = limits
+            .iter()
+            .filter_map(|limit| match limit {
+                Limit::Concurrency(cl) => Some(cl.key.as_str()),
+                Limit::FloatingConcurrency(fl) => Some(fl.key.as_str()),
+                Limit::RateLimit(_) => None,
+            })
+            .collect();
+        let mut guard = RequestRowsGuard {
+            table: Arc::clone(&self.request_row_locks),
+            keys: queues
+                .into_iter()
+                .map(|queue| (tenant.to_string(), queue.to_string()))
+                .collect(),
+            shared: Vec::new(),
+            exclusive: None,
+        };
+        for index in 0..guard.keys.len() {
+            let lock = guard.table.lock_for(&guard.keys[index]);
+            guard.shared.push(lock.read_owned().await);
+        }
+        guard
+    }
+
+    /// Test-only: number of queues with a request-row lock entry.
+    #[doc(hidden)]
+    pub fn request_row_lock_count_for_test(&self) -> usize {
+        self.request_row_locks.locks.len()
     }
 
     /// Install the limit-chain resumer. Must be called exactly once, after the
@@ -2641,6 +2752,10 @@ impl ConcurrencyManager {
             let mut batch = WriteBatch::new();
             let mut chunk_scheduled_refreshes = ScheduledRefreshes::default();
             let mut stale_and_corrupt_count: usize = 0;
+            // Request rows this pass found stale or corrupt. They come from
+            // the invocation's snapshot, so each is confirmed still present
+            // before it is deleted and counted (see the confirm step below).
+            let mut stale_keys: Vec<Vec<u8>> = Vec::new();
 
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
@@ -2667,8 +2782,7 @@ impl ConcurrencyManager {
 
                 let Some(parsed_req) = parse_concurrency_request_key(&kv.key) else {
                     tracing::warn!(queue = %queue, "grant scanner: malformed request key, deleting");
-                    batch.delete(&kv.key);
-                    stale_and_corrupt_count += 1;
+                    stale_keys.push(kv.key.to_vec());
                     continue;
                 };
 
@@ -2676,16 +2790,14 @@ impl ConcurrencyManager {
                     Ok(d) => d,
                     Err(_) => {
                         tracing::warn!(queue = %queue, "grant scanner: failed to decode request, deleting");
-                        batch.delete(&kv.key);
-                        stale_and_corrupt_count += 1;
+                        stale_keys.push(kv.key.to_vec());
                         continue;
                     }
                 };
                 let a = decoded.fb();
                 let Some(et) = a.variant_as_enqueue_task() else {
                     tracing::warn!(queue = %queue, "grant scanner: unknown concurrency action variant, deleting");
-                    batch.delete(&kv.key);
-                    stale_and_corrupt_count += 1;
+                    stale_keys.push(kv.key.to_vec());
                     continue;
                 };
 
@@ -2737,8 +2849,7 @@ impl ConcurrencyManager {
                                     error = %e,
                                     "grant scanner: request needs JobInfo fallback but JobInfo is unreadable; deleting"
                                 );
-                                batch.delete(&kv.key);
-                                stale_and_corrupt_count += 1;
+                                stale_keys.push(kv.key.to_vec());
                                 continue;
                             }
                         },
@@ -2748,8 +2859,7 @@ impl ConcurrencyManager {
                                 job_id = %job_id_str,
                                 "grant scanner: request needs JobInfo fallback but JobInfo is missing; deleting"
                             );
-                            batch.delete(&kv.key);
-                            stale_and_corrupt_count += 1;
+                            stale_keys.push(kv.key.to_vec());
                             continue;
                         }
                         Err(e) => {
@@ -2770,8 +2880,7 @@ impl ConcurrencyManager {
                         job_id = %job_id_str,
                         "grant scanner: request has no decoded limits; deleting"
                     );
-                    batch.delete(&kv.key);
-                    stale_and_corrupt_count += 1;
+                    stale_keys.push(kv.key.to_vec());
                     continue;
                 }
                 if task_group.is_empty() {
@@ -2780,8 +2889,7 @@ impl ConcurrencyManager {
                         job_id = %job_id_str,
                         "grant scanner: request has no task group after fallback; deleting"
                     );
-                    batch.delete(&kv.key);
-                    stale_and_corrupt_count += 1;
+                    stale_keys.push(kv.key.to_vec());
                     continue;
                 }
 
@@ -2796,8 +2904,7 @@ impl ConcurrencyManager {
                         job_id = %job_id_str,
                         "grant scanner: request queue is not in job limits; deleting"
                     );
-                    batch.delete(&kv.key);
-                    stale_and_corrupt_count += 1;
+                    stale_keys.push(kv.key.to_vec());
                     continue;
                 };
 
@@ -2914,6 +3021,12 @@ impl ConcurrencyManager {
             // entries) still get written, then let the outer while guard
             // (which checks `iter_exhausted`) terminate the loop.
             //
+            // Everything from the status reads below to this pass's last
+            // commit runs with the queue's request rows locked, so no cancel
+            // or reimport deletes a row this pass has validated. The guard
+            // drops at the end of the pass, on every exit.
+            let _request_rows = self.lock_request_rows_exclusive(tenant, queue).await;
+
             // --- Batch validate status ---
             // Use `buffered` (order-preserving) rather than `join_all` so that
             // we cap in-flight slatedb reads at grant_scanner_buffer_size. Each
@@ -2992,8 +3105,45 @@ impl ConcurrencyManager {
                 if is_valid {
                     valid_requests.push(req);
                 } else {
-                    batch.delete(&req.request_key);
-                    stale_and_corrupt_count += 1;
+                    stale_keys.push(req.request_key);
+                }
+            }
+
+            // --- Confirm stale rows are still present ---
+            // A stale row was read from the invocation's snapshot. The path
+            // that made it stale may have deleted it since: a cancel or a
+            // reimport rewrites the job's status and deletes its request
+            // rows in one commit, decrementing the requester counter for
+            // them. These reads follow the status reads above, so a row
+            // deleted by such a commit reads as gone here. A row that is
+            // gone gets no delete and no decrement; a row still present is
+            // an orphan nothing else will remove.
+            let stale_rows: Vec<(Vec<u8>, Result<bool, slatedb::Error>)> =
+                futures::stream::iter(stale_keys.into_iter().map(|key| async move {
+                    let present = db.get(&key).await.map(|row| row.is_some());
+                    (key, present)
+                }))
+                .buffered(self.grant_scanner_buffer_size)
+                .collect()
+                .await;
+            for (key, present) in stale_rows {
+                match present {
+                    Ok(true) => {
+                        batch.delete(&key);
+                        stale_and_corrupt_count += 1;
+                    }
+                    Ok(false) => {
+                        if let Some(ref m) = self.metrics {
+                            m.record_concurrency_grant_vanished_request(&self.shard);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            queue = %queue,
+                            "grant scanner: stale request row re-read failed; leaving it for a later pass"
+                        );
+                    }
                 }
             }
 
@@ -3184,8 +3334,27 @@ impl ConcurrencyManager {
                         task_id = %req.task_id,
                         "grant scanner: dropping duplicate request; a live terminal task row already exists for this attempt"
                     );
-                    batch.delete(&req.request_key);
-                    chunk_stale += 1;
+                    // Same confirmation as the stale rows above: delete and
+                    // count the row only if it is still present.
+                    match db.get(&req.request_key).await {
+                        Ok(Some(_)) => {
+                            batch.delete(&req.request_key);
+                            chunk_stale += 1;
+                        }
+                        Ok(None) => {
+                            if let Some(ref m) = self.metrics {
+                                m.record_concurrency_grant_vanished_request(&self.shard);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                job_id = %req.job_id,
+                                queue = %queue,
+                                "grant scanner: duplicate request row re-read failed; leaving it for a later pass"
+                            );
+                        }
+                    }
                     continue;
                 }
 

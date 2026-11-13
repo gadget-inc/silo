@@ -1177,3 +1177,207 @@ async fn replaced_job_holds_no_slot_from_its_old_chain() {
     assert_eq!(requester_count(&shard, tenant, user).await, 1);
     assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
 }
+
+/// A waiting job is cancelled after a scanner pass has read its request row
+/// and before the pass looks at the job's status. The cancel deletes the row
+/// and decrements the counter for it; the pass then finds a status that no
+/// longer wants the request, and must not decrement for a row that is gone.
+#[silo::test]
+async fn scanner_leaves_counter_alone_for_request_cancelled_after_pass_began() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "-";
+    let queue = "cancel-mid-pass-q";
+    let holder_task_id = park_requests(&shard, tenant, queue, 2).await;
+    assert_eq!(requester_count(&shard, tenant, queue).await, 2);
+
+    // Free the slot so the pass scans the requests instead of stopping at
+    // the at-capacity check.
+    shard
+        .report_attempt_outcome(&holder_task_id, AttemptOutcome::Success { result: vec![] })
+        .await
+        .expect("finish holder");
+
+    install_scan_hook(&shard, |shard| async move {
+        shard
+            .cancel_job("-", "cancel-mid-pass-q-waiter-0")
+            .await
+            .expect("cancel waiter");
+    });
+
+    let granted = shard.process_concurrency_grants(tenant, queue, 2).await;
+    shard.set_grant_scan_hook_for_test(None);
+    assert_eq!(
+        granted,
+        vec!["default".to_string()],
+        "the waiter that was not cancelled takes the free slot"
+    );
+
+    assert_eq!(queue_request_rows(&shard, tenant, queue).await, 0);
+    assert_eq!(
+        requester_count(&shard, tenant, queue).await,
+        0,
+        "the cancelled request is decremented for once, by the cancel"
+    );
+}
+
+/// How a cancel started inside a scanner pass stood when the pass moved on.
+enum CancelInPass {
+    Finished(Result<(), silo::job_store_shard::JobStoreShardError>),
+    Waiting(tokio::task::JoinHandle<Result<(), silo::job_store_shard::JobStoreShardError>>),
+}
+
+/// A chain resumer that starts a cancel of `job_id` the first time the
+/// scanner resumes a chain, and gives the cancel a head start before the
+/// grant goes on. By then the pass has checked the status of every
+/// candidate, so the cancel arrives between a candidate's status check and
+/// the commit of its grant.
+struct CancelDuringPass {
+    inner: Arc<dyn silo::concurrency::LimitChainResumer>,
+    shard: std::sync::Weak<silo::job_store_shard::JobStoreShard>,
+    job_id: &'static str,
+    cancel: std::sync::Mutex<Option<CancelInPass>>,
+}
+
+#[async_trait::async_trait]
+impl silo::concurrency::LimitChainResumer for CancelDuringPass {
+    async fn resume_chain(
+        &self,
+        batch: &mut slatedb::WriteBatch,
+        scheduled_refreshes: &mut silo::job_store_shard::ScheduledRefreshes,
+        params: silo::concurrency::ResumeChainParams,
+    ) -> Result<Vec<(String, String)>, silo::concurrency::ConcurrencyError> {
+        let already_started = self.cancel.lock().unwrap().is_some();
+        if !already_started && let Some(shard) = self.shard.upgrade() {
+            let job_id = self.job_id;
+            let mut handle = tokio::spawn(async move { shard.cancel_job("-", job_id).await });
+            let head_start = std::time::Duration::from_millis(250);
+            let state = match tokio::time::timeout(head_start, &mut handle).await {
+                Ok(joined) => CancelInPass::Finished(joined.expect("cancel task")),
+                Err(_) => CancelInPass::Waiting(handle),
+            };
+            *self.cancel.lock().unwrap() = Some(state);
+        }
+        self.inner
+            .resume_chain(batch, scheduled_refreshes, params)
+            .await
+    }
+
+    fn tasks_written(&self, written: &[(String, i64)]) {
+        self.inner.tasks_written(written)
+    }
+
+    fn expect_tasks(&self, written: &[(String, i64)]) {
+        self.inner.expect_tasks(written)
+    }
+
+    fn refresh_index_rows_committed(&self, task_groups: &[String]) {
+        self.inner.refresh_index_rows_committed(task_groups)
+    }
+}
+
+async fn enqueue_on_two_slot_queue(
+    shard: &silo::job_store_shard::JobStoreShard,
+    tenant: &str,
+    queue: &str,
+    job_id: &str,
+) {
+    shard
+        .enqueue(
+            tenant,
+            Some(job_id.to_string()),
+            10,
+            now_ms(),
+            None,
+            test_helpers::msgpack_payload(&serde_json::json!({})),
+            vec![Limit::Concurrency(ConcurrencyLimit {
+                key: queue.to_string(),
+                max_concurrency: 2,
+            })],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue");
+}
+
+/// A cancel arrives after a scanner pass has checked its job's status and
+/// before the pass commits the grant. The pass grants the request and
+/// decrements for it; the cancel then finds the granted task and takes it
+/// and its holder back. The request row is decremented for once, and the
+/// cancelled job keeps no slot.
+#[silo::test]
+async fn cancel_arriving_mid_pass_undoes_the_grant_and_decrements_once() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let tenant = "-";
+    let queue = "cancel-before-commit-q";
+
+    for holder in ["holder-0", "holder-1"] {
+        enqueue_on_two_slot_queue(&shard, tenant, queue, holder).await;
+    }
+    let holder_task_ids = dequeue_task_ids_until(&shard, "w", "default", 2).await;
+    for waiter in ["waiter-0", "waiter-1"] {
+        enqueue_on_two_slot_queue(&shard, tenant, queue, waiter).await;
+    }
+    assert_eq!(requester_count(&shard, tenant, queue).await, 2);
+    for task_id in &holder_task_ids {
+        shard
+            .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+            .await
+            .expect("finish holder");
+    }
+
+    let resumer = Arc::new(CancelDuringPass {
+        inner: shard
+            .take_chain_resumer_for_test()
+            .expect("resumer installed at open"),
+        shard: Arc::downgrade(&shard),
+        job_id: "waiter-1",
+        cancel: std::sync::Mutex::new(None),
+    });
+    shard.set_chain_resumer_for_test(resumer.clone());
+
+    let granted = shard.process_concurrency_grants(tenant, queue, 2).await;
+    assert_eq!(
+        granted.len(),
+        2,
+        "both waiters passed their status check before the cancel arrived"
+    );
+
+    let cancel = resumer
+        .cancel
+        .lock()
+        .unwrap()
+        .take()
+        .expect("cancel started");
+    let cancelled = match cancel {
+        CancelInPass::Finished(result) => result,
+        CancelInPass::Waiting(handle) => handle.await.expect("cancel task"),
+    };
+    cancelled.expect("cancel succeeds");
+
+    assert_eq!(queue_request_rows(&shard, tenant, queue).await, 0);
+    assert_eq!(
+        requester_count(&shard, tenant, queue).await,
+        0,
+        "each request row is decremented for once"
+    );
+    let status = shard
+        .get_job_status(tenant, "waiter-1")
+        .await
+        .expect("get status")
+        .expect("status exists");
+    assert_eq!(status.kind, silo::job::JobStatusKind::Cancelled);
+    assert_eq!(
+        queue_holder_rows(&shard, tenant, queue).await,
+        1,
+        "the cancelled job's holder row is gone"
+    );
+    assert_eq!(shard.concurrency_holder_count(tenant, queue), 1);
+    assert_eq!(
+        shard.request_row_lock_count_for_test(),
+        0,
+        "no lock entry outlives the pass and the cancel"
+    );
+}

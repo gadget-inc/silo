@@ -116,6 +116,10 @@ impl JobStoreShard {
         // (task_id, queue) pair — `atomic_release` keys the in-memory slot
         // by task_id, and the grant scanner is woken per queue.
         let mut holders_to_release: Vec<(String, String)> = Vec::new();
+        // Held from before the job's request rows are looked up until the
+        // transaction has committed, so no grant-scanner pass validates and
+        // grants one of those rows in between.
+        let mut request_rows_guard = None;
         let mut deleted_task_key: Option<Vec<u8>> = None;
         let mut background_action_transition: Option<BackgroundActionMetricTransition> = None;
         macro_rules! try_after_status {
@@ -268,9 +272,15 @@ impl JobStoreShard {
                     // A deferred concurrency request can carry `held_queues` from
                     // upstream chain steps; those holders must be released too,
                     // mirroring the future-RequestTicket path above.
+                    let request_rows = request_rows_guard.insert(
+                        self.concurrency
+                            .lock_request_rows_shared(tenant, &limits)
+                            .await,
+                    );
                     let released = self
                         .delete_concurrency_requests_for_job(
                             &txn,
+                            request_rows,
                             tenant,
                             id,
                             &limits,
@@ -321,6 +331,7 @@ impl JobStoreShard {
             }
             return Err(e.into());
         }
+        drop(request_rows_guard);
 
         // ---- Post-commit: update in-memory state ----
 
@@ -351,10 +362,18 @@ impl JobStoreShard {
     /// caller must release post-commit — a deferred request can carry
     /// `held_queues` from upstream chain steps whose holders are still
     /// reserved.
+    ///
+    /// `_request_rows` is the caller's shared request-row lock over the
+    /// queues in `limits`, taken with
+    /// `ConcurrencyManager::lock_request_rows_shared`. The caller keeps it
+    /// until `txn` has committed: the rows are read outside the transaction,
+    /// and the lock is what keeps a grant-scanner pass from granting one of
+    /// them before the delete lands.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn delete_concurrency_requests_for_job(
         &self,
         txn: &crate::instrumented_db::InstrumentedDbTransaction,
+        _request_rows: &crate::concurrency::RequestRowsGuard,
         tenant: &str,
         job_id: &str,
         limits: &[Limit],
