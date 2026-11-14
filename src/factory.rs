@@ -1568,6 +1568,11 @@ impl ShardFactory {
     pub fn template(&self) -> &DatabaseTemplate {
         &self.template
     }
+
+    /// Get the metrics handle this factory reports to, if metrics are enabled.
+    pub fn metrics(&self) -> Option<&Metrics> {
+        self.metrics.as_ref()
+    }
 }
 
 /// Split-cleanup metadata read from a closed shard's database. Field-level
