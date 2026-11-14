@@ -1651,11 +1651,30 @@ impl JobStoreShard {
     /// Test-only: drop the installed chain resumer so the next
     /// `process_concurrency_grants` exercises the scanner's
     /// release-and-bail branch. Returns the removed resumer (caller may
-    /// drop it or re-install via `set_chain_resumer`).
+    /// drop it or re-install via `set_chain_resumer_for_test`).
     pub fn take_chain_resumer_for_test(
         &self,
     ) -> Option<std::sync::Arc<dyn crate::concurrency::LimitChainResumer>> {
         self.concurrency.take_chain_resumer_for_test()
+    }
+
+    /// Test-only: install `resumer` as the chain resumer. Wrapping the one
+    /// `take_chain_resumer_for_test` returned lets a test act inside a
+    /// grant-scanner pass, after its candidates are validated and before
+    /// their grants commit.
+    #[doc(hidden)]
+    pub fn set_chain_resumer_for_test(
+        &self,
+        resumer: std::sync::Arc<dyn crate::concurrency::LimitChainResumer>,
+    ) {
+        self.concurrency.set_chain_resumer(resumer);
+    }
+
+    /// Test-only: number of queues with a request-row lock entry. Zero when
+    /// no scanner pass, cancel or reimport is in flight.
+    #[doc(hidden)]
+    pub fn request_row_lock_count_for_test(&self) -> usize {
+        self.concurrency.request_row_lock_count_for_test()
     }
 
     /// Test-only: release the in-memory reservation for a (tenant, queue,

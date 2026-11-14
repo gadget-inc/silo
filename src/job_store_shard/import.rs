@@ -629,6 +629,10 @@ impl JobStoreShard {
         // shape of holder releases (from a Task arm or from a deferred
         // concurrency request scan) flows through one accumulator.
         let mut released_holders: Vec<(String, String)> = Vec::new();
+        // Held from before the job's request rows are looked up until the
+        // transaction has committed, so no grant-scanner pass validates and
+        // grants one of those rows in between.
+        let mut request_rows_guard = None;
 
         if old_status.kind == JobStatusKind::Scheduled {
             // Locate the pending task by identity (same pattern as
@@ -701,9 +705,15 @@ impl JobStoreShard {
                 // holders carried by each deferred request and must also
                 // be released post-commit; dropping them silently leaks
                 // every prior chain grant.
+                let request_rows = request_rows_guard.insert(
+                    self.concurrency
+                        .lock_request_rows_shared(tenant, &stored_limits)
+                        .await,
+                );
                 let released = self
                     .delete_concurrency_requests_for_job(
                         &txn,
+                        request_rows,
                         tenant,
                         job_id,
                         &stored_limits,
@@ -865,6 +875,7 @@ impl JobStoreShard {
             );
             return Err(e.into());
         }
+        drop(request_rows_guard);
         if let Some(op) = write_op {
             dst_events::confirm_write(op);
         }
