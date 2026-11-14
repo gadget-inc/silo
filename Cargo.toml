@@ -101,6 +101,7 @@ hex = "0.4"
 base64 = "0.22"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 async-stream = "0.3"
+arc-swap = "1.9.2"
 
 [features]
 default = ["k8s", "server"]

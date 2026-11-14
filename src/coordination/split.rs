@@ -7,9 +7,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::factory::ShardFactory;
-use crate::shard_range::{ShardId, ShardMap, SplitInProgress};
+use crate::shard_range::{ShardId, SplitInProgress};
 
-use crate::coordination::{CloseRetryBackoff, CoordinationError, ShardOwnerMap};
+use crate::coordination::{CloseRetryBackoff, CoordinationError, ShardMapCell, ShardOwnerMap};
 
 /// Log markers for the split's pre-commit child verification. Operational
 /// tooling asserts on these exact strings in deployed logs -- do not reword.
@@ -184,8 +184,8 @@ pub trait SplitStorageBackend: Send + Sync {
 pub struct ShardSplitContext {
     /// This node's ID
     pub node_id: String,
-    /// The shard map (protected by mutex)
-    pub shard_map: Arc<Mutex<ShardMap>>,
+    /// The shard map
+    pub shard_map: Arc<ShardMapCell>,
     /// Set of shards owned by this node (protected by mutex)
     pub owned: Arc<Mutex<HashSet<ShardId>>>,
     /// Factory for shard operations (clone, open, close)
@@ -196,7 +196,7 @@ impl ShardSplitContext {
     /// Create a new context from coordinator base components.
     pub fn new(
         node_id: String,
-        shard_map: Arc<Mutex<ShardMap>>,
+        shard_map: Arc<ShardMapCell>,
         owned: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
     ) -> Self {
@@ -274,7 +274,7 @@ impl ShardSplitter {
         // Split operations must reference an existing parent shard - we cannot split
         // a shard that doesn't exist in the authoritative shard map.
         {
-            let shard_map = self.ctx.shard_map.lock().await;
+            let shard_map = self.ctx.shard_map.load();
             let shard_info = shard_map
                 .get_shard(&shard_id)
                 .ok_or(CoordinationError::ShardNotFound(shard_id))?;
@@ -699,7 +699,7 @@ impl ShardSplitter {
                     for child_id in children_we_own {
                         // Look up the child's range from the reloaded shard map
                         let range = {
-                            let map = self.ctx.shard_map.lock().await;
+                            let map = self.ctx.shard_map.load();
                             let info =
                                 map.get_shard(&child_id)
                                     .ok_or(SplitExecutionError::PostCommit(
@@ -793,7 +793,7 @@ impl ShardSplitter {
         // Look up the parent's range from the shard map (still present since the
         // shard map update failed).
         let range = {
-            let map = self.ctx.shard_map.lock().await;
+            let map = self.ctx.shard_map.load();
             let info = map.get_shard(parent_shard_id).ok_or_else(|| {
                 CoordinationError::BackendError(format!(
                     "parent shard {} not found in shard map during recovery",
@@ -943,7 +943,7 @@ impl ShardSplitter {
 
             // Check if children exist in the shard map (split committed)
             let children_exist = {
-                let shard_map = self.ctx.shard_map.lock().await;
+                let shard_map = self.ctx.shard_map.load();
                 shard_map.get_shard(&split.left_child_id).is_some()
             };
 

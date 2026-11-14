@@ -1939,14 +1939,15 @@ mod stranded {
             shard_id: &ShardId,
             ring: Option<&str>,
         ) -> Result<(Option<String>, Option<String>), CoordinationError> {
-            let mut shard_map = self.base.shard_map.lock().await;
-            let shard = shard_map
-                .get_shard_mut(shard_id)
-                .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
-            let previous = shard.placement_ring.clone();
-            let current = ring.map(|s| s.to_string());
-            shard.placement_ring = current.clone();
-            Ok((previous, current))
+            self.base.shard_map.update(|shard_map| {
+                let shard = shard_map
+                    .get_shard_mut(shard_id)
+                    .ok_or(CoordinationError::ShardNotFound(*shard_id))?;
+                let previous = shard.placement_ring.clone();
+                let current = ring.map(|s| s.to_string());
+                shard.placement_ring = current.clone();
+                Ok((previous, current))
+            })
         }
 
         async fn force_release_shard_lease(
