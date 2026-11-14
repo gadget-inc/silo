@@ -1645,7 +1645,7 @@ async fn grant_scanner_skips_stale_requests_and_grants_valid_ones() {
             task_id: format!("nonexistent-job-{}:1:stale", i),
             limits: Vec::new(),
         };
-        let key = silo::keys::concurrency_request_key(
+        let key = silo::keys::concurrency_request_key_start_time_first(
             tenant,
             queue,
             0,
@@ -2026,7 +2026,7 @@ async fn grant_scanner_interleaved_stale_and_valid_requests() {
             task_id: format!("phantom-{}:1:stale", i),
             limits: Vec::new(),
         };
-        let key = silo::keys::concurrency_request_key(
+        let key = silo::keys::concurrency_request_key_start_time_first(
             tenant,
             queue,
             now - 1000 + i,

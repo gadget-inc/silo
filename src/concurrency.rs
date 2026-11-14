@@ -63,7 +63,8 @@ use crate::job::{ConcurrencyLimit, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
-    concurrency_holders_queue_prefix, concurrency_request_key, concurrency_request_prefix,
+    concurrency_holders_queue_prefix, concurrency_request_band_start, concurrency_request_key,
+    concurrency_request_key_start_time_first, concurrency_request_prefix,
     concurrency_requester_counter_key, end_bound, floating_limit_state_key,
     holder_reconcile_barrier_key, job_info_key, job_status_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, parse_concurrency_requester_counter_key, task_key,
@@ -972,6 +973,11 @@ pub struct GrantScannerConfig {
     /// the scanner defers granting the candidate while that hop is saturated.
     /// 0 disables the skip.
     pub next_hop_skip_min_backlog: u64,
+    /// Whether a new request row is written priority-ordered
+    /// (`concurrency_request_key`) or start-time-ordered
+    /// (`concurrency_request_key_start_time_first`). Rows of both orders are
+    /// read either way.
+    pub priority_ordered_requests: bool,
     /// Fraction of each queue's capacity the scanner leaves unfilled for
     /// immediate (live) grants.
     pub live_headroom_fraction: f64,
@@ -991,6 +997,7 @@ impl Default for GrantScannerConfig {
             cold_batch_size: crate::settings::DEFAULT_GRANT_SCANNER_COLD_BATCH_SIZE,
             next_hop_skip_min_backlog:
                 crate::settings::DEFAULT_GRANT_SCANNER_NEXT_HOP_SKIP_MIN_BACKLOG,
+            priority_ordered_requests: false,
             live_headroom_fraction: crate::settings::DEFAULT_GRANT_SCANNER_LIVE_HEADROOM_FRACTION,
             commit_chunk_size: crate::settings::DEFAULT_GRANT_SCANNER_COMMIT_CHUNK_SIZE,
         }
@@ -1177,6 +1184,9 @@ pub struct ConcurrencyManager {
     /// saturated. 0 disables the next-hop skip. Configurable via
     /// `grant_scanner_next_hop_skip_min_backlog` (default 1024).
     grant_scanner_next_hop_skip_min_backlog: u64,
+    /// Whether `append_request_edits` writes priority-ordered request rows.
+    /// Configurable via `concurrency_request_priority_order` (default false).
+    priority_ordered_requests: bool,
     /// Fraction of each queue's capacity the scanner leaves unfilled for
     /// immediate (live) grants. Configurable via
     /// `grant_scanner_live_headroom_fraction` (default 0.0); stored already
@@ -1275,6 +1285,7 @@ impl ConcurrencyManager {
             grant_scanner_max_scan_per_invocation: scanner.batch_size.max(1).saturating_mul(4),
             grant_scanner_cold_batch_size: scanner.cold_batch_size.max(1),
             grant_scanner_next_hop_skip_min_backlog: scanner.next_hop_skip_min_backlog,
+            priority_ordered_requests: scanner.priority_ordered_requests,
             // Non-finite fractions (NaN/inf from a hand-edited TOML) are
             // meaningless as a headroom share — treat them as disabled.
             grant_scanner_live_headroom_fraction: if scanner.live_headroom_fraction.is_finite() {
@@ -1286,6 +1297,44 @@ impl ConcurrencyManager {
             drift_pass: Mutex::new(DriftPass::default()),
             request_row_locks: Arc::new(RequestRowLocks::default()),
         }
+    }
+
+    /// Append a deferred concurrency request record and its requester
+    /// counter increment, keyed in the order this shard is configured to
+    /// write. See the free function [`append_request_edits`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_request_edits<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        queue: &str,
+        start_time_ms: i64,
+        priority: u8,
+        job_id: &str,
+        attempt_number: u32,
+        relative_attempt_number: u32,
+        task_group: &str,
+        limit_index: u32,
+        held_queues: &[String],
+        task_id: &str,
+        all_limits: &[Limit],
+    ) -> Result<(), ConcurrencyError> {
+        append_request_edits(
+            self.priority_ordered_requests,
+            writer,
+            tenant,
+            queue,
+            start_time_ms,
+            priority,
+            job_id,
+            attempt_number,
+            relative_attempt_number,
+            task_group,
+            limit_index,
+            held_queues,
+            task_id,
+            all_limits,
+        )
     }
 
     /// Lock `(tenant, queue)`'s request rows for one grant-scanner pass.
@@ -1727,7 +1776,7 @@ impl ConcurrencyManager {
             // [SILO-ENQ-CONC-4] [SILO-IMP-CONC-3] [SILO-REIMP-CONC-3] Queue is at capacity
             // [SILO-ENQ-CONC-5] [SILO-IMP-CONC-4] [SILO-REIMP-CONC-4] No task in DB queue, request created
             // [SILO-ENQ-CONC-6] Create request record instead
-            append_request_edits(
+            self.append_request_edits(
                 writer,
                 tenant,
                 queue,
@@ -2810,14 +2859,23 @@ impl ConcurrencyManager {
                 let priority = parsed_req.priority;
 
                 if start_time_ms > now_ms {
-                    // Concurrency request keys encode `start_time_ms` ahead of
-                    // the per-job suffix, so the scan iterates in ascending
-                    // start-time order. The first entry whose start_time_ms
-                    // exceeds now_ms guarantees every subsequent entry in the
-                    // scan also exceeds now_ms — breaking here is safe and
-                    // cannot skip an already-ready request.
-                    iter_exhausted = true;
-                    break;
+                    // Request keys sort by band, then start time, so every
+                    // later entry of this band also starts after now_ms and
+                    // none of them is ready. Later bands hold lower-priority
+                    // rows that may be: seek to the next band and keep
+                    // scanning. The skipped rows are never granted and block
+                    // nothing.
+                    let Some(next_band) = parsed_req.band.checked_add(1) else {
+                        iter_exhausted = true;
+                        break;
+                    };
+                    let next_band_start = concurrency_request_band_start(tenant, queue, next_band);
+                    if let Err(e) = iter.seek(&next_band_start).await {
+                        tracing::warn!(error = %e, "grant scanner: failed to seek to the next request band");
+                        iter_exhausted = true;
+                        break;
+                    }
+                    continue;
                 }
 
                 let task_id_str = match et.task_id() {
@@ -3776,11 +3834,15 @@ fn append_grant_edits<W: WriteBatcher>(
 /// (`handle_request_ticket`). Callers must pass the chain's ORIGINAL
 /// `start_time_ms` and `priority`: cancel/reimport locate request records by
 /// the narrow `(tenant, queue, start_time_ms, priority, job_id, attempt)`
-/// prefix derived from job status, and `process_grants` grants in
-/// start-time order, so a rewritten time would orphan the record from
-/// cleanup and forfeit the job's queue position.
+/// prefix derived from job status, and `process_grants` grants in key order,
+/// so a rewritten time or priority would orphan the record from cleanup and
+/// forfeit the job's queue position.
+///
+/// The key is priority-ordered when `priority_ordered` is set and
+/// start-time-ordered otherwise.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn append_request_edits<W: WriteBatcher>(
+fn append_request_edits<W: WriteBatcher>(
+    priority_ordered: bool,
     writer: &mut W,
     tenant: &str,
     queue: &str,
@@ -3809,7 +3871,12 @@ pub(crate) fn append_request_edits<W: WriteBatcher>(
     };
     let action_val = encode_concurrency_action(&action);
     let suffix = format!("{:08x}", rand::random::<u32>());
-    let req_key = concurrency_request_key(
+    let request_key = if priority_ordered {
+        concurrency_request_key
+    } else {
+        concurrency_request_key_start_time_first
+    };
+    let req_key = request_key(
         tenant,
         queue,
         start_time_ms,

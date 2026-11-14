@@ -172,6 +172,16 @@ impl InstrumentedDbIterator {
     pub async fn next(&mut self) -> Result<Option<KeyValue>, slatedb::Error> {
         self.inner.next().instrument(self.span.clone()).await
     }
+
+    /// Skip ahead: the next record returned is the first with a key at or
+    /// after `next_key`, which must be past the last key returned and inside
+    /// the scanned range.
+    pub async fn seek<K: AsRef<[u8]>>(&mut self, next_key: K) -> Result<(), slatedb::Error> {
+        self.inner
+            .seek(next_key)
+            .instrument(self.span.clone())
+            .await
+    }
 }
 
 /// Wraps a [`slatedb::DbTransaction`] so that every method runs under the shard

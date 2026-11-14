@@ -6,7 +6,7 @@ use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 
 use crate::codec::{DecodedTask, decode_task, encode_attempt, encode_holder, encode_lease};
-use crate::concurrency::{ConcurrencyManager, append_request_edits};
+use crate::concurrency::ConcurrencyManager;
 use crate::dst_events::{self, DstEvent};
 use crate::fb::silo::fb;
 use crate::job::{JobStatus, JobStatusKind, JobView, Limit};
@@ -857,8 +857,8 @@ impl JobStoreShard {
             // The request keeps the ticket's ORIGINAL start_time_ms and
             // priority: cancel/reimport locate request records by the narrow
             // (tenant, queue, start_time, priority, job_id, attempt) prefix
-            // derived from job status, and process_grants grants in
-            // start-time order, so the job keeps its fair queue position.
+            // derived from job status, and process_grants grants in key
+            // order, so the job keeps its queue position.
             //
             // No rollback handling is needed: nothing was reserved in memory
             // (try_reserve failed), and if the batch never commits the ticket
@@ -866,7 +866,7 @@ impl JobStoreShard {
             state.batch.delete(task_key);
             state.ack_deleted(task_key);
             let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
-            append_request_edits(
+            self.concurrency.append_request_edits(
                 &mut writer,
                 &tenant,
                 &queue,

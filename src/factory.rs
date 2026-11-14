@@ -507,6 +507,7 @@ impl ShardFactory {
                             cold_batch_size: template.grant_scanner_cold_batch_size,
                             next_hop_skip_min_backlog: template
                                 .grant_scanner_next_hop_skip_min_backlog,
+                            priority_ordered_requests: template.concurrency_request_priority_order,
                             live_headroom_fraction: template.grant_scanner_live_headroom_fraction,
                             commit_chunk_size: template.grant_scanner_commit_chunk_size,
                         },
@@ -1536,6 +1537,7 @@ impl ShardFactory {
                     next_hop_skip_min_backlog: self
                         .template
                         .grant_scanner_next_hop_skip_min_backlog,
+                    priority_ordered_requests: self.template.concurrency_request_priority_order,
                     live_headroom_fraction: self.template.grant_scanner_live_headroom_fraction,
                     commit_chunk_size: self.template.grant_scanner_commit_chunk_size,
                 },

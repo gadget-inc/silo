@@ -614,9 +614,29 @@ pub fn parse_attempt_key(key: &[u8]) -> Option<ParsedAttemptKey> {
     })
 }
 
-/// Concurrency request queue key.
-/// Ordered by start time (when job should run), then priority (lower = higher), then (job_id, attempt_number, suffix).
+/// Bits of a concurrency request key's ordering field that hold the start
+/// time. The byte above them holds the row's band.
+const CONCURRENCY_REQUEST_START_MASK: u64 = (1 << 56) - 1;
+
+/// The ordering field of a priority-ordered request key: the priority in the
+/// top byte, the start time in the low 56 bits.
+fn concurrency_request_order_field(priority: u8, start_time_ms: i64) -> u64 {
+    ((priority as u64) << 56) | concurrency_request_start_field(start_time_ms)
+}
+
+/// The ordering field of a start-time-ordered request key: the start time in
+/// the low 56 bits under a zero top byte.
+fn concurrency_request_start_field(start_time_ms: i64) -> u64 {
+    (start_time_ms.max(0) as u64).min(CONCURRENCY_REQUEST_START_MASK)
+}
+
+/// Concurrency request queue key, priority-ordered.
+/// Ordered by priority (lower = higher), then start time (when job should run), then (job_id, attempt_number, suffix).
 /// The composed request_id used downstream is `{job_id}:{attempt_number}:{suffix}`.
+///
+/// The `u64` after the queue is the ordering field: the priority in its top
+/// byte (the row's band) and the start time in its low 56 bits. The priority
+/// byte after it is the same value for every row of a band above 0.
 ///
 /// Uses nested tuples to encode 7 fields (storekey supports tuples up to 6 elements).
 /// Since storekey encodes tuple elements sequentially, the nested encoding is byte-identical
@@ -633,9 +653,52 @@ pub fn concurrency_request_key(
     encode_with_prefix(
         prefix::CONCURRENCY_REQUEST,
         &(
-            (tenant, queue, start_time_ms.max(0) as u64, priority),
+            (
+                tenant,
+                queue,
+                concurrency_request_order_field(priority, start_time_ms),
+                priority,
+            ),
             (job_id, attempt_number, suffix),
         ),
+    )
+}
+
+/// Concurrency request queue key, start-time-ordered.
+/// Ordered by start time, then priority, then (job_id, attempt_number, suffix).
+///
+/// Same shape as [`concurrency_request_key`] with a zero top byte in the
+/// ordering field, so every such row is in band 0 whatever its priority. The
+/// two encodings are byte-identical at priority 0.
+pub fn concurrency_request_key_start_time_first(
+    tenant: &str,
+    queue: &str,
+    start_time_ms: i64,
+    priority: u8,
+    job_id: &str,
+    attempt_number: u32,
+    suffix: &str,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::CONCURRENCY_REQUEST,
+        &(
+            (
+                tenant,
+                queue,
+                concurrency_request_start_field(start_time_ms),
+                priority,
+            ),
+            (job_id, attempt_number, suffix),
+        ),
+    )
+}
+
+/// First key of `band` in a queue's request rows: every row of the band sorts
+/// at or after it, every row of a lower band before it.
+pub fn concurrency_request_band_start(tenant: &str, queue: &str, band: u8) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::CONCURRENCY_REQUEST,
+        &(tenant, queue, (band as u64) << 56),
     )
 }
 
@@ -649,7 +712,7 @@ pub fn concurrency_request_tenant_prefix(tenant: &str) -> Vec<u8> {
     encode_with_prefix(prefix::CONCURRENCY_REQUEST, &(tenant,))
 }
 
-/// Prefix for scanning a specific job's concurrency requests within a (tenant, queue, start_time, priority) bucket.
+/// Prefix for scanning a specific job's priority-ordered concurrency requests within a (tenant, queue, priority, start_time) bucket.
 /// Enables narrow O(1) prefix scan instead of scanning the entire queue.
 pub fn concurrency_request_job_prefix(
     tenant: &str,
@@ -664,7 +727,30 @@ pub fn concurrency_request_job_prefix(
         &(
             tenant,
             queue,
-            start_time_ms.max(0) as u64,
+            concurrency_request_order_field(priority, start_time_ms),
+            priority,
+            job_id,
+            attempt_number,
+        ),
+    )
+}
+
+/// Prefix for scanning a specific job's start-time-ordered concurrency
+/// requests. Equal to [`concurrency_request_job_prefix`] at priority 0.
+pub fn concurrency_request_job_prefix_start_time_first(
+    tenant: &str,
+    queue: &str,
+    start_time_ms: i64,
+    priority: u8,
+    job_id: &str,
+    attempt_number: u32,
+) -> Vec<u8> {
+    encode_with_prefix(
+        prefix::CONCURRENCY_REQUEST,
+        &(
+            tenant,
+            queue,
+            concurrency_request_start_field(start_time_ms),
             priority,
             job_id,
             attempt_number,
@@ -682,6 +768,10 @@ pub fn concurrency_requests_prefix() -> Vec<u8> {
 pub struct ParsedConcurrencyRequestKey {
     pub tenant: String,
     pub queue: String,
+    /// Top byte of the key's ordering field. Rows of a queue sort by band,
+    /// then start time. A priority-ordered row's band is its priority; a
+    /// start-time-ordered row's band is 0.
+    pub band: u8,
     pub start_time_ms: u64,
     pub priority: u8,
     pub job_id: String,
@@ -704,14 +794,15 @@ pub fn parse_concurrency_request_key(key: &[u8]) -> Option<ParsedConcurrencyRequ
     if key.first() != Some(&prefix::CONCURRENCY_REQUEST) {
         return None;
     }
-    let ((tenant, queue, start_time_ms, priority), (job_id, attempt_number, suffix)): (
+    let ((tenant, queue, order_field, priority), (job_id, attempt_number, suffix)): (
         (String, String, u64, u8),
         (String, u32, String),
     ) = decode(&key[1..]).ok()?;
     Some(ParsedConcurrencyRequestKey {
         tenant,
         queue,
-        start_time_ms,
+        band: (order_field >> 56) as u8,
+        start_time_ms: order_field & CONCURRENCY_REQUEST_START_MASK,
         priority,
         job_id,
         attempt_number,

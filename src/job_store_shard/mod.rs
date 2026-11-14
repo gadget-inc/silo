@@ -523,6 +523,7 @@ impl JobStoreShard {
                     concurrency: cfg.grant_scanner_concurrency,
                     cold_batch_size: cfg.grant_scanner_cold_batch_size,
                     next_hop_skip_min_backlog: cfg.grant_scanner_next_hop_skip_min_backlog,
+                    priority_ordered_requests: cfg.concurrency_request_priority_order,
                     live_headroom_fraction: cfg.grant_scanner_live_headroom_fraction,
                     commit_chunk_size: cfg.grant_scanner_commit_chunk_size,
                 },

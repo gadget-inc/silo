@@ -11,8 +11,9 @@ use crate::job_store_shard::helpers::{
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
 use crate::keys::{
-    concurrency_holder_key, concurrency_request_job_prefix, concurrency_requester_counter_key,
-    end_bound, job_cancelled_key, job_info_key, job_status_key,
+    concurrency_holder_key, concurrency_request_job_prefix,
+    concurrency_request_job_prefix_start_time_first, concurrency_requester_counter_key, end_bound,
+    job_cancelled_key, job_info_key, job_status_key,
 };
 use crate::task::Task;
 
@@ -420,7 +421,8 @@ impl JobStoreShard {
         Ok(holders_to_release)
     }
 
-    /// Scan a narrow prefix for this job's concurrency requests and delete them.
+    /// Scan the narrow prefixes for this job's concurrency requests, one per
+    /// key order, and delete what they hold.
     /// Returns true if any requests were deleted.
     ///
     /// For each request value found, decodes the persisted `task_id` and
@@ -444,7 +446,18 @@ impl JobStoreShard {
         priority: u8,
         holders_to_release: &mut Vec<(String, String)>,
     ) -> Result<bool, JobStoreShardError> {
-        let prefix = concurrency_request_job_prefix(
+        // A row is priority-ordered or start-time-ordered depending on the
+        // setting in force when it was written, so both prefixes are probed.
+        // They are the same bytes at priority 0.
+        let mut prefixes = vec![concurrency_request_job_prefix(
+            tenant,
+            queue_key,
+            start_time_ms,
+            priority,
+            job_id,
+            attempt_number,
+        )];
+        let start_time_first = concurrency_request_job_prefix_start_time_first(
             tenant,
             queue_key,
             start_time_ms,
@@ -452,11 +465,21 @@ impl JobStoreShard {
             job_id,
             attempt_number,
         );
-        let end = end_bound(&prefix);
-        let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+        if !prefixes.contains(&start_time_first) {
+            prefixes.push(start_time_first);
+        }
+
+        let mut rows = Vec::new();
+        for prefix in prefixes {
+            let end = end_bound(&prefix);
+            let mut iter = self.db.scan::<Vec<u8>, _>(prefix..end).await?;
+            while let Some(kv) = iter.next().await? {
+                rows.push(kv);
+            }
+        }
 
         let mut deleted_count: i64 = 0;
-        while let Some(kv) = iter.next().await? {
+        for kv in rows {
             // Decode the request to recover any upstream `held_queues` the
             // chain accumulated before this gate. Missing/corrupt values are
             // logged — we still delete the request key but cannot recover the
