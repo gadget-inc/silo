@@ -388,3 +388,59 @@ async fn grpc_enqueue_requires_tenant_when_tenancy_enabled() -> anyhow::Result<(
     .expect("test timed out")?;
     Ok(())
 }
+
+#[silo::test(flavor = "multi_thread")]
+async fn grpc_delete_job_that_is_not_terminal_returns_failed_precondition() -> anyhow::Result<()> {
+    let _guard = tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+        let (factory, _tmp) = create_test_factory().await?;
+        let (mut client, shutdown_tx, server, _addr) =
+            setup_test_server(factory.clone(), AppConfig::load(None).unwrap()).await?;
+
+        let payload_bytes = rmp_serde::to_vec(&serde_json::json!({ "hello": "world" })).unwrap();
+        let job_id = client
+            .enqueue(EnqueueRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: "".to_string(),
+                priority: 10,
+                start_at_ms: 0,
+                retry_policy: None,
+                payload: Some(SerializedBytes {
+                    encoding: Some(serialized_bytes::Encoding::Msgpack(payload_bytes)),
+                }),
+                limits: vec![],
+                tenant: None,
+                metadata: std::collections::HashMap::new(),
+                task_group: "default".to_string(),
+            })
+            .await?
+            .into_inner()
+            .id;
+
+        // The job is Scheduled: no worker has leased it
+        let status = client
+            .delete_job(DeleteJobRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: job_id.clone(),
+                tenant: None,
+            })
+            .await
+            .expect_err("deleting a scheduled job should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        // The rejected delete leaves the job in place
+        client
+            .get_job(GetJobRequest {
+                shard: crate::grpc_integration_helpers::TEST_SHARD_ID.to_string(),
+                id: job_id,
+                tenant: None,
+                include_attempts: false,
+            })
+            .await?;
+
+        shutdown_server(shutdown_tx, server).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .expect("test timed out")?;
+    Ok(())
+}
