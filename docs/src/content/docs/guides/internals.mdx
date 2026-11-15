@@ -212,9 +212,9 @@ The tricky part is keeping in-memory counts consistent with durable state. We us
 
 When a job with concurrency limits is enqueued, limits are processed sequentially:
 
-1. **Immediate grant**: Check the in-memory holder count against `max_concurrency`. If there's room, atomically reserve a slot in memory, write a holder record to the batch, and advance to the next limit.
+1. **Immediate grant**: Check the in-memory holder count against `max_concurrency`. If there's room and no job is waiting on the queue, atomically reserve a slot in memory, write a holder record to the batch, and advance to the next limit.
 
-2. **Queued**: If the queue is full and the job is ready to run now, write a requester record to the batch. No task goes in the task queue — the job is parked until a slot opens.
+2. **Queued**: If the queue is full and the job is ready to run now, write a requester record to the batch. No task goes in the task queue — the job is parked until a slot opens. A job that finds room while the queue's requester counter is above zero is queued the same way, so the free slot goes to the grant scanner's pick and not to whichever job arrived last; the grant scanner is nudged for the queue once the requester record is durable. A due `RequestTicket` and a chain reaching its next queue follow the same rule. The counter is a durable read, so a requester still in an uncommitted batch is not seen. Slots in the live-headroom share (`grant_scanner_live_headroom_fraction`), which the scanner never fills, are still taken by arriving jobs directly.
 
 3. **Future-scheduled**: If the queue is full and the job has a future start time, write a `RequestTicket` task to the task queue at that start time. When it fires, it re-attempts the grant.
 

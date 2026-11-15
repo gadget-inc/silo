@@ -483,6 +483,7 @@ impl JobStoreShard {
             }
             dst_events::confirm_write(write_op);
             self.mark_refresh_pending_groups(state.scheduled_refreshes.task_groups());
+            self.request_grants_for_yielded_queues(&state.scheduled_refreshes);
 
             // DB write succeeded — grants are now backed by durable holder
             // rows, no rollback needed. Confirm each one in memory and empty
@@ -828,23 +829,42 @@ impl JobStoreShard {
         self.concurrency
             .cache_queue_limit(&tenant, &queue, max_allowed as u32, limit_type);
 
+        // A due ticket leaves a free slot to the jobs already waiting on the
+        // queue, like an arriving enqueue. Tickets converted earlier in this
+        // iteration are waiters the durable counter does not show yet.
+        let yields_to_waiters = state
+            .converted_requests
+            .iter()
+            .any(|(t, q)| t == &tenant && q == &queue)
+            || self
+                .concurrency
+                .arrival_yields_to_waiters(
+                    &self.db,
+                    &self.get_range(),
+                    &tenant,
+                    &queue,
+                    max_allowed,
+                )
+                .await?;
+
         // Atomically reserve a slot (preserves the original TOCTOU invariant).
-        let reserved = self
-            .concurrency
-            .counts()
-            .try_reserve(
-                &self.db,
-                &self.get_range(),
-                &tenant,
-                &queue,
-                &task_id,
-                max_allowed,
-                &job_id,
-            )
-            .await?;
+        let reserved = !yields_to_waiters
+            && self
+                .concurrency
+                .counts()
+                .try_reserve(
+                    &self.db,
+                    &self.get_range(),
+                    &tenant,
+                    &queue,
+                    &task_id,
+                    max_allowed,
+                    &job_id,
+                )
+                .await?;
 
         if !reserved {
-            // Out of capacity. Do NOT leave the ticket in
+            // Out of capacity, or yielding to waiters. Do NOT leave the ticket in
             // the task keyspace — the broker rescans the group from the front
             // every pass and claims in key order, so a pile of permanently
             // unconsumable tickets head-of-line blocks every later-keyed task

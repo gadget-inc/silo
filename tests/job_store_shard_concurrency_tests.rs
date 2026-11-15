@@ -6189,9 +6189,9 @@ async fn grant_scanner_next_hop_skip_defers_and_resumes_after_release() {
     );
 
     // Free the platform slot: the skip no longer fires (holders < cap
-    // regardless of line depth) and both user grants proceed — the first
-    // waiter chains straight through the platform hop, the second parks
-    // there as a deferred request.
+    // regardless of line depth) and both user grants proceed. The platform
+    // hop's requester counter says jobs are waiting there, so both chains
+    // leave its free slot to them and park as deferred requests.
     shard
         .report_attempt_outcome(&platform_task, AttemptOutcome::Success { result: vec![] })
         .await
@@ -6200,8 +6200,8 @@ async fn grant_scanner_next_hop_skip_defers_and_resumes_after_release() {
     assert_eq!(granted.len(), 2, "grants resume once the hop frees a slot");
     assert_eq!(
         count_concurrency_requests(shard.db()).await,
-        1,
-        "two user rows consumed, one new platform row parked"
+        2,
+        "two user rows consumed, two new platform rows parked"
     );
 }
 
@@ -6646,8 +6646,8 @@ async fn grant_scanner_next_hop_skip_stale_embedded_limit_does_not_poison() {
     );
     assert_eq!(
         count_concurrency_requests(shard.db()).await,
-        1,
-        "old skip row remains; new row was consumed by the grant"
+        2,
+        "old skip row remains; the granted chain parked behind the platform hop's waiters"
     );
 }
 

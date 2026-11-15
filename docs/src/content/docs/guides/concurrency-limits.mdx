@@ -32,7 +32,7 @@ await client.enqueue({
 
 When you enqueue a job with a concurrency limit, Silo:
 
-1. **Checks capacity**: If fewer than `maxConcurrency` jobs are running for that key, the job is granted a "ticket" immediately
+1. **Checks capacity**: If fewer than `maxConcurrency` jobs are running for that key and no job is waiting for it, the job is granted a "ticket" immediately
 2. **Queues if full**: If the limit is at capacity, the job waits in a request queue ordered by priority and start time
 3. **Grants on completion**: When a running job finishes, the next waiting job in the queue is automatically granted a ticket
 

@@ -85,6 +85,16 @@ impl JobStoreShard {
         }
     }
 
+    /// Nudge the grant scanner for every queue on which a chain yielded a
+    /// free slot to waiting jobs, after the batch that wrote the chain's
+    /// request record is durable. A missed nudge is recovered by the
+    /// periodic requester sweep.
+    pub(crate) fn request_grants_for_yielded_queues(&self, refreshes: &ScheduledRefreshes) {
+        for (tenant, queue) in refreshes.yielded_queues() {
+            self.concurrency.request_grant(tenant, queue);
+        }
+    }
+
     /// Whether `task_group` may hold a refresh index row.
     fn refresh_group_pending(&self, task_group: &str) -> bool {
         self.refresh_pending_groups

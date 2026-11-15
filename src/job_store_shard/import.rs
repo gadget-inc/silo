@@ -361,6 +361,7 @@ impl JobStoreShard {
             dst_events::confirm_write(op);
         }
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
+        self.request_grants_for_yielded_queues(&scheduled_refreshes);
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
@@ -880,6 +881,7 @@ impl JobStoreShard {
             dst_events::confirm_write(op);
         }
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
+        self.request_grants_for_yielded_queues(&scheduled_refreshes);
 
         // [SILO-REIMP-6] Remove buffered tasks for this job.
         // Must happen after commit so the scanner cannot re-buffer old tasks from DB.

@@ -258,7 +258,10 @@ pub enum RequestTicketOutcome {
     /// Note: In-memory slot is already reserved by try_reserve before this is returned.
     GrantedImmediately { task_id: String, queue: String },
     /// Ticket queued as a request record (for immediate start time but no capacity)
-    TicketRequested { queue: String },
+    /// `yielded` is set when the queue had a free slot the job left to jobs
+    /// already waiting; the grant scanner must then be nudged for the queue
+    /// once the request record is durable.
+    TicketRequested { queue: String, yielded: bool },
     /// Job queued as a RequestTicket task (for future start time)
     FutureRequestTaskWritten { queue: String, task_id: String },
 }
@@ -1668,6 +1671,48 @@ impl ConcurrencyManager {
         reads.depth.unwrap() >= min_backlog
     }
 
+    /// Whether a job arriving at `(tenant, queue)` should join the queue's
+    /// waiters when a slot is free, leaving the slot to the grant scanner.
+    ///
+    /// True when the queue has a slot the scanner may fill and its requester
+    /// counter is above zero. The caller then writes a request record and
+    /// nudges the scanner once the record is durable; the scanner grants the
+    /// slot to the first eligible waiter in key order, which may be the
+    /// arrival itself.
+    ///
+    /// False when the queue is full (the arrival waits either way) and when
+    /// the only free slots are the live-headroom share the scanner leaves
+    /// unfilled (`scanner_effective_capacity`): yielding those would strand
+    /// them, since the scanner never grants into that share.
+    ///
+    /// The counter is a durable read, so a waiter whose request record sits
+    /// in an uncommitted batch is not seen, and an unreadable counter counts
+    /// as no waiters: the check keeps a slot from going to an arrival ahead
+    /// of visible waiters without ever failing or stalling the arrival.
+    pub(crate) async fn arrival_yields_to_waiters(
+        &self,
+        db: &Arc<InstrumentedDb>,
+        range: &ShardRange,
+        tenant: &str,
+        queue: &str,
+        capacity: usize,
+    ) -> Result<bool, ConcurrencyError> {
+        self.counts
+            .ensure_hydrated(db, range, tenant, queue)
+            .await?;
+        if self.counts.holder_count(tenant, queue) >= self.scanner_effective_capacity(capacity) {
+            return Ok(false);
+        }
+        let waiting = match db
+            .get(&concurrency_requester_counter_key(tenant, queue))
+            .await
+        {
+            Ok(Some(raw)) => decode_counter(&raw),
+            _ => 0,
+        };
+        Ok(waiting > 0)
+    }
+
     /// Handle concurrency for a new job enqueue.
     ///
     /// IMPORTANT: This method atomically reserves in-memory concurrency slots BEFORE returning.
@@ -1727,7 +1772,17 @@ impl ConcurrencyManager {
         // [SILO-RETRY-5-CONC] Skip try_reserve for retries: the old holder is still in-memory
         // (released post-commit), so the retry must go through the request queue. This matches
         // the Alloy model's completeFailureRetryReleaseTicket which creates a TicketRequest.
+        //
+        // A job that could start now leaves a free slot to the jobs already
+        // waiting on the queue and joins them, so the grant scanner fills the
+        // slot in queue order.
+        let yields_to_waiters = !skip_try_reserve
+            && scheduled_at_ms <= now_ms
+            && self
+                .arrival_yields_to_waiters(db, range, tenant, queue, max_allowed)
+                .await?;
         if !skip_try_reserve
+            && !yields_to_waiters
             && self
                 .counts
                 .try_reserve(db, range, tenant, queue, task_id, max_allowed, job_id)
@@ -1793,6 +1848,7 @@ impl ConcurrencyManager {
             )?;
             Ok(Some(RequestTicketOutcome::TicketRequested {
                 queue: queue.clone(),
+                yielded: yields_to_waiters,
             }))
         } else {
             // Job scheduled for future: queue as RequestTicket task. The
@@ -3517,11 +3573,9 @@ impl ConcurrencyManager {
 
                 if chunk_grants.len() >= self.grant_scanner_commit_chunk_size {
                     let commit_batch = std::mem::replace(&mut batch, WriteBatch::new());
+                    let chunk_refreshes = std::mem::take(&mut chunk_scheduled_refreshes);
                     let refresh_groups: Vec<String> =
-                        std::mem::take(&mut chunk_scheduled_refreshes)
-                            .task_groups()
-                            .map(str::to_string)
-                            .collect();
+                        chunk_refreshes.task_groups().map(str::to_string).collect();
                     let stale_deletes = std::mem::take(&mut chunk_stale);
                     if self
                         .commit_grant_chunk(
@@ -3543,6 +3597,9 @@ impl ConcurrencyManager {
                     }
                     if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
                         resumer.refresh_index_rows_committed(&refresh_groups);
+                    }
+                    for (yielded_tenant, yielded_queue) in chunk_refreshes.yielded_queues() {
+                        self.request_grant(yielded_tenant, yielded_queue);
                     }
                     total_granted += chunk_grants.len();
                     total_stale_deleted += stale_deletes;
@@ -3590,6 +3647,9 @@ impl ConcurrencyManager {
             }
             if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
                 resumer.refresh_index_rows_committed(&refresh_groups);
+            }
+            for (yielded_tenant, yielded_queue) in chunk_scheduled_refreshes.yielded_queues() {
+                self.request_grant(yielded_tenant, yielded_queue);
             }
             total_granted += chunk_grants.len();
             total_stale_deleted += stale_deletes;
