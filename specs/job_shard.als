@@ -141,7 +141,9 @@ sig JobQueueRequirement {
 
 /**
  * A pending request for a concurrency ticket.
- * Stored at requests/<tenant>/<queue>/<start_time>/<priority>/<request_id>
+ * Stored at requests/<tenant>/<queue>/<order>/<priority>/<request_id>, where
+ * <order> is <priority>/<start_time> for a priority-ordered request and
+ * <start_time> for a start-time-ordered one
  * Contains the job waiting for a ticket and the task that will run when granted.
  */
 sig TicketRequest {

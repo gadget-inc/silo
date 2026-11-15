@@ -1,7 +1,9 @@
 use silo::job::ListingSegment;
 use silo::keys::{
-    MetadataIndexValue, StatusEnqueueTimeIndexValue, attempt_key, attempt_prefix,
-    concurrency_holder_key, concurrency_request_job_prefix, concurrency_request_key, end_bound,
+    MetadataIndexValue, ParsedConcurrencyRequestKey, StatusEnqueueTimeIndexValue, attempt_key,
+    attempt_prefix, concurrency_holder_key, concurrency_request_band_start,
+    concurrency_request_job_prefix, concurrency_request_job_prefix_start_time_first,
+    concurrency_request_key, concurrency_request_key_start_time_first, end_bound,
     floating_limit_state_key, idx_enqueue_time_key, idx_enqueue_time_tenant_prefix,
     idx_metadata_key, idx_status_enqueue_time_candidate_keys, idx_status_enqueue_time_key,
     idx_status_enqueue_time_priority_prefix, idx_status_enqueue_time_segment_prefix,
@@ -599,15 +601,94 @@ fn test_special_characters_comprehensive() {
 
 #[test]
 fn test_concurrency_request_ordering() {
-    // Requests should sort by start_time, then priority, then job_id, then attempt, then suffix
+    // Requests sort by priority, then start_time, then job_id, then attempt, then suffix
     let key1 = concurrency_request_key("t", "q", 1000, 10, "job1", 1, "aaaa");
     let key2 = concurrency_request_key("t", "q", 2000, 10, "job2", 1, "bbbb");
-    let key3 = concurrency_request_key("t", "q", 1000, 20, "job3", 1, "cccc");
+    let key3 = concurrency_request_key("t", "q", 500, 20, "job3", 1, "cccc");
+    let key4 = concurrency_request_key("t", "q", 3000, 5, "job4", 1, "dddd");
 
-    // Earlier time comes first
+    // Same priority, earlier time comes first
     assert!(key1 < key2);
-    // Same time, lower priority comes first
+    // Lower priority value comes first, whatever the start times
+    assert!(key2 < key3);
+    assert!(key4 < key1);
+}
+
+#[test]
+fn test_concurrency_request_start_time_first_ordering() {
+    // Requests sort by start_time, then priority
+    let key1 = concurrency_request_key_start_time_first("t", "q", 1000, 10, "job1", 1, "aaaa");
+    let key2 = concurrency_request_key_start_time_first("t", "q", 2000, 5, "job2", 1, "bbbb");
+    let key3 = concurrency_request_key_start_time_first("t", "q", 1000, 20, "job3", 1, "cccc");
+
+    assert!(key1 < key2);
     assert!(key1 < key3);
+    assert!(key3 < key2);
+
+    // Every start-time-first row sorts ahead of priority-ordered rows of priority 1 and up
+    let banded = concurrency_request_key("t", "q", 0, 1, "job0", 1, "0000");
+    assert!(key2 < banded);
+    assert!(concurrency_request_band_start("t", "q", 1) <= banded);
+    assert!(key2 < concurrency_request_band_start("t", "q", 1));
+}
+
+#[test]
+fn test_concurrency_request_key_roundtrip_in_both_orders() {
+    for priority in [0u8, 5, 255] {
+        for start_time_ms in [0i64, 1_700_000_000_000] {
+            let key = concurrency_request_key("t", "q", start_time_ms, priority, "job1", 3, "aaaa");
+            let parsed = parse_concurrency_request_key(&key).unwrap();
+            assert_eq!(parsed.tenant, "t");
+            assert_eq!(parsed.queue, "q");
+            assert_eq!(parsed.band, priority);
+            assert_eq!(parsed.start_time_ms, start_time_ms as u64);
+            assert_eq!(parsed.priority, priority);
+            assert_eq!(parsed.job_id, "job1");
+            assert_eq!(parsed.attempt_number, 3);
+            assert_eq!(parsed.suffix, "aaaa");
+
+            let start_time_first = concurrency_request_key_start_time_first(
+                "t",
+                "q",
+                start_time_ms,
+                priority,
+                "job1",
+                3,
+                "aaaa",
+            );
+            let parsed_start_time_first = parse_concurrency_request_key(&start_time_first).unwrap();
+            assert_eq!(parsed_start_time_first.band, 0);
+            assert_eq!(
+                ParsedConcurrencyRequestKey {
+                    band: priority,
+                    ..parsed_start_time_first
+                },
+                parsed
+            );
+            assert_eq!(key == start_time_first, priority == 0);
+        }
+    }
+}
+
+#[test]
+fn test_concurrency_request_job_prefix_start_time_first_scanning() {
+    let prefix = concurrency_request_job_prefix_start_time_first("t", "q", 1000, 10, "job1", 1);
+    let key = concurrency_request_key_start_time_first("t", "q", 1000, 10, "job1", 1, "aaaa0000");
+    assert!(key.starts_with(&prefix));
+
+    let other_job =
+        concurrency_request_key_start_time_first("t", "q", 1000, 10, "job2", 1, "aaaa0000");
+    let other_attempt =
+        concurrency_request_key_start_time_first("t", "q", 1000, 10, "job1", 2, "aaaa0000");
+    let priority_ordered = concurrency_request_key("t", "q", 1000, 10, "job1", 1, "aaaa0000");
+    assert!(!other_job.starts_with(&prefix));
+    assert!(!other_attempt.starts_with(&prefix));
+    assert!(!priority_ordered.starts_with(&prefix));
+
+    assert_eq!(
+        concurrency_request_job_prefix_start_time_first("t", "q", 1000, 0, "job1", 1),
+        concurrency_request_job_prefix("t", "q", 1000, 0, "job1", 1)
+    );
 }
 
 #[test]

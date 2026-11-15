@@ -442,6 +442,17 @@ pub struct DatabaseTemplate {
     /// downstream queue). 0 disables the skip. Defaults to 1024.
     #[serde(default = "default_grant_scanner_next_hop_skip_min_backlog")]
     pub grant_scanner_next_hop_skip_min_backlog: u64,
+    /// When true, a job that starts waiting on a full concurrency queue is
+    /// written priority-ordered: the grant scanner serves a queue's waiters
+    /// by priority, then start time. When false it is written
+    /// start-time-ordered, and priority only orders waiters that share a
+    /// start millisecond. Waiters of both orders are read and granted either
+    /// way, start-time-ordered ones first. Defaults to false. A binary that
+    /// only knows start-time-ordered waiters misreads priority-ordered ones,
+    /// so every binary that can own a shard must read both before this is
+    /// turned on.
+    #[serde(default)]
+    pub concurrency_request_priority_order: bool,
     /// Fraction of each queue's capacity the grant scanner leaves unfilled
     /// for immediate (live) grants, so fresh enqueues keep instant admission
     /// while the scanner digs out a deferred backlog. Clamped to [0.0, 0.9].
@@ -579,6 +590,7 @@ impl Default for DatabaseTemplate {
             orphan_holder_stale_ms: default_orphan_holder_stale_ms(),
             grant_scanner_next_hop_skip_min_backlog:
                 default_grant_scanner_next_hop_skip_min_backlog(),
+            concurrency_request_priority_order: false,
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
@@ -1027,6 +1039,11 @@ pub struct DatabaseConfig {
     /// Defaults to 1024; 0 disables.
     #[serde(default = "default_grant_scanner_next_hop_skip_min_backlog")]
     pub grant_scanner_next_hop_skip_min_backlog: u64,
+    /// Whether new concurrency queue waiters are ordered by priority, then
+    /// start time. See `DatabaseTemplate::concurrency_request_priority_order`
+    /// for details. Defaults to false.
+    #[serde(default)]
+    pub concurrency_request_priority_order: bool,
     /// Fraction of queue capacity the scanner leaves for immediate grants. See
     /// `DatabaseTemplate::grant_scanner_live_headroom_fraction` for details.
     /// Defaults to 0.0.
@@ -1113,6 +1130,7 @@ impl Default for DatabaseConfig {
             orphan_holder_stale_ms: default_orphan_holder_stale_ms(),
             grant_scanner_next_hop_skip_min_backlog:
                 default_grant_scanner_next_hop_skip_min_backlog(),
+            concurrency_request_priority_order: false,
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
