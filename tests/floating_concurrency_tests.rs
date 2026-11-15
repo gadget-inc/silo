@@ -1799,7 +1799,7 @@ async fn floating_limit_refresh_task_lease_expiry_allows_rescheduling() {
     shard.db().flush().await.expect("flush mutated lease");
 
     // Reap expired leases - this should handle the expired refresh task
-    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    let reaped = shard.reap_expired_leases().await.expect("reap");
     assert_eq!(reaped, 1, "should have reaped exactly one lease");
 
     // Verify the lease was deleted
@@ -1961,7 +1961,7 @@ async fn floating_limit_refresh_task_lease_expiry_preserves_state() {
     shard.db().flush().await.expect("flush mutated lease");
 
     // Reap the expired lease
-    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    let reaped = shard.reap_expired_leases().await.expect("reap");
     assert_eq!(reaped, 1);
 
     // Verify all state fields were preserved except refresh_task_scheduled
@@ -2609,7 +2609,7 @@ async fn floating_limit_refresh_lease_expiry_clears_scheduled_stamp() {
         .expect("put expired lease");
     shard.db().flush().await.expect("flush");
 
-    assert_eq!(shard.reap_expired_leases("-").await.expect("reap"), 1);
+    assert_eq!(shard.reap_expired_leases().await.expect("reap"), 1);
 
     let state = read_floating_state(&shard, queue).await;
     assert!(!state.refresh_task_scheduled());
@@ -3750,7 +3750,7 @@ async fn floating_limit_refresh_lease_expiry_clears_the_stale_reset_count() {
         .expect("put expired lease");
     shard.db().flush().await.expect("flush");
 
-    assert_eq!(shard.reap_expired_leases("-").await.expect("reap"), 1);
+    assert_eq!(shard.reap_expired_leases().await.expect("reap"), 1);
     let state = read_floating_state(&shard, queue).await;
     assert!(!state.refresh_task_scheduled());
     assert_eq!(state.stale_reset_count(), 0);

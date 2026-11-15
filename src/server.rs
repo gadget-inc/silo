@@ -2507,7 +2507,7 @@ where
                     // Use default tenant "-" for system-level reaping
                     for (shard_id, shard) in instances.iter() {
                         let reap_start = std::time::Instant::now();
-                        let result = shard.reap_expired_leases("-").await;
+                        let result = shard.reap_expired_leases().await;
                         let shard_label = shard_id.to_string();
                         if let Some(ref m) = reaper_metrics {
                             m.record_lease_reaper_duration(

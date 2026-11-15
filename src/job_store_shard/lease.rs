@@ -259,7 +259,10 @@ impl JobStoreShard {
                     // Use relative_attempt_number for retry delay calculation
                     // This ensures retry schedule resets after a job restart
                     let failures_so_far = relative_attempt_number;
-                    if let Some(policy_rt) = view.retry_policy()
+                    // [SILO-RETRY-6] A cancelled job gets no retry
+                    let job_cancelled = self.is_job_cancelled(&tenant, &job_id).await?;
+                    if !job_cancelled
+                        && let Some(policy_rt) = view.retry_policy()
                         && let Some(next_time) =
                             crate::retry::next_retry_time_ms(now_ms, failures_so_far, &policy_rt)
                     {
@@ -324,11 +327,23 @@ impl JobStoreShard {
                         followup_next_time = Some(next_time);
                         new_job_status_for_dst = Some("Scheduled".to_string());
                     }
-                    // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write)
+                    // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write).
+                    // A cancelled job ends Cancelled; its attempt keeps the reported error.
                     if !scheduled_followup {
-                        let job_status = JobStatus::failed(now_ms);
-                        terminal_expire_ts =
-                            self.terminal_expire_ts(crate::job::JobStatusKind::Failed, now_ms);
+                        let (job_status, terminal_kind, terminal_status_name) = if job_cancelled {
+                            (
+                                JobStatus::cancelled(now_ms),
+                                crate::job::JobStatusKind::Cancelled,
+                                "Cancelled",
+                            )
+                        } else {
+                            (
+                                JobStatus::failed(now_ms),
+                                crate::job::JobStatusKind::Failed,
+                                "Failed",
+                            )
+                        };
+                        terminal_expire_ts = self.terminal_expire_ts(terminal_kind, now_ms);
                         if let Some(transition) = self
                             .set_job_status_with_index_opts(
                                 &mut DbWriteBatcher::new(&self.db, &mut batch),
@@ -342,7 +357,7 @@ impl JobStoreShard {
                         {
                             background_action_transitions.push(transition);
                         }
-                        // Job reached terminal state (failed permanently) - include counter in batch
+                        // Job reached terminal state - include counter in batch
                         if let Err(e) = self.increment_completed_jobs_counter(
                             &mut DbWriteBatcher::new(&self.db, &mut batch),
                         ) {
@@ -351,7 +366,7 @@ impl JobStoreShard {
                             );
                             return Err(e);
                         }
-                        new_job_status_for_dst = Some("Failed".to_string());
+                        new_job_status_for_dst = Some(terminal_status_name.to_string());
                         reached_terminal = true;
                     }
                 } else {
@@ -527,7 +542,7 @@ impl JobStoreShard {
     /// For RefreshFloatingLimit tasks, resets the floating limit state so it can be retried on next periodic refresh.
     /// Skips and deletes leases for tenants outside the shard's range.
     /// Returns the number of expired leases reaped.
-    pub async fn reap_expired_leases(&self, tenant: &str) -> Result<usize, JobStoreShardError> {
+    pub async fn reap_expired_leases(&self) -> Result<usize, JobStoreShardError> {
         // Scan all lease keys using the binary prefix
         let start = crate::keys::leases_prefix();
         let end = crate::keys::end_bound(&start);
@@ -590,7 +605,7 @@ impl JobStoreShard {
 
             // Check if job was cancelled - if so, report Cancelled instead of WORKER_CRASHED
             let was_cancelled = self
-                .is_job_cancelled(tenant, &job_id)
+                .is_job_cancelled(lease_tenant, &job_id)
                 .await
                 .unwrap_or(false);
 

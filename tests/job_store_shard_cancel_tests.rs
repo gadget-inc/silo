@@ -395,7 +395,7 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
         shard.db().flush().await.expect("flush mutated lease");
 
         // Reap expired leases
-        let reaped = shard.reap_expired_leases("-").await.expect("reap");
+        let reaped = shard.reap_expired_leases().await.expect("reap");
         assert_eq!(reaped, 1);
 
         // Verify job status is Cancelled (not Failed)
@@ -413,6 +413,230 @@ async fn reap_expired_lease_cancelled_job_sets_cancelled_status() {
         // Verify attempt status is Cancelled
         let attempt = shard
             .get_job_attempt("-", &job_id, 1)
+            .await
+            .expect("get attempt")
+            .expect("exists");
+        match attempt.state() {
+            AttemptStatus::Cancelled { .. } => {}
+            other => panic!("expected Cancelled, got {:?}", other),
+        }
+    });
+}
+
+/// An attempt that reports an error after its job was cancelled ends the job
+/// Cancelled: no retry is scheduled and its concurrency slot is released.
+#[silo::test]
+async fn error_outcome_for_cancelled_running_job_cancels_instead_of_retrying() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let policy = silo::retry::RetryPolicy {
+            retry_count: 3,
+            initial_interval_ms: 1,
+            max_interval_ms: i64::MAX,
+            randomize_interval: false,
+            backoff_factor: 1.0,
+        };
+        let limits = vec![silo::job::Limit::Concurrency(silo::job::ConcurrencyLimit {
+            key: "q-cancel-error".to_string(),
+            max_concurrency: 1,
+        })];
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                Some(policy),
+                payload,
+                limits,
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        assert_eq!(tasks.len(), 1);
+        let task_id = tasks[0].attempt().task_id().to_string();
+        assert_eq!(count_concurrency_holders(shard.db()).await, 1);
+
+        // Cancel while the attempt is running, then the attempt fails
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: b"boom".to_vec(),
+                },
+            )
+            .await
+            .expect("report error");
+
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("status")
+            .expect("exists");
+        assert_eq!(
+            status.kind,
+            JobStatusKind::Cancelled,
+            "the error should end the job Cancelled"
+        );
+
+        // The attempt keeps the error the worker reported
+        let attempt = shard
+            .get_job_attempt("-", &job_id, 1)
+            .await
+            .expect("attempt")
+            .expect("exists");
+        match attempt.state() {
+            AttemptStatus::Failed { error_code, .. } => assert_eq!(error_code, "TEST"),
+            other => panic!("expected Failed, got {:?}", other),
+        }
+
+        assert!(first_task_kv(shard.db()).await.is_none(), "no retry task");
+        assert_eq!(
+            count_concurrency_requests(shard.db()).await,
+            0,
+            "no retry request"
+        );
+        assert_eq!(
+            count_concurrency_holders(shard.db()).await,
+            0,
+            "slot released"
+        );
+        assert!(first_lease_kv(shard.db()).await.is_none(), "lease removed");
+    });
+}
+
+/// A cancelled job whose last attempt errors with retries exhausted ends
+/// Cancelled, the same as one that still had retries left.
+#[silo::test]
+async fn error_outcome_for_cancelled_running_job_without_retries_ends_cancelled() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("worker-1", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let task_id = tasks[0].attempt().task_id().to_string();
+
+        shard.cancel_job("-", &job_id).await.expect("cancel_job");
+        shard
+            .report_attempt_outcome(
+                &task_id,
+                AttemptOutcome::Error {
+                    error_code: "TEST".to_string(),
+                    error: b"boom".to_vec(),
+                },
+            )
+            .await
+            .expect("report error");
+
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("status")
+            .expect("exists");
+        assert_eq!(status.kind, JobStatusKind::Cancelled);
+    });
+}
+
+#[silo::test]
+async fn reap_expired_lease_cancelled_job_under_named_tenant_sets_cancelled_status() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let now = now_ms();
+        let job_id = shard
+            .enqueue(
+                "tenant-a",
+                None,
+                10u8,
+                now,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        let tasks = shard
+            .dequeue("w", "default", 1)
+            .await
+            .expect("dequeue")
+            .tasks;
+        let _leased_task_id = tasks[0].attempt().task_id().to_string();
+
+        // Cancel the job while it's running
+        shard
+            .cancel_job("tenant-a", &job_id)
+            .await
+            .expect("cancel_job");
+
+        // Find the lease and rewrite expiry to the past (simulate worker crash)
+        let (lease_key, lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
+        let decoded = decode_lease(lease_value).expect("decode lease");
+        let expired_ms = now_ms() - 1;
+        let new_record = LeaseRecord {
+            worker_id: decoded.worker_id().to_string(),
+            task: decoded.to_task().unwrap(),
+            expiry_ms: expired_ms,
+            started_at_ms: decoded.started_at_ms(),
+        };
+        let new_val = encode_lease(&new_record);
+        shard
+            .db()
+            .put(&lease_key, &new_val)
+            .await
+            .expect("put mutated lease");
+        shard.db().flush().await.expect("flush mutated lease");
+
+        // Reap expired leases
+        let reaped = shard.reap_expired_leases().await.expect("reap");
+        assert_eq!(reaped, 1);
+
+        // Verify job status is Cancelled (not Failed)
+        let status = shard
+            .get_job_status("tenant-a", &job_id)
+            .await
+            .expect("get status")
+            .expect("exists");
+        assert_eq!(
+            status.kind,
+            JobStatusKind::Cancelled,
+            "expired lease on cancelled job should result in Cancelled status"
+        );
+
+        // Verify attempt status is Cancelled
+        let attempt = shard
+            .get_job_attempt("tenant-a", &job_id, 1)
             .await
             .expect("get attempt")
             .expect("exists");

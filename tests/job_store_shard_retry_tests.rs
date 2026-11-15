@@ -1103,7 +1103,7 @@ async fn reap_marks_expired_lease_as_failed_and_enqueues_retry() {
         .expect("put mutated lease");
     shard.db().flush().await.expect("flush mutated lease");
 
-    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    let reaped = shard.reap_expired_leases().await.expect("reap");
     assert_eq!(reaped, 1);
 
     // Lease removed

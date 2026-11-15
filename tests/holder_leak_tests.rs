@@ -152,7 +152,7 @@ async fn floating_concurrency_holder_released_on_lease_expiry() {
 
     // Worker disappears (SIGTERM) — lease expires, server reaps.
     expire_first_lease(&shard).await;
-    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    let reaped = shard.reap_expired_leases().await.expect("reap");
     assert_eq!(reaped, 1);
 
     // Steady-state invariant: holder must be gone.
@@ -197,7 +197,7 @@ async fn floating_concurrency_holder_released_when_report_outcome_after_reap() {
     let task_id = leased[0].attempt().task_id().to_string();
 
     expire_first_lease(&shard).await;
-    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    let reaped = shard.reap_expired_leases().await.expect("reap");
     assert_eq!(reaped, 1);
 
     // Late ack from the worker that just came back: server should signal not-found,
@@ -610,7 +610,7 @@ async fn late_report_outcome_followed_by_purge_clears_holder() {
     assert_eq!(count_concurrency_holders(shard.db()).await, 2);
 
     expire_first_lease(&shard).await;
-    shard.reap_expired_leases(tenant).await.expect("reap");
+    shard.reap_expired_leases().await.expect("reap");
     // Reaper handled the legitimate held queue; the planted orphan remains.
     assert_eq!(count_concurrency_holders(shard.db()).await, 1);
 
@@ -700,7 +700,7 @@ async fn floating_concurrency_steady_state_zero_holders_after_full_cycle() {
             .expect("put expired");
     }
     shard.db().flush().await.expect("flush");
-    shard.reap_expired_leases("-").await.expect("reap");
+    shard.reap_expired_leases().await.expect("reap");
 
     assert_eq!(
         count_concurrency_holders(shard.db()).await,
@@ -1185,7 +1185,7 @@ async fn steady_state_zero_holders_under_mixed_workload() {
         .tasks;
     assert_eq!(reap_tasks.len(), 4);
     expire_all_leases(&shard).await;
-    let reaped = shard.reap_expired_leases(tenant).await.expect("reap");
+    let reaped = shard.reap_expired_leases().await.expect("reap");
     assert!(
         reaped >= 4,
         "expected at least 4 leases reaped, got {reaped}"

@@ -11,7 +11,7 @@ Jobs in Silo can be cancelled to stop processing, restarted to retry after failu
 Cancellation requests that a job stop processing. The behavior depends on the job's current state:
 
 - **Scheduled jobs**: The job is immediately marked as Cancelled and will never run
-- **Running jobs**: A cancellation flag is set and the worker discovers this on its next heartbeat. The worker's task then should stop processing and report a cancelled outcome, but the specific JS task handler can take arbitrarily long to do this as long as it continues to hold the lease.
+- **Running jobs**: A cancellation flag is set and the worker discovers this on its next heartbeat. The worker's task then should stop processing and report a cancelled outcome, but the specific JS task handler can take arbitrarily long to do this as long as it continues to hold the lease. If the attempt reports an error after the job was cancelled, the job ends Cancelled and no retry is scheduled, whatever its retry policy; the attempt keeps the reported error.
 
 ### Using the Client
 

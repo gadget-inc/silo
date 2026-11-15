@@ -2424,9 +2424,9 @@ async fn setup_cancelled_while_running(shard: &Arc<JobStoreShard>, job_id: &str)
 // Import → dequeue → Running → cancel_job → report(Error) => Failed + stale
 // cancelled key marker, which reimport must always clear.
 
-async fn setup_failed_after_cancel_while_running(shard: &Arc<JobStoreShard>, job_id: &str) {
+async fn setup_errored_after_cancel_while_running(shard: &Arc<JobStoreShard>, job_id: &str) {
     let mut params = base_import_params(job_id);
-    params.retry_policy = None; // no retries so Error finalizes to Failed
+    params.retry_policy = None;
     let r = shard.import_jobs("-", vec![params]).await.unwrap();
     assert!(r[0].success);
 
@@ -2450,8 +2450,9 @@ async fn setup_failed_after_cancel_while_running(shard: &Arc<JobStoreShard>, job
         .await
         .unwrap();
 
+    // The error outcome of a cancelled job ends the job Cancelled.
     let s = shard.get_job_status("-", job_id).await.unwrap().unwrap();
-    assert_eq!(s.kind, JobStatusKind::Failed);
+    assert_eq!(s.kind, JobStatusKind::Cancelled);
     assert!(
         shard.is_job_cancelled("-", job_id).await.unwrap(),
         "cancelled marker should still exist before reimport"
@@ -2484,7 +2485,7 @@ async fn reimport_transitions_cancel_while_running_to_scheduled() {
 async fn reimport_transitions_cancel_while_running_error_to_scheduled() {
     let (_tmp, shard) = test_helpers::open_temp_shard().await;
     let job_id = "sys-cxl-run-err-to-sched";
-    setup_failed_after_cancel_while_running(&shard, job_id).await;
+    setup_errored_after_cancel_while_running(&shard, job_id).await;
 
     let existing = existing_attempts_as_imported(&shard, "-", job_id).await;
     let reimport = build_reimport_params(job_id, existing, false);

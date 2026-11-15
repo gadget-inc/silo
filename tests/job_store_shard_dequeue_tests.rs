@@ -262,7 +262,7 @@ async fn reap_ignores_unexpired_leases() {
     // Do not mutate the lease; it should not be reaped
     let (lease_key, _lease_value) = first_lease_kv(shard.db()).await.expect("lease present");
 
-    let reaped = shard.reap_expired_leases("-").await.expect("reap");
+    let reaped = shard.reap_expired_leases().await.expect("reap");
     assert_eq!(reaped, 0);
 
     // Lease should still exist
