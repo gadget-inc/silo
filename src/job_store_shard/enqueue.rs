@@ -35,16 +35,28 @@ use crate::task::{GubernatorRateLimitData, Task};
 /// the same stale flag and write its own replacement refresh. Once the
 /// batch is durable, its owner marks the recorded groups pending for the
 /// refresh drain.
+///
+/// Also carries the queues on which a chain walked into the batch left a
+/// free slot to jobs already waiting (see
+/// `ConcurrencyManager::arrival_yields_to_waiters`). Once the batch is
+/// durable, its owner nudges the grant scanner for each with
+/// `JobStoreShard::request_grants_for_yielded_queues`, so the slot is filled
+/// from the queue the arrival just joined.
 #[derive(Debug, Default)]
-pub struct ScheduledRefreshes(Vec<(String, String, String)>);
+pub struct ScheduledRefreshes {
+    refreshes: Vec<(String, String, String)>,
+    yielded_queues: Vec<(String, String)>,
+}
 
 impl ScheduledRefreshes {
     pub(crate) fn contains(&self, tenant: &str, queue_key: &str) -> bool {
-        self.0.iter().any(|(t, q, _)| t == tenant && q == queue_key)
+        self.refreshes
+            .iter()
+            .any(|(t, q, _)| t == tenant && q == queue_key)
     }
 
     pub(crate) fn record(&mut self, tenant: &str, queue_key: &str, task_group: &str) {
-        self.0.push((
+        self.refreshes.push((
             tenant.to_string(),
             queue_key.to_string(),
             task_group.to_string(),
@@ -53,7 +65,22 @@ impl ScheduledRefreshes {
 
     /// Task groups that received an index row in this batch.
     pub fn task_groups(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(|(_, _, g)| g.as_str())
+        self.refreshes.iter().map(|(_, _, g)| g.as_str())
+    }
+
+    pub(crate) fn record_yield(&mut self, tenant: &str, queue_key: &str) {
+        let entry = (tenant.to_string(), queue_key.to_string());
+        if !self.yielded_queues.contains(&entry) {
+            self.yielded_queues.push(entry);
+        }
+    }
+
+    /// `(tenant, queue)` pairs on which a chain in this batch yielded a free
+    /// slot to waiting jobs.
+    pub(crate) fn yielded_queues(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.yielded_queues
+            .iter()
+            .map(|(t, q)| (t.as_str(), q.as_str()))
     }
 }
 
@@ -377,6 +404,7 @@ impl JobStoreShard {
         let grants = grant_guard.disarm();
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
+        self.request_grants_for_yielded_queues(&scheduled_refreshes);
 
         self.finish_enqueue(tenant, job_id, task_group, effective_start_at_ms, &grants)
             .await
@@ -508,6 +536,7 @@ impl JobStoreShard {
         let grants = grant_guard.disarm();
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
+        self.request_grants_for_yielded_queues(&scheduled_refreshes);
 
         self.finish_enqueue(tenant, job_id, task_group, effective_start_at_ms, &grants)
             .await
@@ -824,6 +853,13 @@ impl JobStoreShard {
                         )
                         .await?;
 
+                    if matches!(
+                        outcome,
+                        Some(RequestTicketOutcome::TicketRequested { yielded: true, .. })
+                    ) {
+                        scheduled_refreshes.record_yield(tenant, &cl.key);
+                    }
+
                     // Cache the resolved limit for the query system
                     self.concurrency.cache_queue_limit(
                         tenant,
@@ -900,6 +936,13 @@ impl JobStoreShard {
                             limits,
                         )
                         .await?;
+
+                    if matches!(
+                        outcome,
+                        Some(RequestTicketOutcome::TicketRequested { yielded: true, .. })
+                    ) {
+                        scheduled_refreshes.record_yield(tenant, &fl.key);
+                    }
 
                     // Cache the resolved floating limit for the query system
                     self.concurrency.cache_queue_limit(

@@ -488,6 +488,7 @@ impl JobStoreShard {
         }
         dst_events::confirm_write(write_op);
         self.mark_refresh_pending_groups(retry_scheduled_refreshes.task_groups());
+        self.request_grants_for_yielded_queues(&retry_scheduled_refreshes);
         for (queue, grant_task_id) in &retry_grants {
             self.concurrency
                 .confirm_grant(&tenant, queue, grant_task_id);
