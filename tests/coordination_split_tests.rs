@@ -1757,7 +1757,9 @@ mod splitter_unit_tests {
 
     use silo::coordination::CoordinationError;
     use silo::coordination::split::{ShardSplitter, SplitStorageBackend};
-    use silo::coordination::{Coordinator, CoordinatorBase, MemberInfo, ShardOwnerMap, SplitPhase};
+    use silo::coordination::{
+        Coordinator, CoordinatorBase, MemberInfo, ShardMapCell, ShardOwnerMap, SplitPhase,
+    };
     use silo::factory::ShardFactory;
     use silo::shard_range::{ShardId, ShardMap, SplitInProgress};
 
@@ -1770,7 +1772,7 @@ mod splitter_unit_tests {
 
     impl MockSplitBackend {
         fn new(
-            shard_map: Arc<Mutex<ShardMap>>,
+            shard_map: Arc<ShardMapCell>,
             owned: Arc<Mutex<HashSet<ShardId>>>,
             factory: Arc<ShardFactory>,
         ) -> Self {
@@ -1807,7 +1809,7 @@ mod splitter_unit_tests {
         }
 
         async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
-            let shard_map = self.base.shard_map.lock().await.clone();
+            let shard_map = ShardMap::clone(&self.base.shard_map.load());
             Ok(ShardOwnerMap {
                 shard_map,
                 shard_to_node: HashMap::new(),
@@ -1820,14 +1822,15 @@ mod splitter_unit_tests {
             shard_id: &ShardId,
             ring: Option<&str>,
         ) -> Result<(Option<String>, Option<String>), CoordinationError> {
-            let mut shard_map = self.base.shard_map.lock().await;
-            let shard = shard_map
-                .get_shard_mut(shard_id)
-                .ok_or_else(|| CoordinationError::ShardNotFound(*shard_id))?;
-            let previous = shard.placement_ring.clone();
-            let current = ring.map(|s| s.to_string());
-            shard.placement_ring = current.clone();
-            Ok((previous, current))
+            self.base.shard_map.update(|shard_map| {
+                let shard = shard_map
+                    .get_shard_mut(shard_id)
+                    .ok_or_else(|| CoordinationError::ShardNotFound(*shard_id))?;
+                let previous = shard.placement_ring.clone();
+                let current = ring.map(|s| s.to_string());
+                shard.placement_ring = current.clone();
+                Ok((previous, current))
+            })
         }
 
         async fn force_release_shard_lease(
@@ -1868,13 +1871,14 @@ mod splitter_unit_tests {
             &self,
             split: &SplitInProgress,
         ) -> Result<(), CoordinationError> {
-            let mut shard_map = self.base.shard_map.lock().await;
-            shard_map.split_shard(
-                &split.parent_shard_id,
-                &split.split_point,
-                split.left_child_id,
-                split.right_child_id,
-            )?;
+            self.base.shard_map.update(|shard_map| {
+                shard_map.split_shard(
+                    &split.parent_shard_id,
+                    &split.split_point,
+                    split.left_child_id,
+                    split.right_child_id,
+                )
+            })?;
             Ok(())
         }
 
@@ -1898,7 +1902,7 @@ mod splitter_unit_tests {
 
     impl MockSplitBackendWithSharedStorage {
         fn new(
-            shard_map: Arc<Mutex<ShardMap>>,
+            shard_map: Arc<ShardMapCell>,
             owned: Arc<Mutex<HashSet<ShardId>>>,
             factory: Arc<ShardFactory>,
             splits: Arc<Mutex<HashMap<ShardId, SplitInProgress>>>,
@@ -1933,7 +1937,7 @@ mod splitter_unit_tests {
         }
 
         async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
-            let shard_map = self.base.shard_map.lock().await.clone();
+            let shard_map = ShardMap::clone(&self.base.shard_map.load());
             Ok(ShardOwnerMap {
                 shard_map,
                 shard_to_node: HashMap::new(),
@@ -1987,13 +1991,14 @@ mod splitter_unit_tests {
             &self,
             split: &SplitInProgress,
         ) -> Result<(), CoordinationError> {
-            let mut shard_map = self.base.shard_map.lock().await;
-            shard_map.split_shard(
-                &split.parent_shard_id,
-                &split.split_point,
-                split.left_child_id,
-                split.right_child_id,
-            )?;
+            self.base.shard_map.update(|shard_map| {
+                shard_map.split_shard(
+                    &split.parent_shard_id,
+                    &split.split_point,
+                    split.left_child_id,
+                    split.right_child_id,
+                )
+            })?;
             Ok(())
         }
 
@@ -2011,7 +2016,7 @@ mod splitter_unit_tests {
     /// returns false, allowing traffic through to a shard that was mid-split.
     #[tokio::test]
     async fn test_restart_loses_paused_state_for_stuck_split() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = Arc::new(ShardFactory::new_noop());
 
@@ -2019,7 +2024,7 @@ mod splitter_unit_tests {
         let splits: Arc<Mutex<HashMap<ShardId, SplitInProgress>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let shard_id = shard_map.load().shard_ids()[0];
         owned.lock().await.insert(shard_id);
 
         // --- First incarnation: request a split and advance to SplitPausing ---
@@ -2114,13 +2119,13 @@ mod splitter_unit_tests {
     /// paused with no way to unpause through normal operation.
     #[tokio::test]
     async fn test_recover_stale_splits_clears_paused_cache() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = Arc::new(ShardFactory::new_noop());
         let splits: Arc<Mutex<HashMap<ShardId, SplitInProgress>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let shard_id = shard_map.load().shard_ids()[0];
         owned.lock().await.insert(shard_id);
 
         // Create a split and advance to SplitPausing.
@@ -2163,7 +2168,7 @@ mod splitter_unit_tests {
 
     #[tokio::test]
     async fn test_request_split_validates_ownership() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = Arc::new(ShardFactory::new_noop());
 
@@ -2171,7 +2176,7 @@ mod splitter_unit_tests {
         let splitter = ShardSplitter::new(Arc::new(mock));
 
         // Get a shard ID from the map
-        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let shard_id = shard_map.load().shard_ids()[0];
 
         // Should fail because we don't own the shard
         // Use "2" as the split point (valid within shard 0's hash-space range)
@@ -2195,14 +2200,14 @@ mod splitter_unit_tests {
 
     #[tokio::test]
     async fn test_is_shard_paused() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = Arc::new(ShardFactory::new_noop());
 
         let mock = MockSplitBackend::new(shard_map.clone(), owned.clone(), factory);
         let splitter = ShardSplitter::new(Arc::new(mock));
 
-        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let shard_id = shard_map.load().shard_ids()[0];
         owned.lock().await.insert(shard_id);
 
         // Not paused initially
@@ -2227,7 +2232,7 @@ mod splitter_unit_tests {
     /// when cloning fails (pre-commit error).
     #[tokio::test]
     async fn test_execute_split_abandons_on_clone_failure() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         // noop factory has no open shards, so clone_closed_shard will fail
         let factory = Arc::new(ShardFactory::new_noop());
@@ -2239,7 +2244,7 @@ mod splitter_unit_tests {
         ));
         let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
 
-        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let shard_id = shard_map.load().shard_ids()[0];
         owned.lock().await.insert(shard_id);
 
         // Request a split
@@ -2252,7 +2257,7 @@ mod splitter_unit_tests {
         let result = splitter
             .execute_split(shard_id, || async {
                 Ok(ShardOwnerMap {
-                    shard_map: shard_map.lock().await.clone(),
+                    shard_map: ShardMap::clone(&shard_map.load()),
                     shard_to_node: HashMap::new(),
                     shard_to_addr: HashMap::new(),
                 })
@@ -2274,7 +2279,7 @@ mod splitter_unit_tests {
         );
 
         // The shard map should be unchanged (parent still exists)
-        let map = shard_map.lock().await;
+        let map = shard_map.load();
         assert!(
             map.get_shard(&shard_id).is_some(),
             "parent shard should still exist in shard map"
@@ -2285,7 +2290,7 @@ mod splitter_unit_tests {
     /// on the same shard.
     #[tokio::test]
     async fn test_can_retry_split_after_abandonment() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = Arc::new(ShardFactory::new_noop());
 
@@ -2296,7 +2301,7 @@ mod splitter_unit_tests {
         ));
         let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
 
-        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let shard_id = shard_map.load().shard_ids()[0];
         owned.lock().await.insert(shard_id);
 
         // First split attempt: request and execute (will fail on clone)
@@ -2307,7 +2312,7 @@ mod splitter_unit_tests {
         let result = splitter
             .execute_split(shard_id, || async {
                 Ok(ShardOwnerMap {
-                    shard_map: shard_map.lock().await.clone(),
+                    shard_map: ShardMap::clone(&shard_map.load()),
                     shard_to_node: HashMap::new(),
                     shard_to_addr: HashMap::new(),
                 })
@@ -2328,7 +2333,7 @@ mod splitter_unit_tests {
     /// to the owned set.
     #[tokio::test]
     async fn test_owned_set_clean_after_clone_failure() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = Arc::new(ShardFactory::new_noop());
 
@@ -2339,7 +2344,7 @@ mod splitter_unit_tests {
         ));
         let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
 
-        let shard_id = shard_map.lock().await.shard_ids()[0];
+        let shard_id = shard_map.load().shard_ids()[0];
         owned.lock().await.insert(shard_id);
 
         // Capture owned set before split
@@ -2353,7 +2358,7 @@ mod splitter_unit_tests {
         let _ = splitter
             .execute_split(shard_id, || async {
                 Ok(ShardOwnerMap {
-                    shard_map: shard_map.lock().await.clone(),
+                    shard_map: ShardMap::clone(&shard_map.load()),
                     shard_to_node: HashMap::new(),
                     shard_to_addr: HashMap::new(),
                 })
@@ -2391,7 +2396,7 @@ mod splitter_unit_tests {
 
     impl FailingUpdateMockBackend {
         fn new(
-            shard_map: Arc<Mutex<ShardMap>>,
+            shard_map: Arc<ShardMapCell>,
             owned: Arc<Mutex<HashSet<ShardId>>>,
             factory: Arc<ShardFactory>,
         ) -> Self {
@@ -2429,7 +2434,7 @@ mod splitter_unit_tests {
         }
 
         async fn get_shard_owner_map(&self) -> Result<ShardOwnerMap, CoordinationError> {
-            let shard_map = self.base.shard_map.lock().await.clone();
+            let shard_map = ShardMap::clone(&self.base.shard_map.load());
             Ok(ShardOwnerMap {
                 shard_map,
                 shard_to_node: HashMap::new(),
@@ -2491,13 +2496,14 @@ mod splitter_unit_tests {
                     "injected shard map update failure".to_string(),
                 ));
             }
-            let mut shard_map = self.base.shard_map.lock().await;
-            shard_map.split_shard(
-                &split.parent_shard_id,
-                &split.split_point,
-                split.left_child_id,
-                split.right_child_id,
-            )?;
+            self.base.shard_map.update(|shard_map| {
+                shard_map.split_shard(
+                    &split.parent_shard_id,
+                    &split.split_point,
+                    split.left_child_id,
+                    split.right_child_id,
+                )
+            })?;
             Ok(())
         }
 
@@ -2533,19 +2539,13 @@ mod splitter_unit_tests {
     /// serve requests again.
     #[silo::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_parent_shard_recovered_after_shard_map_update_failure() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = make_test_factory_for_unit_test("recover-shard-map-fail");
 
         // Pick a shard and open it in the factory
-        let shard_id = shard_map.lock().await.shard_ids()[0];
-        let range = shard_map
-            .lock()
-            .await
-            .get_shard(&shard_id)
-            .unwrap()
-            .range
-            .clone();
+        let shard_id = shard_map.load().shard_ids()[0];
+        let range = shard_map.load().get_shard(&shard_id).unwrap().range.clone();
         factory.open(&shard_id, &range).await.unwrap();
         owned.lock().await.insert(shard_id);
 
@@ -2576,7 +2576,7 @@ mod splitter_unit_tests {
         let result = splitter
             .execute_split(shard_id, || async {
                 Ok(ShardOwnerMap {
-                    shard_map: shard_map.lock().await.clone(),
+                    shard_map: ShardMap::clone(&shard_map.load()),
                     shard_to_node: HashMap::new(),
                     shard_to_addr: HashMap::new(),
                 })
@@ -2593,7 +2593,7 @@ mod splitter_unit_tests {
 
         // The parent shard should still be in the shard map
         assert!(
-            shard_map.lock().await.get_shard(&shard_id).is_some(),
+            shard_map.load().get_shard(&shard_id).is_some(),
             "parent shard should still exist in shard map"
         );
 
@@ -2620,24 +2620,18 @@ mod splitter_unit_tests {
         test_name: &str,
     ) -> (
         Arc<ShardFactory>,
-        Arc<Mutex<ShardMap>>,
+        Arc<ShardMapCell>,
         Arc<Mutex<HashSet<ShardId>>>,
         Arc<FailingUpdateMockBackend>,
         Arc<ShardSplitter>,
         ShardId,
     ) {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let owned = Arc::new(Mutex::new(HashSet::new()));
         let factory = make_test_factory_for_unit_test(test_name);
 
-        let shard_id = shard_map.lock().await.shard_ids()[0];
-        let range = shard_map
-            .lock()
-            .await
-            .get_shard(&shard_id)
-            .unwrap()
-            .range
-            .clone();
+        let shard_id = shard_map.load().shard_ids()[0];
+        let range = shard_map.load().get_shard(&shard_id).unwrap().range.clone();
         factory.open(&shard_id, &range).await.unwrap();
         owned.lock().await.insert(shard_id);
 
@@ -2659,13 +2653,13 @@ mod splitter_unit_tests {
 
     async fn execute_failing_split(
         splitter: &ShardSplitter,
-        shard_map: &Arc<Mutex<ShardMap>>,
+        shard_map: &Arc<ShardMapCell>,
         shard_id: ShardId,
     ) -> Result<(), CoordinationError> {
         splitter
             .execute_split(shard_id, || async {
                 Ok(ShardOwnerMap {
-                    shard_map: shard_map.lock().await.clone(),
+                    shard_map: ShardMap::clone(&shard_map.load()),
                     shard_to_node: HashMap::new(),
                     shard_to_addr: HashMap::new(),
                 })
@@ -2726,7 +2720,7 @@ mod splitter_unit_tests {
     /// attempt has failed, which opens recovery's retry window.
     async fn spawn_split_and_wait_for_pending_close(
         factory: &Arc<ShardFactory>,
-        shard_map: &Arc<Mutex<ShardMap>>,
+        shard_map: &Arc<ShardMapCell>,
         splitter: &Arc<ShardSplitter>,
         shard_id: ShardId,
     ) -> tokio::task::JoinHandle<Result<(), CoordinationError>> {
@@ -2851,18 +2845,12 @@ mod splitter_unit_tests {
     /// by `factory.open` builds a fresh instance, which is what recovery does.
     #[silo::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_parent_shard_unusable_without_recovery_after_close() {
-        let shard_map = Arc::new(Mutex::new(ShardMap::create_initial(4).unwrap()));
+        let shard_map = Arc::new(ShardMapCell::new(ShardMap::create_initial(4).unwrap()));
         let factory = make_test_factory_for_unit_test("unusable-without-recovery");
 
         // Pick a shard and open it in the factory
-        let shard_id = shard_map.lock().await.shard_ids()[0];
-        let range = shard_map
-            .lock()
-            .await
-            .get_shard(&shard_id)
-            .unwrap()
-            .range
-            .clone();
+        let shard_id = shard_map.load().shard_ids()[0];
+        let range = shard_map.load().get_shard(&shard_id).unwrap().range.clone();
         factory.open(&shard_id, &range).await.unwrap();
 
         // Verify the shard is usable
@@ -2906,7 +2894,7 @@ mod splitter_unit_tests {
     /// cloning-capable factory driven by the mock split backend, with no
     /// coordinator or shard guards attached that could race the status.
     struct CloningSplitHarness {
-        shard_map: Arc<Mutex<silo::shard_range::ShardMap>>,
+        shard_map: Arc<ShardMapCell>,
         owned: Arc<Mutex<HashSet<ShardId>>>,
         factory: Arc<ShardFactory>,
         splitter: ShardSplitter,
@@ -2924,7 +2912,7 @@ mod splitter_unit_tests {
     }
 
     async fn setup_cloning_harness_with_factory(factory: Arc<ShardFactory>) -> CloningSplitHarness {
-        let shard_map = Arc::new(Mutex::new(
+        let shard_map = Arc::new(ShardMapCell::new(
             silo::shard_range::ShardMap::create_initial(1).unwrap(),
         ));
         let owned = Arc::new(Mutex::new(HashSet::new()));
@@ -2935,11 +2923,10 @@ mod splitter_unit_tests {
         ));
         let splitter = ShardSplitter::new(Arc::clone(&mock) as Arc<dyn Coordinator>);
 
-        let parent_id = shard_map.lock().await.shard_ids()[0];
+        let parent_id = shard_map.load().shard_ids()[0];
         owned.lock().await.insert(parent_id);
         let parent_range = shard_map
-            .lock()
-            .await
+            .load()
             .get_shard(&parent_id)
             .unwrap()
             .range
@@ -2984,7 +2971,7 @@ mod splitter_unit_tests {
     /// from the mock initiator (`mock-node`), so the post-commit loop opens
     /// no child and nothing can race the initialized metadata.
     fn owner_map_assigning_children_away(
-        shard_map: Arc<Mutex<silo::shard_range::ShardMap>>,
+        shard_map: Arc<ShardMapCell>,
         left: ShardId,
         right: ShardId,
     ) -> impl Fn() -> std::pin::Pin<
@@ -2997,7 +2984,7 @@ mod splitter_unit_tests {
                 shard_to_node.insert(left, "other-node".to_string());
                 shard_to_node.insert(right, "other-node".to_string());
                 Ok(ShardOwnerMap {
-                    shard_map: shard_map.lock().await.clone(),
+                    shard_map: ShardMap::clone(&shard_map.load()),
                     shard_to_node,
                     shard_to_addr: HashMap::new(),
                 })
@@ -3200,8 +3187,7 @@ mod splitter_unit_tests {
         let left_id = split.left_child_id;
         let left_range = h
             .shard_map
-            .lock()
-            .await
+            .load()
             .get_shard(&left_id)
             .unwrap()
             .range
@@ -3289,8 +3275,7 @@ mod splitter_unit_tests {
         let right_grandchild_id = second.right_child_id;
         let right_range = h
             .shard_map
-            .lock()
-            .await
+            .load()
             .get_shard(&right_grandchild_id)
             .unwrap()
             .range
@@ -3382,7 +3367,7 @@ mod splitter_unit_tests {
 
         // Pre-commit abort: the shard map still routes to the parent only.
         {
-            let map = h.shard_map.lock().await;
+            let map = h.shard_map.load();
             assert!(map.get_shard(&h.parent_id).is_some());
             assert!(map.get_shard(&split.left_child_id).is_none());
             assert!(map.get_shard(&split.right_child_id).is_none());
@@ -3481,8 +3466,7 @@ mod splitter_unit_tests {
         let left_id = split.left_child_id;
         let left_range = h
             .shard_map
-            .lock()
-            .await
+            .load()
             .get_shard(&left_id)
             .unwrap()
             .range
@@ -3555,7 +3539,7 @@ mod splitter_unit_tests {
                     shard_to_node.insert(left_id, "mock-node".to_string());
                     shard_to_node.insert(right_id, "mock-node".to_string());
                     Ok(ShardOwnerMap {
-                        shard_map: shard_map.lock().await.clone(),
+                        shard_map: ShardMap::clone(&shard_map.load()),
                         shard_to_node,
                         shard_to_addr: HashMap::new(),
                     })
@@ -3567,8 +3551,7 @@ mod splitter_unit_tests {
         for child_id in [left_id, right_id] {
             let committed_range = h
                 .shard_map
-                .lock()
-                .await
+                .load()
                 .get_shard(&child_id)
                 .unwrap()
                 .range

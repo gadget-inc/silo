@@ -372,7 +372,7 @@ async fn wait_converged_success() {
 
     // Pre-populate owned with all shards so it matches desired
     {
-        let shard_map = base.shard_map.lock().await;
+        let shard_map = base.shard_map.load();
         let mut owned = base.owned.lock().await;
         for shard_info in shard_map.shards() {
             owned.insert(shard_info.id);
