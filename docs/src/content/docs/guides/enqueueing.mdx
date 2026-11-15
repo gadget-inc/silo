@@ -226,7 +226,7 @@ const handle = await client.enqueue({
 #### Retry behavior
 
 - If a job fails, it will be retried up to `retryCount` times
-- Each retry waits `initialIntervalMs * (backoffFactor ^ attempt)` milliseconds
+- Retry `n` waits `initialIntervalMs * (backoffFactor ^ (n - 1))` milliseconds, so the first retry waits `initialIntervalMs`
 - Wait time is capped at `maxIntervalMs`
 - If `randomizeInterval` is true, a random jitter is added to the wait time
 

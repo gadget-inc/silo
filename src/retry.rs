@@ -28,7 +28,8 @@ pub fn retries_exhausted(failures_so_far: u32, policy: &RetryPolicy) -> bool {
 
 /// Compute the time (epoch ms) for the next retry attempt, if any.
 /// - `failure_time_ms`: time the last attempt failed
-/// - `failures_so_far`: number of failed attempts so far (0 for first failure)
+/// - `failures_so_far`: number of failed attempts, counting the one that just
+///   failed (1 for the first failure)
 /// - `policy`: retry configuration
 ///
 /// Returns Some(next_time_ms) or None if no more retries should be attempted.
@@ -46,9 +47,10 @@ pub fn next_retry_time_ms(
     let max_interval = policy.max_interval_ms;
     let randomize = policy.randomize_interval;
 
-    // Exponential backoff similar to npm `retry`: delay_n = initial * factor^n
-    // where n = failures_so_far (0-based)
-    let mut delay = (initial as f64 * factor.powi(failures_so_far as i32)).round() as i64;
+    // Exponential backoff similar to npm `retry`: the retry after failure k
+    // waits initial * factor^(k - 1), so the first retry waits `initial`.
+    let exponent = failures_so_far.saturating_sub(1);
+    let mut delay = (initial as f64 * factor.powi(exponent as i32)).round() as i64;
     if randomize {
         // Deterministic pseudo-random multiplier in [1.0, 2.0)
         let mut seed = (failure_time_ms as u64) ^ ((failures_so_far as u64) << 32);
