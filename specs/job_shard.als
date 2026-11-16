@@ -617,8 +617,9 @@ pred dequeue[tid: TaskId, w: Worker, a: Attempt, t: Time, tnext: Time] {
         j in jobExistsAt[t]
 
         -- Note: No cancelled check here. Cancelled jobs' tasks are eagerly removed
-        -- by cancelJob. If a task for a cancelled job appears (e.g., retry after cancel),
-        -- it will be leased normally and the worker discovers cancellation via heartbeat.
+        -- by cancelJob, and a failed attempt of a cancelled job schedules no retry
+        -- [SILO-RETRY-6]. If a task for a cancelled job does appear, it is leased
+        -- normally and the worker discovers cancellation via heartbeat.
 
         -- [SILO-DEQ-CONC] Pre: If job requires concurrency, task must hold all required queues
         -- (holders were created at enqueue time or by grant_next)
@@ -924,6 +925,9 @@ pred completeFailureRetry[tid: TaskId, w: Worker, newTid: TaskId, t: Time, tnext
         one a
         attemptStatusAt[a, t] = AttemptRunning
         
+        -- [SILO-RETRY-6] Pre: job is not cancelled (a cancelled job gets no retry)
+        not isCancelledAt[j, t]
+        
         -- Pre: Task does NOT hold any concurrency tickets
         no taskHeldQueuesAt[tid, t]
         
@@ -980,6 +984,9 @@ pred completeFailureRetryReleaseTicket[tid: TaskId, w: Worker, q: Queue, newTid:
         one j
         one a
         attemptStatusAt[a, t] = AttemptRunning
+        
+        -- [SILO-RETRY-6] Pre: job is not cancelled (a cancelled job gets no retry)
+        not isCancelledAt[j, t]
         
         -- [SILO-RETRY-2] Post: release lease
         no leaseAt[tid, tnext]
@@ -2048,6 +2055,17 @@ assert noZombieAttempts {
 assert noQueuedTasksForTerminal {
     all t: Time, j: Job | (j in jobExistsAt[t] and isTerminal[statusAt[j, t]]) implies 
         no qt: DbQueuedTask | qt.db_qjob = j and qt.db_qtime = t
+}
+
+/**
+ * A running job that is cancelled, and stays cancelled, is never sent back to
+ * Scheduled: a failed attempt of a cancelled job schedules no retry.
+ */
+assert cancelledRunningJobIsNotRescheduled {
+    all t: Time - last, j: Job |
+        (j in jobExistsAt[t] and statusAt[j, t] = Running
+            and isCancelledAt[j, t] and isCancelledAt[j, t.next])
+        implies statusAt[j, t.next] != Scheduled
 }
 
 /**
@@ -3268,6 +3286,8 @@ check noZombieAttempts for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
 check noQueuedTasksForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
 check noLeasesForTerminal for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
+    16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
+check cancelledRunningJobIsNotRescheduled for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 12 JobCancelled
 check cancellationClearedRequiresRestartable for 4 but 2 Job, 2 Worker, 3 TaskId, 4 Attempt, 8 Time,
     16 JobState, 24 AttemptState, 6 DbQueuedTask, 6 BufferedTask, 4 Lease, 8 AttemptExists, 8 JobExists, 4 JobAttemptRelation, 16 JobCancelled

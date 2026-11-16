@@ -432,7 +432,7 @@ async fn main() -> anyhow::Result<()> {
             while running.load(Ordering::SeqCst) {
                 tick.tick().await;
                 for shard in shards.values() {
-                    let _ = shard.reap_expired_leases("-").await;
+                    let _ = shard.reap_expired_leases().await;
                 }
             }
         }))

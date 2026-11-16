@@ -752,7 +752,8 @@ impl JobStoreShard {
 
         // Clean up cancelled key: cancel_job writes a separate cancelled key that blocks
         // lease creation. The marker can outlive Cancelled status (for example when a
-        // running cancelled job later reports Error), so always delete it on reimport.
+        // cancel commits while a running job's error outcome is being written), so
+        // always delete it on reimport.
         if let Err(e) = txn.delete(job_cancelled_key(tenant, job_id)) {
             if let Some(transition) = &background_action_transition {
                 self.rollback_background_action_metric_gauge_transition(transition);
