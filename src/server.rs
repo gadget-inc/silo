@@ -2504,7 +2504,7 @@ where
                         m.set_coordination_shards_open(instances.len() as u64);
                     }
 
-                    // Use default tenant "-" for system-level reaping
+                    // Reap every tenant's expired leases on each open shard
                     for (shard_id, shard) in instances.iter() {
                         let reap_start = std::time::Instant::now();
                         let result = shard.reap_expired_leases().await;
