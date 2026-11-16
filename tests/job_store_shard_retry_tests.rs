@@ -567,6 +567,91 @@ async fn next_retry_time_matches_scheduled_time_smoke() {
 }
 
 #[silo::test]
+async fn retry_delays_start_at_initial_interval_and_make_retry_count_plus_one_attempts() {
+    with_timeout!(20000, {
+        let (_tmp, shard) = open_temp_shard().await;
+        let payload = test_helpers::msgpack_payload(&serde_json::json!({"k": "v"}));
+        let policy = RetryPolicy {
+            retry_count: 2,
+            initial_interval_ms: 1_000,
+            max_interval_ms: i64::MAX,
+            randomize_interval: false,
+            backoff_factor: 3.0,
+        };
+        let job_id = shard
+            .enqueue(
+                "-",
+                None,
+                10u8,
+                now_ms(),
+                Some(policy),
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue");
+
+        // Delay between each failure and the next attempt's scheduled start
+        let mut delays: Vec<i64> = Vec::new();
+        for attempt_number in 1..=3u32 {
+            let tasks = shard
+                .dequeue("w", "default", 1)
+                .await
+                .expect("dequeue")
+                .tasks;
+            assert_eq!(tasks.len(), 1, "attempt {attempt_number} should be leased");
+            let task_id = tasks[0].attempt().task_id().to_string();
+            shard
+                .report_attempt_outcome(
+                    &task_id,
+                    AttemptOutcome::Error {
+                        error_code: "TEST".to_string(),
+                        error: b"e".to_vec(),
+                    },
+                )
+                .await
+                .expect("report");
+
+            let attempt = shard
+                .get_job_attempt("-", &job_id, attempt_number)
+                .await
+                .expect("get attempt")
+                .expect("attempt exists");
+            let finished_at = match attempt.state() {
+                AttemptStatus::Failed { finished_at_ms, .. } => finished_at_ms,
+                _ => panic!("expected Failed"),
+            };
+            let Some((task_key, _)) = first_task_kv(shard.db()).await else {
+                break;
+            };
+            let scheduled_ms = parse_time_from_binary_task_key(&task_key).expect("parse time");
+            delays.push(scheduled_ms as i64 - finished_at);
+            // Run the retry now instead of waiting out the backoff
+            shard.expedite_job("-", &job_id).await.expect("expedite");
+        }
+
+        assert_eq!(
+            delays,
+            vec![1_000, 3_000],
+            "retry k waits initial * factor^(k - 1)"
+        );
+        let status = shard
+            .get_job_status("-", &job_id)
+            .await
+            .expect("status")
+            .expect("exists");
+        assert_eq!(status.kind, silo::job::JobStatusKind::Failed);
+        let attempts = shard
+            .get_job_attempts("-", &job_id)
+            .await
+            .expect("attempts");
+        assert_eq!(attempts.len(), 3, "retry_count: 2 makes exactly 3 attempts");
+    });
+}
+
+#[silo::test]
 async fn duplicate_reporting_error_then_error_is_rejected_and_no_extra_tasks() {
     with_timeout!(20000, {
         let (_tmp, shard) = open_temp_shard().await;
