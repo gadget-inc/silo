@@ -2062,6 +2062,7 @@ export class SiloGRPCClient {
    * @param id     The job ID.
    * @param tenant Tenant ID for routing to the correct shard. Uses default tenant if not provided.
    * @throws JobNotFoundError if the job doesn't exist.
+   * @throws SiloFailedPreconditionError if the job is not in a terminal state.
    */
   public async deleteJob(id: string, tenant?: string): Promise<void> {
     try {
