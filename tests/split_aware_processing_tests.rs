@@ -14,10 +14,16 @@ use test_helpers::{
     open_temp_shard_with_range,
 };
 
-use silo::shard_range::ShardRange;
+use silo::factory::ShardFactory;
+use silo::gubernator::MockGubernatorClient;
+use silo::settings::{Backend, DatabaseTemplate};
+use silo::shard_range::{ShardId, ShardRange};
 
 /// Boundary at the midpoint of the u64 hash space, encoded as a 16-char hex string.
 const RANGE_BOUNDARY: &str = "8000000000000000";
+const HEAVY_TENANT: &str = "heavy-tenant";
+const NEXT_AFTER_HEAVY_TENANT: &str = "heavy-tenant-next";
+const HEAVY_TENANT_JOB_COUNT: usize = 256;
 
 /// Helper to enqueue jobs for multiple tenants
 async fn enqueue_jobs_for_tenants(
@@ -45,6 +51,107 @@ async fn enqueue_jobs_for_tenants(
                 .expect("enqueue should succeed");
         }
     }
+}
+
+#[silo::test]
+async fn split_at_named_heavy_tenant_preserves_jobs_after_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let factory = ShardFactory::new(
+        DatabaseTemplate {
+            backend: Backend::Fs,
+            path: tmp.path().join("%shard%").to_string_lossy().to_string(),
+            slatedb: Some(test_helpers::fast_flush_slatedb_settings()),
+            ..Default::default()
+        },
+        MockGubernatorClient::new_arc(),
+        None,
+    );
+
+    let parent_id = ShardId::new();
+    let parent = factory
+        .open(&parent_id, &ShardRange::full())
+        .await
+        .expect("open parent shard");
+
+    for i in 0..HEAVY_TENANT_JOB_COUNT {
+        let payload = msgpack_payload(&serde_json::json!({ "job": i }));
+        parent
+            .enqueue(
+                HEAVY_TENANT,
+                Some(format!("heavy-job-{i:04}")),
+                0,
+                i as i64,
+                None,
+                payload,
+                vec![],
+                None,
+                "default",
+            )
+            .await
+            .expect("enqueue heavy tenant job");
+    }
+    parent.db().flush().await.expect("flush parent");
+    assert_eq!(
+        count_job_info_keys_for_tenant(parent.db(), HEAVY_TENANT).await,
+        HEAVY_TENANT_JOB_COUNT,
+        "T0: parent should contain all heavy tenant jobs before split"
+    );
+
+    parent.close().await.expect("close parent before clone");
+
+    let left_of_heavy_id = ShardId::new();
+    let at_or_after_heavy_id = ShardId::new();
+    factory
+        .clone_closed_shard(&parent_id, &left_of_heavy_id, &at_or_after_heavy_id)
+        .await
+        .expect("first split clone");
+
+    let (_left_of_heavy_range, at_or_after_heavy_range) = ShardRange::full()
+        .split(HEAVY_TENANT)
+        .expect("split at named tenant");
+
+    let isolated_heavy_id = ShardId::new();
+    let after_heavy_id = ShardId::new();
+    factory
+        .clone_closed_shard(&at_or_after_heavy_id, &isolated_heavy_id, &after_heavy_id)
+        .await
+        .expect("second split clone");
+
+    let (isolated_heavy_range, _after_heavy_range) = at_or_after_heavy_range
+        .split(NEXT_AFTER_HEAVY_TENANT)
+        .expect("split just after named tenant");
+
+    assert!(
+        isolated_heavy_range.contains(HEAVY_TENANT),
+        "raw split boundary semantics put the named tenant in the isolated child"
+    );
+    assert!(
+        !isolated_heavy_range.contains_tenant(HEAVY_TENANT),
+        "hash-space cleanup treats the named tenant as outside the raw isolated range"
+    );
+
+    let isolated = factory
+        .open(&isolated_heavy_id, &isolated_heavy_range)
+        .await
+        .expect("open isolated heavy-tenant child");
+
+    assert_eq!(
+        count_job_info_keys_for_tenant(isolated.db(), HEAVY_TENANT).await,
+        HEAVY_TENANT_JOB_COUNT,
+        "T1: cloned isolated child should contain the heavy tenant before cleanup"
+    );
+
+    isolated
+        .after_split_cleanup_defunct_data(&isolated_heavy_range, 64)
+        .await
+        .expect("cleanup isolated heavy-tenant child");
+    isolated.db().flush().await.expect("flush isolated child");
+
+    assert_eq!(
+        count_job_info_keys_for_tenant(isolated.db(), HEAVY_TENANT).await,
+        HEAVY_TENANT_JOB_COUNT,
+        "T2: split-at-tenant cleanup must not delete the named heavy tenant's jobs"
+    );
 }
 
 /// Cleanup should remove tasks outside the specified range
