@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { describe, it, expect, vi } from "vitest";
 import { SiloWorker, type TaskHandler } from "../src/worker";
 import type { SiloGRPCClient, LeaseTasksResult } from "../src/client";
@@ -144,6 +145,33 @@ describe("SiloWorker", () => {
       // Stopping again should be a no-op
       await worker.stop();
       expect(worker.isRunning).toBe(false);
+    });
+
+    it("holds at most one abort listener per poller while polling", async () => {
+      const leaseTasks = vi.fn().mockResolvedValue(tasksResult([]));
+      const client = createMockClient({ leaseTasks });
+      const handler: TaskHandler = async () => ({
+        type: "success",
+        result: {},
+      });
+
+      const worker = new SiloWorker({
+        client,
+        workerId: "test-worker",
+        taskGroup: "default",
+        handler,
+        pollIntervalMs: 1,
+        concurrentPollers: 2,
+      });
+
+      worker.start();
+      const signal = (worker as unknown as { _abortController: AbortController })._abortController
+        .signal;
+
+      await vi.waitFor(() => expect(leaseTasks.mock.calls.length).toBeGreaterThan(20));
+      expect(getEventListeners(signal, "abort").length).toBeLessThanOrEqual(2);
+
+      await worker.stop();
     });
 
     it("polls for tasks when started", async () => {
