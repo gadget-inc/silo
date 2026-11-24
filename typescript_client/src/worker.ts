@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   context as otelContext,
   type Meter,
@@ -869,18 +870,11 @@ export class SiloWorker<
   /**
    * Sleep for the specified duration.
    */
-  private _sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      const timeout = setTimeout(resolve, ms);
-      // If we're stopping, resolve immediately
-      this._abortController?.signal.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timeout);
-          resolve();
-        },
-        { once: true },
-      );
-    });
+  private async _sleep(ms: number): Promise<void> {
+    try {
+      await sleep(ms, undefined, { signal: this._abortController?.signal });
+    } catch {
+      // The worker is stopping, so the sleep ends early
+    }
   }
 }
