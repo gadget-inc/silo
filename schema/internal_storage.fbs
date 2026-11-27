@@ -243,6 +243,11 @@ table JobStatus {
   // fills them on the next transition.
   enqueue_time_ms: int64 = null;
   priority: ubyte = null;
+  // The highest attempt number the job has an attempt row for, set on
+  // records written when an attempt starts or finishes. Absent on Scheduled
+  // records, whose current_attempt bounds the rows instead, and on records
+  // written without it.
+  latest_attempt: uint32 = null;
 }
 
 // ============================================================

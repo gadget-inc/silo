@@ -20,14 +20,23 @@ use crate::job_store_shard::{
     JobStoreShard, JobStoreShardError, LimitTaskParams, ScheduledRefreshes,
 };
 use crate::keys::{
-    MetadataIndexValue, ParsedConcurrencyHolderKey, attempt_key, attempt_prefix,
-    concurrency_holder_key, concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key,
-    idx_enqueue_time_key, idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key,
+    MetadataIndexValue, ParsedConcurrencyHolderKey, attempt_key, concurrency_holder_key,
+    concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key, idx_enqueue_time_key,
+    idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key, parse_attempt_key,
     parse_concurrency_holder_key, parse_lease_key,
 };
 use crate::lease_index::{FullScanSchedule, ScannedLease};
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
+
+/// A job whose rows [`JobStoreShard::revive_terminal_job_records`] re-put
+/// without a TTL.
+pub(crate) struct RevivedJob {
+    pub view: JobView,
+    /// The highest attempt number the job has run: the caller's bound when
+    /// it gave one, else the highest attempt row found.
+    pub highest_attempt: u32,
+}
 
 /// What one pass of the lease reaper over a shard did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -221,7 +230,7 @@ impl JobStoreShard {
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
             AttemptOutcome::Success { .. } => {
-                let job_status = JobStatus::succeeded(now_ms);
+                let job_status = JobStatus::succeeded(now_ms).with_latest_attempt(attempt_number);
                 terminal_expire_ts =
                     self.terminal_expire_ts(crate::job::JobStatusKind::Succeeded, now_ms);
                 // No JobView is loaded on the Success/Cancelled branches; the
@@ -254,7 +263,7 @@ impl JobStoreShard {
             }
             // Worker acknowledges cancellation - set job status to Cancelled
             AttemptOutcome::Cancelled => {
-                let job_status = JobStatus::cancelled(now_ms);
+                let job_status = JobStatus::cancelled(now_ms).with_latest_attempt(attempt_number);
                 terminal_expire_ts =
                     self.terminal_expire_ts(crate::job::JobStatusKind::Cancelled, now_ms);
                 if let Some(transition) = self
@@ -371,13 +380,13 @@ impl JobStoreShard {
                     if !scheduled_followup {
                         let (job_status, terminal_kind, terminal_status_name) = if job_cancelled {
                             (
-                                JobStatus::cancelled(now_ms),
+                                JobStatus::cancelled(now_ms).with_latest_attempt(attempt_number),
                                 crate::job::JobStatusKind::Cancelled,
                                 "Cancelled",
                             )
                         } else {
                             (
-                                JobStatus::failed(now_ms),
+                                JobStatus::failed(now_ms).with_latest_attempt(attempt_number),
                                 crate::job::JobStatusKind::Failed,
                                 "Failed",
                             )
@@ -416,12 +425,15 @@ impl JobStoreShard {
 
         // Re-put all of the job's *prior* associated records (JOB_INFO,
         // IDX_METADATA, earlier ATTEMPT rows, JOB_CANCELLED) with the TTL.
+        // The reported attempt is the job's highest, and its row is written
+        // below, so the helper is bounded to the attempts before it.
         //
         // Ordering note: this MUST happen before we write the new ATTEMPT row
-        // for the current attempt. The helper scans `attempt_prefix` from
-        // `self.db` (which reflects committed state, pre-batch) — so the row
-        // for the current attempt comes back with its old Running status, and
-        // would clobber a freshly-batched terminal put on the same key
+        // for the current attempt. When the helper scans `attempt_prefix`
+        // (a job with more earlier attempts than the point-read limit) it
+        // reads `self.db`, which reflects committed state, pre-batch — so the
+        // row for the current attempt comes back with its old Running status,
+        // and would clobber a freshly-batched terminal put on the same key
         // because WriteBatch is last-write-wins per key. Writing the new
         // attempt afterwards lets it win.
         //
@@ -429,7 +441,7 @@ impl JobStoreShard {
         // attempt rows in parallel — the lease for the running attempt was
         // just deleted earlier in this batch, no other attempt for this
         // job_id can be Running, and the job's terminal status will block
-        // dequeue / restart / reimport, so the scan sees a stable view.
+        // dequeue / restart / reimport, so the read sees a stable view.
         if reached_terminal
             && let Some(ts) = terminal_expire_ts
             && let Err(e) = self
@@ -438,6 +450,7 @@ impl JobStoreShard {
                     &tenant,
                     &job_id,
                     ts,
+                    Some(attempt_number.saturating_sub(1)),
                 )
                 .await
         {
@@ -450,7 +463,7 @@ impl JobStoreShard {
         // [SILO-SUCC-4][SILO-FAIL-4][SILO-RETRY-4] Update attempt status.
         // Apply TTL to terminal-job attempts so they expire alongside the rest of
         // the job's records. The retry-scheduling branch leaves the attempt
-        // without a TTL — it'll be picked up by the helper's scan when the job
+        // without a TTL — the helper re-puts it with one when the job
         // ultimately hits a terminal status.
         match (reached_terminal, terminal_expire_ts) {
             (true, Some(ts)) => {
@@ -1055,32 +1068,43 @@ impl JobStoreShard {
     ///   - `JOB_INFO`            (read existing bytes, re-put with TTL)
     ///   - `IDX_METADATA`        (one entry per metadata pair on the job)
     ///   - `IDX_ENQUEUE_TIME`    (the job's listing entry, keyed by its enqueue time)
-    ///   - `ATTEMPT`             (scan all attempt rows for the job, re-put each)
+    ///   - `ATTEMPT`             (each existing attempt row, read as
+    ///     [`Self::read_attempt_rows`] describes for `highest_attempt`)
     ///   - `JOB_CANCELLED`       (re-put with TTL if present)
     ///
     /// `JOB_STATUS`, `IDX_STATUS_TIME`, and `IDX_STATUS_ENQUEUE_TIME` are written
     /// with TTL by the caller via `set_job_status_with_index_opts`, so they are
     /// intentionally not handled here.
     ///
-    /// All reads go through `writer` so that when the caller uses a
-    /// `TxnWriter`, the JOB_INFO / ATTEMPT range / JOB_CANCELLED reads are
-    /// tracked in the transaction's SSI read set. A concurrent writer that
-    /// mutates any of those keys between this helper and the caller's commit
-    /// will trip a read-write (or phantom-read) conflict, so the re-put
-    /// cannot silently clobber a concurrent write with stale bytes.
+    /// `highest_attempt` is the highest attempt number whose row the helper
+    /// should re-put, when the caller knows it: the job's
+    /// [`JobStatus::highest_attempt`], or one below an attempt whose row the
+    /// caller writes itself. With `None` the helper scans the job's attempt
+    /// prefix.
     ///
-    /// The attempt scan returns the *committed* (pre-batch) attempt rows. For
-    /// the current attempt this means the old Running value, so the caller
-    /// MUST put the new terminal ATTEMPT row **after** invoking this helper.
-    /// `WriteBatch` is last-write-wins per key, and putting the new row
-    /// earlier would be silently clobbered when the helper re-puts the old
-    /// Running value with TTL.
+    /// All reads go through `writer` so that when the caller uses a
+    /// `TxnWriter`, the JOB_INFO / ATTEMPT / JOB_CANCELLED reads are tracked
+    /// in the transaction's SSI read set. A concurrent writer that mutates
+    /// any of those keys between this helper and the caller's commit will
+    /// trip a read-write (or, on the scan path, phantom-read) conflict, so
+    /// the re-put cannot silently clobber a concurrent write with stale
+    /// bytes. A new attempt row can only be added by a writer that also
+    /// rewrites the job's status record, which every transactional caller
+    /// has read.
+    ///
+    /// The attempt read returns the *committed* (pre-batch) attempt rows. If
+    /// it covers an attempt the caller is finishing, that row comes back with
+    /// its old Running value, so the caller MUST put the new terminal ATTEMPT
+    /// row **after** invoking this helper. `WriteBatch` is last-write-wins
+    /// per key, and putting the new row earlier would be silently clobbered
+    /// when the helper re-puts the old Running value with TTL.
     pub(crate) async fn expire_terminal_job_records<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
         job_id: &str,
         expire_ts: i64,
+        highest_attempt: Option<u32>,
     ) -> Result<(), JobStoreShardError> {
         let info_key = job_info_key(tenant, job_id);
         if let Some(info_raw) = writer.get(&info_key).await? {
@@ -1095,10 +1119,11 @@ impl JobStoreShard {
             writer.put_with_expire(&entry_key, [], expire_ts)?;
         }
 
-        let attempt_start = attempt_prefix(tenant, job_id);
-        let mut iter = writer.scan_prefix(&attempt_start).await?;
-        while let Some(kv) = iter.next().await? {
-            writer.put_with_expire(&kv.key, &kv.value, expire_ts)?;
+        for (key, value) in self
+            .read_attempt_rows(writer, tenant, job_id, highest_attempt)
+            .await?
+        {
+            writer.put_with_expire(&key, &value, expire_ts)?;
         }
 
         let cancelled_key = job_cancelled_key(tenant, job_id);
@@ -1118,13 +1143,18 @@ impl JobStoreShard {
     /// `JOB_CANCELLED` is deliberately not revived: the caller deletes it in
     /// the same transaction, and the write set is last-write-wins per key.
     ///
-    /// Returns the job's decoded `JOB_INFO`, or `JobNotFound` when absent.
+    /// `highest_attempt` is the job's [`JobStatus::highest_attempt`]; with
+    /// `None` the helper scans the job's attempt prefix.
+    ///
+    /// Returns the job's decoded `JOB_INFO` and its highest attempt number,
+    /// or `JobNotFound` when the `JOB_INFO` is absent.
     pub(crate) async fn revive_terminal_job_records<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
         job_id: &str,
-    ) -> Result<JobView, JobStoreShardError> {
+        highest_attempt: Option<u32>,
+    ) -> Result<RevivedJob, JobStoreShardError> {
         let info_key = job_info_key(tenant, job_id);
         let Some(info_raw) = writer.get(&info_key).await? else {
             return Err(JobStoreShardError::JobNotFound(job_id.to_string()));
@@ -1140,12 +1170,20 @@ impl JobStoreShard {
             [],
         )?;
 
-        let attempt_start = attempt_prefix(tenant, job_id);
-        let mut iter = writer.scan_prefix(&attempt_start).await?;
-        while let Some(kv) = iter.next().await? {
-            writer.put(&kv.key, &kv.value)?;
+        let mut highest_row = 0;
+        for (key, value) in self
+            .read_attempt_rows(writer, tenant, job_id, highest_attempt)
+            .await?
+        {
+            if let Some(parsed) = parse_attempt_key(&key) {
+                highest_row = highest_row.max(parsed.attempt);
+            }
+            writer.put(&key, &value)?;
         }
 
-        Ok(view)
+        Ok(RevivedJob {
+            view,
+            highest_attempt: highest_attempt.unwrap_or(highest_row),
+        })
     }
 }

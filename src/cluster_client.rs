@@ -787,7 +787,7 @@ impl ClusterClient {
             // Optionally fetch attempts if requested
             let attempts = if include_attempts {
                 let attempt_views = shard
-                    .get_job_attempts(tenant, job_id)
+                    .get_job_attempts_for_status(tenant, job_id, &job_status)
                     .await
                     .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
                 attempt_views
@@ -804,7 +804,7 @@ impl ClusterClient {
                     crate::pb_convert::result_from_proto_attempts(&attempts)
                 } else {
                     let latest = shard
-                        .get_latest_job_attempt(tenant, job_id)
+                        .get_latest_job_attempt_for_status(tenant, job_id, &job_status)
                         .await
                         .map_err(|e| ClusterClientError::QueryFailed(e.to_string()))?;
                     latest.and_then(|a| {

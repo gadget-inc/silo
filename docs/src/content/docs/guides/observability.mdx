@@ -34,11 +34,13 @@ These metrics track jobs as they flow through the system.
 | `silo_jobs_completed_total` | Counter | `shard`, `status` | Total jobs completed. Status is `succeeded`, `failed`, or `cancelled` |
 | `silo_job_attempts_total` | Counter | `shard`, `task_group`, `is_retry` | Total job attempts started. `is_retry=true` for attempts after the first |
 | `silo_job_wait_time_seconds` | Histogram | `shard`, `task_group` | Time jobs spent in queue before being dequeued (enqueue to dequeue latency) |
+| `silo_job_attempt_reads_total` | Counter | `shard`, `source` | Reads of a job's attempt rows. Source is `keys` (point reads of the job's attempt keys) or `scan` (a scan of the job's attempt prefix) |
 
 **Key insights:**
 - Compare `silo_jobs_enqueued_total` vs `silo_jobs_dequeued_total` to detect queue buildup
 - High `silo_job_wait_time_seconds` indicates workers can't keep up with incoming jobs
 - Track `is_retry=true` in `silo_job_attempts_total` to monitor retry rates
+- `silo_job_attempt_reads_total{source="scan"}` counts the attempt reads that opened a SlateDB scan: `GetJob`, `GetJobResult`, restart or a terminal outcome on a job whose status record carries no attempt number, a job with more than 32 attempts, and every reimport that lands a job in a terminal status. It should be a small fraction of `source="keys"`
 
 ### Lease Metrics
 
