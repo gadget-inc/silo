@@ -226,6 +226,8 @@ impl JobStoreShard {
         // both the `expire_terminal_job_records` invocation and the TTL on the
         // new attempt row written below.
         let mut reached_terminal = false;
+        // The attempt bound of the terminal status record written below.
+        let mut terminal_attempt_bound: Option<u32> = None;
 
         match &outcome {
             // [SILO-SUCC-3] If success: mark job succeeded now (pure write)
@@ -236,8 +238,8 @@ impl JobStoreShard {
                 // No JobView is loaded on the Success/Cancelled branches; the
                 // helper falls back to its own JOB_INFO get. The Error branch
                 // below already loads `view` and threads it through.
-                if let Some(transition) = self
-                    .set_job_status_with_index_opts(
+                let written = self
+                    .replace_job_status(
                         &mut DbWriteBatcher::new(&self.db, &mut batch),
                         &tenant,
                         &job_id,
@@ -245,8 +247,9 @@ impl JobStoreShard {
                         terminal_expire_ts,
                         None,
                     )
-                    .await?
-                {
+                    .await?;
+                terminal_attempt_bound = written.highest_attempt;
+                if let Some(transition) = written.background_action_transition {
                     background_action_transitions.push(transition);
                 }
                 // Job reached terminal state - include counter in batch
@@ -266,8 +269,8 @@ impl JobStoreShard {
                 let job_status = JobStatus::cancelled(now_ms).with_latest_attempt(attempt_number);
                 terminal_expire_ts =
                     self.terminal_expire_ts(crate::job::JobStatusKind::Cancelled, now_ms);
-                if let Some(transition) = self
-                    .set_job_status_with_index_opts(
+                let written = self
+                    .replace_job_status(
                         &mut DbWriteBatcher::new(&self.db, &mut batch),
                         &tenant,
                         &job_id,
@@ -275,8 +278,9 @@ impl JobStoreShard {
                         terminal_expire_ts,
                         None,
                     )
-                    .await?
-                {
+                    .await?;
+                terminal_attempt_bound = written.highest_attempt;
+                if let Some(transition) = written.background_action_transition {
                     background_action_transitions.push(transition);
                 }
                 // Job reached terminal state - include counter in batch
@@ -392,8 +396,8 @@ impl JobStoreShard {
                             )
                         };
                         terminal_expire_ts = self.terminal_expire_ts(terminal_kind, now_ms);
-                        if let Some(transition) = self
-                            .set_job_status_with_index_opts(
+                        let written = self
+                            .replace_job_status(
                                 &mut DbWriteBatcher::new(&self.db, &mut batch),
                                 &tenant,
                                 &job_id,
@@ -401,8 +405,9 @@ impl JobStoreShard {
                                 terminal_expire_ts,
                                 Some(&view),
                             )
-                            .await?
-                        {
+                            .await?;
+                        terminal_attempt_bound = written.highest_attempt;
+                        if let Some(transition) = written.background_action_transition {
                             background_action_transitions.push(transition);
                         }
                         // Job reached terminal state - include counter in batch
@@ -425,12 +430,15 @@ impl JobStoreShard {
 
         // Re-put all of the job's *prior* associated records (JOB_INFO,
         // IDX_METADATA, earlier ATTEMPT rows, JOB_CANCELLED) with the TTL.
-        // The reported attempt is the job's highest, and its row is written
-        // below, so the helper is bounded to the attempts before it.
+        // The reported attempt's row is written below, so when it is the
+        // job's highest the helper is bounded to the attempts before it. A
+        // terminal record that carries a higher bound has attempt rows above
+        // the reported one, and the helper is bounded to that instead.
         //
         // Ordering note: this MUST happen before we write the new ATTEMPT row
-        // for the current attempt. When the helper scans `attempt_prefix`
-        // (a job with more earlier attempts than the point-read limit) it
+        // for the current attempt. When the helper's read covers that attempt
+        // (a scan of `attempt_prefix` for a job with more earlier attempts
+        // than the point-read limit, or key reads up to a bound above it) it
         // reads `self.db`, which reflects committed state, pre-batch — so the
         // row for the current attempt comes back with its old Running status,
         // and would clobber a freshly-batched terminal put on the same key
@@ -442,6 +450,10 @@ impl JobStoreShard {
         // just deleted earlier in this batch, no other attempt for this
         // job_id can be Running, and the job's terminal status will block
         // dequeue / restart / reimport, so the read sees a stable view.
+        let highest_attempt_to_expire = match terminal_attempt_bound {
+            Some(bound) if bound > attempt_number => bound,
+            _ => attempt_number.saturating_sub(1),
+        };
         if reached_terminal
             && let Some(ts) = terminal_expire_ts
             && let Err(e) = self
@@ -450,7 +462,7 @@ impl JobStoreShard {
                     &tenant,
                     &job_id,
                     ts,
-                    Some(attempt_number.saturating_sub(1)),
+                    Some(highest_attempt_to_expire),
                 )
                 .await
         {

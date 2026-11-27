@@ -965,6 +965,37 @@ async fn attempts_above_a_dispatched_attempt_are_still_read() {
     assert_eq!(attempt_reads(&metrics, "scan"), 0.0);
 }
 
+/// A terminal outcome on an attempt below the job's kept bound gives the
+/// terminal TTL to every attempt row up to that bound, and the reported
+/// attempt's row holds its outcome.
+#[silo::test]
+async fn a_terminal_report_below_the_kept_bound_expires_the_attempts_above_it() {
+    let (_tmp, shard, _metrics) = open_expiring_shard_with_metrics().await;
+    job_with_a_pending_attempt_below_its_rows(&shard, "job").await;
+    let task_id = dequeue_one(&shard).await;
+
+    report_success(&shard, &task_id).await;
+
+    let succeeded = status(&shard, "job").await;
+    assert_eq!(succeeded.kind, JobStatusKind::Succeeded);
+    assert_eq!(succeeded.highest_attempt(), Some(4));
+    for attempt in 1..=4 {
+        assert!(
+            attempt_expire_ts(&shard, "job", attempt).await.is_some(),
+            "attempt {attempt} has no TTL"
+        );
+    }
+    let attempts = shard
+        .get_job_attempts(TENANT, "job")
+        .await
+        .expect("attempts");
+    assert_eq!(attempt_numbers(&attempts), [1, 2, 3, 4]);
+    assert!(matches!(
+        attempts[1].state(),
+        AttemptStatus::Succeeded { .. }
+    ));
+}
+
 #[silo::test]
 async fn a_job_that_retries_and_succeeds_never_lowers_its_attempt_bound() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
