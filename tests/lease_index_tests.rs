@@ -113,19 +113,6 @@ fn releasing_an_unknown_lease_is_a_no_op() {
 }
 
 #[test]
-fn forgetting_a_lease_drops_its_entry_whatever_expiry_it_holds() {
-    let index = LeaseIndex::default();
-    index.expect_written("a", 1_000);
-    index.confirm_written("a", 2_000);
-
-    index.forget("a");
-    index.forget("never written");
-
-    assert_eq!(index.len(), 0);
-    assert_eq!(index.next_expiry_ms(), None);
-}
-
-#[test]
 fn a_full_scan_adds_a_lease_the_index_has_not_heard_of() {
     let index = LeaseIndex::default();
     let scan = index.begin_full_scan();
@@ -133,7 +120,7 @@ fn a_full_scan_adds_a_lease_the_index_has_not_heard_of() {
     assert_eq!(scan.lookup("a"), ScannedLease::Untracked);
     assert!(scan.seed("a", 1_000));
 
-    assert_eq!(scan.lookup("a"), ScannedLease::Tracked);
+    assert_eq!(scan.lookup("a"), ScannedLease::Tracked { expiry_ms: 1_000 });
     assert_eq!(due_ids(&index, 1_000), ["a"]);
 }
 
@@ -145,7 +132,7 @@ fn a_full_scan_leaves_an_indexed_lease_at_its_expiry() {
     index.expect_written("a", 2_000);
     let scan = index.begin_full_scan();
 
-    assert_eq!(scan.lookup("a"), ScannedLease::Tracked);
+    assert_eq!(scan.lookup("a"), ScannedLease::Tracked { expiry_ms: 2_000 });
     assert!(!scan.seed("a", 1_000));
 
     assert_eq!(index.next_expiry_ms(), Some(2_000));
@@ -163,10 +150,8 @@ fn a_full_scan_does_not_add_a_lease_released_since_it_began() {
 
     index.release("tracked", 1_000);
     index.release("never tracked", 1_000);
-    index.expect_written("forgotten", 1_000);
-    index.forget("forgotten");
 
-    for task_id in ["tracked", "never tracked", "forgotten"] {
+    for task_id in ["tracked", "never tracked"] {
         assert_eq!(scan.lookup(task_id), ScannedLease::Released, "{task_id}");
         assert!(!scan.seed(task_id, 1_000), "{task_id}");
     }
@@ -184,9 +169,32 @@ fn a_lease_written_again_after_its_release_is_tracked_by_a_full_scan() {
     index.expect_written("a", 3_000);
     index.release("a", 1_000);
 
-    assert_eq!(scan.lookup("a"), ScannedLease::Tracked);
+    assert_eq!(scan.lookup("a"), ScannedLease::Tracked { expiry_ms: 3_000 });
     assert!(!scan.seed("a", 1_000));
     assert_eq!(index.next_expiry_ms(), Some(3_000));
+}
+
+/// A pass that deletes a lease row drops the entry it saw for the lease. A
+/// renewal that lands between that sighting and the drop moves the entry,
+/// which then stays for the row the renewal wrote.
+#[test]
+fn a_release_at_the_expiry_a_full_scan_saw_leaves_a_lease_renewed_since() {
+    let index = LeaseIndex::default();
+    index.expect_written("renewed", 1_000);
+    index.expect_written("idle", 1_000);
+    let scan = index.begin_full_scan();
+    let ScannedLease::Tracked { expiry_ms: renewed } = scan.lookup("renewed") else {
+        panic!("the index holds the lease");
+    };
+    let ScannedLease::Tracked { expiry_ms: idle } = scan.lookup("idle") else {
+        panic!("the index holds the lease");
+    };
+
+    index.confirm_written("renewed", 9_000);
+    index.release("renewed", renewed);
+    index.release("idle", idle);
+
+    assert_eq!(due_ids(&index, 9_000), ["renewed"]);
 }
 
 #[test]

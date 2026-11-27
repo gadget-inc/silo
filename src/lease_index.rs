@@ -27,8 +27,8 @@ pub struct DueLease {
 /// What the index knows of a lease whose row a full scan read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScannedLease {
-    /// The index holds an entry for the lease.
-    Tracked,
+    /// The index holds an entry for the lease, at `expiry_ms`.
+    Tracked { expiry_ms: i64 },
     /// The lease was released after the scan began and the index holds no
     /// entry for it, so the row the scan read has been deleted.
     Released,
@@ -69,31 +69,33 @@ impl Inner {
         false
     }
 
-    /// Drop the entry for `task_id` if `matches` its expiry, and remember
+    /// Drop the entry for `task_id` if it holds `expiry_ms`, and remember
     /// the release for any full scan that is open.
-    fn remove(&mut self, task_id: &str, matches: impl FnOnce(i64) -> bool) {
+    fn release(&mut self, task_id: &str, expiry_ms: i64) {
         let entry = self
             .expiry_by_task
             .get_key_value(task_id)
-            .map(|(task, expiry_ms)| (Arc::clone(task), *expiry_ms));
+            .map(|(task, indexed_ms)| (Arc::clone(task), *indexed_ms));
         if self.open_scans > 0 {
             let task = entry
                 .as_ref()
                 .map_or_else(|| Arc::from(task_id), |(task, _)| Arc::clone(task));
             self.released_during_scan.insert(task);
         }
-        let Some((task, expiry_ms)) = entry else {
+        let Some((task, indexed_ms)) = entry else {
             return;
         };
-        if matches(expiry_ms) {
+        if indexed_ms == expiry_ms {
             self.by_expiry.remove(&(expiry_ms, Arc::clone(&task)));
             self.expiry_by_task.remove(&task);
         }
     }
 
     fn scanned(&self, task_id: &str) -> ScannedLease {
-        if self.expiry_by_task.contains_key(task_id) {
-            ScannedLease::Tracked
+        if let Some(expiry_ms) = self.expiry_by_task.get(task_id) {
+            ScannedLease::Tracked {
+                expiry_ms: *expiry_ms,
+            }
         } else if self.released_during_scan.contains(task_id) {
             ScannedLease::Released
         } else {
@@ -170,14 +172,7 @@ impl LeaseIndex {
     /// while the index held `expiry_ms` for it. An entry holding any other
     /// expiry belongs to a newer write of the same task id and stays.
     pub fn release(&self, task_id: &str, expiry_ms: i64) {
-        self.lock()
-            .remove(task_id, |indexed_ms| indexed_ms == expiry_ms);
-    }
-
-    /// Drop the entry for a lease row that was deleted, whatever expiry the
-    /// index holds for it.
-    pub fn forget(&self, task_id: &str) {
-        self.lock().remove(task_id, |_| true);
+        self.lock().release(task_id, expiry_ms);
     }
 
     /// Open a scan of the whole lease range. Call before opening the scan's

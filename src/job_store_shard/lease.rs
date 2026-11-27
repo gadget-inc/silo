@@ -58,8 +58,8 @@ enum LeaseRow {
 /// A lease row to delete because its tenant is outside the shard's range.
 struct DefunctLease {
     key: Vec<u8>,
-    /// The task id in the row's key, when the key parses.
-    task_id: Option<String>,
+    /// The lease's index entry as the pass saw it: its task id and expiry.
+    entry: Option<(String, i64)>,
 }
 
 impl JobStoreShard {
@@ -625,7 +625,7 @@ impl JobStoreShard {
                 }
                 LeaseRow::Defunct => defunct.push(DefunctLease {
                     key,
-                    task_id: Some(due.task_id),
+                    entry: Some((due.task_id, due.expiry_ms)),
                 }),
                 LeaseRow::Reaped => pass.reaped += 1,
                 // No pass acts on this row, so an entry left in place would
@@ -699,16 +699,22 @@ impl JobStoreShard {
                     }
                 }
                 LeaseRow::Defunct => {
+                    let entry = match known {
+                        Some(ScannedLease::Tracked { expiry_ms }) => {
+                            task_id.map(|task_id| (task_id, expiry_ms))
+                        }
+                        _ => None,
+                    };
                     defunct.push(DefunctLease {
                         key: kv.key.to_vec(),
-                        task_id,
+                        entry,
                     });
                     continue;
                 }
                 LeaseRow::Reaped => pass.reaped += 1,
                 LeaseRow::Unreadable => continue,
             }
-            if seeded && known != Some(ScannedLease::Tracked) {
+            if seeded && !matches!(known, Some(ScannedLease::Tracked { .. })) {
                 pass.untracked += 1;
             }
         }
@@ -799,7 +805,9 @@ impl JobStoreShard {
     }
 
     /// Delete lease rows that belong to tenants outside the shard's range,
-    /// then drop their index entries.
+    /// then drop their index entries. An entry that has moved since the pass
+    /// saw it belongs to a renewal that may have written the row again, and
+    /// stays.
     async fn delete_defunct_leases(&self, defunct: Vec<DefunctLease>) {
         if defunct.is_empty() {
             return;
@@ -812,8 +820,8 @@ impl JobStoreShard {
             debug!(error = %e, count = defunct.len(), "failed to delete defunct leases");
             return;
         }
-        for task_id in defunct.iter().filter_map(|lease| lease.task_id.as_deref()) {
-            self.leases.forget(task_id);
+        for (task_id, expiry_ms) in defunct.iter().filter_map(|lease| lease.entry.as_ref()) {
+            self.leases.release(task_id, *expiry_ms);
         }
         debug!(
             count = defunct.len(),
