@@ -317,10 +317,17 @@ impl JobStoreShard {
         // these keys trips a conflict rather than being silently clobbered with
         // stale bytes (see `expire_terminal_job_records`). JOB_INFO and any
         // prior ATTEMPT rows were written by earlier transactions; re-putting
-        // them here tags them with the row TTL.
+        // them here tags them with the row TTL. The status read at the top of
+        // this transaction bounds which attempt rows exist.
         if let Some(ts) = terminal_expire_ts {
             let expire_result = self
-                .expire_terminal_job_records(&mut TxnWriter(&txn), tenant, id, ts)
+                .expire_terminal_job_records(
+                    &mut TxnWriter(&txn),
+                    tenant,
+                    id,
+                    ts,
+                    status.highest_attempt(),
+                )
                 .await;
             try_after_status!(expire_result);
         }

@@ -565,6 +565,7 @@ pub fn encode_job_status(status: &JobStatus) -> Vec<u8> {
             current_attempt: status.current_attempt,
             enqueue_time_ms: status.enqueue_time_ms,
             priority: status.priority,
+            latest_attempt: status.latest_attempt,
         },
     );
     builder.finish(root, None);
@@ -1124,6 +1125,7 @@ pub fn decode_job_status_owned(bytes: &[u8]) -> Result<JobStatus, CodecError> {
         current_attempt: s.current_attempt(),
         enqueue_time_ms: s.enqueue_time_ms(),
         priority: s.priority(),
+        latest_attempt: s.latest_attempt(),
     })
 }
 

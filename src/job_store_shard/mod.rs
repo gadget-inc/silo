@@ -1,4 +1,5 @@
 //! Job store shard - a single shard of the distributed job storage system.
+mod attempts;
 mod cancel;
 mod cleanup;
 pub(crate) mod counters;
@@ -19,6 +20,7 @@ mod rate_limit;
 mod restart;
 pub(crate) mod scan;
 
+pub use attempts::{ATTEMPT_POINT_READ_LIMIT, AttemptReadSource};
 pub use cleanup::{CleanupProgress, CleanupResult};
 pub use drop_tenant_holders::DropTenantStats;
 pub use listing_index_backfill::{
@@ -1935,38 +1937,6 @@ impl JobStoreShard {
             Some(raw) => Ok(Some(JobAttemptView::new(raw)?)),
             None => Ok(None),
         }
-    }
-
-    /// Fetch all attempts for a job, ordered by attempt number (ascending).
-    /// Returns an empty vector if the job has no attempts.
-    pub async fn get_job_attempts(
-        &self,
-        tenant: &str,
-        job_id: &str,
-    ) -> Result<Vec<JobAttemptView>, JobStoreShardError> {
-        let start = crate::keys::attempt_prefix(tenant, job_id);
-        let end = crate::keys::end_bound(&start);
-
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let mut attempts = Vec::new();
-
-        while let Some(kv) = iter.next().await? {
-            let view = JobAttemptView::new(kv.value.clone())?;
-            attempts.push(view);
-        }
-
-        Ok(attempts)
-    }
-
-    /// Get the latest (highest numbered) attempt for a job, if any.
-    /// This is typically the attempt that contains the final result for completed jobs.
-    pub async fn get_latest_job_attempt(
-        &self,
-        tenant: &str,
-        job_id: &str,
-    ) -> Result<Option<JobAttemptView>, JobStoreShardError> {
-        let attempts = self.get_job_attempts(tenant, job_id).await?;
-        Ok(attempts.into_iter().last())
     }
 
     /// Delete a job by id.

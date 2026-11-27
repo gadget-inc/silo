@@ -217,7 +217,7 @@ impl JobStoreShard {
                 &mut writer,
                 tenant,
                 id,
-                crate::job::JobStatus::running(now_ms),
+                crate::job::JobStatus::running(now_ms).with_latest_attempt(attempt_number),
                 Some(&job_view),
             )
             .await?;

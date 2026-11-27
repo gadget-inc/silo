@@ -36,6 +36,7 @@ fn status(kind: JobStatusKind, current_attempt: Option<u32>) -> JobStatus {
         current_attempt,
         enqueue_time_ms: None,
         priority: None,
+        latest_attempt: None,
     }
 }
 

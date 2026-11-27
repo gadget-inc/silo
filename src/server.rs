@@ -1053,7 +1053,7 @@ impl Silo for SiloService {
         // Optionally fetch attempts if requested
         let attempts = if r.include_attempts {
             let attempt_views = shard
-                .get_job_attempts(&tenant, &r.id)
+                .get_job_attempts_for_status(&tenant, &r.id, &job_status)
                 .await
                 .map_err(map_err)?;
             attempt_views
@@ -1072,7 +1072,7 @@ impl Silo for SiloService {
             } else {
                 // Attempts not loaded, query the latest attempt
                 let latest = shard
-                    .get_latest_job_attempt(&tenant, &r.id)
+                    .get_latest_job_attempt_for_status(&tenant, &r.id, &job_status)
                     .await
                     .map_err(map_err)?;
                 latest.and_then(|a| {
@@ -1143,7 +1143,7 @@ impl Silo for SiloService {
 
         // Get the latest attempt to retrieve the result
         let Some(attempt) = shard
-            .get_latest_job_attempt(&tenant, &r.id)
+            .get_latest_job_attempt_for_status(&tenant, &r.id, &job_status)
             .await
             .map_err(map_err)?
         else {

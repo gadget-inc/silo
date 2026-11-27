@@ -551,9 +551,10 @@ impl JobStoreShard {
         // last-write-wins per key, so it must run *before* the in-txn writes
         // that override the same keys (updated JOB_INFO below, JOB_CANCELLED
         // delete further down) — otherwise the helper's re-put of the old value
-        // would clobber the new one.
+        // would clobber the new one. Existing attempts are counted, not
+        // numbered, on this path, so the helper scans for them.
         if let Some(ts) = terminal_expire_ts {
-            self.expire_terminal_job_records(&mut TxnWriter(&txn), tenant, job_id, ts)
+            self.expire_terminal_job_records(&mut TxnWriter(&txn), tenant, job_id, ts, None)
                 .await?;
         }
 
@@ -954,12 +955,12 @@ fn determine_import_status(
 
     match &last_attempt.status {
         ImportedAttemptStatus::Succeeded { .. } => (
-            JobStatus::succeeded(last_attempt.finished_at_ms),
+            JobStatus::succeeded(last_attempt.finished_at_ms).with_latest_attempt(num_attempts),
             JobStatusKind::Succeeded,
             true,
         ),
         ImportedAttemptStatus::Cancelled => (
-            JobStatus::cancelled(last_attempt.finished_at_ms),
+            JobStatus::cancelled(last_attempt.finished_at_ms).with_latest_attempt(num_attempts),
             JobStatusKind::Cancelled,
             true,
         ),
@@ -977,7 +978,8 @@ fn determine_import_status(
 
             if exhausted {
                 (
-                    JobStatus::failed(last_attempt.finished_at_ms),
+                    JobStatus::failed(last_attempt.finished_at_ms)
+                        .with_latest_attempt(num_attempts),
                     JobStatusKind::Failed,
                     true,
                 )

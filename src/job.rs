@@ -208,6 +208,12 @@ pub struct JobStatus {
     /// The job's priority, copied from `JobInfo` when the record is written.
     /// Absent on records stored without it.
     pub priority: Option<u8>,
+    /// The highest attempt number the job has an attempt row for. Present on
+    /// records written when an attempt starts or finishes (Running, and the
+    /// terminal status an attempt's outcome sets) and on a record that
+    /// replaces one bounding the rows higher than it would; absent on
+    /// records stored without it. See [`JobStatus::highest_attempt`].
+    pub latest_attempt: Option<u32>,
 }
 
 impl JobStatus {
@@ -226,7 +232,27 @@ impl JobStatus {
             current_attempt,
             enqueue_time_ms: None,
             priority: None,
+            latest_attempt: None,
         }
+    }
+
+    /// Record `attempt_number` as the highest attempt the job has an attempt
+    /// row for.
+    pub fn with_latest_attempt(mut self, attempt_number: u32) -> Self {
+        self.latest_attempt = Some(attempt_number);
+        self
+    }
+
+    /// The highest attempt number the job can have an attempt row for, when
+    /// this record says: the recorded latest attempt, or one below the
+    /// pending attempt, whose row is written only when it is dequeued. The
+    /// job's attempt rows are then among `1..=n`, though any of them may be
+    /// absent. `None` when the record carries neither number.
+    pub fn highest_attempt(&self) -> Option<u32> {
+        self.latest_attempt.or_else(|| {
+            self.current_attempt
+                .map(|pending| pending.saturating_sub(1))
+        })
     }
 
     /// The job-derived `(enqueue_time_ms, priority)` pair when both are

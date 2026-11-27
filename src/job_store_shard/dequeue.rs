@@ -609,7 +609,7 @@ impl JobStoreShard {
         batch.put(&lease_key, &leased_value);
 
         // [SILO-DEQ-6] Mark job as running
-        let job_status = JobStatus::running(now_ms);
+        let job_status = JobStatus::running(now_ms).with_latest_attempt(attempt_number);
         let background_action_transition = self
             .set_job_status_with_index(
                 &mut DbWriteBatcher::new(&self.db, batch),

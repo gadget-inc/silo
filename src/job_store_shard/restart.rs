@@ -11,7 +11,7 @@ use crate::job_store_shard::helpers::{
     TxnWriter, decode_job_status_owned, now_epoch_ms, retry_on_txn_conflict,
 };
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
-use crate::keys::{attempt_prefix, job_cancelled_key, job_status_key};
+use crate::keys::{job_cancelled_key, job_status_key};
 use crate::task::Task;
 
 /// Error returned when a job cannot be restarted because it's not in a restartable state.
@@ -119,35 +119,19 @@ impl JobStoreShard {
 
         // Re-put the job's rows without the terminal-retention TTL they may
         // carry, and read the job info to know the priority and compute
-        // start_at_ms.
-        let job_view = self
-            .revive_terminal_job_records(&mut TxnWriter(&txn), tenant, id)
+        // start_at_ms. The status record bounds the job's attempt rows when
+        // it carries an attempt number; without one the helper scans for
+        // them. Either way it reports the job's highest attempt, which must
+        // be known before the status is set.
+        let revived = self
+            .revive_terminal_job_records(&mut TxnWriter(&txn), tenant, id, status.highest_attempt())
             .await?;
+        let job_view = revived.view;
         let priority = job_view.priority();
         let start_at_ms = job_view.enqueue_time_ms().max(now_ms);
 
-        // Find the maximum attempt number from existing attempts
-        // We scan the attempts prefix to find the highest attempt number
-        // This must happen before we set the status so we know the attempt number
-        let start = attempt_prefix(tenant, id);
-        let end = crate::keys::end_bound(&start);
-
-        let mut max_attempt_number: u32 = 0;
-        let mut iter = txn.scan::<Vec<u8>, _>(start..end).await?;
-        while let Some(kv) = iter.next().await? {
-            // Attempt keys use storekey encoding: prefix + (tenant, job_id, attempt)
-            // The attempt number is the last field encoded as u32 big-endian
-            // For simplicity, decode the full key and extract attempt number
-            if kv.key.first() == Some(&crate::keys::prefix::ATTEMPT) {
-                let decoded: Result<(String, String, u32), _> = storekey::decode(&kv.key[1..]);
-                if let Ok((_, _, attempt_num)) = decoded {
-                    max_attempt_number = max_attempt_number.max(attempt_num);
-                }
-            }
-        }
-
         // [SILO-RESTART-5] Attempt numbers are monotonically increasing; relative attempts reset to 1 on restart
-        let next_attempt_number = max_attempt_number + 1;
+        let next_attempt_number = revived.highest_attempt + 1;
 
         // [SILO-RESTART-6] Post: Set status to Scheduled with next attempt time and attempt number
         let new_status = JobStatus::scheduled(now_ms, start_at_ms, next_attempt_number);

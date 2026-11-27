@@ -293,6 +293,15 @@ fn record_grant_outcome(
     }
 }
 
+/// What [`JobStoreShard::replace_job_status`] wrote.
+pub(crate) struct JobStatusWrite {
+    /// The background-action gauge change the write applied, if any.
+    pub background_action_transition: Option<BackgroundActionMetricTransition>,
+    /// The written record's [`JobStatus::highest_attempt`]: the bound the
+    /// caller gave, or the previous record's when that was higher.
+    pub highest_attempt: Option<u32>,
+}
+
 impl JobStoreShard {
     /// Enqueue a new job with optional limits (concurrency and/or rate limits).
     /// The payload is stored as raw bytes (MessagePack-encoded by the client).
@@ -1129,7 +1138,37 @@ impl JobStoreShard {
     /// The new record carries the job's enqueue time and priority: from the
     /// previous status record when it has them, else from `job_metric_info`,
     /// else from the same single `JOB_INFO` read.
+    ///
+    /// The new record's [`JobStatus::highest_attempt`] is never below the
+    /// previous record's. When `new_status` would lower it, the record is
+    /// written with the previous bound as its `latest_attempt`, and the
+    /// write is counted and logged. A record on either side that carries no
+    /// bound is left alone.
     pub(crate) async fn set_job_status_with_index_opts<W: WriteBatcher>(
+        &self,
+        writer: &mut W,
+        tenant: &str,
+        job_id: &str,
+        new_status: JobStatus,
+        expire_ts: Option<i64>,
+        job_metric_info: Option<&JobView>,
+    ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
+        let written = self
+            .replace_job_status(
+                writer,
+                tenant,
+                job_id,
+                new_status,
+                expire_ts,
+                job_metric_info,
+            )
+            .await?;
+        Ok(written.background_action_transition)
+    }
+
+    /// [`Self::set_job_status_with_index_opts`], also reporting the attempt
+    /// bound of the record it wrote.
+    pub(crate) async fn replace_job_status<W: WriteBatcher>(
         &self,
         writer: &mut W,
         tenant: &str,
@@ -1137,7 +1176,7 @@ impl JobStoreShard {
         mut new_status: JobStatus,
         expire_ts: Option<i64>,
         job_metric_info: Option<&JobView>,
-    ) -> Result<Option<BackgroundActionMetricTransition>, JobStoreShardError> {
+    ) -> Result<JobStatusWrite, JobStoreShardError> {
         // Delete old index entries if present
         let old_status = if let Some(old_raw) = writer.get(&job_status_key(tenant, job_id)).await? {
             let old = decode_job_status_owned(&old_raw)?;
@@ -1153,6 +1192,26 @@ impl JobStoreShard {
         } else {
             None
         };
+
+        // Attempt rows are read by key up to the bound a status record
+        // gives, so a record never carries a lower bound than the one it
+        // replaces: a row above it would be left out of every read.
+        if let Some(stored_bound) = old_status.as_ref().and_then(JobStatus::highest_attempt)
+            && let Some(written_bound) = new_status.highest_attempt()
+            && stored_bound > written_bound
+        {
+            new_status.latest_attempt = Some(stored_bound);
+            if let Some(ref m) = self.metrics {
+                m.record_job_attempt_bound_regression(&self.name);
+            }
+            tracing::warn!(
+                tenant = %tenant,
+                job_id = %job_id,
+                stored_bound,
+                written_bound,
+                "status write carried a lower attempt bound than the stored record; kept the stored bound",
+            );
+        }
 
         let old_kind = old_status.as_ref().map(|old| old.kind);
         let new_kind = new_status.kind;
@@ -1211,6 +1270,7 @@ impl JobStoreShard {
             );
         }
 
+        let highest_attempt = new_status.highest_attempt();
         if let Err(e) = Self::write_job_status_with_index_opts_and_metadata(
             writer, tenant, job_id, new_status, expire_ts,
         ) {
@@ -1221,7 +1281,10 @@ impl JobStoreShard {
             }
             return Err(e);
         }
-        Ok(background_action_transition)
+        Ok(JobStatusWrite {
+            background_action_transition,
+            highest_attempt,
+        })
     }
 
     /// Shared helper: write status value and index entry.
