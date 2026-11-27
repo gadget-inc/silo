@@ -2643,7 +2643,8 @@ impl ConcurrencyManager {
                     }
                     // Lane sizes AFTER the take: what remains queued. Hot is
                     // ~0 in steady state (drained fully every iteration);
-                    // cold sawtooths with the periodic reconcile sweep.
+                    // cold sawtooths with the periodic reconcile sweep and
+                    // holds follow-up passes while queues catch up.
                     if let Some(ref m) = mgr.metrics {
                         let hot = mgr.pending_grants.lock().unwrap().len();
                         let cold = mgr.pending_grants_cold.lock().unwrap().entries.len();

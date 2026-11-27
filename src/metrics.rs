@@ -1047,8 +1047,8 @@ impl Metrics {
     }
 
     /// Update the grant scanner pending-lane size gauges (hot = event-driven
-    /// nudges drained fully each iteration; cold = reconciler sweep entries
-    /// drained in bounded batches).
+    /// nudges drained fully each iteration; cold = reconcile sweep entries
+    /// and follow-up passes, drained in bounded batches).
     pub fn set_concurrency_pending_grants(&self, shard: &str, hot: usize, cold: usize) {
         self.concurrency_pending_grants
             .with_label_values(&[shard, "hot"])
@@ -2981,7 +2981,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         GaugeVec::new(
             Opts::new(
                 "silo_concurrency_pending_grants",
-                "Number of (tenant, queue) entries pending in the grant scanner's lanes: lane=hot (event-driven nudges, drained fully each iteration) vs lane=cold (reconciler sweep entries, drained in bounded batches)",
+                "Number of (tenant, queue) entries pending in the grant scanner's lanes: lane=hot (event-driven nudges, drained fully each iteration) vs lane=cold (reconcile sweep entries and follow-up passes for queues left with free capacity, drained in bounded batches)",
             ),
             &["shard", "lane"],
         )?,
