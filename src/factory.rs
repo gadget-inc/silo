@@ -524,6 +524,8 @@ impl ShardFactory {
                         broker_tombstone_revive_after_generations: template
                             .broker_tombstone_revive_after_generations,
                         broker_full_rescan_interval_ms: template.broker_full_rescan_interval_ms,
+                        broker_keyed_read_min_lag_ms: template.broker_keyed_read_min_lag_ms,
+                        broker_keyed_read_max_keys: template.broker_keyed_read_max_keys,
                         lease_reaper_full_scan_interval_ms: template
                             .lease_reaper_full_scan_interval_ms,
                         enqueue_time_index_backfill: template.enqueue_time_index_backfill.clone(),
@@ -1557,6 +1559,8 @@ impl ShardFactory {
                     .template
                     .broker_tombstone_revive_after_generations,
                 broker_full_rescan_interval_ms: self.template.broker_full_rescan_interval_ms,
+                broker_keyed_read_min_lag_ms: self.template.broker_keyed_read_min_lag_ms,
+                broker_keyed_read_max_keys: self.template.broker_keyed_read_max_keys,
                 lease_reaper_full_scan_interval_ms: self
                     .template
                     .lease_reaper_full_scan_interval_ms,

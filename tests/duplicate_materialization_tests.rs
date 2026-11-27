@@ -491,7 +491,7 @@ async fn concurrent_chain_resumes_in_two_batches_keep_single_terminal_row() {
     let mut batches = Vec::new();
     for offset in [0, 1] {
         let mut batch = WriteBatch::new();
-        let grants = resumer
+        let resumed = resumer
             .resume_chain(
                 &mut batch,
                 &mut silo::job_store_shard::ScheduledRefreshes::default(),
@@ -500,7 +500,7 @@ async fn concurrent_chain_resumes_in_two_batches_keep_single_terminal_row() {
             .await
             .expect("resume chain");
         assert!(
-            grants.is_empty(),
+            resumed.grants.is_empty(),
             "terminal resume makes no further reservations"
         );
         batches.push(batch);

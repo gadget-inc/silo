@@ -229,6 +229,10 @@ pub struct Metrics {
     broker_tombstone_count: GaugeVec,
     broker_full_rescans_total: CounterVec,
     broker_full_rescan_inserted_total: CounterVec,
+    broker_scan_floor_lag_ms: GaugeVec,
+    broker_keyed_reads_total: CounterVec,
+    broker_noted_keys: GaugeVec,
+    broker_keyed_read_overflows_total: CounterVec,
 
     // Poll metrics
     polls_total: CounterVec,
@@ -692,6 +696,53 @@ impl Metrics {
         self.broker_full_rescan_inserted_total
             .with_label_values(&[shard, task_group])
             .inc_by(inserted_below_floor as f64);
+    }
+
+    /// Record how far behind the current time a broker scan started: the
+    /// scan's time minus its scan floor, or 0 for a scan of the whole range.
+    pub fn set_broker_scan_floor_lag_ms(&self, shard: &str, task_group: &str, lag_ms: u64) {
+        self.broker_scan_floor_lag_ms
+            .with_label_values(&[shard, task_group])
+            .set(lag_ms as f64);
+    }
+
+    /// Record the point reads a broker scan made of task keys noted for
+    /// reading by key, by what became of each.
+    pub fn record_broker_keyed_reads(
+        &self,
+        shard: &str,
+        task_group: &str,
+        counts: &crate::task_broker::KeyedReadCounts,
+    ) {
+        for (outcome, count) in [
+            ("inserted", counts.inserted),
+            ("already_buffered", counts.already_buffered),
+            ("in_flight", counts.in_flight),
+            ("tombstone", counts.tombstone),
+            ("defunct", counts.defunct),
+            ("missing", counts.missing),
+            ("pending", counts.pending),
+            ("error", counts.error),
+        ] {
+            self.broker_keyed_reads_total
+                .with_label_values(&[shard, task_group, outcome])
+                .inc_by(count as f64);
+        }
+    }
+
+    /// Update how many task keys a broker holds for reading by key.
+    pub fn set_broker_noted_keys(&self, shard: &str, task_group: &str, count: u64) {
+        self.broker_noted_keys
+            .with_label_values(&[shard, task_group])
+            .set(count as f64);
+    }
+
+    /// Record a task row that lowered the broker's scan floor because the
+    /// keys waiting to be read by key were at their limit.
+    pub fn record_broker_keyed_read_overflow(&self, shard: &str, task_group: &str) {
+        self.broker_keyed_read_overflows_total
+            .with_label_values(&[shard, task_group])
+            .inc();
     }
 
     /// Update the number of ack tombstones for a shard and task group.
@@ -2419,6 +2470,50 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let broker_scan_floor_lag_ms = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_broker_scan_floor_lag_ms",
+                "How far behind the current time the last broker scan started reading, in milliseconds: the scan's time minus its scan floor, 0 for a scan of the whole range. A scan steps over every task row and tombstone between its floor and the current time",
+            ),
+            &["shard", "task_group"],
+        )?,
+    );
+
+    let broker_keyed_reads_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_broker_keyed_reads_total",
+                "Point reads broker scans made of task keys noted for reading by key, broken down by outcome",
+            ),
+            &["shard", "task_group", "outcome"],
+        )?,
+    );
+
+    let broker_noted_keys = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_broker_noted_keys",
+                "Number of task keys the broker holds for reading by key, as of its last scan",
+            ),
+            &["shard", "task_group"],
+        )?,
+    );
+
+    let broker_keyed_read_overflows_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_broker_keyed_read_overflows_total",
+                "Task rows that lowered the broker's scan floor because the keys waiting to be read by key were at their limit",
+            ),
+            &["shard", "task_group"],
+        )?,
+    );
+
     // Poll metrics
     let polls_total = register(
         &registry,
@@ -2917,6 +3012,10 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_tombstone_count,
         broker_full_rescans_total,
         broker_full_rescan_inserted_total,
+        broker_scan_floor_lag_ms,
+        broker_keyed_reads_total,
+        broker_noted_keys,
+        broker_keyed_read_overflows_total,
         polls_total,
         poll_duration,
         task_leases_active,

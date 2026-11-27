@@ -131,21 +131,25 @@ pub struct ResumeChainParams {
 }
 
 /// A grant the scanner has reserved and written into the current chunk's
-/// batch: the chain's task id, its task group, and the start time of the
-/// task row the resumed chain wrote (the job's original start time).
+/// batch: the chain's task id, its task group, and the key of the task row
+/// the resumed chain wrote. A chain that parked on a later concurrency limit
+/// wrote no task row and has no key.
 struct ChunkGrant {
     task_id: String,
     task_group: String,
-    start_time_ms: i64,
+    task_key: Option<Vec<u8>>,
 }
 
-/// Record that a task row with `start_time_ms` was written under
-/// `task_group`, keeping the earliest start time per group.
-fn merge_granted_group(groups: &mut BTreeMap<String, i64>, task_group: String, start_time_ms: i64) {
-    groups
-        .entry(task_group)
-        .and_modify(|earliest| *earliest = (*earliest).min(start_time_ms))
-        .or_insert(start_time_ms);
+/// What resuming a limit chain into a batch produced.
+#[derive(Debug, Default)]
+pub struct ResumedChain {
+    /// The `(queue, task_id)` pairs of the in-memory concurrency
+    /// reservations the chain made beyond the caller's own, for the caller
+    /// to roll back if the batch write fails.
+    pub grants: Vec<(String, String)>,
+    /// The key of the task row the chain wrote, or `None` when the chain
+    /// parked on a concurrency request and wrote no task row.
+    pub task_key: Option<Vec<u8>>,
 }
 
 /// Bridge between the grant scanner / `process_grants` and the shard-level
@@ -160,30 +164,29 @@ pub trait LimitChainResumer: Send + Sync {
     /// Append edits to `batch` that continue the limit chain from
     /// `params.limit_index`. `scheduled_refreshes` is shared by every chain
     /// resumed into the same batch, so a downstream floating queue's refresh
-    /// is scheduled once per batch. Returns the `(queue, task_id)` pairs of
-    /// any additional in-memory concurrency reservations the chain made (so
-    /// the caller can roll them back if the batch write fails).
+    /// is scheduled once per batch. Returns the additional in-memory
+    /// concurrency reservations the chain made and the key of the task row
+    /// it wrote, if it wrote one.
     async fn resume_chain(
         &self,
         batch: &mut slatedb::WriteBatch,
         scheduled_refreshes: &mut ScheduledRefreshes,
         params: ResumeChainParams,
-    ) -> Result<Vec<(String, String)>, ConcurrencyError>;
+    ) -> Result<ResumedChain, ConcurrencyError>;
 
     /// Tell the task brokers about the task rows a durable grant commit
-    /// wrote, one `(task_group, start_time_ms)` per group with the earliest
-    /// start time written under it, so freshly written tasks become claimable
+    /// wrote, one key per row, so freshly written tasks become claimable
     /// without waiting for the grant scanner's drain iteration to finish
     /// every other queue's pass. A resumed chain keeps the job's original
-    /// start time, which may sort below the broker's scan floor. Default is a
-    /// no-op for resumers with no broker access.
-    fn tasks_written(&self, _written: &[(String, i64)]) {}
+    /// start time, which may sort far below the broker's scan floor. Default
+    /// is a no-op for resumers with no broker access.
+    fn tasks_written(&self, _task_keys: &[Vec<u8>]) {}
 
     /// Tell the task brokers that a grant commit is about to write the task
-    /// rows in `written` (same shape as [`Self::tasks_written`]), so a scan
-    /// that sees a row while the commit awaits durability buffers it. Default
-    /// is a no-op for resumers with no broker access.
-    fn expect_tasks(&self, _written: &[(String, i64)]) {}
+    /// rows at `task_keys`, so a scan that sees a row while the commit awaits
+    /// durability buffers it. Default is a no-op for resumers with no broker
+    /// access.
+    fn expect_tasks(&self, _task_keys: &[Vec<u8>]) {}
 
     /// The chunk that wrote refresh index rows under `task_groups` is
     /// durable; the shard marks those groups pending for its refresh drain.
@@ -263,7 +266,12 @@ pub enum RequestTicketOutcome {
     /// once the request record is durable.
     TicketRequested { queue: String, yielded: bool },
     /// Job queued as a RequestTicket task (for future start time)
-    FutureRequestTaskWritten { queue: String, task_id: String },
+    FutureRequestTaskWritten {
+        queue: String,
+        task_id: String,
+        /// The key of the `RequestTicket` task row.
+        task_key: Vec<u8>,
+    },
 }
 
 /// Why the orphan sweep judged a durable holder to be dead.
@@ -1876,20 +1884,19 @@ impl ConcurrencyManager {
                 limits: all_limits.to_vec(),
             };
             let ticket_value = encode_task(&ticket);
-            writer.put(
-                task_key(
-                    task_group,
-                    scheduled_at_ms,
-                    priority,
-                    job_id,
-                    attempt_number,
-                    task_key_epoch_ms,
-                ),
-                &ticket_value,
-            )?;
+            let ticket_key = task_key(
+                task_group,
+                scheduled_at_ms,
+                priority,
+                job_id,
+                attempt_number,
+                task_key_epoch_ms,
+            );
+            writer.put(&ticket_key, &ticket_value)?;
             Ok(Some(RequestTicketOutcome::FutureRequestTaskWritten {
                 queue: queue.clone(),
                 task_id: task_id.to_string(),
+                task_key: ticket_key,
             }))
         }
     }
@@ -2474,35 +2481,32 @@ impl ConcurrencyManager {
                     // serializes other queues behind the busiest one. With
                     // `buffer_unordered`, a slow pass occupies exactly one slot
                     // while the remaining slots keep draining the other queues.
-                    let granted: Vec<Vec<(String, i64)>> =
-                        futures::stream::iter(work.into_values())
-                            .map(|(tenant, queue, count)| {
-                                let mgr = Arc::clone(&mgr);
-                                let db = Arc::clone(&db);
-                                let range = range.clone();
-                                async move {
-                                    mgr.process_grants(&db, &range, &tenant, &queue, count)
-                                        .await
-                                }
-                            })
-                            .buffer_unordered(mgr.grant_scanner_concurrency)
-                            .collect()
-                            .await;
+                    let granted: Vec<Vec<String>> = futures::stream::iter(work.into_values())
+                        .map(|(tenant, queue, count)| {
+                            let mgr = Arc::clone(&mgr);
+                            let db = Arc::clone(&db);
+                            let range = range.clone();
+                            async move {
+                                mgr.process_grants(&db, &range, &tenant, &queue, count)
+                                    .await
+                            }
+                        })
+                        .buffer_unordered(mgr.grant_scanner_concurrency)
+                        .collect()
+                        .await;
                     // Canonicalize: `buffer_unordered` collects in completion
-                    // order, which depends on scheduling. Merging into an
-                    // ordered map (one entry per group, with the earliest
-                    // start time granted via any queue) makes the broker wake
-                    // sequence a pure function of the granted *set*, keeping
-                    // downstream behavior independent of interleaving for DST.
-                    let mut granted_groups: BTreeMap<String, i64> = BTreeMap::new();
-                    for (task_group, start_time_ms) in granted.into_iter().flatten() {
-                        merge_granted_group(&mut granted_groups, task_group, start_time_ms);
-                    }
+                    // order, which depends on scheduling. Collecting into an
+                    // ordered set makes the broker wake sequence a pure
+                    // function of the granted *set*, keeping downstream
+                    // behavior independent of interleaving for DST.
+                    let granted_groups: BTreeSet<String> = granted.into_iter().flatten().collect();
 
-                    // Wake only the brokers whose task groups received grants
-                    if !granted_groups.is_empty() {
-                        let written: Vec<(String, i64)> = granted_groups.into_iter().collect();
-                        brokers.notify_tasks_written(&written);
+                    // Wake only the brokers whose task groups received grants.
+                    // Each chunk's commit has already told the brokers which
+                    // task rows it wrote, so this is a wake-up alone: it says
+                    // nothing about where those rows sort.
+                    for task_group in &granted_groups {
+                        brokers.wakeup(task_group);
                     }
                 }
             }
@@ -2654,8 +2658,7 @@ impl ConcurrencyManager {
 
     /// Process pending grant requests for a single (tenant, queue).
     /// Scans up to `count` pending requests and grants those for which capacity exists.
-    /// Returns one `(task_group, start_time_ms)` per grant: the task group of
-    /// the granted chain and the start time of the task row it wrote.
+    /// Returns the task group of each granted chain, one entry per grant.
     ///
     /// Optimized for throughput: scans candidates in batches, batch-validates their
     /// status concurrently, reserves in-memory slots, then writes all grants plus
@@ -2669,7 +2672,7 @@ impl ConcurrencyManager {
         tenant: &str,
         queue: &str,
         count: u32,
-    ) -> Vec<(String, i64)> {
+    ) -> Vec<String> {
         let invocation_started = std::time::Instant::now();
         // Invocation-level accounting, recorded once at every exit path
         // (including precheck skips) so invocation rate and per-invocation
@@ -2805,7 +2808,7 @@ impl ConcurrencyManager {
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
-        let mut all_granted: Vec<(String, i64)> = Vec::new();
+        let mut all_granted: Vec<String> = Vec::new();
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
@@ -3540,14 +3543,15 @@ impl ConcurrencyManager {
                     read_cache: read_cache.clone(),
                 };
 
-                match resumer
+                let task_key = match resumer
                     .resume_chain(&mut batch, &mut chunk_scheduled_refreshes, resume_params)
                     .await
                 {
-                    Ok(chain_grants) => {
+                    Ok(resumed) => {
                         // Each (queue, task_id) the chain reserved must roll back
                         // alongside ours if this chunk's write fails.
-                        chunk_reservations.extend(chain_grants);
+                        chunk_reservations.extend(resumed.grants);
+                        resumed.task_key
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -3562,13 +3566,13 @@ impl ConcurrencyManager {
                         record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted;
                     }
-                }
+                };
 
                 chunk_materialized.insert(attempt_key);
                 chunk_grants.push(ChunkGrant {
                     task_id: req.task_id.clone(),
                     task_group: req.task_group.clone(),
-                    start_time_ms: req.start_time_ms,
+                    task_key,
                 });
 
                 if chunk_grants.len() >= self.grant_scanner_commit_chunk_size {
@@ -3603,11 +3607,7 @@ impl ConcurrencyManager {
                     }
                     total_granted += chunk_grants.len();
                     total_stale_deleted += stale_deletes;
-                    all_granted.extend(
-                        chunk_grants
-                            .drain(..)
-                            .map(|grant| (grant.task_group, grant.start_time_ms)),
-                    );
+                    all_granted.extend(chunk_grants.drain(..).map(|grant| grant.task_group));
                     chunk_reservations.clear();
                     chunk_materialized.clear();
                     chunk_now = crate::job_store_shard::now_epoch_ms();
@@ -3653,11 +3653,7 @@ impl ConcurrencyManager {
             }
             total_granted += chunk_grants.len();
             total_stale_deleted += stale_deletes;
-            all_granted.extend(
-                chunk_grants
-                    .into_iter()
-                    .map(|grant| (grant.task_group, grant.start_time_ms)),
-            );
+            all_granted.extend(chunk_grants.into_iter().map(|grant| grant.task_group));
             chunk_materialized.clear();
         }
 
@@ -3708,19 +3704,14 @@ impl ConcurrencyManager {
             );
         }
 
-        // The task rows this chunk writes, one entry per task group with the
-        // earliest start time: told to the brokers before the write so a scan
-        // that sees a row during the durability wait buffers it, and again
-        // once the rows are durable.
-        let mut written_groups: BTreeMap<String, i64> = BTreeMap::new();
-        for grant in chunk_grants {
-            merge_granted_group(
-                &mut written_groups,
-                grant.task_group.clone(),
-                grant.start_time_ms,
-            );
-        }
-        let written: Vec<(String, i64)> = written_groups.into_iter().collect();
+        // The keys of the task rows this chunk writes: told to the brokers
+        // before the write so a scan that sees a row during the durability
+        // wait buffers it, and again once the rows are durable. A grant whose
+        // chain parked on a later limit wrote no task row and is not told.
+        let written: Vec<Vec<u8>> = chunk_grants
+            .iter()
+            .filter_map(|grant| grant.task_key.clone())
+            .collect();
         if let Some(resumer) = chain_resumer
             && !written.is_empty()
         {
@@ -3779,9 +3770,8 @@ impl ConcurrencyManager {
         }
 
         // Tell the brokers about this chunk's task rows now that they are
-        // durable; without this the tasks wait for the drain iteration's
-        // post-fan-out notification, or for a full rescan if their start
-        // time sorts below the broker's scan floor.
+        // durable; without this the tasks wait for a full rescan when their
+        // start time sorts below the broker's scan floor.
         if let Some(resumer) = chain_resumer
             && !written.is_empty()
         {

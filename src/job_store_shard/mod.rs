@@ -164,6 +164,13 @@ pub struct OpenShardOptions {
     /// starting at the scan floor. Populated from
     /// `DatabaseConfig::broker_full_rescan_interval_ms`.
     pub broker_full_rescan_interval_ms: u64,
+    /// How far behind the current time a task row's start time has to be for
+    /// the broker to read the row by its key instead of lowering its scan
+    /// floor. Populated from `DatabaseConfig::broker_keyed_read_min_lag_ms`.
+    pub broker_keyed_read_min_lag_ms: u64,
+    /// How many task keys a broker holds for reading by key. Populated from
+    /// `DatabaseConfig::broker_keyed_read_max_keys`.
+    pub broker_keyed_read_max_keys: u64,
     /// The longest the lease reaper goes between scans of the whole lease
     /// range, which it runs instead of reading only the leases its index
     /// reports due. The shard's name sets where in the interval its scans
@@ -551,6 +558,8 @@ impl JobStoreShard {
                 broker_tombstone_revive_after_generations: cfg
                     .broker_tombstone_revive_after_generations,
                 broker_full_rescan_interval_ms: cfg.broker_full_rescan_interval_ms,
+                broker_keyed_read_min_lag_ms: cfg.broker_keyed_read_min_lag_ms,
+                broker_keyed_read_max_keys: cfg.broker_keyed_read_max_keys,
                 lease_reaper_full_scan_interval_ms: cfg.lease_reaper_full_scan_interval_ms,
                 enqueue_time_index_backfill: cfg.enqueue_time_index_backfill.clone(),
             },
@@ -604,6 +613,8 @@ impl JobStoreShard {
             floating_refresh_stale_max_ms,
             broker_tombstone_revive_after_generations,
             broker_full_rescan_interval_ms,
+            broker_keyed_read_min_lag_ms,
+            broker_keyed_read_max_keys,
             lease_reaper_full_scan_interval_ms,
             enqueue_time_index_backfill,
         } = options;
@@ -699,8 +710,15 @@ impl JobStoreShard {
             name.clone(),
             metrics.clone(),
             range.clone(),
-            broker_tombstone_revive_after_generations,
-            std::time::Duration::from_millis(broker_full_rescan_interval_ms),
+            crate::task_broker::BrokerSettings {
+                tombstone_revive_after_generations: broker_tombstone_revive_after_generations,
+                full_rescan_interval: std::time::Duration::from_millis(
+                    broker_full_rescan_interval_ms,
+                ),
+                keyed_read_min_lag_ms: broker_keyed_read_min_lag_ms,
+                keyed_read_max_keys: usize::try_from(broker_keyed_read_max_keys)
+                    .unwrap_or(usize::MAX),
+            },
         );
 
         let lease_full_scan_schedule = crate::lease_index::FullScanSchedule::for_shard(
@@ -1629,9 +1647,6 @@ impl JobStoreShard {
         self.concurrency
             .process_grants(&self.db, &range, tenant, queue, count)
             .await
-            .into_iter()
-            .map(|(task_group, _)| task_group)
-            .collect()
     }
 
     /// Test-only: install or clear the grant scanner's per-batch hook. See

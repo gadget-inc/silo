@@ -213,9 +213,9 @@ impl JobStoreShard {
         }
 
         // Commit the transaction. The task row becomes visible to broker
-        // scans before the commit returns; lower the scan floor first so such
-        // a scan buffers it.
-        self.brokers.expect_task_written(&task_group, start_at_ms);
+        // scans before the commit returns; tell the broker first so such a
+        // scan buffers it.
+        self.brokers.expect_task_written(&task_key);
         match txn.commit().await {
             Ok(_) => dst_events::confirm_write(write_op),
             Err(e) => {
@@ -229,7 +229,7 @@ impl JobStoreShard {
 
         // Wake the broker to pick up the new task promptly, or record its
         // start time when it is future-dated.
-        self.brokers.notify_task_written(&task_group, start_at_ms);
+        self.brokers.notify_task_written(&task_key);
 
         Ok(())
     }

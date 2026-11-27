@@ -160,6 +160,37 @@ With permanent leases:
 
 On each RPC, the server checks a local map of owned shards. If not the owner, return NOT_OWNER with an optional hint `{ owner_id, owner_addr }` read from the cached `owner` value. Clients retry a few times and may redirect using the hint. Servers never query the coordinator on the request path.
 
+## Task broker
+
+Each task group on a shard has a broker: an in-memory buffer of ready tasks that dequeues claim from, filled by a background scan of the task group's key range (prefix `0x05`). Task keys sort by start time, so the buffer and the claims from it are in start time order.
+
+### Scan floor
+
+SlateDB keeps a tombstone for every deleted row until a compaction removes it, and a range scan steps over each one. A task group that has dequeued many tasks has that many tombstones at the head of its range. So a scan does not start at the head: it starts at the broker's **scan floor**, the start time below which every task row has already been dealt with (buffered, claimed and in flight, suppressed by an ack tombstone, or deleted as belonging to another shard). A scan that reads to the end of the range, or to the first future-dated row, moves the floor to the current time. A scan that stops early, at its batch limit or because the buffer is full, moves the floor only to the last row it read, so a task group with more ready rows than the buffer holds has a floor that lags behind the rows not yet buffered.
+
+Every path that writes a task row tells the broker the row's key, once before the write is issued and again when it is durable. What the broker does with it depends on the row's age:
+
+- A row whose start time is within `broker_keyed_read_min_lag_ms` (default 1000) of the current time lowers the floor to that start time, and the next range scan reads it. One short range scan serves a burst of recent writes more cheaply than a point read per row.
+- An older row leaves the floor where it is, and the broker holds its key. Before a scan reads its range it **reads by key** each held key that sorts below its floor, running the row through the same checks a scanned row gets. A held key at or above the floor is left to the range.
+
+The second case exists because some rows are old when they are written. A job granted a concurrency slot after waiting keeps its original start time in its task key, so that it is claimed ahead of newer jobs instead of going to the back of the buffer. Lowering the floor to such a row would make the next scan step over every row and tombstone written since the job was enqueued, once per grant, for as long as the queue is draining its backlog. A point read costs the same whatever the row's age.
+
+Only keys below the floor are read by key because of claim order. A row below the floor is older than every row the range has left to read, so buffering it first keeps tasks in start time order. A row above a lagging floor is not: reading it by key would buffer it ahead of older rows the range has not reached. The range reads it when it gets there.
+
+The row's age decides, not its distance from the floor, so an old row never holds the floor back: not while the floor is at the current time, not while the floor is itself old, and not while a scan of the whole range is running and there is no floor to compare with.
+
+A held key leaves the broker in one of two ways. One below the floor is settled by its point read. One at or above the floor is dropped when a scan that began after it was noted ends: the row was in that scan's view, so the scan either dealt with it or stopped short of it, and the floor a scan leaves is never above a row it could see and did not deal with. A key noted while a scan runs may describe a row the scan's view does not include, so it is kept for the next scan, which reads it by key if the floor has moved past it and drops it otherwise.
+
+The broker holds at most `broker_keyed_read_max_keys` keys (default 8192, the size of the buffer). With that many held, a further old row lowers the floor instead, so a row that does not fit is still found, by a range scan that costs more.
+
+A point read can race the write it is reading for, so the broker settles each read against the key's state from before the read was issued. A key noted again while its read was in flight (its write reported durable, or its row released from an abandoned dequeue) is kept for the next scan whatever the read returned. A read that finds no row drops the key only if the write was already durable when the read was issued, which means the row has since been dequeued, cancelled or rewritten. A key whose write is not yet durable is read once, so a row visible before its write is durable is buffered early, and then left until the write is reported.
+
+### Full rescan
+
+Once every `broker_full_rescan_interval_ms` (default 60000) a scan ignores the floor and reads the whole range. It finds any row a writer did not report. Every held key is in its range, so it drops each one noted before it began, which is how a key whose write never happened leaves the broker.
+
+A full rescan steps over every tombstone in the range, so its cost follows their number. Two other scans share that cost: a new broker's first scan, which has no floor yet, and the scan after an old row lowers the floor because no more keys could be held, which reads from that row's start time.
+
 ## Concurrency Queues
 
 Concurrency queues limit how many jobs with the same queue key can run simultaneously. They work like a ticket system: a job must hold a ticket for a queue before it can proceed to execution, and each queue has a limited number of tickets available.

@@ -278,12 +278,13 @@ impl JobStoreShard {
         // [SILO-IMP-CONC-3] Queue at capacity -> try_reserve fails in enqueue_limit_task_at_index
         // [SILO-IMP-CONC-4] Request created (no task in DB) when concurrency queued
         let mut grants = Vec::new();
+        let mut task_key: Option<Vec<u8>> = None;
         let mut scheduled_refreshes = ScheduledRefreshes::default();
         if !is_terminal {
             let next_attempt = num_attempts + 1;
             let task_id = Uuid::new_v4().to_string();
 
-            grants = self
+            let chain = self
                 .enqueue_limit_task_at_index(
                     &mut writer,
                     LimitTaskParams {
@@ -307,8 +308,9 @@ impl JobStoreShard {
                         scheduled_refreshes: &mut scheduled_refreshes,
                     },
                 )
-                .await?
-                .grants;
+                .await?;
+            grants = chain.grants;
+            task_key = chain.written_task.map(|written| written.key);
         }
 
         // Include counters in the transaction (unmark_write excludes them from conflict detection)
@@ -338,11 +340,10 @@ impl JobStoreShard {
         };
 
         // A non-terminal import's task row becomes visible to broker scans
-        // before the commit is durable; lower the scan floor first so such a
-        // scan buffers it.
-        if !is_terminal {
-            self.brokers
-                .expect_task_written(&params.task_group, effective_start_at_ms);
+        // before the commit is durable; tell the broker first so such a scan
+        // buffers it.
+        if let Some(key) = &task_key {
+            self.brokers.expect_task_written(key);
         }
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
@@ -369,7 +370,7 @@ impl JobStoreShard {
                 tenant,
                 job_id,
                 &params.task_group,
-                effective_start_at_ms,
+                task_key.as_deref(),
                 &grants,
             )
             .await?;
@@ -763,6 +764,7 @@ impl JobStoreShard {
 
         // Create new scheduling state if non-terminal
         let mut grants = Vec::new();
+        let mut task_key: Option<Vec<u8>> = None;
         let mut scheduled_refreshes = ScheduledRefreshes::default();
         if !is_terminal {
             let next_attempt = total_attempts + 1;
@@ -797,7 +799,10 @@ impl JobStoreShard {
                 )
                 .await
             {
-                Ok(result) => result.grants,
+                Ok(result) => {
+                    task_key = result.written_task.map(|written| written.key);
+                    result.grants
+                }
                 Err(e) => {
                     self.rollback_background_action_queue_counter_transition(
                         tenant,
@@ -850,11 +855,10 @@ impl JobStoreShard {
         };
 
         // A non-terminal reimport's task row becomes visible to broker scans
-        // before the commit is durable; lower the scan floor first so such a
-        // scan buffers it.
-        if !is_terminal {
-            self.brokers
-                .expect_task_written(&task_group, effective_start_at_ms);
+        // before the commit is durable; tell the broker first so such a scan
+        // buffers it.
+        if let Some(key) = &task_key {
+            self.brokers.expect_task_written(key);
         }
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
@@ -899,7 +903,7 @@ impl JobStoreShard {
 
         // For non-terminal, finish enqueue (flush + broker wakeup)
         if !is_terminal {
-            self.finish_enqueue(tenant, job_id, &task_group, effective_start_at_ms, &grants)
+            self.finish_enqueue(tenant, job_id, &task_group, task_key.as_deref(), &grants)
                 .await?;
         }
 

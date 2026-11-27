@@ -1246,7 +1246,7 @@ impl silo::concurrency::LimitChainResumer for CancelDuringPass {
         batch: &mut slatedb::WriteBatch,
         scheduled_refreshes: &mut silo::job_store_shard::ScheduledRefreshes,
         params: silo::concurrency::ResumeChainParams,
-    ) -> Result<Vec<(String, String)>, silo::concurrency::ConcurrencyError> {
+    ) -> Result<silo::concurrency::ResumedChain, silo::concurrency::ConcurrencyError> {
         let already_started = self.cancel.lock().unwrap().is_some();
         if !already_started && let Some(shard) = self.shard.upgrade() {
             let job_id = self.job_id;
@@ -1263,12 +1263,12 @@ impl silo::concurrency::LimitChainResumer for CancelDuringPass {
             .await
     }
 
-    fn tasks_written(&self, written: &[(String, i64)]) {
-        self.inner.tasks_written(written)
+    fn tasks_written(&self, task_keys: &[Vec<u8>]) {
+        self.inner.tasks_written(task_keys)
     }
 
-    fn expect_tasks(&self, written: &[(String, i64)]) {
-        self.inner.expect_tasks(written)
+    fn expect_tasks(&self, task_keys: &[Vec<u8>]) {
+        self.inner.expect_tasks(task_keys)
     }
 
     fn refresh_index_rows_committed(&self, task_groups: &[String]) {
