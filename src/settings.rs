@@ -1391,6 +1391,30 @@ pub fn expand_env_vars_for_test(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The value that makes every row lower the floor has to fit in a
+    /// config file, where an integer is a signed 64-bit one.
+    #[test]
+    fn broker_keyed_read_min_lag_ms_takes_the_largest_toml_integer() {
+        let db: DatabaseTemplate = toml::from_str(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            broker_keyed_read_min_lag_ms = 9223372036854775807
+            "#,
+        )
+        .expect("the largest TOML integer should parse");
+        assert_eq!(db.broker_keyed_read_min_lag_ms, i64::MAX as u64);
+
+        toml::from_str::<DatabaseTemplate>(
+            r#"
+            backend = "memory"
+            path = "/tmp/silo-%shard%"
+            broker_keyed_read_min_lag_ms = 18446744073709551615
+            "#,
+        )
+        .expect_err("u64::MAX is not a TOML integer");
+    }
+
     #[test]
     fn periodic_full_compaction_s_defaults_to_none() {
         let db: DatabaseTemplate = toml::from_str(

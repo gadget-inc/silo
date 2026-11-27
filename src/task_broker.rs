@@ -2683,6 +2683,24 @@ mod keyed_read_tests {
         assert_eq!(h.keyed_reads("inserted"), 0.0);
     }
 
+    /// With the lag at the largest value a config file can hold, no row is
+    /// old enough to be read by key: every row lowers the floor.
+    #[tokio::test]
+    async fn no_row_is_read_by_key_at_the_largest_lag_a_config_file_holds() {
+        let h = harness_with(settings(i64::MAX as u64), 4096).await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = h.put("oldest", 0).await;
+        h.broker.note_task_key(&key, 0, now_ms, true);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.broker.scan_floor_ms(), Some(0));
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.range_reads("inserted"), 1.0);
+        assert_eq!(h.keyed_reads("inserted"), 0.0);
+    }
+
     /// A key noted before its write is issued, whose row is not yet visible,
     /// is read once and then waits: later scans do not read it, and it does
     /// not keep nudges scanning. Once the write is reported durable the row
