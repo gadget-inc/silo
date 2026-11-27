@@ -2479,12 +2479,29 @@ impl ConcurrencyManager {
     /// through a large backlog fills one chunk per iteration until it is
     /// full or its eligible waiters run out.
     ///
+    /// `count` comes from `unfilled_capacity_pass_size`.
+    fn request_unfilled_capacity_pass(&self, tenant: &str, queue: &str, count: u32) {
+        self.request_grant_count_cold(tenant, queue, count);
+        if let Some(ref m) = self.metrics {
+            m.record_concurrency_grant_unfilled_capacity_pass(&self.shard);
+        }
+    }
+
+    /// How many grants a follow-up pass for `(tenant, queue)` asks for: the
+    /// slots the scanner may still fill, capped at one commit chunk. `None`
+    /// when the queue has no such slot, so no follow-up is due.
+    ///
     /// `capacity` is the queue's capacity as the pass resolved it, or `None`
     /// when the pass never reached a row it could decode (every row it
     /// walked was malformed and deleted). With no capacity to compare
-    /// against, the follow-up is queued regardless and resolves the capacity
-    /// from the first decodable row it reaches.
-    fn request_unfilled_capacity_pass(&self, tenant: &str, queue: &str, capacity: Option<usize>) {
+    /// against, the follow-up asks for a full chunk and resolves the
+    /// capacity from the first decodable row it reaches.
+    fn unfilled_capacity_pass_size(
+        &self,
+        tenant: &str,
+        queue: &str,
+        capacity: Option<usize>,
+    ) -> Option<u32> {
         let chunk = self.grant_scanner_commit_chunk_size;
         let count = match capacity {
             Some(capacity) => {
@@ -2492,16 +2509,13 @@ impl ConcurrencyManager {
                     .scanner_effective_capacity(capacity)
                     .saturating_sub(self.counts.holder_count(tenant, queue));
                 if free == 0 {
-                    return;
+                    return None;
                 }
                 free.min(chunk)
             }
             None => chunk,
         };
-        self.request_grant_count_cold(tenant, queue, u32::try_from(count).unwrap_or(u32::MAX));
-        if let Some(ref m) = self.metrics {
-            m.record_concurrency_grant_unfilled_capacity_pass(&self.shard);
-        }
+        Some(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Compute one drain iteration's work set: ALL hot-lane entries plus at
@@ -3583,10 +3597,11 @@ impl ConcurrencyManager {
             // object-store round trip whenever the candidate's block is not
             // cached; reading a window concurrently pays that latency once
             // per window instead of once per candidate. A window covers at
-            // most one commit chunk and no more candidates than the queue has
-            // free slots, so a pass that can grant one request reads one
-            // check. `None` marks a candidate already in
-            // `materialized_attempts` when its window was read.
+            // most one commit chunk, no more candidates than the queue has
+            // free slots, and no more than the pass has grants left to make,
+            // so a pass with one grant to make reads one check at a time
+            // however many candidates it holds. `None` marks a candidate
+            // already in `materialized_attempts` when its window was read.
             let mut terminal_row_checks: VecDeque<Option<Result<bool, slatedb::Error>>> =
                 VecDeque::new();
             for (index, req) in valid_requests.iter().enumerate() {
@@ -3600,8 +3615,15 @@ impl ConcurrencyManager {
                     let free_slots = limit
                         .saturating_sub(self.counts.holder_count(tenant, queue))
                         .max(1);
+                    let grants_left = (count as usize)
+                        .saturating_sub(total_granted + chunk_grants.len())
+                        .max(1);
                     let window_end = index
-                        .saturating_add(free_slots.min(self.grant_scanner_commit_chunk_size))
+                        .saturating_add(
+                            free_slots
+                                .min(self.grant_scanner_commit_chunk_size)
+                                .min(grants_left),
+                        )
                         .min(valid_requests.len());
                     // Owned lookups: the async closures below capture by move,
                     // and borrowing `valid_requests` across the stream's await
@@ -3851,12 +3873,14 @@ impl ConcurrencyManager {
                         // follow-up pass retries from that candidate; if it
                         // fails again first thing, that pass changes nothing
                         // and queues no further one.
-                        if total_granted > 0 || total_stale_deleted > 0 {
-                            self.request_unfilled_capacity_pass(
+                        if (total_granted > 0 || total_stale_deleted > 0)
+                            && let Some(follow_up) = self.unfilled_capacity_pass_size(
                                 tenant,
                                 queue,
                                 max_concurrency.map(|(capacity, _)| capacity),
-                            );
+                            )
+                        {
+                            self.request_unfilled_capacity_pass(tenant, queue, follow_up);
                         }
                         record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted;
@@ -3981,9 +4005,18 @@ impl ConcurrencyManager {
         // queue is full, when the walk reached the end of the ready rows, or
         // when the invocation changed nothing: a front that cannot be granted
         // (every candidate deferred or unreadable) would be walked again to
-        // the same end, so it is left to the periodic sweep.
+        // the same end, so it is left to the periodic sweep. The free-slot
+        // check comes first so a pass that fills the queue reads nothing
+        // more.
         let made_progress = total_granted > 0 || total_stale_deleted > 0;
-        if made_progress && !capacity_exhausted {
+        if made_progress
+            && !capacity_exhausted
+            && let Some(follow_up) = self.unfilled_capacity_pass_size(
+                tenant,
+                queue,
+                max_concurrency.map(|(capacity, _)| capacity),
+            )
+        {
             let rows_unreached =
                 if budget_exhausted || walk_interrupted || candidates_left_ungranted {
                     true
@@ -4012,11 +4045,7 @@ impl ConcurrencyManager {
                     }
                 };
             if rows_unreached {
-                self.request_unfilled_capacity_pass(
-                    tenant,
-                    queue,
-                    max_concurrency.map(|(capacity, _)| capacity),
-                );
+                self.request_unfilled_capacity_pass(tenant, queue, follow_up);
             }
         }
 
