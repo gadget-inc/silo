@@ -393,7 +393,7 @@ fn default_grant_scanner_request_noted_max_keys() -> usize {
 /// Default for `grant_scanner_request_floor_rebuild_interval_ms`: how long a
 /// queue's request floor is used before a pass drops it and reads the
 /// queue's request rows from the start. Every writer of a request row tells
-/// the floor; the rebuild bounds how long a row a writer failed to report
+/// the floor; the rebuild bounds how long a row the floor does not know of
 /// can wait below it.
 pub const DEFAULT_GRANT_SCANNER_REQUEST_FLOOR_REBUILD_INTERVAL_MS: u64 = 60_000;
 
@@ -564,8 +564,11 @@ pub struct DatabaseTemplate {
     pub grant_scanner_request_noted_max_keys: usize,
     /// How long (ms) a queue's request floor is used before a pass drops it
     /// and reads the queue's request rows from the start. Bounds how long a
-    /// request row written without telling the floor can wait below it.
-    /// Zero drops the floor on every pass. Defaults to 60000.
+    /// request row the floor does not know of can wait below it: one
+    /// written without telling the floor, or one whose write committed more
+    /// than 10 seconds after its writer stopped waiting for it. Nothing
+    /// else finds such a row, so an interval too long to elapse leaves it
+    /// unread. Zero drops the floor on every pass. Defaults to 60000.
     #[serde(default = "default_grant_scanner_request_floor_rebuild_interval_ms")]
     pub grant_scanner_request_floor_rebuild_interval_ms: u64,
     /// How long (ms) a floating limit's outstanding-refresh flag is trusted

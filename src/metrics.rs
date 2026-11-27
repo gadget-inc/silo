@@ -140,6 +140,35 @@ impl FloatingWaiterProbeResult {
     }
 }
 
+/// What became of a request row a grant-scanner pass read by key from below
+/// its queue's floor, recorded as the `outcome` label on
+/// `silo_concurrency_request_noted_reads_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestNotedReadOutcome {
+    /// The pass granted the request.
+    Granted,
+    /// The row was deleted without a grant.
+    Deleted,
+    /// The pass read the row and left it in place.
+    Left,
+    /// No row, and the key was retired.
+    Missing,
+    /// No row yet, and the key stays noted.
+    Pending,
+}
+
+impl RequestNotedReadOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestNotedReadOutcome::Granted => "granted",
+            RequestNotedReadOutcome::Deleted => "deleted",
+            RequestNotedReadOutcome::Left => "left",
+            RequestNotedReadOutcome::Missing => "missing",
+            RequestNotedReadOutcome::Pending => "pending",
+        }
+    }
+}
+
 /// Result of one periodic full-compaction submission, recorded as the
 /// `outcome` label on `silo_periodic_full_compaction_submissions_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1049,13 +1078,16 @@ impl Metrics {
     }
 
     /// Record `count` request rows a grant-scanner pass read by key from
-    /// below its queue's floor, by what became of them: `granted`,
-    /// `deleted`, `left` in place, `missing` (no row, key retired) or
-    /// `pending` (no row yet, key kept).
-    pub fn record_concurrency_request_noted_reads(&self, shard: &str, outcome: &str, count: u64) {
+    /// below its queue's floor, by what became of them.
+    pub fn record_concurrency_request_noted_reads(
+        &self,
+        shard: &str,
+        outcome: RequestNotedReadOutcome,
+        count: u64,
+    ) {
         if count > 0 {
             self.concurrency_request_noted_reads
-                .with_label_values(&[shard, outcome])
+                .with_label_values(&[shard, outcome.as_str()])
                 .inc_by(count as f64);
         }
     }

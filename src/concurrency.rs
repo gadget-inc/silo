@@ -1019,7 +1019,8 @@ pub struct GrantScannerConfig {
     /// Most request keys a queue keeps noted below its floor.
     pub request_noted_max_keys: usize,
     /// How long (ms) a queue's floor is used before a pass drops it and
-    /// reads from the prefix. Zero drops it on every pass.
+    /// reads from the prefix. Zero drops it on every pass. See
+    /// [`crate::request_floor::RequestFloorConfig::rebuild_interval`].
     pub request_floor_rebuild_interval_ms: u64,
     /// How long (ms) a request row write whose batch was not confirmed
     /// committed is still treated as possibly committing.

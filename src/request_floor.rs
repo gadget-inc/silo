@@ -43,7 +43,7 @@ use crate::keys::{
     concurrency_request_band_start, concurrency_request_key_order, concurrency_request_prefix,
     end_bound,
 };
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, RequestNotedReadOutcome};
 
 /// Settings of a shard's [`RequestFloors`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +61,10 @@ pub struct RequestFloorConfig {
     /// exceed it lowers the floor to its key instead.
     pub noted_max_keys: usize,
     /// How long a queue's floor is used before a pass drops it and reads
-    /// from the prefix. Zero drops it on every pass.
+    /// from the prefix. Zero drops it on every pass. That pass is the only
+    /// one that finds a row whose write committed more than
+    /// [`Self::abandon_grace`] after its [`RequestRowWrite`] was dropped,
+    /// so an interval too long to elapse leaves such a row unread.
     pub rebuild_interval: Duration,
     /// How long a write whose [`RequestRowWrite`] was dropped unconfirmed
     /// is still treated as possibly committing.
@@ -292,7 +295,10 @@ impl RequestFloors {
             {
                 let close =
                     lag_below_floor_ms(floor, &request_key, prefix_len) <= self.config.min_lag_ms;
-                let full = !close && state.noted_below_floor().count() > self.config.noted_max_keys;
+                let max_keys = self.config.noted_max_keys;
+                let full = !close
+                    && state.noted.len() > max_keys
+                    && state.noted_below_floor().nth(max_keys).is_some();
                 if close || full {
                     state.floor = Some(request_key.clone());
                     state.floor_version += 1;
@@ -953,7 +959,11 @@ impl<'a> RequestRowCursor<'a> {
                         if let Some(ref m) = self.floors.metrics {
                             m.record_concurrency_request_noted_reads(
                                 &self.floors.shard,
-                                if retired { "missing" } else { "pending" },
+                                if retired {
+                                    RequestNotedReadOutcome::Missing
+                                } else {
+                                    RequestNotedReadOutcome::Pending
+                                },
                                 1,
                             );
                         }
@@ -1087,9 +1097,13 @@ impl Drop for RequestRowCursor<'_> {
                     }
                 }
                 let shard = &self.floors.shard;
-                m.record_concurrency_request_noted_reads(shard, "granted", granted);
-                m.record_concurrency_request_noted_reads(shard, "deleted", deleted);
-                m.record_concurrency_request_noted_reads(shard, "left", left);
+                for (outcome, count) in [
+                    (RequestNotedReadOutcome::Granted, granted),
+                    (RequestNotedReadOutcome::Deleted, deleted),
+                    (RequestNotedReadOutcome::Left, left),
+                ] {
+                    m.record_concurrency_request_noted_reads(shard, outcome, count);
+                }
                 m.record_concurrency_request_floor_rebuild_rows(shard, self.unnoted_rows);
             }
         }
