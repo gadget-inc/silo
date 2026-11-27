@@ -692,6 +692,125 @@ async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow)
     );
 }
 
+/// A queue with slots free holds one ready waiter and one waiter that starts
+/// in an hour. The pass that grants the ready waiter sees a row behind it and
+/// asks for a follow-up; the follow-up walks to the end of the ready rows,
+/// grants nothing, and asks for no more.
+#[silo::test]
+async fn follow_ups_stop_at_the_end_of_the_ready_rows_with_slots_free() {
+    const MAX: u32 = 8;
+
+    let (_tmp, shard) = open_shard_with_scanner_stopped().await;
+    let queue = "ready-rows-end";
+
+    write_future_waiter(&shard, queue, MAX).await;
+    enqueue(&shard, "ready-job", vec![fixed_limit(queue, MAX)], now_ms()).await;
+    let discarded = shard.take_pending_grant_batch_for_test();
+    assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
+    assert_eq!(holders(&shard, queue), 0);
+    assert_eq!(requester_count(&shard, queue).await, 2);
+
+    shard.seed_hot_pending_grant_for_test(TENANT, queue, 1);
+    let first = run_scanner_iteration(&shard).await;
+    assert_eq!(first, vec![(queue.to_string(), 1)]);
+    assert_eq!(holders(&shard, queue), 1);
+    assert_eq!(
+        shard.pending_grant_count_for_test(TENANT, queue),
+        COMMIT_CHUNK as u32,
+        "a row is left behind the grant and slots are free"
+    );
+
+    let second = run_scanner_iteration(&shard).await;
+    assert_eq!(second, vec![(queue.to_string(), COMMIT_CHUNK as u32)]);
+    assert_eq!(holders(&shard, queue), 1);
+    assert_eq!(requester_count(&shard, queue).await, 1);
+    assert_eq!(shard.pending_grant_count_for_test(TENANT, queue), 0);
+    assert_eq!(run_scanner_until_idle(&shard, 1).await, 0);
+}
+
+/// A queue with slots free holds one waiter the scanner can grant, then more
+/// waiters than a pass may walk whose next queue is full with its own line,
+/// then another grantable waiter. The follow-up to the first grant spends its
+/// whole walk on waiters it defers, changes nothing, and asks for no further
+/// pass: the waiter behind them is left to the periodic sweep.
+#[silo::test]
+async fn follow_ups_stop_when_a_pass_changes_nothing_and_stops_short_of_the_end() {
+    const MAX: u32 = 8;
+    const DEFERRED: usize = WALK_BUDGET + 1;
+
+    let (_tmp, shard) = open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
+        GrantScannerConfig {
+            next_hop_skip_min_backlog: 1,
+            ..small_scanner_config()
+        },
+        NO_SWEEP_INTERVAL_MS,
+    )
+    .await;
+    shard.stop_grant_scanner();
+    let queue = "deferred-front";
+    let next_queue = "deferred-front-next";
+    let now = now_ms();
+
+    // The next queue is full and has a waiter of its own.
+    enqueue(&shard, "next-holder", vec![fixed_limit(next_queue, 1)], now).await;
+    enqueue(&shard, "next-waiter", vec![fixed_limit(next_queue, 1)], now).await;
+    assert_eq!(holders(&shard, next_queue), 1);
+    assert_eq!(requester_count(&shard, next_queue).await, 1);
+
+    // Arrivals join the waiters behind the future waiter. Start times a
+    // millisecond apart fix the order of the ready rows.
+    write_future_waiter(&shard, queue, MAX).await;
+    let first_ms = now - 1_000;
+    enqueue(&shard, "front-job", vec![fixed_limit(queue, MAX)], first_ms).await;
+    for i in 0..DEFERRED {
+        enqueue(
+            &shard,
+            &format!("two-queue-job-{i:02}"),
+            vec![fixed_limit(queue, MAX), fixed_limit(next_queue, 1)],
+            first_ms + 1 + i as i64,
+        )
+        .await;
+    }
+    enqueue(
+        &shard,
+        "back-job",
+        vec![fixed_limit(queue, MAX)],
+        first_ms + 1 + DEFERRED as i64,
+    )
+    .await;
+    let discarded = shard.take_pending_grant_batch_for_test();
+    assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
+    assert_eq!(holders(&shard, queue), 0);
+    let waiting = DEFERRED as i64 + 3;
+    assert_eq!(requester_count(&shard, queue).await, waiting);
+
+    shard.seed_hot_pending_grant_for_test(TENANT, queue, 1);
+    let first = run_scanner_iteration(&shard).await;
+    assert_eq!(first, vec![(queue.to_string(), 1)]);
+    assert_eq!(holders(&shard, queue), 1);
+    assert_eq!(requester_count(&shard, queue).await, waiting - 1);
+    assert_eq!(
+        shard.pending_grant_count_for_test(TENANT, queue),
+        COMMIT_CHUNK as u32
+    );
+
+    let second = run_scanner_iteration(&shard).await;
+    assert_eq!(second, vec![(queue.to_string(), COMMIT_CHUNK as u32)]);
+    assert_eq!(
+        holders(&shard, queue),
+        1,
+        "every row the follow-up walked is deferred"
+    );
+    assert_eq!(holders(&shard, next_queue), 1);
+    assert_eq!(requester_count(&shard, queue).await, waiting - 1);
+    assert_eq!(
+        shard.pending_grant_count_for_test(TENANT, queue),
+        0,
+        "a pass that changed nothing asks for no follow-up"
+    );
+    assert_eq!(run_scanner_until_idle(&shard, 1).await, 0);
+}
+
 /// One queue has a deep backlog and far more free capacity than a pass can
 /// fill, and several small queues release slots while it catches up. Every
 /// small queue's waiter is granted in the first iteration after its release,
