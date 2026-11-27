@@ -551,6 +551,85 @@ async fn slot_is_filled_after_a_pass_spends_its_walk_budget_on_undecodable_reque
     assert_slot_is_filled_behind_a_stale_front("undecodable-front", StaleRow::Undecodable).await;
 }
 
+/// A release asks for one grant, and 40 stale rows sit ahead of the live
+/// waiters. The pass doubles how many rows it reads each time a read yields
+/// nothing to grant, so it clears the front and fills the slot in six reads
+/// rather than one read per stale row.
+#[silo::test]
+async fn pass_reads_wider_batches_while_it_finds_nothing_to_grant() {
+    // The stale rows written by `write_stale_requests` carry a limit of 4,
+    // and a pass takes the queue's capacity from the first row it decodes.
+    const MAX: u32 = 4;
+    const BATCH: usize = 16;
+    const STALE: usize = 40;
+    const WAITERS: usize = 2;
+
+    let (_tmp, shard) = open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
+        GrantScannerConfig {
+            batch_size: BATCH,
+            ..small_scanner_config()
+        },
+        NO_SWEEP_INTERVAL_MS,
+    )
+    .await;
+    shard.stop_grant_scanner();
+    let queue = "widening-front";
+    let now = now_ms();
+
+    for i in 0..MAX as usize {
+        enqueue(
+            &shard,
+            &format!("holder-{i}"),
+            vec![fixed_limit(queue, MAX)],
+            now,
+        )
+        .await;
+    }
+    write_stale_requests(&shard, queue, StaleRow::MissingJob, STALE, now).await;
+    for i in 0..WAITERS {
+        enqueue(
+            &shard,
+            &format!("waiter-{i}"),
+            vec![fixed_limit(queue, MAX)],
+            now,
+        )
+        .await;
+    }
+    let (running, _) = lease_ready(&shard, MAX as usize, 0).await;
+    succeed(&shard, &running[0].1).await;
+    assert_eq!(holders(&shard, queue), MAX as usize - 1);
+
+    // The hook runs once per batch of rows the pass reads.
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&reads);
+    shard.set_grant_scan_hook_for_test(Some(Arc::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {})
+    })));
+    let taken = run_scanner_iteration(&shard).await;
+    shard.set_grant_scan_hook_for_test(None);
+
+    assert_eq!(taken, vec![(queue.to_string(), 1)]);
+    assert_eq!(
+        holders(&shard, queue),
+        MAX as usize,
+        "the one pass reaches the first live waiter"
+    );
+    assert_eq!(
+        requester_count(&shard, queue).await,
+        (WAITERS - 1) as i64,
+        "every stale row is deleted and one waiter is left"
+    );
+    // Reads of 1, 2, 4, 8 and 16 rows cover 31 stale rows; the sixth covers
+    // the last 9 and both waiters.
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert_eq!(
+        shard.pending_grant_count_for_test(TENANT, queue),
+        0,
+        "the queue is full, so the waiter the pass read but did not grant asks for no follow-up"
+    );
+}
+
 async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow) {
     const MAX: u32 = 4;
     const STALE: usize = WALK_BUDGET + 4;

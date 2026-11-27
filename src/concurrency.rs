@@ -3028,12 +3028,37 @@ impl ConcurrencyManager {
         // (`budget_exhausted`) additionally bounds total keys walked across all
         // passes, so a queue whose front is millions of non-grantable keys yields
         // after bounded work instead of walking the whole backlog in one call.
+        //
+        // A pass scans as many candidates as it still has grants to make, so
+        // a pass asked for one grant reads one row. When a pass grants
+        // nothing — every candidate it read was stale, deferred or
+        // unreadable — the next pass scans twice as many, up to
+        // `grant_scanner_batch_size`. Each pass takes the request-row lock
+        // and commits its stale deletes with its own durable write, so
+        // widening walks a non-grantable front in a handful of passes rather
+        // than one per requested grant. Candidates a widened pass reads
+        // beyond what it may grant are left in place.
+        //
+        // `previous_pass` is the grant total and scan width at the start of
+        // the pass before this one.
+        let mut previous_pass: Option<(usize, usize)> = None;
+        // Set when a pass stops at the requested count with validated
+        // candidates it did not grant: the cursor has moved past them, so
+        // reaching its end does not mean no waiter is left.
+        let mut candidates_left_ungranted = false;
         while total_granted < count as usize
             && !iter_exhausted
             && !capacity_exhausted
             && !budget_exhausted
         {
-            let needed = (count as usize - total_granted).min(self.grant_scanner_batch_size);
+            let wanted = (count as usize - total_granted).min(self.grant_scanner_batch_size);
+            let needed = match previous_pass {
+                Some((granted_before, width)) if granted_before == total_granted => {
+                    wanted.max(width.saturating_mul(2).min(self.grant_scanner_batch_size))
+                }
+                _ => wanted,
+            };
+            previous_pass = Some((total_granted, needed));
 
             let mut batch = WriteBatch::new();
             let mut chunk_scheduled_refreshes = ScheduledRefreshes::default();
@@ -3566,6 +3591,8 @@ impl ConcurrencyManager {
                 VecDeque::new();
             for (index, req) in valid_requests.iter().enumerate() {
                 if total_granted + chunk_grants.len() >= count as usize {
+                    // A widened pass read more candidates than it may grant.
+                    candidates_left_ungranted = true;
                     break;
                 }
 
@@ -3957,31 +3984,33 @@ impl ConcurrencyManager {
         // the same end, so it is left to the periodic sweep.
         let made_progress = total_granted > 0 || total_stale_deleted > 0;
         if made_progress && !capacity_exhausted {
-            let rows_unreached = if budget_exhausted || walk_interrupted {
-                true
-            } else if iter_exhausted {
-                false
-            } else {
-                // Stopped at the requested count without looking past the
-                // last grant: the next row the cursor returns, if any, is a
-                // row left. A noted key read without a row is not one, and
-                // spends budget like any other key. A spent budget or a read
-                // error leaves the answer unknown, which counts as a row.
-                loop {
-                    match requests.next().await {
-                        Ok(RequestRead::End) => break false,
-                        Ok(RequestRead::Missing) => {
-                            scanned_this_invocation += 1;
-                            if scanned_this_invocation
-                                >= self.grant_scanner_max_scan_per_invocation
-                            {
-                                break true;
+            let rows_unreached =
+                if budget_exhausted || walk_interrupted || candidates_left_ungranted {
+                    true
+                } else if iter_exhausted {
+                    false
+                } else {
+                    // Stopped at the requested count without looking past the
+                    // last grant: the next row the cursor returns, if any, is
+                    // a row left. A noted key read without a row is not one,
+                    // and spends budget like any other key. A spent budget or
+                    // a read error leaves the answer unknown, which counts as
+                    // a row.
+                    loop {
+                        match requests.next().await {
+                            Ok(RequestRead::End) => break false,
+                            Ok(RequestRead::Missing) => {
+                                scanned_this_invocation += 1;
+                                if scanned_this_invocation
+                                    >= self.grant_scanner_max_scan_per_invocation
+                                {
+                                    break true;
+                                }
                             }
+                            Ok(RequestRead::Row(_)) | Err(_) => break true,
                         }
-                        Ok(RequestRead::Row(_)) | Err(_) => break true,
                     }
-                }
-            };
+                };
             if rows_unreached {
                 self.request_unfilled_capacity_pass(
                     tenant,
