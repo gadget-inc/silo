@@ -507,7 +507,13 @@ async fn ten_thousand_grants_walk_no_dead_rows(priority_ordered: bool) {
         let pass = harness.pass(queue, 1).await;
         assert_eq!(pass.granted.len(), 1);
         assert_eq!(pass.trace().scans_opened, 1);
-        assert_eq!(pass.trace().steps.len(), 2, "one open and one key read");
+        // The raised limit still has free slots, so the pass looks for a
+        // waiter behind its grant.
+        assert_eq!(
+            pass.trace().steps.len(),
+            3,
+            "one open, the granted row and the row behind it"
+        );
         assert_eq!(pass.trace().dead_rows_walked(&dead), 0);
         dead.insert(key.clone());
     }
@@ -553,12 +559,12 @@ async fn an_arrival_below_the_floor_does_not_walk_the_drained_rows(priority_orde
         .await;
     let pass = harness.pass(queue, 1).await;
     assert_eq!(pass.granted, ["urgent"]);
-    assert_eq!(pass.trace().point_reads, 1);
-    assert_eq!(
-        pass.trace().scans_opened,
-        0,
-        "the row was read by key alone"
-    );
+    assert_eq!(pass.trace().point_reads, 1, "the row was read by key");
+    // The limit still has free slots, so the pass looks for a waiter behind
+    // its grant: a scan opened at the floor, past the drained rows.
+    assert_eq!(pass.trace().scans_opened, 1);
+    assert_eq!(pass.trace().steps.len(), 2, "one open and one key read");
+    assert_eq!(pass.trace().dead_rows_walked(&dead), 0);
 
     let pass = harness.pass(queue, 1).await;
     assert_eq!(pass.granted, [TASK_GROUP]);

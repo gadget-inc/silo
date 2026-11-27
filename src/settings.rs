@@ -211,9 +211,9 @@ fn default_grant_scanner_concurrency() -> usize {
     DEFAULT_GRANT_SCANNER_CONCURRENCY
 }
 
-/// Default for `grant_scanner_cold_batch_size`: max reconciler-sourced
-/// (cold-lane) queue entries merged into one drain iteration alongside all
-/// event-driven (hot-lane) entries.
+/// Default for `grant_scanner_cold_batch_size`: max cold-lane queue entries
+/// (reconcile-sweep finds and follow-up passes) merged into one drain
+/// iteration alongside all event-driven (hot-lane) entries.
 pub const DEFAULT_GRANT_SCANNER_COLD_BATCH_SIZE: usize = 64;
 
 fn default_grant_scanner_cold_batch_size() -> usize {
@@ -405,7 +405,8 @@ fn default_grant_scanner_request_floor_rebuild_interval_ms() -> u64 {
 /// `process_grants` pass accumulates before committing their edits durably
 /// and waking the granted task groups' brokers. Smaller chunks stream grants
 /// out of a long read-bound pass earlier (lower leasable latency); larger
-/// chunks amortize commit overhead.
+/// chunks amortize commit overhead. A follow-up pass for a queue left with
+/// free capacity and waiters requests one chunk of grants.
 pub const DEFAULT_GRANT_SCANNER_COMMIT_CHUNK_SIZE: usize = 16;
 
 fn default_grant_scanner_commit_chunk_size() -> usize {
@@ -472,11 +473,12 @@ pub struct DatabaseTemplate {
     /// Values below 1 are treated as 1.
     #[serde(default = "default_grant_scanner_concurrency")]
     pub grant_scanner_concurrency: usize,
-    /// Max reconciler-sourced (cold-lane) queue entries the grant scanner
-    /// merges into a single drain iteration alongside all event-driven
-    /// (hot-lane) entries. Bounds how long a reconcile-sweep backlog can delay
-    /// servicing a release-driven nudge. Defaults to 64. Values below 1 are
-    /// treated as 1.
+    /// Max cold-lane queue entries the grant scanner merges into a single
+    /// drain iteration alongside all event-driven (hot-lane) entries. The
+    /// cold lane holds queues found by the reconcile sweep and queues a pass
+    /// left with free capacity and waiters. Bounds how long that backlog can
+    /// delay servicing a release-driven nudge. Defaults to 64. Values below 1
+    /// are treated as 1.
     #[serde(default = "default_grant_scanner_cold_batch_size")]
     pub grant_scanner_cold_batch_size: usize,
     /// Max requester-counter keys the periodic concurrency reconcile sweep
@@ -536,8 +538,10 @@ pub struct DatabaseTemplate {
     #[serde(default = "default_grant_scanner_live_headroom_fraction")]
     pub grant_scanner_live_headroom_fraction: f64,
     /// Max grants a `process_grants` pass accumulates before committing their
-    /// edits durably and waking the granted task groups' brokers. Values
-    /// below 1 are treated as 1. Defaults to 16.
+    /// edits durably and waking the granted task groups' brokers. Also the
+    /// number of grants requested by the follow-up pass queued for a queue
+    /// left with free capacity and waiters, so such a queue fills one chunk
+    /// per drain iteration. Values below 1 are treated as 1. Defaults to 16.
     #[serde(default = "default_grant_scanner_commit_chunk_size")]
     pub grant_scanner_commit_chunk_size: usize,
     /// Whether a grant scanner pass starts reading a queue's request rows at

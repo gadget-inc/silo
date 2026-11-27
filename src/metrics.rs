@@ -316,6 +316,9 @@ pub struct Metrics {
     /// Sizes of the grant scanner's pending lanes, labeled `lane=hot|cold`.
     concurrency_pending_grants: GaugeVec,
     concurrency_grant_next_hop_skips: CounterVec,
+    /// Follow-up passes the grant scanner queued for a queue it left with
+    /// free capacity and request rows it did not reach.
+    concurrency_grant_unfilled_capacity_passes: CounterVec,
     /// Grant-scanner candidates skipped because their request row was gone
     /// by the time the scanner re-read it.
     concurrency_grant_vanished_requests: CounterVec,
@@ -1056,6 +1059,14 @@ impl Metrics {
     /// hop was saturated with a deep requester backlog.
     pub fn record_concurrency_grant_next_hop_skip(&self, shard: &str) {
         self.concurrency_grant_next_hop_skips
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record a follow-up pass queued for a queue whose pass ended with free
+    /// capacity and request rows it did not reach.
+    pub fn record_concurrency_grant_unfilled_capacity_pass(&self, shard: &str) {
+        self.concurrency_grant_unfilled_capacity_passes
             .with_label_values(&[shard])
             .inc();
     }
@@ -2976,6 +2987,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_grant_unfilled_capacity_passes = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_grant_unfilled_capacity_passes_total",
+                "Follow-up grant-scanner passes queued for a queue left with free capacity and request rows the pass did not reach",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let concurrency_grant_vanished_requests = register(
         &registry,
         CounterVec::new(
@@ -3224,6 +3246,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_reconcile_duration,
         concurrency_pending_grants,
         concurrency_grant_next_hop_skips,
+        concurrency_grant_unfilled_capacity_passes,
         concurrency_grant_vanished_requests,
         concurrency_request_floor_lag_ms,
         concurrency_request_noted_reads,

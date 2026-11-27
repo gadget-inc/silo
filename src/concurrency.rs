@@ -987,8 +987,9 @@ pub struct GrantScannerConfig {
     /// Max per-queue `process_grants` passes run concurrently per drain
     /// iteration.
     pub concurrency: usize,
-    /// Max reconciler-sourced (cold-lane) queue entries merged into a single
-    /// drain iteration alongside all event-driven (hot-lane) entries.
+    /// Max cold-lane queue entries (reconcile-sweep finds and follow-up
+    /// passes) merged into a single drain iteration alongside all
+    /// event-driven (hot-lane) entries.
     pub cold_batch_size: usize,
     /// Minimum requester backlog on a candidate's next concurrency hop before
     /// the scanner defers granting the candidate while that hop is saturated.
@@ -1005,7 +1006,8 @@ pub struct GrantScannerConfig {
     /// Max grants accumulated in a pass before their edits are committed and
     /// their task groups' brokers woken. Smaller chunks stream grants out of a
     /// long pass earlier (lower leasable latency); larger chunks amortize
-    /// commit overhead.
+    /// commit overhead. Also the number of grants a follow-up pass requests
+    /// for a queue left with free capacity and waiters.
     pub commit_chunk_size: usize,
     /// Whether a pass starts reading a queue's request rows at the queue's
     /// request floor. When false every pass reads from the queue's prefix.
@@ -1056,10 +1058,12 @@ impl Default for GrantScannerConfig {
 /// grant scanner allows for that.
 pub const DEFAULT_REQUEST_WRITE_ABANDON_GRACE_MS: u64 = 10_000;
 
-/// The grant scanner's cold pending lane: (tenant, queue) entries seeded by
-/// the periodic `reconcile_pending_requests` sweep, drained in bounded
-/// batches so a shard-wide sweep backlog can never delay servicing the hot
-/// lane's event-driven nudges. `pop_cursor` implements round-robin draining —
+/// The grant scanner's cold pending lane: (tenant, queue) entries for queues
+/// with a backlog to work through, seeded by the periodic
+/// `reconcile_pending_requests` sweep and by passes that end with capacity
+/// still free (`request_unfilled_capacity_pass`). Drained in bounded batches
+/// so a shard-wide backlog can never delay servicing the hot lane's
+/// event-driven nudges. `pop_cursor` implements round-robin draining —
 /// see `take_pending_grant_batch` for why a plain `pop_first` would starve
 /// the lexicographic tail.
 #[derive(Default)]
@@ -1146,7 +1150,8 @@ pub struct ConcurrencyManager {
     /// deterministic iteration order for DST reproducibility.
     pending_grants: Mutex<BTreeMap<Vec<u8>, (String, String, u32)>>,
     /// COLD pending lane: entries seeded by the periodic
-    /// `reconcile_pending_requests` counter sweep, drained at most
+    /// `reconcile_pending_requests` counter sweep and by passes that leave
+    /// capacity unfilled, drained at most
     /// `grant_scanner_cold_batch_size` per iteration behind the hot lane. On
     /// a queue-heavy shard the sweep re-seeds hundreds of thousands of
     /// entries; letting them share the hot lane meant a release nudge waited
@@ -1219,16 +1224,20 @@ pub struct ConcurrencyManager {
     /// bounds the cost one queue can impose per scanner cycle so a single queue
     /// with a huge backlog of non-grantable keys (holder-orphan / stale-request
     /// shape) can't pin a `.buffer_unordered` slot and starve every other
-    /// tenant's queue on the shard. The queue is re-driven on the next cycle (its requester
-    /// counter is still non-zero), making bounded forward progress from the
-    /// front each time. Derived from `grant_scanner_batch_size` (a small
+    /// tenant's queue on the shard. An invocation that yields on the budget
+    /// after granting or deleting rows queues a follow-up pass
+    /// (`request_unfilled_capacity_pass`), making bounded forward progress
+    /// from the front each time; one that changed nothing leaves the queue to
+    /// the periodic sweep, which finds its requester counter still non-zero.
+    /// Derived from `grant_scanner_batch_size` (a small
     /// multiple) in `new`; always `>= grant_scanner_batch_size` so every
     /// invocation can run at least one full pass.
     grant_scanner_max_scan_per_invocation: usize,
-    /// Max cold-lane (reconciler-sourced) queue entries merged into a single
-    /// drain iteration alongside all hot-lane (event-driven) entries. Bounds
-    /// how long a reconcile-sweep backlog can delay servicing a release
-    /// nudge. Configurable via `grant_scanner_cold_batch_size` (default 64);
+    /// Max cold-lane queue entries (reconcile-sweep finds and follow-up
+    /// passes) merged into a single drain iteration alongside all hot-lane
+    /// (event-driven) entries. Bounds how long a cold-lane backlog can delay
+    /// servicing a release nudge. Configurable via
+    /// `grant_scanner_cold_batch_size` (default 64);
     /// stored already clamped to `>= 1`.
     grant_scanner_cold_batch_size: usize,
     /// Minimum requester backlog on a candidate's next concurrency hop before
@@ -1245,9 +1254,11 @@ pub struct ConcurrencyManager {
     /// clamped to `[0.0, 0.9]` with non-finite values treated as 0.0.
     grant_scanner_live_headroom_fraction: f64,
     /// Max grants accumulated in a `process_grants` pass before their edits
-    /// are committed and their task groups' brokers woken. Configurable via
-    /// `grant_scanner_commit_chunk_size` (default 16); stored already clamped
-    /// to `>= 1`.
+    /// are committed and their task groups' brokers woken. Also the count a
+    /// follow-up pass requests (`request_unfilled_capacity_pass`) and the
+    /// widest window of duplicate-materialization checks read at once.
+    /// Configurable via `grant_scanner_commit_chunk_size` (default 16);
+    /// stored already clamped to `>= 1`.
     grant_scanner_commit_chunk_size: usize,
     /// State of the (possibly multi-tick) holder-drift pass. Maintained only
     /// by `report_holder_drift` (a single periodic task). See `DriftPass`.
@@ -2426,15 +2437,17 @@ impl ConcurrencyManager {
         self.grant_notify.notify_one();
     }
 
-    /// Cold-lane variant of `request_grant_count`, used only by the
-    /// `reconcile_pending_requests` counter sweep.
+    /// Cold-lane variant of `request_grant_count`, used by the
+    /// `reconcile_pending_requests` counter sweep and by
+    /// `request_unfilled_capacity_pass`.
     ///
-    /// SET/max semantics rather than accumulation: the sweep re-reads the
-    /// durable requester counter on every visit, so the counter value IS the
-    /// outstanding demand. Accumulating it (the old shared-lane behavior)
-    /// grew the pending count without bound while a queue went unserviced —
-    /// u32 overflow in minutes for a queue with tens of millions of
-    /// requesters.
+    /// SET/max semantics rather than accumulation: each caller states the
+    /// queue's outstanding demand as it stands (the sweep re-reads the
+    /// durable requester counter on every visit; a pass reports the capacity
+    /// it left free), so the largest stated value IS the demand.
+    /// Accumulating it would grow the pending count without bound while a
+    /// queue goes unserviced — u32 overflow in minutes for a queue with tens
+    /// of millions of requesters.
     pub(crate) fn request_grant_count_cold(&self, tenant: &str, queue: &str, count: u32) {
         let key = concurrency_counts_key(tenant, queue);
         {
@@ -2446,6 +2459,37 @@ impl ConcurrencyManager {
             entry.2 = entry.2.max(count);
         }
         self.grant_notify.notify_one();
+    }
+
+    /// Queue another pass for a queue whose pass ended with capacity the
+    /// scanner may fill still free and request rows it did not reach.
+    ///
+    /// A pass grants at most the count it was asked for and walks at most
+    /// its key budget, so it can end with free slots and waiters behind
+    /// them: a release asks for one grant however many slots are free, and a
+    /// raised floating limit can ask for more than one walk reaches. The
+    /// caller invokes this only after a pass that granted or deleted at
+    /// least one request row, so every follow-up pass starts from a shorter
+    /// queue, and a queue whose front cannot be granted stops asking.
+    ///
+    /// The follow-up goes to the cold lane and asks for one commit chunk.
+    /// Each drain iteration therefore spends at most one chunk of grants on
+    /// a catching-up queue, on at most `grant_scanner_cold_batch_size` such
+    /// queues, and still serves every hot-lane nudge. A queue working
+    /// through a large backlog fills one chunk per iteration until it is
+    /// full or its eligible waiters run out.
+    fn request_unfilled_capacity_pass(&self, tenant: &str, queue: &str, capacity: usize) {
+        let free = self
+            .scanner_effective_capacity(capacity)
+            .saturating_sub(self.counts.holder_count(tenant, queue));
+        if free == 0 {
+            return;
+        }
+        let count = free.min(self.grant_scanner_commit_chunk_size);
+        self.request_grant_count_cold(tenant, queue, u32::try_from(count).unwrap_or(u32::MAX));
+        if let Some(ref m) = self.metrics {
+            m.record_concurrency_grant_unfilled_capacity_pass(&self.shard);
+        }
     }
 
     /// Compute one drain iteration's work set: ALL hot-lane entries plus at
@@ -2775,9 +2819,14 @@ impl ConcurrencyManager {
     ///
     /// Optimized for throughput: scans candidates in batches, batch-validates their
     /// status concurrently, reserves in-memory slots, then writes all grants plus
-    /// stale deletions in a single durable batch. If stale/corrupt requests reduce
-    /// the yield, scanning continues until `count` valid grants are found or the
-    /// request queue is exhausted.
+    /// stale deletions in chunked durable batches. If stale/corrupt requests reduce
+    /// the yield, scanning continues until `count` valid grants are found, the
+    /// request queue is exhausted, or the per-invocation key budget is spent.
+    ///
+    /// An invocation that made progress and ends with free capacity and
+    /// request rows it did not reach queues a follow-up pass
+    /// (`request_unfilled_capacity_pass`), so a queue with free slots and
+    /// eligible waiters keeps filling without waiting for the periodic sweep.
     pub(crate) async fn process_grants(
         &self,
         db: &Arc<InstrumentedDb>,
@@ -2922,6 +2971,10 @@ impl ConcurrencyManager {
         let mut all_granted: Vec<String> = Vec::new();
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
+        // Set alongside `iter_exhausted` when the walk stopped on a scan error
+        // rather than at the end of the queue's ready rows: rows it did not
+        // reach may still be waiting.
+        let mut walk_interrupted = false;
         let mut capacity_exhausted = false;
         // Next-hop saturation skip state: per-hop durable reads memoized for
         // the whole invocation (most candidates in one queue share the same
@@ -2937,8 +2990,9 @@ impl ConcurrencyManager {
         // not exhausted, so a single queue with a huge non-grantable front
         // cannot starve other tenants' queues sharing the `.buffer_unordered`
         // fan-out.
-        // The queue is re-driven next cycle (its requester counter is still
-        // non-zero), making bounded forward progress from the front each time.
+        // An invocation that yields here after making progress queues a
+        // follow-up pass at its end, making bounded forward progress from the
+        // front each time.
         let mut scanned_this_invocation: usize = 0;
         let mut total_stale_deleted: usize = 0;
         let mut budget_exhausted = false;
@@ -3005,6 +3059,7 @@ impl ConcurrencyManager {
                     Err(e) => {
                         tracing::warn!(error = %e, "grant scanner: iteration error");
                         iter_exhausted = true;
+                        walk_interrupted = true;
                         break;
                     }
                 };
@@ -3055,6 +3110,7 @@ impl ConcurrencyManager {
                         Err(e) => {
                             tracing::warn!(error = %e, "grant scanner: failed to seek to the next request band");
                             iter_exhausted = true;
+                            walk_interrupted = true;
                             break;
                         }
                     }
@@ -3199,9 +3255,11 @@ impl ConcurrencyManager {
             // a front of >budget saturated candidates yields at the budget
             // like any other non-grantable front and a grantable candidate
             // anywhere within the budget window is still reached this
-            // invocation. Liveness for candidates past the window: the
-            // requester counter stays non-zero, so the periodic reconcile
-            // sweep re-drives this queue on its next cursor rotation. The
+            // invocation. Liveness for candidates past the window: an
+            // invocation that granted or deleted rows queues a follow-up
+            // pass; one whose whole window was skipped changes nothing, and
+            // the queue waits for the periodic reconcile sweep, which finds
+            // its requester counter non-zero on its next cursor rotation. The
             // min-backlog threshold is a heuristic that the hop stays
             // saturated across that rotation — sound for a deep, slowly
             // draining hop (the wedge shape this targets), but a small-cap
@@ -3749,6 +3807,16 @@ impl ConcurrencyManager {
                         for (q, tid) in &chunk_reservations {
                             self.counts.release_reservation(tenant, q, tid);
                         }
+                        // The failed candidate and everything behind it are
+                        // still waiting. After earlier chunks committed, a
+                        // follow-up pass retries from that candidate; if it
+                        // fails again first thing, that pass changes nothing
+                        // and queues no further one.
+                        if (total_granted > 0 || total_stale_deleted > 0)
+                            && let Some((capacity, _)) = max_concurrency
+                        {
+                            self.request_unfilled_capacity_pass(tenant, queue, capacity);
+                        }
                         record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted;
                     }
@@ -3860,8 +3928,52 @@ impl ConcurrencyManager {
                 scanned = scanned_this_invocation,
                 stale_deleted = total_stale_deleted,
                 total_granted,
-                "grant scanner: hit per-invocation scan budget; yielding, will re-drive next cycle"
+                "grant scanner: hit per-invocation scan budget; yielding"
             );
+        }
+
+        // --- Follow-up pass for capacity left unfilled ---
+        // The invocation ends with whatever `count` and the key budget let it
+        // grant, which can be fewer slots than the queue has free. When it
+        // made progress and rows it did not reach may still be waiting, queue
+        // a follow-up pass so the queue keeps filling. No follow-up when the
+        // queue is full, when the walk reached the end of the ready rows, or
+        // when the invocation changed nothing: a front that cannot be granted
+        // (every candidate deferred or unreadable) would be walked again to
+        // the same end, so it is left to the periodic sweep.
+        let made_progress = total_granted > 0 || total_stale_deleted > 0;
+        if made_progress
+            && !capacity_exhausted
+            && let Some((capacity, _)) = max_concurrency
+        {
+            let rows_unreached = if budget_exhausted || walk_interrupted {
+                true
+            } else if iter_exhausted {
+                false
+            } else {
+                // Stopped at the requested count without looking past the
+                // last grant: the next row the cursor returns, if any, is a
+                // row left. A noted key read without a row is not one, and
+                // spends budget like any other key. A spent budget or a read
+                // error leaves the answer unknown, which counts as a row.
+                loop {
+                    match requests.next().await {
+                        Ok(RequestRead::End) => break false,
+                        Ok(RequestRead::Missing) => {
+                            scanned_this_invocation += 1;
+                            if scanned_this_invocation
+                                >= self.grant_scanner_max_scan_per_invocation
+                            {
+                                break true;
+                            }
+                        }
+                        Ok(RequestRead::Row(_)) | Err(_) => break true,
+                    }
+                }
+            };
+            if rows_unreached {
+                self.request_unfilled_capacity_pass(tenant, queue, capacity);
+            }
         }
 
         record_invocation(scanned_this_invocation, total_stale_deleted);

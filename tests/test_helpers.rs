@@ -184,6 +184,21 @@ pub async fn open_temp_shard_with_split_expire_s(
 pub async fn open_temp_shard_with_reconcile_interval_ms(
     interval_ms: u64,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
+        silo::concurrency::GrantScannerConfig::default(),
+        interval_ms,
+    )
+    .await
+}
+
+/// Open a temp shard with a custom grant scanner config and a concurrency
+/// reconcile interval. Pass a long interval so the periodic requester sweep
+/// never runs during the test and the scanner is driven by event nudges only.
+#[allow(dead_code)]
+pub async fn open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
+    grant_scanner: silo::concurrency::GrantScannerConfig,
+    interval_ms: u64,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let rate_limiter = MockGubernatorClient::new_arc();
     let tmp = tempfile::tempdir().unwrap();
     let resolved = resolve_object_store(&Backend::Fs, tmp.path().to_string_lossy().as_ref())
@@ -202,7 +217,7 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
             counter_reconciliation_seconds: None,
             hydrate_all_at_startup: false,
-            grant_scanner: silo::concurrency::GrantScannerConfig::default(),
+            grant_scanner,
             concurrency_reconcile_scan_slice:
                 silo::settings::DEFAULT_CONCURRENCY_RECONCILE_SCAN_SLICE,
             holder_drift_scan_slice: silo::settings::DEFAULT_HOLDER_DRIFT_SCAN_SLICE,
