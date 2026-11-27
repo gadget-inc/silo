@@ -229,6 +229,7 @@ pub struct Metrics {
     broker_tombstone_count: GaugeVec,
     broker_full_rescans_total: CounterVec,
     broker_full_rescan_inserted_total: CounterVec,
+    broker_scan_floor_lag_ms: GaugeVec,
 
     // Poll metrics
     polls_total: CounterVec,
@@ -692,6 +693,14 @@ impl Metrics {
         self.broker_full_rescan_inserted_total
             .with_label_values(&[shard, task_group])
             .inc_by(inserted_below_floor as f64);
+    }
+
+    /// Record how far behind the current time a broker scan started: the
+    /// scan's time minus its scan floor, or 0 for a scan of the whole range.
+    pub fn set_broker_scan_floor_lag_ms(&self, shard: &str, task_group: &str, lag_ms: u64) {
+        self.broker_scan_floor_lag_ms
+            .with_label_values(&[shard, task_group])
+            .set(lag_ms as f64);
     }
 
     /// Update the number of ack tombstones for a shard and task group.
@@ -2419,6 +2428,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let broker_scan_floor_lag_ms = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_broker_scan_floor_lag_ms",
+                "How far behind the current time the last broker scan started reading, in milliseconds: the scan's time minus its scan floor, 0 for a scan of the whole range. A scan steps over every task row and tombstone between its floor and the current time",
+            ),
+            &["shard", "task_group"],
+        )?,
+    );
+
     // Poll metrics
     let polls_total = register(
         &registry,
@@ -2917,6 +2937,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         broker_tombstone_count,
         broker_full_rescans_total,
         broker_full_rescan_inserted_total,
+        broker_scan_floor_lag_ms,
         polls_total,
         poll_duration,
         task_leases_active,

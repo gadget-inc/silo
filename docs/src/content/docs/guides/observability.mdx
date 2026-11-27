@@ -84,6 +84,7 @@ The task broker maintains an in-memory buffer of ready tasks for efficient deque
 | `silo_broker_tombstone_count` | Gauge | `shard`, `task_group` | Number of ack tombstones currently held by the broker |
 | `silo_broker_full_rescans_total` | Counter | `shard`, `task_group` | Scans that read the whole task group range instead of starting at the scan floor (one per task group every `broker_full_rescan_interval_ms`, default 60000) |
 | `silo_broker_full_rescan_inserted_total` | Counter | `shard`, `task_group` | Tasks buffered by full-range scans from below the scan floor they cleared |
+| `silo_broker_scan_floor_lag_ms` | Gauge | `shard`, `task_group` | How far behind the current time the last scan started reading: the scan's time minus its scan floor, 0 for a scan of the whole range |
 
 **Key insights:**
 - `silo_broker_buffer_size` near 0 with pending work may indicate scan issues

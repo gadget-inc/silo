@@ -206,6 +206,10 @@ impl TaskBroker {
             full_rescan,
             cleared_floor_ms,
         } = self.begin_scan_cursor();
+        if let Some(ref m) = self.metrics {
+            let lag_ms = floor_ms.map_or(0, |floor_ms| now_ms.saturating_sub(floor_ms).max(0));
+            m.set_broker_scan_floor_lag_ms(&self.shard_name, &self.task_group, lag_ms as u64);
+        }
 
         // [SILO-SCAN-1] Scan only this task group's key range, from the floor
         let prefix = task_group_prefix(&self.task_group);
@@ -1540,6 +1544,75 @@ mod scan_gating_tests {
             TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
             interval,
         )
+    }
+
+    async fn broker_with_metrics(metrics: Metrics) -> Arc<TaskBroker> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::DbBuilder::new("test", store)
+            .build()
+            .await
+            .expect("open in-memory db");
+        let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
+        TaskBroker::new(
+            "tg".to_string(),
+            db,
+            "shard".to_string(),
+            Some(metrics),
+            ShardRange::full(),
+            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+            Duration::from_secs(60),
+        )
+    }
+
+    /// The value of the `silo_broker_scan_floor_lag_ms` series for the test
+    /// broker, or `None` before its first scan.
+    fn scan_floor_lag_ms(metrics: &Metrics) -> Option<f64> {
+        metrics
+            .registry()
+            .gather()
+            .iter()
+            .find(|family| family.get_name() == "silo_broker_scan_floor_lag_ms")
+            .and_then(|family| {
+                family.get_metric().iter().find(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "task_group" && l.get_value() == "tg")
+                })
+            })
+            .map(|metric| metric.get_gauge().get_value())
+    }
+
+    /// Each scan reports how far behind its own time it started reading: 0
+    /// for a scan of the whole range, otherwise the distance to the floor. A
+    /// note of a row an hour below the floor moves the next scan's start back
+    /// by that hour.
+    #[tokio::test]
+    async fn scan_reports_how_far_behind_its_floor_it_started() {
+        let metrics = crate::metrics::init().expect("init metrics");
+        let broker = broker_with_metrics(metrics.clone()).await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(scan_floor_lag_ms(&metrics), None);
+
+        assert_eq!(scan(&broker, now_ms).await, 0);
+        assert_eq!(
+            scan_floor_lag_ms(&metrics),
+            Some(0.0),
+            "a scan of the whole range has no floor to lag behind"
+        );
+
+        assert_eq!(scan(&broker, now_ms + 250).await, 0);
+        assert_eq!(scan_floor_lag_ms(&metrics), Some(250.0));
+
+        let hour_ms = 3_600_000;
+        put_run_attempt(&broker, "waited", now_ms - hour_ms).await;
+        broker.note_task_written(now_ms - hour_ms);
+        assert_eq!(scan(&broker, now_ms + 300).await, 1);
+        assert_eq!(
+            scan_floor_lag_ms(&metrics),
+            Some((hour_ms + 300) as f64),
+            "the scan started at the noted row's start time"
+        );
     }
 
     /// A scan that reads to the end of the range moves the floor to its
