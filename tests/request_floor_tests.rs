@@ -547,12 +547,17 @@ impl Model {
     }
 }
 
+/// A start time later than any pass of a test begins, so a key that starts
+/// then is close under a whole-queue floor whenever the test runs.
+const AFTER_EVERY_PASS_MS: i64 = 1 << 50;
+
 /// A request key with a random band and start time. Most start long ago
-/// and close together; some start now, where a whole-queue floor lies.
+/// and close together; some start at [`AFTER_EVERY_PASS_MS`]. The key
+/// depends on `rng` and `serial` alone, so a seed replays the same keys.
 fn random_key(rng: &mut StdRng, serial: &mut u32) -> Vec<u8> {
     *serial += 1;
     let start_ms = if rng.random_bool(0.1) {
-        now_ms() + rng.random_range(0..4)
+        AFTER_EVERY_PASS_MS + rng.random_range(0..4)
     } else {
         1_000_000 + rng.random_range(0..24) * 250
     };

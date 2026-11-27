@@ -1289,30 +1289,32 @@ async fn an_emptied_queue_keeps_its_floor_through_a_rebuild(priority_ordered: bo
     // Free the slot so passes get past the capacity precheck.
     harness.complete_one().await;
 
-    // Run passes across several rebuild intervals. Each interval has one
-    // pass that reads from the prefix and walks every drained row.
-    let started = std::time::Instant::now();
-    let mut walked = Vec::new();
-    while started.elapsed() < rebuild_interval * 3 {
-        let pass = harness.pass(queue, 1).await;
-        assert!(pass.granted.is_empty());
-        walked.push(pass.trace().dead_rows_walked(&dead));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    // Each round waits out the rebuild interval, so its first pass drops
+    // the floor and reads from the prefix. A pass after that one walks the
+    // drained rows again only if another whole interval went by before it
+    // began, so of three passes at least one starts at the floor.
+    for _ in 0..2 {
+        tokio::time::sleep(rebuild_interval + Duration::from_millis(100)).await;
+        let rebuild = harness.pass(queue, 1).await;
+        assert!(rebuild.granted.is_empty());
+        assert_eq!(
+            rebuild.trace().dead_rows_walked(&dead),
+            DRAINED,
+            "a rebuilding pass reads from the prefix"
+        );
+        let mut walked = Vec::new();
+        for _ in 0..3 {
+            let pass = harness.pass(queue, 1).await;
+            assert!(pass.granted.is_empty());
+            walked.push(pass.trace().dead_rows_walked(&dead));
+        }
+        assert!(
+            walked.contains(&0),
+            "a pass after the rebuild starts at the floor it put back: {walked:?}"
+        );
+        let floor = harness.floor(queue).expect("the queue has a floor");
+        assert!(dead.iter().all(|key| key < &floor));
     }
-    let rebuilds = walked.iter().filter(|rows| **rows > 0).count();
-    let intervals = (started.elapsed().as_millis() / rebuild_interval.as_millis()) as usize + 1;
-    assert!(walked.len() > 4 * intervals, "passes ran between rebuilds");
-    assert!(
-        (1..=intervals).contains(&rebuilds),
-        "only a rebuilding pass walks the drained rows: {rebuilds} of {} passes did",
-        walked.len()
-    );
-    assert!(
-        walked.contains(&DRAINED),
-        "a rebuilding pass reads from the prefix"
-    );
-    let floor = harness.floor(queue).expect("the queue has a floor");
-    assert!(dead.iter().all(|key| key < &floor));
 
     // Rows that arrive afterwards are granted in order.
     let start = now_ms();
@@ -1337,7 +1339,7 @@ async fn an_emptied_queue_keeps_its_floor_through_a_rebuild(priority_ordered: bo
 /// its key, and passes scan from there.
 async fn a_queue_found_empty_without_a_floor_gets_one(priority_ordered: bool) {
     const DRAINED: usize = 200;
-    let rebuild_interval = Duration::from_millis(3_000);
+    let rebuild_interval = Duration::from_secs(3_600);
     let harness = Harness::open(GrantScannerConfig {
         request_floor_rebuild_interval_ms: rebuild_interval.as_millis() as u64,
         ..config(priority_ordered)
@@ -1348,11 +1350,11 @@ async fn a_queue_found_empty_without_a_floor_gets_one(priority_ordered: bool) {
     harness.complete_one().await;
 
     // The idle sweep drops the state of a queue whose floor has expired.
-    tokio::time::sleep(rebuild_interval + Duration::from_millis(100)).await;
+    // Run it as of a time past the rebuild interval.
     harness
         .shard
         .request_floors_for_test()
-        .sweep_idle(std::time::Instant::now());
+        .sweep_idle(std::time::Instant::now() + 2 * rebuild_interval);
     assert_eq!(harness.floor(queue), None);
 
     let first = harness.pass(queue, 1).await;
