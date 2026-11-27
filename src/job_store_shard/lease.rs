@@ -204,7 +204,9 @@ impl JobStoreShard {
         batch.delete(&leased_task_key);
 
         let mut job_missing_error: Option<JobStoreShardError> = None;
-        let mut followup_next_time: Option<i64> = None;
+        // Whether a retry was scheduled, and the key of the task row it wrote.
+        let mut followup_scheduled = false;
+        let mut followup_task_key: Option<Vec<u8>> = None;
         // Track grants from retry scheduling for rollback if DB write fails
         let mut retry_grants: Vec<(String, String)> = Vec::new();
         let mut retry_scheduled_refreshes = ScheduledRefreshes::default();
@@ -314,7 +316,7 @@ impl JobStoreShard {
                         // [SILO-RETRY-5-CONC] Enqueue retry with skip_try_reserve=true.
                         // The old holder is still in-memory (released post-commit), so the
                         // retry must go through the request queue, not get an immediate grant.
-                        retry_grants = self
+                        let retry = self
                             .enqueue_limit_task_at_index(
                                 &mut DbWriteBatcher::new(&self.db, &mut batch),
                                 LimitTaskParams {
@@ -341,8 +343,9 @@ impl JobStoreShard {
                                     scheduled_refreshes: &mut retry_scheduled_refreshes,
                                 },
                             )
-                            .await?
-                            .grants;
+                            .await?;
+                        retry_grants = retry.grants;
+                        followup_task_key = retry.written_task.map(|written| written.key);
 
                         // [SILO-RETRY-3] Set job status to Scheduled with next attempt time
                         let job_status =
@@ -360,7 +363,7 @@ impl JobStoreShard {
                             background_action_transitions.push(transition);
                         }
                         scheduled_followup = true;
-                        followup_next_time = Some(next_time);
+                        followup_scheduled = true;
                         new_job_status_for_dst = Some("Scheduled".to_string());
                     }
                     // [SILO-FAIL-3] If no follow-up scheduled, mark job as failed (pure write).
@@ -507,9 +510,9 @@ impl JobStoreShard {
         // Commit durable state — write_with_options with await_durable:true blocks
         // until the WAL is flushed to object storage, so no separate flush is needed.
         // A follow-up task row becomes visible to broker scans before that;
-        // lower the scan floor first so such a scan buffers it.
-        if let Some(nt) = followup_next_time {
-            self.brokers.expect_task_written(&task_group, nt);
+        // tell the broker first so such a scan buffers it.
+        if let Some(key) = &followup_task_key {
+            self.brokers.expect_task_written(key);
         }
         if let Err(e) = self
             .db
@@ -564,9 +567,12 @@ impl JobStoreShard {
             self.concurrency.request_grant(&release_tenant, &queue);
         }
         // A follow-up that is ready now wakes the scanner; a future-dated one
-        // lowers the broker's recorded next-ready time.
-        if let Some(nt) = followup_next_time {
-            self.brokers.notify_task_written(&task_group, nt);
+        // lowers the broker's recorded next-ready time. A retry that parked
+        // on a concurrency request wrote no task row and only wakes it.
+        match &followup_task_key {
+            Some(key) => self.brokers.notify_task_written(key),
+            None if followup_scheduled => self.brokers.wakeup(&task_group),
+            None => {}
         }
         if let Some(err) = job_missing_error {
             return Err(err);

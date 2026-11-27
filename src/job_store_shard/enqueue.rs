@@ -194,10 +194,19 @@ pub(crate) struct LimitTaskWriteResult {
     /// In-memory grants made while walking the chain. Callers must roll these
     /// back if their surrounding durable write fails.
     pub grants: Vec<(String, String)>,
-    /// The task-key timestamp when this walk wrote a concrete DB task
-    /// (`RunAttempt`, `CheckRateLimit`, or future `RequestTicket`). `None`
-    /// means the walk parked on a durable concurrency request instead.
-    pub pending_task_key_start_ms: Option<i64>,
+    /// The task row this walk wrote (`RunAttempt`, `CheckRateLimit`, or
+    /// future `RequestTicket`). `None` means the walk parked on a durable
+    /// concurrency request instead.
+    pub written_task: Option<WrittenTask>,
+}
+
+/// A task row a chain walk put into its batch.
+#[derive(Debug, Clone)]
+pub(crate) struct WrittenTask {
+    /// The row's full key, for the caller to report to the task broker.
+    pub key: Vec<u8>,
+    /// The start time the key carries.
+    pub start_time_ms: i64,
 }
 
 /// Whether a concurrency grant was obtained or the job was queued for later.
@@ -205,9 +214,7 @@ enum GrantResult {
     /// Slot granted immediately; caller should advance to the next limit.
     Granted,
     /// Not granted; a RequestTicket/request was written. Caller should return.
-    Queued {
-        pending_task_key_start_ms: Option<i64>,
-    },
+    Queued { written_task: Option<WrittenTask> },
 }
 
 /// Process the outcome of a `handle_enqueue` call, updating shared loop state.
@@ -250,13 +257,16 @@ fn record_grant_outcome(
             // Not granted - a request/RequestTicket was already written by
             // handle_enqueue. Stop processing further limits; remaining ones
             // will be applied when the queued request is granted later.
+            GrantResult::Queued { written_task: None }
+        }
+        Some(RequestTicketOutcome::FutureRequestTaskWritten { task_key, .. }) => {
             GrantResult::Queued {
-                pending_task_key_start_ms: None,
+                written_task: Some(WrittenTask {
+                    key: task_key,
+                    start_time_ms: scheduled_at_ms,
+                }),
             }
         }
-        Some(RequestTicketOutcome::FutureRequestTaskWritten { .. }) => GrantResult::Queued {
-            pending_task_key_start_ms: Some(scheduled_at_ms),
-        },
     }
 }
 
@@ -332,7 +342,7 @@ impl JobStoreShard {
         let mut scheduled_refreshes = ScheduledRefreshes::default();
         let background_action_metadata = metadata.clone().unwrap_or_default();
         let mut grant_guard = PendingEnqueueGrantGuard::new(&self.concurrency, tenant);
-        let effective_start_at_ms = self
+        let task_key = self
             .write_enqueue_data(
                 &mut DbWriteBatcher::new(&self.db, &mut batch),
                 &mut scheduled_refreshes,
@@ -376,9 +386,10 @@ impl JobStoreShard {
         );
 
         // The task row becomes visible to broker scans before the write is
-        // durable; lower the scan floor first so such a scan buffers it.
-        self.brokers
-            .expect_task_written(task_group, effective_start_at_ms);
+        // durable; tell the broker first so such a scan buffers it.
+        if let Some(key) = &task_key {
+            self.brokers.expect_task_written(key);
+        }
         if let Err(e) = self
             .db
             .write_with_options(
@@ -406,7 +417,7 @@ impl JobStoreShard {
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
         self.request_grants_for_yielded_queues(&scheduled_refreshes);
 
-        self.finish_enqueue(tenant, job_id, task_group, effective_start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, task_key.as_deref(), &grants)
             .await
     }
 
@@ -468,7 +479,7 @@ impl JobStoreShard {
 
         let mut scheduled_refreshes = ScheduledRefreshes::default();
         let mut grant_guard = PendingEnqueueGrantGuard::new(&self.concurrency, tenant);
-        let effective_start_at_ms = self
+        let task_key = self
             .write_enqueue_data(
                 &mut TxnWriter(&txn),
                 &mut scheduled_refreshes,
@@ -511,10 +522,11 @@ impl JobStoreShard {
 
         // Commit durable state — commit_with_options with await_durable:true blocks
         // until the WAL is flushed to object storage, so no separate flush is needed.
-        // The task row becomes visible to broker scans before that; lower the
-        // scan floor first so such a scan buffers it.
-        self.brokers
-            .expect_task_written(task_group, effective_start_at_ms);
+        // The task row becomes visible to broker scans before that; tell the
+        // broker first so such a scan buffers it.
+        if let Some(key) = &task_key {
+            self.brokers.expect_task_written(key);
+        }
         if let Err(e) = txn
             .commit_with_options(&WriteOptions {
                 await_durable: true,
@@ -538,7 +550,7 @@ impl JobStoreShard {
         self.mark_refresh_pending_groups(scheduled_refreshes.task_groups());
         self.request_grants_for_yielded_queues(&scheduled_refreshes);
 
-        self.finish_enqueue(tenant, job_id, task_group, effective_start_at_ms, &grants)
+        self.finish_enqueue(tenant, job_id, task_group, task_key.as_deref(), &grants)
             .await
     }
 
@@ -550,9 +562,11 @@ impl JobStoreShard {
     /// sees every reservation the moment it exists. On `Err` the chain has
     /// already rolled back its own grants and `grants` is unchanged.
     ///
-    /// Returns the start time the task row is keyed at: `start_at_ms`, or
-    /// the current time for an immediate enqueue (`start_at_ms <= 0`). This
-    /// is the time to tell the broker, not the raw `start_at_ms`.
+    /// Returns the key of the task row the limit chain wrote, or `None`
+    /// when the chain parked on a concurrency request and wrote no task
+    /// row. The key carries the start time the row is keyed at:
+    /// `start_at_ms`, or the current time for an immediate enqueue
+    /// (`start_at_ms <= 0`).
     #[allow(clippy::too_many_arguments)]
     async fn write_enqueue_data<W: WriteBatcher>(
         &self,
@@ -568,7 +582,7 @@ impl JobStoreShard {
         limits: Vec<Limit>,
         metadata: Option<Vec<(String, String)>>,
         task_group: &str,
-    ) -> Result<i64, JobStoreShardError> {
+    ) -> Result<Option<Vec<u8>>, JobStoreShardError> {
         let now_ms = now_epoch_ms();
 
         let job = JobInfo {
@@ -608,38 +622,39 @@ impl JobStoreShard {
 
         Self::write_job_status_with_index_and_metadata(writer, tenant, job_id, job_status)?;
 
-        self.enqueue_limit_task_at_index_into(
-            writer,
-            grants,
-            LimitTaskParams {
-                tenant,
-                task_id: &first_task_id,
-                job_id,
-                attempt_number: 1,
-                relative_attempt_number: 1,
-                limit_index: 0,
-                limits: &job.limits,
-                priority,
-                // Fresh enqueue: the task_key starts at the job's schedule. If
-                // the job is future-scheduled (`start_at_ms > now_ms`) the
-                // resulting `RequestTicket` lands at the future time so the
-                // broker picks it up exactly then. Use `effective_start_at_ms`
-                // (not the raw `start_at_ms`) so an immediate enqueue
-                // (`start_at_ms <= 0`) keys the task at `now_ms` — matching the
-                // `effective_start_at_ms` the JobStatus stores and the import
-                // path, so identity lookups never have to fall back to time=0.
-                // Fresh chain head → epoch is just the write time; no
-                // predecessor tombstone to dodge.
-                scheduled_at_ms: effective_start_at_ms,
-                task_key_epoch_ms: now_ms,
-                now_ms,
-                held_queues: Vec::new(),
-                task_group,
-                skip_try_reserve: false,
-                scheduled_refreshes,
-            },
-        )
-        .await?;
+        let written_task = self
+            .enqueue_limit_task_at_index_into(
+                writer,
+                grants,
+                LimitTaskParams {
+                    tenant,
+                    task_id: &first_task_id,
+                    job_id,
+                    attempt_number: 1,
+                    relative_attempt_number: 1,
+                    limit_index: 0,
+                    limits: &job.limits,
+                    priority,
+                    // Fresh enqueue: the task_key starts at the job's schedule. If
+                    // the job is future-scheduled (`start_at_ms > now_ms`) the
+                    // resulting `RequestTicket` lands at the future time so the
+                    // broker picks it up exactly then. Use `effective_start_at_ms`
+                    // (not the raw `start_at_ms`) so an immediate enqueue
+                    // (`start_at_ms <= 0`) keys the task at `now_ms` — matching the
+                    // `effective_start_at_ms` the JobStatus stores and the import
+                    // path, so identity lookups never have to fall back to time=0.
+                    // Fresh chain head → epoch is just the write time; no
+                    // predecessor tombstone to dodge.
+                    scheduled_at_ms: effective_start_at_ms,
+                    task_key_epoch_ms: now_ms,
+                    now_ms,
+                    held_queues: Vec::new(),
+                    task_group,
+                    skip_try_reserve: false,
+                    scheduled_refreshes,
+                },
+            )
+            .await?;
         self.apply_background_action_queue_counter_transition(
             tenant,
             task_group,
@@ -647,20 +662,20 @@ impl JobStoreShard {
             job_status_kind,
             &job.metadata,
         );
-        Ok(effective_start_at_ms)
+        Ok(written_task.map(|task| task.key))
     }
 
     /// Complete an enqueue after successful write/commit and DST event emission.
     /// Confirms and logs grants and tells the broker for the given task group
-    /// about the written task: a due task wakes it, a future-dated one lowers
-    /// its recorded next-ready time. `start_at_ms` is the time the task row
-    /// is keyed at, never the raw immediate-enqueue `0`.
+    /// about the task row at `task_key`: a due task wakes it, a future-dated
+    /// one lowers its recorded next-ready time. With no task row (the job
+    /// parked on a concurrency request) the broker is only woken.
     pub(crate) async fn finish_enqueue(
         &self,
         tenant: &str,
         job_id: &str,
         task_group: &str,
-        start_at_ms: i64,
+        task_key: Option<&[u8]>,
         grants: &[(String, String)],
     ) -> Result<(), JobStoreShardError> {
         for (queue, task_id) in grants {
@@ -670,7 +685,10 @@ impl JobStoreShard {
             debug!("granted concurrency slot immediately");
         }
 
-        self.brokers.notify_task_written(task_group, start_at_ms);
+        match task_key {
+            Some(key) => self.brokers.notify_task_written(key),
+            None => self.brokers.wakeup(task_group),
+        }
 
         Ok(())
     }
@@ -709,12 +727,12 @@ impl JobStoreShard {
         params: LimitTaskParams<'_>,
     ) -> Result<LimitTaskWriteResult, JobStoreShardError> {
         let mut grants: Vec<(String, String)> = Vec::new();
-        let pending_task_key_start_ms = self
+        let written_task = self
             .enqueue_limit_task_at_index_into(writer, &mut grants, params)
             .await?;
         Ok(LimitTaskWriteResult {
             grants,
-            pending_task_key_start_ms,
+            written_task,
         })
     }
 
@@ -729,13 +747,13 @@ impl JobStoreShard {
         writer: &mut W,
         grants: &mut Vec<(String, String)>,
         params: LimitTaskParams<'_>,
-    ) -> Result<Option<i64>, JobStoreShardError> {
+    ) -> Result<Option<WrittenTask>, JobStoreShardError> {
         // Save the tenant ref so we can roll back grants if walk_limit_chain errors.
         // (references are Copy, so this doesn't conflict with moving `params`.)
         let tenant_for_rollback: &str = params.tenant;
         let first_new_grant = grants.len();
         match self.walk_limit_chain(writer, params, grants).await {
-            Ok(pending_task_key_start_ms) => Ok(pending_task_key_start_ms),
+            Ok(written_task) => Ok(written_task),
             Err(e) => {
                 for (queue, task_id) in grants.drain(first_new_grant..) {
                     self.concurrency
@@ -747,9 +765,9 @@ impl JobStoreShard {
     }
 
     /// Inner loop body for `enqueue_limit_task_at_index`. Pushes successful
-    /// in-memory grants to `grants` as it goes. Returns `Ok(())` on normal
-    /// completion (the caller hands `grants` back to its caller), returning
-    /// the concrete task-key timestamp when the walk wrote a DB task, or
+    /// in-memory grants to `grants` as it goes. Returns `Ok(_)` on normal
+    /// completion (the caller hands `grants` back to its caller), with the
+    /// task row the walk wrote when it wrote one, or
     /// `Err(_)` with `grants` containing whatever was accumulated up to the
     /// failure point — the outer wrapper rolls those back before returning the
     /// error.
@@ -758,7 +776,7 @@ impl JobStoreShard {
         writer: &mut W,
         params: LimitTaskParams<'_>,
         grants: &mut Vec<(String, String)>,
-    ) -> Result<Option<i64>, JobStoreShardError> {
+    ) -> Result<Option<WrittenTask>, JobStoreShardError> {
         let LimitTaskParams {
             tenant,
             task_id,
@@ -813,7 +831,7 @@ impl JobStoreShard {
                     held_queues: current_held_queues,
                     task_group: task_group.to_string(),
                 };
-                put_task(
+                let key = put_task(
                     writer,
                     task_group,
                     scheduled_at_ms,
@@ -823,7 +841,10 @@ impl JobStoreShard {
                     task_key_epoch_ms,
                     &run_task,
                 )?;
-                return Ok(Some(scheduled_at_ms));
+                return Ok(Some(WrittenTask {
+                    key,
+                    start_time_ms: scheduled_at_ms,
+                }));
             }
 
             match &limits[current_index] {
@@ -878,13 +899,11 @@ impl JobStoreShard {
                         &mut current_index,
                     ) {
                         GrantResult::Granted => {}
-                        GrantResult::Queued {
-                            pending_task_key_start_ms,
-                        } => {
+                        GrantResult::Queued { written_task } => {
                             // No partial RunAttempt task is written before a
                             // queued concurrency gate; if this was a future
                             // RequestTicket, report its concrete task key.
-                            return Ok(pending_task_key_start_ms);
+                            return Ok(written_task);
                         }
                     }
                 }
@@ -1002,12 +1021,10 @@ impl JobStoreShard {
 
                     match grant_result {
                         GrantResult::Granted => {}
-                        GrantResult::Queued {
-                            pending_task_key_start_ms,
-                        } => {
+                        GrantResult::Queued { written_task } => {
                             // See the Concurrency branch comment: holder-only
                             // grants continue, queued gates stop the walk.
-                            return Ok(pending_task_key_start_ms);
+                            return Ok(written_task);
                         }
                     }
                 }
@@ -1028,7 +1045,7 @@ impl JobStoreShard {
                         held_queues: current_held_queues,
                         task_group: task_group.to_string(),
                     };
-                    put_task(
+                    let key = put_task(
                         writer,
                         task_group,
                         scheduled_at_ms,
@@ -1038,7 +1055,10 @@ impl JobStoreShard {
                         task_key_epoch_ms,
                         &task,
                     )?;
-                    return Ok(Some(scheduled_at_ms));
+                    return Ok(Some(WrittenTask {
+                        key,
+                        start_time_ms: scheduled_at_ms,
+                    }));
                 }
             }
         }

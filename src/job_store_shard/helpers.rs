@@ -273,7 +273,8 @@ pub fn now_epoch_ms() -> i64 {
 /// `time_ms` is the logical start time (governs broker ordering); `epoch_ms` is
 /// the write-time disambiguator that lets a chain rewrite dodge the broker
 /// ack-tombstone of a just-deleted predecessor without perturbing ordering. See
-/// [`crate::keys::task_key`].
+/// [`crate::keys::task_key`]. Returns the key the task was written at, for
+/// the caller to report to the task broker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn put_task<W: WriteBatcher>(
     writer: &mut W,
@@ -284,13 +285,11 @@ pub(crate) fn put_task<W: WriteBatcher>(
     attempt: u32,
     epoch_ms: i64,
     task: &Task,
-) -> Result<(), JobStoreShardError> {
+) -> Result<Vec<u8>, JobStoreShardError> {
     let task_value = encode_task(task);
-    writer.put(
-        task_key(task_group, time_ms, priority, job_id, attempt, epoch_ms),
-        &task_value,
-    )?;
-    Ok(())
+    let key = task_key(task_group, time_ms, priority, job_id, attempt, epoch_ms);
+    writer.put(&key, &task_value)?;
+    Ok(key)
 }
 
 /// Find the single live task identified by

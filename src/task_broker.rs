@@ -1036,53 +1036,57 @@ impl TaskBrokerRegistry {
         self.get_or_create(task_group).wakeup();
     }
 
-    /// Record a committed task row with `start_time_ms`: lower the broker's
-    /// scan floor to it, then wake the scanner when the row is due now or
-    /// lower the broker's recorded next-ready time so the row is scanned for
-    /// once it becomes due.
+    /// Record the committed task row at `task_key`: lower the scan floor of
+    /// its task group's broker to the row's start time, then wake the scanner
+    /// when the row is due now or lower the broker's recorded next-ready time
+    /// so the row is scanned for once it becomes due.
     ///
     /// Call after the write is durable, from every path that writes a task
     /// row. A broker created later starts with nothing known about its range
     /// and scans all of it on its first nudge, so a future-dated row only
     /// needs noting on a broker that already exists.
-    pub fn notify_task_written(&self, task_group: &str, start_time_ms: i64) {
+    pub fn notify_task_written(&self, task_key: &[u8]) {
+        let Some(parsed) = parse_task_key(task_key) else {
+            return;
+        };
+        let start_time_ms = parsed.start_time_ms as i64;
         if start_time_ms <= crate::job_store_shard::now_epoch_ms() {
-            let broker = self.get_or_create(task_group);
+            let broker = self.get_or_create(&parsed.task_group);
             broker.note_task_written(start_time_ms);
             broker.wakeup();
-        } else if let Some(broker) = self.brokers.get(task_group) {
+        } else if let Some(broker) = self.brokers.get(&parsed.task_group) {
             broker.note_scheduled(start_time_ms);
         }
     }
 
-    /// [`Self::notify_task_written`] for several task groups at once, each
-    /// with the earliest start time written under it.
-    pub fn notify_tasks_written(&self, written: &[(String, i64)]) {
-        for (task_group, start_time_ms) in written {
-            self.notify_task_written(task_group, *start_time_ms);
+    /// [`Self::notify_task_written`] for several task rows at once.
+    pub fn notify_tasks_written(&self, task_keys: &[Vec<u8>]) {
+        for task_key in task_keys {
+            self.notify_task_written(task_key);
         }
     }
 
-    /// Record that a task row with `start_time_ms` is about to be written
-    /// under `task_group`: lower the broker's scan floor to it, so a scan that
-    /// sees the row while its write awaits durability buffers it instead of
-    /// starting above it.
+    /// Record that the task row at `task_key` is about to be written: lower
+    /// the scan floor of its task group's broker to the row's start time, so
+    /// a scan that sees the row while its write awaits durability buffers it
+    /// instead of starting above it.
     ///
     /// Call before the write is issued; [`Self::notify_task_written`] still
     /// follows once the write is durable. A write that fails leaves the floor
     /// lowered, which costs one scan a few extra reads. A broker that does
     /// not exist yet has no floor to lower.
-    pub fn expect_task_written(&self, task_group: &str, start_time_ms: i64) {
-        if let Some(broker) = self.brokers.get(task_group) {
-            broker.note_task_written(start_time_ms);
+    pub fn expect_task_written(&self, task_key: &[u8]) {
+        if let Some(parsed) = parse_task_key(task_key)
+            && let Some(broker) = self.brokers.get(&parsed.task_group)
+        {
+            broker.note_task_written(parsed.start_time_ms as i64);
         }
     }
 
-    /// [`Self::expect_task_written`] for several task groups at once, each
-    /// with the earliest start time about to be written under it.
-    pub fn expect_tasks_written(&self, written: &[(String, i64)]) {
-        for (task_group, start_time_ms) in written {
-            self.expect_task_written(task_group, *start_time_ms);
+    /// [`Self::expect_task_written`] for several task rows at once.
+    pub fn expect_tasks_written(&self, task_keys: &[Vec<u8>]) {
+        for task_key in task_keys {
+            self.expect_task_written(task_key);
         }
     }
 

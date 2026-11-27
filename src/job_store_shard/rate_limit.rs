@@ -15,6 +15,8 @@ impl JobStoreShard {
     /// terminal RunAttempt later writes under the new id, the worker's
     /// completion releases holders under the new id, and the original
     /// holders are never reachable again.
+    ///
+    /// Returns the key of the retry's task row.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule_rate_limit_retry<W: WriteBatcher>(
         &self,
@@ -33,7 +35,7 @@ impl JobStoreShard {
         retry_at_ms: i64,
         parent_epoch_ms: i64,
         task_group: &str,
-    ) -> Result<(), JobStoreShardError> {
+    ) -> Result<Vec<u8>, JobStoreShardError> {
         // The retry's task_key keeps `retry_at_ms` as its start time (the broker
         // must dispatch it after the backoff). `handle_check_rate_limit`
         // ack-deleted the parent CheckRateLimit, installing a broker tombstone at

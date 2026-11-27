@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use slatedb::WriteBatch;
 
 use crate::codec::DecodedFloatingLimitState;
-use crate::concurrency::{ConcurrencyError, LimitChainResumer, ResumeChainParams};
+use crate::concurrency::{ConcurrencyError, LimitChainResumer, ResumeChainParams, ResumedChain};
 use crate::job_store_shard::helpers::DbWriteBatcher;
 use crate::job_store_shard::{
     JobStoreShard, JobStoreShardError, LimitTaskParams, LimitTaskWriteResult, ScheduledRefreshes,
@@ -42,7 +42,7 @@ impl LimitChainResumer for ShardChainResumer {
         batch: &mut WriteBatch,
         scheduled_refreshes: &mut ScheduledRefreshes,
         params: ResumeChainParams,
-    ) -> Result<Vec<(String, String)>, ConcurrencyError> {
+    ) -> Result<ResumedChain, ConcurrencyError> {
         let shard = self
             .shard
             .upgrade()
@@ -114,18 +114,21 @@ impl LimitChainResumer for ShardChainResumer {
             return Err(into_concurrency_error(e));
         }
 
-        Ok(result.grants)
+        Ok(ResumedChain {
+            grants: result.grants,
+            task_key: result.written_task.map(|task| task.key),
+        })
     }
 
-    fn tasks_written(&self, written: &[(String, i64)]) {
+    fn tasks_written(&self, task_keys: &[Vec<u8>]) {
         if let Some(shard) = self.shard.upgrade() {
-            shard.brokers.notify_tasks_written(written);
+            shard.brokers.notify_tasks_written(task_keys);
         }
     }
 
-    fn expect_tasks(&self, written: &[(String, i64)]) {
+    fn expect_tasks(&self, task_keys: &[Vec<u8>]) {
         if let Some(shard) = self.shard.upgrade() {
-            shard.brokers.expect_tasks_written(written);
+            shard.brokers.expect_tasks_written(task_keys);
         }
     }
 
@@ -164,7 +167,8 @@ async fn retarget_if_concrete_task(
     params: &ResumeChainParams,
     result: &LimitTaskWriteResult,
 ) -> Result<(), JobStoreShardError> {
-    let Some(task_key_start_ms) = result.pending_task_key_start_ms else {
+    let Some(task_key_start_ms) = result.written_task.as_ref().map(|task| task.start_time_ms)
+    else {
         return Ok(());
     };
     if task_key_start_ms == params.start_at_ms {
