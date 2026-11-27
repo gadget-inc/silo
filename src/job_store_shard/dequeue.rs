@@ -1760,10 +1760,15 @@ mod claimed_inflight_guard_tests {
             "shard".to_string(),
             None,
             ShardRange::full(),
-            crate::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
-            std::time::Duration::from_millis(
-                crate::settings::DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS,
-            ),
+            crate::task_broker::BrokerSettings {
+                tombstone_revive_after_generations:
+                    crate::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
+                full_rescan_interval: std::time::Duration::from_millis(
+                    crate::settings::DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS,
+                ),
+                keyed_read_min_lag_ms: crate::settings::DEFAULT_BROKER_KEYED_READ_MIN_LAG_MS,
+                keyed_read_max_keys: crate::settings::DEFAULT_BROKER_KEYED_READ_MAX_KEYS as usize,
+            },
         )
     }
 

@@ -1,8 +1,10 @@
 //! Tests for the broker scan floor: each scan starts at the start time below
 //! which every task row has already been dealt with, so the tombstones of
 //! dequeued tasks at the head of the range are not walked again. Every path
-//! that writes a task row lowers the floor to the row's start time, and a
-//! periodic full rescan bounds the cost of one that did not.
+//! that writes a task row tells the broker, which lowers the floor to a
+//! recent row's start time, and a periodic full rescan bounds the cost of a
+//! path that did not. Rows too old to lower the floor for are covered by
+//! `broker_keyed_read_tests`.
 
 mod test_helpers;
 
@@ -123,10 +125,13 @@ async fn dequeued_rows_move_the_scan_floor_past_them() {
 }
 
 /// A task enqueued with a start time below the floor is leased promptly:
-/// the enqueue lowers the floor to the row's start time.
+/// the enqueue lowers the floor to the row's start time. The shard is
+/// configured so that no row is old enough to be read by key instead.
 #[silo::test]
 async fn enqueue_below_the_floor_is_leased() {
-    let (_tmp, shard) = open_temp_shard().await;
+    let (_tmp, shard, _metrics) =
+        open_temp_shard_with_metrics_and_config(|cfg| cfg.broker_keyed_read_min_lag_ms = u64::MAX)
+            .await;
     enqueue_at(&shard, "head", now_ms(), vec![]).await;
     let (ids, _) = lease_within(&shard, "default", Duration::from_secs(5)).await;
     assert_eq!(ids.len(), 1);
@@ -198,7 +203,7 @@ async fn retry_after_a_failed_attempt_is_leased() {
 
 /// A chain the grant scanner resumes keeps the job's original start time,
 /// which sorts below the floor by the time the slot frees up. The grant
-/// lowers the floor, so the resumed attempt is leased promptly.
+/// tells the broker about the row, so the resumed attempt is leased promptly.
 #[silo::test]
 async fn grant_scanner_resume_below_the_floor_is_leased() {
     let (_tmp, shard) = open_temp_shard().await;

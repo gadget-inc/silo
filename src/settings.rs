@@ -317,12 +317,37 @@ fn default_broker_tombstone_revive_after_generations() -> u64 {
 
 /// Default for `broker_full_rescan_interval_ms`: how often a broker scan
 /// ignores its scan floor and reads the whole task group range. Every writer
-/// of a task row lowers the floor to the row's start time; the full rescan
-/// bounds how long a row a writer failed to note can go unnoticed.
+/// of a task row tells the broker the row's key; the full rescan bounds how
+/// long a row a writer failed to note can go unnoticed.
 pub const DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS: u64 = 60_000;
 
 fn default_broker_full_rescan_interval_ms() -> u64 {
     DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS
+}
+
+/// Default for `broker_keyed_read_min_lag_ms`: how far behind the current
+/// time a task row's start time has to be for the broker to read the row by
+/// its key instead of lowering its scan floor to it. A scan steps over every
+/// row and tombstone between its floor and the current time, so lowering the
+/// floor to an old row costs one scan that whole span; a point read costs the
+/// same whatever the row's age. Rows newer than this lower the floor, because
+/// one short range scan serves a burst of recent writes more cheaply than a
+/// point read per row. One second covers the writes that land while a scan
+/// is running without letting the floor follow a backlog.
+pub const DEFAULT_BROKER_KEYED_READ_MIN_LAG_MS: u64 = 1_000;
+
+fn default_broker_keyed_read_min_lag_ms() -> u64 {
+    DEFAULT_BROKER_KEYED_READ_MIN_LAG_MS
+}
+
+/// Default for `broker_keyed_read_max_keys`: how many task keys a broker
+/// holds for reading by key before a further old row lowers the scan floor
+/// instead. The same size as the broker's buffer, which is the most rows a
+/// broker can take in before it stops reading.
+pub const DEFAULT_BROKER_KEYED_READ_MAX_KEYS: u64 = 8_192;
+
+fn default_broker_keyed_read_max_keys() -> u64 {
+    DEFAULT_BROKER_KEYED_READ_MAX_KEYS
 }
 
 /// Default for `lease_reaper_full_scan_interval_ms`: how often the lease
@@ -501,6 +526,20 @@ pub struct DatabaseTemplate {
     /// without telling the broker can wait. Defaults to 60000.
     #[serde(default = "default_broker_full_rescan_interval_ms")]
     pub broker_full_rescan_interval_ms: u64,
+    /// How far (ms) behind the current time a task row's start time has to
+    /// be for the broker to read the row by its key instead of lowering its
+    /// scan floor to the row. A job granted a concurrency slot after waiting
+    /// keeps its original start time, so its task row can be hours old when
+    /// it is written; reading it by key keeps the scan's range, and so its
+    /// cost, to recent writes. `u64::MAX` makes every row lower the floor.
+    /// Defaults to 1000.
+    #[serde(default = "default_broker_keyed_read_min_lag_ms")]
+    pub broker_keyed_read_min_lag_ms: u64,
+    /// How many task keys a broker holds for reading by key. When that many
+    /// are waiting, a further old row lowers the scan floor instead, which
+    /// `silo_broker_keyed_read_overflows_total` counts. Defaults to 8192.
+    #[serde(default = "default_broker_keyed_read_max_keys")]
+    pub broker_keyed_read_max_keys: u64,
     /// How often (ms) the lease reaper scans the shard's whole lease range.
     /// Between those scans it reads only the leases its in-memory index
     /// reports due, so the scan bounds how long an expired lease missing from
@@ -621,6 +660,8 @@ impl Default for DatabaseTemplate {
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
             broker_full_rescan_interval_ms: default_broker_full_rescan_interval_ms(),
+            broker_keyed_read_min_lag_ms: default_broker_keyed_read_min_lag_ms(),
+            broker_keyed_read_max_keys: default_broker_keyed_read_max_keys(),
             lease_reaper_full_scan_interval_ms: default_lease_reaper_full_scan_interval_ms(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
@@ -1098,6 +1139,17 @@ pub struct DatabaseConfig {
     /// Defaults to 60000.
     #[serde(default = "default_broker_full_rescan_interval_ms")]
     pub broker_full_rescan_interval_ms: u64,
+    /// How far (ms) behind the current time a task row's start time has to
+    /// be for the broker to read the row by its key. See
+    /// `DatabaseTemplate::broker_keyed_read_min_lag_ms` for details.
+    /// Defaults to 1000.
+    #[serde(default = "default_broker_keyed_read_min_lag_ms")]
+    pub broker_keyed_read_min_lag_ms: u64,
+    /// How many task keys a broker holds for reading by key. See
+    /// `DatabaseTemplate::broker_keyed_read_max_keys` for details. Defaults
+    /// to 8192.
+    #[serde(default = "default_broker_keyed_read_max_keys")]
+    pub broker_keyed_read_max_keys: u64,
     /// How often (ms) the lease reaper scans the shard's whole lease range.
     /// See `DatabaseTemplate::lease_reaper_full_scan_interval_ms` for
     /// details. Defaults to 60000.
@@ -1167,6 +1219,8 @@ impl Default for DatabaseConfig {
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
             broker_full_rescan_interval_ms: default_broker_full_rescan_interval_ms(),
+            broker_keyed_read_min_lag_ms: default_broker_keyed_read_min_lag_ms(),
+            broker_keyed_read_max_keys: default_broker_keyed_read_max_keys(),
             lease_reaper_full_scan_interval_ms: default_lease_reaper_full_scan_interval_ms(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
@@ -1460,6 +1514,8 @@ mod tests {
         assert_eq!(template.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(template.broker_tombstone_revive_after_generations, 64);
         assert_eq!(template.broker_full_rescan_interval_ms, 60_000);
+        assert_eq!(template.broker_keyed_read_min_lag_ms, 1_000);
+        assert_eq!(template.broker_keyed_read_max_keys, 8_192);
         assert_eq!(template.lease_reaper_full_scan_interval_ms, 60_000);
 
         let config: DatabaseConfig = toml::from_str(
@@ -1474,6 +1530,8 @@ mod tests {
         assert_eq!(config.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(config.broker_tombstone_revive_after_generations, 64);
         assert_eq!(config.broker_full_rescan_interval_ms, 60_000);
+        assert_eq!(config.broker_keyed_read_min_lag_ms, 1_000);
+        assert_eq!(config.broker_keyed_read_max_keys, 8_192);
         assert_eq!(config.lease_reaper_full_scan_interval_ms, 60_000);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str;
 use std::sync::{
     Arc, Mutex,
@@ -68,6 +68,88 @@ struct OfferedRow {
     revived: bool,
 }
 
+/// What became of a point read of a noted task key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyedRead {
+    /// The row was read and offered to the buffer.
+    Row(RowOutcome),
+    /// No row, and the write that noted the key is durable: the row has
+    /// been dequeued, cancelled or rewritten since.
+    Missing,
+    /// No row, and the write that noted the key is not yet durable.
+    Pending,
+    /// The read failed.
+    Error,
+}
+
+/// Counts of [`KeyedRead`]s by the outcome label they are exported under.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyedReadCounts {
+    pub inserted: u64,
+    pub already_buffered: u64,
+    pub in_flight: u64,
+    pub tombstone: u64,
+    pub defunct: u64,
+    pub missing: u64,
+    pub pending: u64,
+    pub error: u64,
+}
+
+impl KeyedReadCounts {
+    fn record(&mut self, read: KeyedRead) {
+        let count = match read {
+            KeyedRead::Row(RowOutcome::Inserted) => &mut self.inserted,
+            KeyedRead::Row(RowOutcome::AlreadyBuffered) => &mut self.already_buffered,
+            KeyedRead::Row(RowOutcome::InFlight) => &mut self.in_flight,
+            KeyedRead::Row(RowOutcome::Tombstone) => &mut self.tombstone,
+            KeyedRead::Row(RowOutcome::Defunct) => &mut self.defunct,
+            KeyedRead::Row(RowOutcome::Malformed) => return,
+            KeyedRead::Missing => &mut self.missing,
+            KeyedRead::Pending => &mut self.pending,
+            KeyedRead::Error => &mut self.error,
+        };
+        *count += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Settings shared by every task group's broker on a shard.
+#[derive(Debug, Clone, Copy)]
+pub struct BrokerSettings {
+    /// Scan generations a tombstone may keep suppressing a re-observed key
+    /// before the scanner point-reads the row to check the delete landed.
+    pub tombstone_revive_after_generations: u64,
+    /// How often a scan ignores the floor and reads the whole range.
+    pub full_rescan_interval: Duration,
+    /// How far behind the current time a task row's start time has to be
+    /// for the row to be read by its key instead of lowering the scan floor.
+    /// `u64::MAX` makes every row lower the floor.
+    pub keyed_read_min_lag_ms: u64,
+    /// How many task keys a broker holds for reading by key. With that many
+    /// waiting, a further old row lowers the floor instead.
+    pub keyed_read_max_keys: usize,
+}
+
+#[cfg(test)]
+impl BrokerSettings {
+    /// Settings under which every noted row lowers the scan floor and none
+    /// is read by key, for tests of the floor itself.
+    fn lowering_the_floor(
+        tombstone_revive_after_generations: u64,
+        full_rescan_interval: Duration,
+    ) -> Self {
+        Self {
+            tombstone_revive_after_generations,
+            full_rescan_interval,
+            keyed_read_min_lag_ms: u64::MAX,
+            keyed_read_max_keys: 0,
+        }
+    }
+}
+
 /// A single per-task-group broker that scans only its own key range.
 ///
 /// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key bytes.
@@ -80,8 +162,13 @@ struct OfferedRow {
 /// - Starts each scan at the scan floor: the start time below which every
 ///   row has already been dealt with, so the SlateDB tombstones of dequeued
 ///   and cancelled tasks at the head of the range are not walked again.
-///   Every writer of a task row lowers the floor to the row's start time, and
-///   a periodic full-range scan bounds the cost of a writer that did not.
+/// - Every writer of a task row tells the broker the row's key. A row with a
+///   recent start time lowers the floor to it. A row with an old start time
+///   (a job granted a concurrency slot after waiting keeps its original one)
+///   is read by its key at the next scan and leaves the floor alone, so a
+///   scan's range covers recent writes whatever the age of the rows being
+///   written. A periodic full-range scan bounds the cost of a writer that
+///   told the broker nothing.
 pub struct TaskBroker {
     // The task group this broker is responsible for
     task_group: String,
@@ -97,6 +184,12 @@ pub struct TaskBroker {
     // Scan generations a tombstone may keep suppressing a re-observed key
     // before the scanner point-reads the row to check the delete landed.
     tombstone_revive_after_generations: u64,
+    // How far behind the current time a row's start time has to be for the
+    // row to be read by its key instead of lowering the floor.
+    keyed_read_min_lag_ms: u64,
+    // How many keys wait to be read by key before a further one lowers the
+    // floor instead.
+    keyed_read_max_keys: usize,
     // Monotonic generation numbers for scanner iterations.
     scan_generation_started: Arc<AtomicU64>,
     scan_generation_completed: Arc<AtomicU64>,
@@ -110,8 +203,8 @@ pub struct TaskBroker {
     // begins, so a write that lands mid-scan forces one more pass.
     dirty: AtomicBool,
     // Where and when the next scan reads. One lock covers the floor, the
-    // next-ready time and the note generation so a note and a scan's result
-    // never interleave.
+    // next-ready time, the note generation and the keys noted for reading by
+    // key, so a note and a scan's result never interleave.
     cursor: Mutex<ScanCursor>,
     // How often a scan ignores the floor and reads the whole range.
     full_rescan_interval: Duration,
@@ -132,15 +225,13 @@ impl TaskBroker {
     // refresh `last_seen` whenever a stale key is observed again.
     const ACK_TOMBSTONE_RETAIN_GENERATIONS: u64 = 64;
 
-    #[allow(clippy::too_many_arguments)]
     fn new(
         task_group: String,
         db: Arc<InstrumentedDb>,
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
-        tombstone_revive_after_generations: u64,
-        full_rescan_interval: Duration,
+        settings: BrokerSettings,
     ) -> Arc<Self> {
         // scan_batch must be >= target_buffer / 2 (the low watermark) so that
         // a single scan pass can refill from low-watermark to target. With a
@@ -148,15 +239,7 @@ impl TaskBroker {
         // re-reads every already-buffered entry from the start of the key
         // range, wasting O(buffer_size) reads/pass.
         Self::new_with_limits(
-            task_group,
-            db,
-            shard_name,
-            metrics,
-            range,
-            tombstone_revive_after_generations,
-            full_rescan_interval,
-            8192,
-            4096,
+            task_group, db, shard_name, metrics, range, settings, 8192, 4096,
         )
     }
 
@@ -167,8 +250,7 @@ impl TaskBroker {
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
-        tombstone_revive_after_generations: u64,
-        full_rescan_interval: Duration,
+        settings: BrokerSettings,
         target_buffer: usize,
         scan_batch: usize,
     ) -> Arc<Self> {
@@ -185,13 +267,15 @@ impl TaskBroker {
             scan_requested: Arc::new(AtomicBool::new(false)),
             dirty: AtomicBool::new(false),
             cursor: Mutex::new(ScanCursor::new()),
-            full_rescan_interval,
+            full_rescan_interval: settings.full_rescan_interval,
             target_buffer,
             scan_batch,
             shard_name,
             metrics,
             range,
-            tombstone_revive_after_generations,
+            tombstone_revive_after_generations: settings.tombstone_revive_after_generations,
+            keyed_read_min_lag_ms: settings.keyed_read_min_lag_ms,
+            keyed_read_max_keys: settings.keyed_read_max_keys,
         })
     }
 
@@ -218,9 +302,10 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     ///
-    /// Reads from the scan floor unless a full rescan is due, and records in
-    /// the cursor why the scan stopped (which gates the nudges that empty
-    /// polls send, see `nudge`) and the new floor.
+    /// Reads the rows noted for reading by key, then the range from the scan
+    /// floor (the whole range when a full rescan is due), and records in the
+    /// cursor why the scan stopped (which gates the nudges that empty polls
+    /// send, see `nudge`) and the new floor.
     async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
         // Clear `dirty` and read the cursor before the iterator is created: a
         // write or note that lands after this point may describe a row the
@@ -230,6 +315,7 @@ impl TaskBroker {
         let ScanStart {
             floor_ms,
             notes_before,
+            keys_noted_before,
             full_rescan,
             cleared_floor_ms,
         } = self.begin_scan_cursor();
@@ -238,6 +324,18 @@ impl TaskBroker {
             m.set_broker_scan_floor_lag_ms(&self.shard_name, &self.task_group, lag_ms as u64);
         }
 
+        // Rows noted for reading by key sort below the floor, where the range
+        // scan does not look. A scan of the whole range reads them anyway.
+        let keyed = if floor_ms.is_some() {
+            self.read_noted_keys(generation).await
+        } else {
+            KeyedReads::default()
+        };
+
+        // Collect keys to delete for defunct tasks (outside shard range)
+        let mut defunct_keys: Vec<Vec<u8>> =
+            keyed.defunct.iter().map(|(key, _)| key.clone()).collect();
+
         // [SILO-SCAN-1] Scan only this task group's key range, from the floor
         let prefix = task_group_prefix(&self.task_group);
         let end = end_bound(&prefix);
@@ -245,27 +343,25 @@ impl TaskBroker {
             Some(floor_ms) => task_group_time_prefix(&self.task_group, floor_ms),
             None => prefix,
         };
-
-        let Ok(mut iter) = self
+        // A range that fails to open is a scan that read nothing and stopped
+        // with ready rows possibly remaining.
+        let mut iter = self
             .db
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await
-        else {
-            self.record_scan_stop(ScanStop::MoreReady, 0, notes_before, floor_ms);
-            return 0;
-        };
+            .ok();
 
-        // Collect keys to delete for defunct tasks (outside shard range)
-        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
-
-        let mut inserted = 0;
+        // Rows buffered by this scan from either source: what the batch
+        // limit counts.
+        let mut inserted = keyed.counts.inserted as usize;
+        let mut range_inserted = 0u64;
         let mut total_read = 0u64;
         let mut skipped_future = 0u64;
         let mut skipped_inflight = 0u64;
         let mut skipped_tombstone = 0u64;
         let mut skipped_already_buffered = 0u64;
         let mut skipped_defunct = 0u64;
-        let mut revived = 0u64;
+        let mut revived = keyed.revived;
         // Rows a full rescan buffered from below the floor it cleared: rows
         // a floor-bounded scan would not have read, so a writer did not tell
         // the broker about them.
@@ -277,6 +373,9 @@ impl TaskBroker {
         // limit was hit with ready rows possibly remaining.
         let mut stop = ScanStop::MoreReady;
         while inserted < self.scan_batch && self.buffer.len() < self.target_buffer {
+            let Some(iter) = iter.as_mut() else {
+                break;
+            };
             let kv = match iter.next().await {
                 Ok(Some(kv)) => kv,
                 Ok(None) => {
@@ -316,8 +415,12 @@ impl TaskBroker {
             match offered.outcome {
                 RowOutcome::Inserted => {
                     inserted += 1;
+                    range_inserted += 1;
+                    // A row whose key a writer noted for reading by key was
+                    // told to the broker, wherever it sorts.
                     if cleared_floor_ms
                         .is_some_and(|cleared_ms| (parsed_key.start_time_ms as i64) < cleared_ms)
+                        && !self.cursor.lock().unwrap().noted.contains(&kv.key)
                     {
                         inserted_below_floor += 1;
                     }
@@ -339,7 +442,8 @@ impl TaskBroker {
         }
 
         // Delete defunct tasks from the database. Until they are gone they
-        // still have to be read, so a failed delete leaves the floor alone.
+        // still have to be read, so a failed delete leaves the floor alone
+        // and keeps the keys that were noted for reading by key.
         let mut defunct_deleted = true;
         if !defunct_keys.is_empty() {
             let mut batch = WriteBatch::new();
@@ -361,22 +465,38 @@ impl TaskBroker {
         // the first future-dated row) proves no row at or before `now_ms` is
         // left, so the floor moves to `now_ms` even when nothing was read;
         // stopping early moves it only as far as the rows actually read.
+        let read_to_the_end = matches!(stop, ScanStop::EndOfRange | ScanStop::Future { .. });
         let new_floor_ms = if !defunct_deleted {
             floor_ms
+        } else if read_to_the_end {
+            Some(now_ms)
         } else {
-            match stop {
-                ScanStop::EndOfRange | ScanStop::Future { .. } => Some(now_ms),
-                ScanStop::MoreReady => consumed_through_ms.or(floor_ms),
+            consumed_through_ms.or(floor_ms)
+        };
+        let noted_keys = {
+            let mut cursor = self.cursor.lock().unwrap();
+            if defunct_deleted {
+                for (key, noted_at) in &keyed.defunct {
+                    cursor.noted.remove_unchanged(key, *noted_at);
+                }
             }
+            // A scan of the whole range that read to its end read the row
+            // of every key noted before it began, and found no row for a
+            // key whose write never happened. A key noted since may
+            // describe a row the scan's view does not include.
+            if floor_ms.is_none() && read_to_the_end {
+                cursor.noted.remove_noted_through(keys_noted_before);
+            }
+            cursor.noted.len()
         };
         self.record_scan_stop(stop, skipped_tombstone, notes_before, new_floor_ms);
 
         if let Some(ref m) = self.metrics {
-            if total_read > 0 {
+            if total_read > 0 || revived > 0 {
                 m.record_broker_scan_tasks(
                     &self.shard_name,
                     &self.task_group,
-                    inserted as u64,
+                    range_inserted,
                     skipped_future,
                     skipped_inflight,
                     skipped_tombstone,
@@ -390,6 +510,10 @@ impl TaskBroker {
                     self.ack_tombstones.lock().unwrap().len() as u64,
                 );
             }
+            if !keyed.counts.is_empty() {
+                m.record_broker_keyed_reads(&self.shard_name, &self.task_group, &keyed.counts);
+            }
+            m.set_broker_noted_keys(&self.shard_name, &self.task_group, noted_keys as u64);
             if full_rescan {
                 m.record_broker_full_rescan(
                     &self.shard_name,
@@ -400,6 +524,91 @@ impl TaskBroker {
         }
 
         inserted
+    }
+
+    /// Read the row of each key noted for reading by key and offer it to the
+    /// buffer, in key order, until the scan's batch or the buffer is full.
+    async fn read_noted_keys(&self, generation: u64) -> KeyedReads {
+        let mut reads = KeyedReads::default();
+        if self.buffer.len() >= self.target_buffer {
+            return reads;
+        }
+        let noted = self.cursor.lock().unwrap().noted.readable(self.scan_batch);
+        for (key, noted) in noted {
+            if reads.counts.inserted as usize >= self.scan_batch
+                || self.buffer.len() >= self.target_buffer
+            {
+                break;
+            }
+            let read = self.db.get(&key).await;
+            let outcome = self
+                .settle_keyed_read(&key, noted, read, generation, &mut reads)
+                .await;
+            reads.counts.record(outcome);
+
+            // Yield periodically to avoid starving other tasks
+            if outcome == KeyedRead::Row(RowOutcome::Inserted) && reads.counts.inserted % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        reads
+    }
+
+    /// Act on the result of the point read of a noted key.
+    ///
+    /// `noted` is the key's entry as it stood before the read was issued,
+    /// and the entry is dropped or marked only while it is unchanged. A
+    /// note that lands while the read is in flight describes a row the read
+    /// may not have seen: a write reported durable after a read that found
+    /// no row, or a key released from in-flight after a read that found it
+    /// in flight. Such a key stays for the next scan.
+    async fn settle_keyed_read(
+        &self,
+        key: &[u8],
+        noted: NotedKey,
+        read: Result<Option<slatedb::bytes::Bytes>, slatedb::Error>,
+        generation: u64,
+        reads: &mut KeyedReads,
+    ) -> KeyedRead {
+        match read {
+            Ok(Some(value)) => {
+                let offered = self.offer_row(key.to_vec(), value, generation).await;
+                if offered.revived {
+                    reads.revived += 1;
+                }
+                if offered.outcome == RowOutcome::Defunct {
+                    // Dropped once the row's delete has landed.
+                    reads.defunct.push((key.to_vec(), noted.noted_at));
+                } else {
+                    self.cursor
+                        .lock()
+                        .unwrap()
+                        .noted
+                        .remove_unchanged(key, noted.noted_at);
+                }
+                KeyedRead::Row(offered.outcome)
+            }
+            Ok(None) if noted.durable => {
+                self.cursor
+                    .lock()
+                    .unwrap()
+                    .noted
+                    .remove_unchanged(key, noted.noted_at);
+                KeyedRead::Missing
+            }
+            Ok(None) => {
+                self.cursor
+                    .lock()
+                    .unwrap()
+                    .noted
+                    .mark_probed_unchanged(key, noted.noted_at);
+                KeyedRead::Pending
+            }
+            Err(e) => {
+                debug!(error = %e, "point read of a noted task key failed; keeping the key");
+                KeyedRead::Error
+            }
+        }
     }
 
     /// Decide what becomes of a task row that was just read from the
@@ -509,6 +718,7 @@ impl TaskBroker {
         ScanStart {
             floor_ms: cursor.floor_ms,
             notes_before: cursor.note_generation,
+            keys_noted_before: cursor.noted.notes,
             full_rescan,
             cleared_floor_ms,
         }
@@ -734,12 +944,13 @@ impl TaskBroker {
             }
         }
         // The rows may still be durable and were skipped as in-flight by any
-        // scan that ran meanwhile, which may have moved the floor past them,
-        // so the next nudge must scan again from no later than their start
-        // times.
+        // read that happened meanwhile: a scan that moved the floor past
+        // them, or a point read that dropped their noted keys. Note each as
+        // a durable row, so the next nudge reads it again.
+        let now_ms = crate::job_store_shard::now_epoch_ms();
         for k in keys {
             if let Some(parsed) = parse_task_key(k) {
-                self.note_task_written(parsed.start_time_ms as i64);
+                self.note_task_key(k, parsed.start_time_ms as i64, now_ms, true);
             }
         }
         self.dirty.store(true, Ordering::SeqCst);
@@ -802,6 +1013,57 @@ impl TaskBroker {
         self.cursor.lock().unwrap().note_task_written(start_time_ms);
     }
 
+    /// Record that the task row at `key`, whose start time is no later than
+    /// `now_ms`, exists (`durable`) or is about to be written, without
+    /// waking the scanner.
+    ///
+    /// A row whose start time is more than the keyed-read lag behind
+    /// `now_ms` is read by its key at the next scan, and the floor stays
+    /// where it is: lowering it would make one scan step over every row and
+    /// tombstone from that start time to now. The row's age decides, not its
+    /// distance below the floor, so an old row never holds the floor back,
+    /// whether the floor is at the current time, is itself old, or is absent
+    /// while a scan of the whole range runs. A recent row lowers the floor,
+    /// because one short range scan serves a burst of recent writes more
+    /// cheaply than a point read per row. So does an old row when the keys
+    /// already waiting are at their limit.
+    fn note_task_key(&self, key: &[u8], start_time_ms: i64, now_ms: i64, durable: bool) {
+        if self.is_read_by_key(start_time_ms, now_ms) {
+            // A durable row that is buffered or in flight has been read from
+            // the database already. Releasing it from in-flight notes it
+            // again.
+            let already_read = durable
+                && (self.buffer.contains_key(key) || self.inflight.lock().unwrap().contains(key));
+            let outcome = self.cursor.lock().unwrap().noted.note(
+                key,
+                durable,
+                already_read,
+                self.keyed_read_max_keys,
+            );
+            match outcome {
+                NoteOutcome::Noted | NoteOutcome::AlreadyRead => return,
+                NoteOutcome::Full => {
+                    if let Some(ref m) = self.metrics {
+                        m.record_broker_keyed_read_overflow(&self.shard_name, &self.task_group);
+                    }
+                }
+            }
+        }
+        self.note_task_written(start_time_ms);
+    }
+
+    /// Whether a row with `start_time_ms` is old enough at `now_ms` to be
+    /// read by its key.
+    fn is_read_by_key(&self, start_time_ms: i64, now_ms: i64) -> bool {
+        u64::try_from(now_ms.saturating_sub(start_time_ms))
+            .is_ok_and(|age_ms| age_ms > self.keyed_read_min_lag_ms)
+    }
+
+    /// How many task keys are waiting to be read by key.
+    fn noted_key_count(&self) -> usize {
+        self.cursor.lock().unwrap().noted.len()
+    }
+
     /// Record that a future-dated task row with `start_time_ms` was written,
     /// without waking the scanner. Lowers the floor and the recorded
     /// next-ready time so a nudge or the scanner's own timer fires when the
@@ -849,6 +1111,12 @@ impl TaskBroker {
         } else {
             cursor.at_ms = cursor.at_ms.min(next_ready_at_ms);
         }
+        // A key whose write is durable and whose row has not been read is a
+        // row a scan can buffer now: the scan ran out of room, the read
+        // failed, or the key was noted while the scan ran.
+        if cursor.noted.has_durable() {
+            cursor.at_ms = 0;
+        }
     }
 
     /// The start time the next scan reads from, or `None` when it reads the
@@ -878,9 +1146,155 @@ impl TaskBroker {
     }
 }
 
+/// A task key a writer reported whose row a scan reads by key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotedKey {
+    /// Whether the write that noted the key has been reported durable. Until
+    /// it has, a read that finds no row means the write has not landed, not
+    /// that the row is gone.
+    durable: bool,
+    /// Whether a read has found no row while the write was not yet durable.
+    /// Such a key is not read again until the write is reported durable, so
+    /// a write that never lands costs one read, not one per scan.
+    probed: bool,
+    /// The value of [`NotedKeys::notes`] when the key was last noted. A scan
+    /// acts on the result of a read only while this is what it was when the
+    /// read was issued.
+    noted_at: u64,
+}
+
+/// What noting a key for reading by key did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteOutcome {
+    /// The key is waiting to be read.
+    Noted,
+    /// The key was not waiting and its row has been read already.
+    AlreadyRead,
+    /// The key was not waiting and no more keys can wait.
+    Full,
+}
+
+/// The task keys waiting to be read by key. Ordered by key, which is start
+/// time order, so scans read them in the order they would claim them and
+/// iteration is deterministic.
+#[derive(Debug, Default)]
+struct NotedKeys {
+    keys: BTreeMap<Vec<u8>, NotedKey>,
+    /// Bumped by every note of a key.
+    notes: u64,
+    /// How many of the keys are durable.
+    durable: usize,
+}
+
+impl NotedKeys {
+    /// Note `key`. A key already waiting stays, becoming durable if this
+    /// note is; a new key is added unless its row has been read already or
+    /// `max_keys` are waiting.
+    fn note(
+        &mut self,
+        key: &[u8],
+        durable: bool,
+        already_read: bool,
+        max_keys: usize,
+    ) -> NoteOutcome {
+        self.notes += 1;
+        if let Some(noted) = self.keys.get_mut(key) {
+            if durable && !noted.durable {
+                noted.durable = true;
+                self.durable += 1;
+            }
+            noted.noted_at = self.notes;
+            return NoteOutcome::Noted;
+        }
+        if already_read {
+            return NoteOutcome::AlreadyRead;
+        }
+        if self.keys.len() >= max_keys {
+            return NoteOutcome::Full;
+        }
+        self.keys.insert(
+            key.to_vec(),
+            NotedKey {
+                durable,
+                probed: false,
+                noted_at: self.notes,
+            },
+        );
+        if durable {
+            self.durable += 1;
+        }
+        NoteOutcome::Noted
+    }
+
+    /// Up to `limit` keys worth reading now, in key order, each with its
+    /// entry as it stands: every durable key, and every key not yet durable
+    /// that has not been read since it was noted.
+    fn readable(&self, limit: usize) -> Vec<(Vec<u8>, NotedKey)> {
+        self.keys
+            .iter()
+            .filter(|(_, noted)| noted.durable || !noted.probed)
+            .take(limit)
+            .map(|(key, noted)| (key.clone(), *noted))
+            .collect()
+    }
+
+    /// Drop `key` if it has not been noted again since `noted_at`.
+    fn remove_unchanged(&mut self, key: &[u8], noted_at: u64) {
+        if self
+            .keys
+            .get(key)
+            .is_some_and(|noted| noted.noted_at == noted_at)
+            && let Some(noted) = self.keys.remove(key)
+            && noted.durable
+        {
+            self.durable -= 1;
+        }
+    }
+
+    /// Record that a read of `key` found no row, if the key has not been
+    /// noted again since `noted_at`.
+    fn mark_probed_unchanged(&mut self, key: &[u8], noted_at: u64) {
+        if let Some(noted) = self.keys.get_mut(key)
+            && noted.noted_at == noted_at
+        {
+            noted.probed = true;
+        }
+    }
+
+    /// Drop every key last noted at or before `notes`.
+    fn remove_noted_through(&mut self, notes: u64) {
+        self.keys.retain(|_, noted| noted.noted_at > notes);
+        self.durable = self.keys.values().filter(|noted| noted.durable).count();
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        self.keys.contains_key(key)
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn has_durable(&self) -> bool {
+        self.durable > 0
+    }
+}
+
+/// What reading the noted keys did, for the scan that read them to finish.
+#[derive(Debug, Default)]
+struct KeyedReads {
+    counts: KeyedReadCounts,
+    /// Rows whose ack tombstone was dropped because the row is still there.
+    revived: u64,
+    /// Keys whose rows belong to a tenant outside the shard's range, each
+    /// with the note it was read under. The scan deletes the rows and then
+    /// drops the keys.
+    defunct: Vec<(Vec<u8>, u64)>,
+}
+
 /// Where and when the next scan reads. A new cursor (`at_ms` of 0, no floor)
 /// knows nothing about the range, so the first nudge scans all of it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct ScanCursor {
     /// When a scan could next find a task to buffer. See
     /// [`TaskBroker::next_ready_at_ms`].
@@ -903,6 +1317,11 @@ struct ScanCursor {
     pending_floor_ms: Option<i64>,
     /// When the floor was last cleared for a full-range scan.
     last_full_scan: Instant,
+    /// The keys of rows too old to lower the floor for, which the next scan
+    /// reads by key. Noting one leaves `note_generation` and
+    /// `pending_floor_ms` alone: the key itself is what a scan that
+    /// overlapped the note leaves behind.
+    noted: NotedKeys,
 }
 
 /// What a scan starts from, taken from the cursor as its iterator is created.
@@ -912,6 +1331,9 @@ struct ScanStart {
     /// The note generation to compare against when the scan records its
     /// result.
     notes_before: u64,
+    /// [`NotedKeys::notes`] as the scan began: a key noted later may
+    /// describe a row the scan's view does not include.
+    keys_noted_before: u64,
     /// Whether this scan is a periodic full rescan.
     full_rescan: bool,
     /// The floor a full rescan cleared, if one was set: a row it buffers
@@ -927,6 +1349,7 @@ impl ScanCursor {
             floor_ms: None,
             pending_floor_ms: None,
             last_full_scan: Instant::now(),
+            noted: NotedKeys::default(),
         }
     }
 
@@ -967,8 +1390,7 @@ pub struct TaskBrokerRegistry {
     shard_name: String,
     metrics: Option<Metrics>,
     range: ShardRange,
-    tombstone_revive_after_generations: u64,
-    full_rescan_interval: Duration,
+    settings: BrokerSettings,
     brokers: DashMap<String, Arc<TaskBroker>>,
 }
 
@@ -978,16 +1400,14 @@ impl TaskBrokerRegistry {
         shard_name: String,
         metrics: Option<Metrics>,
         range: ShardRange,
-        tombstone_revive_after_generations: u64,
-        full_rescan_interval: Duration,
+        settings: BrokerSettings,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             shard_name,
             metrics,
             range,
-            tombstone_revive_after_generations,
-            full_rescan_interval,
+            settings,
             brokers: DashMap::new(),
         })
     }
@@ -1009,8 +1429,7 @@ impl TaskBrokerRegistry {
                     self.shard_name.clone(),
                     self.metrics.clone(),
                     self.range.clone(),
-                    self.tombstone_revive_after_generations,
-                    self.full_rescan_interval,
+                    self.settings,
                 );
                 b.start();
                 b
@@ -1036,10 +1455,11 @@ impl TaskBrokerRegistry {
         self.get_or_create(task_group).wakeup();
     }
 
-    /// Record the committed task row at `task_key`: lower the scan floor of
-    /// its task group's broker to the row's start time, then wake the scanner
-    /// when the row is due now or lower the broker's recorded next-ready time
-    /// so the row is scanned for once it becomes due.
+    /// Record the committed task row at `task_key` with its task group's
+    /// broker. A row due now is noted for the next scan (read by its key when
+    /// its start time is old, by lowering the scan floor when it is recent)
+    /// and the scanner is woken; a future-dated row lowers the broker's
+    /// recorded next-ready time so it is scanned for once it becomes due.
     ///
     /// Call after the write is durable, from every path that writes a task
     /// row. A broker created later starts with nothing known about its range
@@ -1050,9 +1470,10 @@ impl TaskBrokerRegistry {
             return;
         };
         let start_time_ms = parsed.start_time_ms as i64;
-        if start_time_ms <= crate::job_store_shard::now_epoch_ms() {
+        let now_ms = crate::job_store_shard::now_epoch_ms();
+        if start_time_ms <= now_ms {
             let broker = self.get_or_create(&parsed.task_group);
-            broker.note_task_written(start_time_ms);
+            broker.note_task_key(task_key, start_time_ms, now_ms, true);
             broker.wakeup();
         } else if let Some(broker) = self.brokers.get(&parsed.task_group) {
             broker.note_scheduled(start_time_ms);
@@ -1066,20 +1487,28 @@ impl TaskBrokerRegistry {
         }
     }
 
-    /// Record that the task row at `task_key` is about to be written: lower
-    /// the scan floor of its task group's broker to the row's start time, so
-    /// a scan that sees the row while its write awaits durability buffers it
-    /// instead of starting above it.
+    /// Record that the task row at `task_key` is about to be written, so a
+    /// scan that sees the row while its write awaits durability buffers it:
+    /// its key is noted for reading when its start time is old, and the scan
+    /// floor of its task group's broker is lowered to it otherwise.
     ///
     /// Call before the write is issued; [`Self::notify_task_written`] still
-    /// follows once the write is durable. A write that fails leaves the floor
-    /// lowered, which costs one scan a few extra reads. A broker that does
-    /// not exist yet has no floor to lower.
+    /// follows once the write is durable. A write that fails leaves a
+    /// lowered floor, which costs one scan a few extra reads, or a noted key,
+    /// which costs one point read and is dropped by the next scan of the
+    /// whole range. A broker that does not exist yet scans its whole range
+    /// first and needs neither.
     pub fn expect_task_written(&self, task_key: &[u8]) {
         if let Some(parsed) = parse_task_key(task_key)
             && let Some(broker) = self.brokers.get(&parsed.task_group)
         {
-            broker.note_task_written(parsed.start_time_ms as i64);
+            let start_time_ms = parsed.start_time_ms as i64;
+            let now_ms = crate::job_store_shard::now_epoch_ms();
+            if start_time_ms <= now_ms {
+                broker.note_task_key(task_key, start_time_ms, now_ms, false);
+            } else {
+                broker.note_task_written(start_time_ms);
+            }
         }
     }
 
@@ -1096,6 +1525,14 @@ impl TaskBrokerRegistry {
         self.brokers
             .get(task_group)
             .map(|e| e.value().scan_floor_ms())
+    }
+
+    /// How many task keys a task group's broker holds for reading by key,
+    /// if the broker exists.
+    pub fn group_noted_key_count(&self, task_group: &str) -> Option<usize> {
+        self.brokers
+            .get(task_group)
+            .map(|e| e.value().noted_key_count())
     }
 
     /// The next-ready time recorded by a task group's broker, if one exists:
@@ -1232,8 +1669,7 @@ mod inflight_release_tests {
             "shard".to_string(),
             None,
             ShardRange::full(),
-            bound,
-            Duration::ZERO,
+            BrokerSettings::lowering_the_floor(bound, Duration::ZERO),
         )
     }
 
@@ -1368,8 +1804,10 @@ mod scan_gating_tests {
             "shard".to_string(),
             None,
             ShardRange::full(),
-            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
-            Duration::from_secs(60),
+            BrokerSettings::lowering_the_floor(
+                TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+                Duration::from_secs(60),
+            ),
             8192,
             scan_batch,
         )
@@ -1595,8 +2033,10 @@ mod scan_gating_tests {
             "shard".to_string(),
             None,
             ShardRange::full(),
-            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
-            interval,
+            BrokerSettings::lowering_the_floor(
+                TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+                interval,
+            ),
         )
     }
 
@@ -1613,8 +2053,10 @@ mod scan_gating_tests {
             "shard".to_string(),
             Some(metrics),
             ShardRange::full(),
-            TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
-            Duration::from_secs(60),
+            BrokerSettings::lowering_the_floor(
+                TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+                Duration::from_secs(60),
+            ),
         )
     }
 
@@ -1855,5 +2297,641 @@ mod scan_gating_tests {
             0,
             "within the interval the floor is honoured"
         );
+    }
+}
+
+#[cfg(test)]
+mod keyed_read_tests {
+    use super::*;
+    use crate::codec::encode_task;
+    use crate::instrumented_db::InstrumentedDb;
+    use crate::job_store_shard::now_epoch_ms;
+    use crate::shard_range::ShardRange;
+    use crate::task::Task;
+
+    const HOUR_MS: i64 = 3_600_000;
+    const LAG_MS: u64 = 1_000;
+
+    struct Harness {
+        broker: Arc<TaskBroker>,
+        metrics: Metrics,
+    }
+
+    fn settings(keyed_read_min_lag_ms: u64) -> BrokerSettings {
+        BrokerSettings {
+            tombstone_revive_after_generations: TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS,
+            full_rescan_interval: Duration::from_secs(60),
+            keyed_read_min_lag_ms,
+            keyed_read_max_keys: 8192,
+        }
+    }
+
+    async fn harness_with(settings: BrokerSettings, scan_batch: usize) -> Harness {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = slatedb::DbBuilder::new("test", store)
+            .build()
+            .await
+            .expect("open in-memory db");
+        let db = InstrumentedDb::new(Arc::new(db), tracing::Span::none());
+        let metrics = crate::metrics::init().expect("init metrics");
+        let broker = TaskBroker::new_with_limits(
+            "tg".to_string(),
+            db,
+            "shard".to_string(),
+            Some(metrics.clone()),
+            ShardRange::full(),
+            settings,
+            8192,
+            scan_batch,
+        );
+        Harness { broker, metrics }
+    }
+
+    async fn harness() -> Harness {
+        harness_with(settings(LAG_MS), 4096).await
+    }
+
+    impl Harness {
+        /// The value of the series of `name` whose labels include every pair
+        /// in `labels`, or 0 when no such series has been recorded.
+        fn metric(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
+            self.metrics
+                .registry()
+                .gather()
+                .iter()
+                .filter(|family| family.get_name() == name)
+                .flat_map(|family| family.get_metric().iter())
+                .find(|metric| {
+                    labels.iter().all(|(label, value)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|l| l.get_name() == *label && l.get_value() == *value)
+                    })
+                })
+                .map_or(0.0, |metric| {
+                    if metric.has_gauge() {
+                        metric.get_gauge().get_value()
+                    } else {
+                        metric.get_counter().get_value()
+                    }
+                })
+        }
+
+        /// Point reads of noted keys that ended in `outcome`.
+        fn keyed_reads(&self, outcome: &str) -> f64 {
+            self.metric("silo_broker_keyed_reads_total", &[("outcome", outcome)])
+        }
+
+        /// Rows the range scans read that ended in `outcome`.
+        fn range_reads(&self, outcome: &str) -> f64 {
+            self.metric("silo_broker_scan_tasks_read_total", &[("outcome", outcome)])
+        }
+
+        async fn put(&self, job_id: &str, start_time_ms: i64) -> Vec<u8> {
+            let key = key_for(job_id, start_time_ms);
+            self.broker
+                .db
+                .put(&key, &encode_task(&run_attempt(job_id)))
+                .await
+                .expect("put row");
+            key
+        }
+
+        async fn scan(&self, now_ms: i64) -> usize {
+            let generation = self.broker.begin_scan_generation();
+            let inserted = self.broker.scan_tasks(now_ms, generation).await;
+            self.broker.complete_scan_generation(generation);
+            inserted
+        }
+
+        /// The keys a claim of everything in the buffer returns, in order.
+        fn claim_all(&self) -> Vec<Vec<u8>> {
+            self.broker
+                .claim_ready(self.broker.buffer_len())
+                .into_iter()
+                .map(|task| task.key)
+                .collect()
+        }
+    }
+
+    fn run_attempt(job_id: &str) -> Task {
+        Task::RunAttempt {
+            id: format!("task-{job_id}"),
+            tenant: "-".to_string(),
+            job_id: job_id.to_string(),
+            attempt_number: 1,
+            relative_attempt_number: 1,
+            held_queues: vec![],
+            task_group: "tg".to_string(),
+        }
+    }
+
+    fn key_for(job_id: &str, start_time_ms: i64) -> Vec<u8> {
+        crate::keys::task_key("tg", start_time_ms, 0, job_id, 1, start_time_ms)
+    }
+
+    /// A row noted far behind the current time is buffered by a point read,
+    /// and the floor stays where it was: the range scan reads nothing.
+    #[tokio::test]
+    async fn row_noted_far_behind_is_read_by_key_and_the_floor_stays() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.broker.noted_key_count(), 1);
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.keyed_reads("inserted"), 1.0);
+        assert_eq!(h.range_reads("inserted"), 0.0);
+        assert_eq!(
+            h.metric("silo_broker_scan_floor_lag_ms", &[("task_group", "tg")]),
+            0.0,
+            "the scan that buffered the row started at the current time"
+        );
+        assert_eq!(h.claim_all(), vec![key]);
+    }
+
+    /// What the scan that buffers one old row reads of 500 live rows that
+    /// are already buffered or in flight: the rows already buffered, and the
+    /// rows in flight.
+    async fn live_rows_read_for_one_old_row(keyed_read_min_lag_ms: u64) -> (f64, f64) {
+        let h = harness_with(settings(keyed_read_min_lag_ms), 4096).await;
+        let now_ms = now_epoch_ms();
+        let mut live = WriteBatch::new();
+        for i in 0..500 {
+            let job_id = format!("live-{i:03}");
+            live.put(
+                key_for(&job_id, now_ms - 10),
+                encode_task(&run_attempt(&job_id)),
+            );
+        }
+        h.broker.db.write(live).await.expect("write live rows");
+        assert_eq!(h.scan(now_ms).await, 500);
+        assert_eq!(h.broker.claim_ready(100).len(), 100);
+        assert_eq!(h.scan(now_ms).await, 0);
+        let buffered_before = h.range_reads("skipped_already_buffered");
+        let in_flight_before = h.range_reads("skipped_inflight");
+
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.scan(now_ms).await, 1, "the old row is buffered");
+        assert_eq!(h.broker.buffer_len(), 401);
+        (
+            h.range_reads("skipped_already_buffered") - buffered_before,
+            h.range_reads("skipped_inflight") - in_flight_before,
+        )
+    }
+
+    /// The cost of buffering one old row follows that row, not the rows
+    /// written since its start time: read by key, none of them is read.
+    #[tokio::test]
+    async fn scan_for_an_old_row_reads_none_of_the_live_rows() {
+        assert_eq!(live_rows_read_for_one_old_row(LAG_MS).await, (0.0, 0.0));
+    }
+
+    /// The same old row, noted by lowering the floor to it, makes its scan
+    /// read every live row again. This is the cost the keyed read removes.
+    #[tokio::test]
+    async fn scan_for_an_old_row_reads_every_live_row_when_it_lowers_the_floor() {
+        assert_eq!(
+            live_rows_read_for_one_old_row(u64::MAX).await,
+            (400.0, 100.0)
+        );
+    }
+
+    /// A row noted within the lag lowers the floor and is read by the range
+    /// scan, with no point read.
+    #[tokio::test]
+    async fn row_noted_within_the_lag_lowers_the_floor() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let recent_ms = now_ms - LAG_MS as i64;
+        let key = h.put("recent", recent_ms).await;
+        h.broker.note_task_key(&key, recent_ms, now_ms, true);
+        assert_eq!(h.broker.scan_floor_ms(), Some(recent_ms));
+        assert_eq!(h.broker.noted_key_count(), 0);
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.range_reads("inserted"), 1.0);
+        assert_eq!(h.keyed_reads("inserted"), 0.0);
+    }
+
+    /// A key noted before its write is issued, whose row is not yet visible,
+    /// is read once and then waits: later scans do not read it, and it does
+    /// not keep nudges scanning. Once the write is reported durable the row
+    /// is buffered.
+    #[tokio::test]
+    async fn expected_key_waits_for_its_write_to_be_reported() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = key_for("waited", now_ms - HOUR_MS);
+        h.broker
+            .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
+        for _ in 0..3 {
+            assert_eq!(h.scan(now_ms).await, 0);
+        }
+        assert_eq!(h.keyed_reads("pending"), 1.0, "read once while not durable");
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert!(
+            !h.broker.nudge(now_ms),
+            "a key not yet durable arms no nudge"
+        );
+
+        h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.claim_all(), vec![key]);
+    }
+
+    /// A row visible while its write awaits durability is buffered by the
+    /// first scan, and the durable note that follows adds no key to read
+    /// again.
+    #[tokio::test]
+    async fn row_visible_before_it_is_durable_is_buffered_and_read_once() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = key_for("waited", now_ms - HOUR_MS);
+        h.broker
+            .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
+        h.put("waited", now_ms - HOUR_MS).await;
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.broker.noted_key_count(), 0);
+
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.broker.noted_key_count(), 0, "the row is already buffered");
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.keyed_reads("inserted"), 1.0);
+        assert_eq!(h.keyed_reads("already_buffered"), 0.0);
+    }
+
+    /// A durable noted key whose row is gone is dropped after one point
+    /// read, and later scans do not read it again.
+    #[tokio::test]
+    async fn durable_key_whose_row_is_gone_is_dropped_after_one_read() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = key_for("gone", now_ms - HOUR_MS);
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        for _ in 0..3 {
+            assert_eq!(h.scan(now_ms).await, 0);
+        }
+        assert_eq!(h.keyed_reads("missing"), 1.0);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.broker.next_ready_at_ms(), i64::MAX);
+    }
+
+    /// A noted key whose write never happens is dropped by the next scan of
+    /// the whole range.
+    #[tokio::test]
+    async fn key_whose_write_never_happens_is_dropped_by_the_next_full_rescan() {
+        let h = harness_with(
+            BrokerSettings {
+                full_rescan_interval: Duration::from_millis(50),
+                ..settings(LAG_MS)
+            },
+            4096,
+        )
+        .await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = key_for("never-written", now_ms - HOUR_MS);
+        h.broker
+            .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.broker.noted_key_count(), 1);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(
+            h.metric("silo_broker_full_rescans_total", &[("task_group", "tg")]),
+            1.0
+        );
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(
+            h.metric("silo_broker_noted_keys", &[("task_group", "tg")]),
+            0.0
+        );
+    }
+
+    /// A scan of the whole range buffers a row that a writer noted by key
+    /// without counting it as a row no writer told the broker about.
+    #[tokio::test]
+    async fn full_rescan_does_not_count_a_noted_row_as_unreported() {
+        let h = harness_with(
+            BrokerSettings {
+                full_rescan_interval: Duration::from_millis(50),
+                ..settings(LAG_MS)
+            },
+            4096,
+        )
+        .await;
+        let now_ms = now_epoch_ms();
+        h.put("head", now_ms - 10).await;
+        assert_eq!(h.scan(now_ms).await, 1);
+
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker
+            .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(h.scan(now_ms).await, 1, "the full rescan buffers the row");
+        assert_eq!(
+            h.metric(
+                "silo_broker_full_rescan_inserted_total",
+                &[("task_group", "tg")]
+            ),
+            0.0
+        );
+        assert_eq!(h.broker.noted_key_count(), 0);
+    }
+
+    /// A noted key whose row is in flight is not buffered again.
+    #[tokio::test]
+    async fn noted_key_in_flight_is_not_rebuffered() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![key.clone()]);
+
+        // A durable note of a row in flight adds no key; one that is not
+        // yet durable does, and its read finds the row in flight.
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        h.broker
+            .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
+        assert_eq!(h.broker.noted_key_count(), 1);
+
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.keyed_reads("in_flight"), 1.0);
+        assert_eq!(h.broker.buffer_len(), 0);
+        assert_eq!(h.broker.noted_key_count(), 0);
+    }
+
+    /// A noted key under an ack tombstone is not buffered again: the row a
+    /// point read returns may predate the delete the tombstone records.
+    #[tokio::test]
+    async fn noted_key_under_an_ack_tombstone_is_not_rebuffered() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![key.clone()]);
+        h.broker
+            .ack_durable(std::slice::from_ref(&key), std::slice::from_ref(&key));
+
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.keyed_reads("tombstone"), 1.0);
+        assert_eq!(h.broker.buffer_len(), 0);
+        assert_eq!(h.broker.noted_key_count(), 0);
+    }
+
+    /// With as many keys waiting as the broker holds, a further old row
+    /// lowers the floor and is still buffered.
+    #[tokio::test]
+    async fn old_row_lowers_the_floor_when_no_more_keys_can_wait() {
+        let h = harness_with(
+            BrokerSettings {
+                keyed_read_max_keys: 2,
+                ..settings(LAG_MS)
+            },
+            4096,
+        )
+        .await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let mut keys = Vec::new();
+        for (i, job_id) in ["a", "b", "c"].into_iter().enumerate() {
+            let start_ms = now_ms - HOUR_MS + i as i64;
+            let key = h.put(job_id, start_ms).await;
+            h.broker.note_task_key(&key, start_ms, now_ms, true);
+            keys.push(key);
+        }
+        assert_eq!(h.broker.noted_key_count(), 2);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms - HOUR_MS + 2));
+        assert_eq!(
+            h.metric(
+                "silo_broker_keyed_read_overflows_total",
+                &[("task_group", "tg")]
+            ),
+            1.0
+        );
+
+        assert_eq!(h.scan(now_ms).await, 3);
+        assert_eq!(h.keyed_reads("inserted"), 2.0);
+        assert_eq!(h.range_reads("inserted"), 1.0);
+        assert_eq!(h.claim_all(), keys);
+    }
+
+    /// Releasing an in-flight key far behind the current time re-arms the
+    /// nudge and gets the row buffered again without moving the floor.
+    #[tokio::test]
+    async fn release_inflight_of_an_old_key_is_read_by_key() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+        let key = h.put("stranded", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![key.clone()]);
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert!(!h.broker.nudge(now_ms));
+
+        h.broker.release_inflight(std::slice::from_ref(&key));
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert!(h.broker.nudge(now_ms));
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.claim_all(), vec![key]);
+    }
+
+    /// A write reported durable while a point read of its key is in flight
+    /// keeps the key: the read found no row because it was issued before the
+    /// row was visible, not because the row is gone.
+    #[tokio::test]
+    async fn write_reported_durable_during_a_read_keeps_the_key() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = key_for("waited", now_ms - HOUR_MS);
+        h.broker
+            .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
+        // The scan takes the key to read while its write is not durable...
+        let to_read = h.broker.cursor.lock().unwrap().noted.readable(10);
+        assert_eq!(to_read.len(), 1);
+        let (read_key, noted) = to_read[0].clone();
+        assert!(!noted.durable);
+        // ...the write lands and is reported durable...
+        h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        // ...and the read, issued before the row was visible, finds no row.
+        let generation = h.broker.begin_scan_generation();
+        let outcome = h
+            .broker
+            .settle_keyed_read(
+                &read_key,
+                noted,
+                Ok(None),
+                generation,
+                &mut KeyedReads::default(),
+            )
+            .await;
+        h.broker.complete_scan_generation(generation);
+        assert_eq!(outcome, KeyedRead::Pending);
+        assert_eq!(h.broker.noted_key_count(), 1, "the key survives the read");
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![key]);
+    }
+
+    /// A key noted again after a read of it was issued is not dropped by
+    /// that read's result, and is not marked as read either.
+    #[test]
+    fn result_of_a_read_applies_only_to_the_note_it_was_issued_under() {
+        let mut noted = NotedKeys::default();
+        assert_eq!(noted.note(b"k", true, false, 8), NoteOutcome::Noted);
+        let issued_under = noted.readable(8)[0].1.noted_at;
+        assert_eq!(noted.note(b"k", true, false, 8), NoteOutcome::Noted);
+
+        noted.remove_unchanged(b"k", issued_under);
+        assert!(noted.contains(b"k"));
+        assert!(noted.has_durable());
+
+        let current = noted.readable(8)[0].1.noted_at;
+        noted.remove_unchanged(b"k", current);
+        assert!(!noted.contains(b"k"));
+        assert!(!noted.has_durable());
+
+        assert_eq!(noted.note(b"p", false, false, 8), NoteOutcome::Noted);
+        let issued_under = noted.readable(8)[0].1.noted_at;
+        assert_eq!(noted.note(b"p", false, false, 8), NoteOutcome::Noted);
+        noted.mark_probed_unchanged(b"p", issued_under);
+        assert_eq!(noted.readable(8).len(), 1, "still read by the next scan");
+    }
+
+    /// A scan of the whole range drops the keys noted before it began and
+    /// keeps the ones noted while it ran.
+    #[test]
+    fn keys_noted_during_a_scan_of_the_whole_range_are_kept() {
+        let mut noted = NotedKeys::default();
+        assert_eq!(noted.note(b"before", true, false, 8), NoteOutcome::Noted);
+        assert_eq!(noted.note(b"expected", false, false, 8), NoteOutcome::Noted);
+        let scan_began = noted.notes;
+        assert_eq!(noted.note(b"during", true, false, 8), NoteOutcome::Noted);
+        // Reported durable while the scan ran: its row may not be in the
+        // scan's view.
+        assert_eq!(noted.note(b"expected", true, false, 8), NoteOutcome::Noted);
+
+        noted.remove_noted_through(scan_began);
+        assert!(!noted.contains(b"before"));
+        assert!(noted.contains(b"during"));
+        assert!(noted.contains(b"expected"));
+        assert_eq!(noted.len(), 2);
+        assert!(noted.has_durable());
+    }
+
+    /// An old row noted while a scan of the whole range runs (when there is
+    /// no floor to compare it with) is read by key: the scan's floor ends at
+    /// the current time, not at the old row's start time.
+    #[tokio::test]
+    async fn old_row_noted_with_no_floor_does_not_hold_the_floor_back() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        let start = h.broker.begin_scan_cursor();
+        assert_eq!(start.floor_ms, None);
+
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        h.broker
+            .record_scan_stop(ScanStop::EndOfRange, 0, start.notes_before, Some(now_ms));
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(
+            h.broker.next_ready_at_ms(),
+            0,
+            "a durable key waiting keeps nudges scanning"
+        );
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.broker.next_ready_at_ms(), i64::MAX);
+        assert_eq!(h.claim_all(), vec![key]);
+    }
+
+    /// An old row above an old floor is read by key too, so a scan that
+    /// overlaps its note is free to move the floor to the current time.
+    #[tokio::test]
+    async fn old_row_above_an_old_floor_does_not_hold_the_floor_back() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms - 2 * HOUR_MS).await, 0);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms - 2 * HOUR_MS));
+
+        let start = h.broker.begin_scan_cursor();
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        h.broker
+            .record_scan_stop(ScanStop::EndOfRange, 0, start.notes_before, Some(now_ms));
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.broker.noted_key_count(), 1);
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![key]);
+    }
+
+    /// Noted keys are read in key order, which is start time order, and a
+    /// scan that stops at its batch limit with durable keys left keeps
+    /// nudges scanning.
+    #[tokio::test]
+    async fn noted_keys_are_read_oldest_first_and_the_rest_stay_ready() {
+        let h = harness_with(settings(LAG_MS), 1).await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let newer = h.put("newer", now_ms - HOUR_MS + 5).await;
+        h.broker
+            .note_task_key(&newer, now_ms - HOUR_MS + 5, now_ms, true);
+        let older = h.put("older", now_ms - HOUR_MS).await;
+        h.broker
+            .note_task_key(&older, now_ms - HOUR_MS, now_ms, true);
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![older]);
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert_eq!(h.broker.next_ready_at_ms(), 0);
+        assert!(h.broker.nudge(now_ms));
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![newer]);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        // That scan filled its batch from the noted keys before reading the
+        // range; the next one reads the range to its end.
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.broker.next_ready_at_ms(), i64::MAX);
     }
 }
