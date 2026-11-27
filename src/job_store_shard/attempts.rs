@@ -47,6 +47,16 @@ fn point_read_bound(highest_attempt: Option<u32>) -> Option<u32> {
     highest_attempt.filter(|highest| *highest <= ATTEMPT_POINT_READ_LIMIT)
 }
 
+/// Where a read of attempts `1..=highest_attempt` gets its rows from, or
+/// `None` when the bound says the job has no attempt rows to read.
+fn read_source(highest_attempt: Option<u32>) -> Option<AttemptReadSource> {
+    match point_read_bound(highest_attempt) {
+        None => Some(AttemptReadSource::Scan),
+        Some(0) => None,
+        Some(_) => Some(AttemptReadSource::Keys),
+    }
+}
+
 impl JobStoreShard {
     fn record_attempt_read(&self, source: AttemptReadSource) {
         if let Some(ref m) = self.metrics {
@@ -107,15 +117,29 @@ impl JobStoreShard {
     /// The job's attempts in ascending attempt order: by key for attempts
     /// `1..=highest_attempt` when that bound is known and within the
     /// point-read limit, by a scan of the job's attempt prefix otherwise. An
-    /// attempt number with no row is left out.
+    /// attempt number with no row is left out. Counts as one read.
     async fn read_attempt_views(
         &self,
         tenant: &str,
         job_id: &str,
         highest_attempt: Option<u32>,
     ) -> Result<Vec<JobAttemptView>, JobStoreShardError> {
+        if let Some(source) = read_source(highest_attempt) {
+            self.record_attempt_read(source);
+        }
+        self.fetch_attempt_views(tenant, job_id, highest_attempt)
+            .await
+    }
+
+    /// The rows [`Self::read_attempt_views`] returns, without counting a
+    /// read.
+    async fn fetch_attempt_views(
+        &self,
+        tenant: &str,
+        job_id: &str,
+        highest_attempt: Option<u32>,
+    ) -> Result<Vec<JobAttemptView>, JobStoreShardError> {
         let Some(highest) = point_read_bound(highest_attempt) else {
-            self.record_attempt_read(AttemptReadSource::Scan);
             let start = attempt_prefix(tenant, job_id);
             let end = end_bound(&start);
             let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
@@ -125,11 +149,7 @@ impl JobStoreShard {
             }
             return Ok(attempts);
         };
-        if highest == 0 {
-            return Ok(Vec::new());
-        }
 
-        self.record_attempt_read(AttemptReadSource::Keys);
         let rows: Vec<Option<Bytes>> = futures::stream::iter((1..=highest).map(|attempt| {
             let key = attempt_key(tenant, job_id, attempt);
             async move { self.db.get(&key).await }
@@ -145,7 +165,8 @@ impl JobStoreShard {
 
     /// The job's highest-numbered attempt: one read of the key for
     /// `highest_attempt` when that bound is known, falling back to the rows
-    /// below it when that row is absent.
+    /// below it when that row is absent. Counts as one read, by scan when
+    /// the fallback scans and by key otherwise.
     async fn read_latest_attempt_view(
         &self,
         tenant: &str,
@@ -158,14 +179,13 @@ impl JobStoreShard {
         if highest == 0 {
             return Ok(None);
         }
-        self.record_attempt_read(AttemptReadSource::Keys);
         if let Some(view) = self.get_job_attempt(tenant, job_id, highest).await? {
+            self.record_attempt_read(AttemptReadSource::Keys);
             return Ok(Some(view));
         }
-        Ok(self
-            .read_attempt_views(tenant, job_id, Some(highest - 1))
-            .await?
-            .pop())
+        let below = Some(highest - 1);
+        self.record_attempt_read(read_source(below).unwrap_or(AttemptReadSource::Keys));
+        Ok(self.fetch_attempt_views(tenant, job_id, below).await?.pop())
     }
 
     /// The `(key, value)` of each of the job's attempt rows, in ascending

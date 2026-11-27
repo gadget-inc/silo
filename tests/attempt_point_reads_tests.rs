@@ -503,12 +503,15 @@ async fn an_absent_attempt_row_is_left_out_of_a_read() {
 }
 
 /// When the row for the highest attempt is absent, the latest attempt is
-/// the highest one that does have a row.
+/// the highest one that does have a row, and finding it counts as one read
+/// by key.
 #[silo::test]
 async fn the_latest_attempt_is_the_highest_row_present() {
-    let (_tmp, shard) = open_temp_shard().await;
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
     import_with_failed_attempts(&shard, "job", 3).await;
     delete_attempt_row(&shard, "job", 3).await;
+    let keys_before = attempt_reads(&metrics, "keys");
+    let scans_before = attempt_reads(&metrics, "scan");
 
     let latest = shard
         .get_latest_job_attempt(TENANT, "job")
@@ -517,6 +520,52 @@ async fn the_latest_attempt_is_the_highest_row_present() {
         .expect("an attempt");
 
     assert_eq!(latest.attempt_number(), 2);
+    assert_eq!(attempt_reads(&metrics, "keys") - keys_before, 1.0);
+    assert_eq!(attempt_reads(&metrics, "scan") - scans_before, 0.0);
+}
+
+/// Above the point-read limit, a latest-attempt read whose highest row is
+/// absent finds the rows below it with a scan, and counts as one read by
+/// scan and none by key.
+#[silo::test]
+async fn a_latest_attempt_read_that_scans_counts_as_one_scan() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let count = ATTEMPT_POINT_READ_LIMIT + 8;
+    import_with_failed_attempts(&shard, "job", count as usize).await;
+    delete_attempt_row(&shard, "job", count).await;
+    let keys_before = attempt_reads(&metrics, "keys");
+    let scans_before = attempt_reads(&metrics, "scan");
+
+    let latest = shard
+        .get_latest_job_attempt(TENANT, "job")
+        .await
+        .expect("latest")
+        .expect("an attempt");
+
+    assert_eq!(latest.attempt_number(), count - 1);
+    assert_eq!(attempt_reads(&metrics, "scan") - scans_before, 1.0);
+    assert_eq!(attempt_reads(&metrics, "keys") - keys_before, 0.0);
+}
+
+/// A latest-attempt read that finds the highest row counts as one read by
+/// key, however many attempts the job has.
+#[silo::test]
+async fn a_latest_attempt_read_above_the_point_read_limit_counts_as_one_key_read() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let count = ATTEMPT_POINT_READ_LIMIT + 8;
+    import_with_failed_attempts(&shard, "job", count as usize).await;
+    let keys_before = attempt_reads(&metrics, "keys");
+    let scans_before = attempt_reads(&metrics, "scan");
+
+    let latest = shard
+        .get_latest_job_attempt(TENANT, "job")
+        .await
+        .expect("latest")
+        .expect("an attempt");
+
+    assert_eq!(latest.attempt_number(), count);
+    assert_eq!(attempt_reads(&metrics, "keys") - keys_before, 1.0);
+    assert_eq!(attempt_reads(&metrics, "scan") - scans_before, 0.0);
 }
 
 #[silo::test]
