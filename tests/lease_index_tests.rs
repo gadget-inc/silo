@@ -1,0 +1,130 @@
+//! Tests for the in-memory lease index: which leases it reports due, and how
+//! writes, renewals and releases move an entry.
+
+use silo::lease_index::LeaseIndex;
+
+fn due_ids(index: &LeaseIndex, now_ms: i64) -> Vec<String> {
+    index
+        .due(now_ms)
+        .into_iter()
+        .map(|lease| lease.task_id)
+        .collect()
+}
+
+#[test]
+fn an_empty_index_has_nothing_due() {
+    let index = LeaseIndex::default();
+    assert!(index.due(i64::MAX).is_empty());
+    assert_eq!(index.next_expiry_ms(), None);
+    assert_eq!(index.len(), 0);
+}
+
+#[test]
+fn a_lease_is_due_from_its_expiry_onward() {
+    let index = LeaseIndex::default();
+    index.expect_written("a", 1_000);
+
+    assert!(due_ids(&index, 999).is_empty());
+    assert_eq!(due_ids(&index, 1_000), ["a"]);
+    assert_eq!(due_ids(&index, 5_000), ["a"]);
+    assert_eq!(index.next_expiry_ms(), Some(1_000));
+}
+
+#[test]
+fn due_leases_come_back_earliest_first_with_their_expiry() {
+    let index = LeaseIndex::default();
+    index.expect_written("late", 300);
+    index.expect_written("early", 100);
+    index.expect_written("middle", 200);
+    index.expect_written("future", 900);
+
+    let due = index.due(300);
+    let pairs: Vec<(&str, i64)> = due
+        .iter()
+        .map(|lease| (lease.task_id.as_str(), lease.expiry_ms))
+        .collect();
+    assert_eq!(pairs, [("early", 100), ("middle", 200), ("late", 300)]);
+    assert_eq!(index.len(), 4, "reading due leases removes nothing");
+}
+
+#[test]
+fn an_expected_write_never_raises_an_existing_entry() {
+    let index = LeaseIndex::default();
+    index.expect_written("a", 1_000);
+    index.expect_written("a", 2_000);
+    assert_eq!(index.next_expiry_ms(), Some(1_000));
+
+    index.expect_written("a", 500);
+    assert_eq!(index.next_expiry_ms(), Some(500));
+    assert_eq!(index.len(), 1);
+}
+
+#[test]
+fn a_confirmed_write_sets_the_entry_in_either_direction() {
+    let index = LeaseIndex::default();
+    index.expect_written("a", 1_000);
+
+    assert!(index.confirm_written("a", 2_000), "the entry existed");
+    assert!(due_ids(&index, 1_999).is_empty());
+    assert_eq!(due_ids(&index, 2_000), ["a"]);
+
+    assert!(index.confirm_written("a", 700));
+    assert_eq!(due_ids(&index, 700), ["a"]);
+    assert_eq!(index.len(), 1);
+}
+
+#[test]
+fn confirming_an_unknown_lease_adds_it_and_says_it_was_untracked() {
+    let index = LeaseIndex::default();
+    assert!(!index.confirm_written("a", 1_000));
+    assert_eq!(due_ids(&index, 1_000), ["a"]);
+}
+
+#[test]
+fn a_release_removes_the_entry_it_names() {
+    let index = LeaseIndex::default();
+    index.expect_written("a", 1_000);
+    index.expect_written("b", 1_000);
+
+    index.release("a", 1_000);
+
+    assert_eq!(due_ids(&index, 1_000), ["b"]);
+    assert_eq!(index.len(), 1);
+}
+
+/// A release names the expiry of the lease row it deleted. An entry that has
+/// moved since belongs to a newer write of the same task id and stays.
+#[test]
+fn a_release_leaves_an_entry_whose_expiry_has_moved() {
+    let index = LeaseIndex::default();
+    index.expect_written("a", 1_000);
+    index.confirm_written("a", 2_000);
+
+    index.release("a", 1_000);
+
+    assert_eq!(due_ids(&index, 2_000), ["a"]);
+}
+
+#[test]
+fn releasing_an_unknown_lease_is_a_no_op() {
+    let index = LeaseIndex::default();
+    index.release("a", 1_000);
+    assert_eq!(index.len(), 0);
+}
+
+#[test]
+fn a_full_scan_is_due_before_the_first_and_again_after_the_interval() {
+    let index = LeaseIndex::default();
+    assert!(
+        index.full_scan_due(0, 60_000),
+        "nothing has seeded the index"
+    );
+    assert!(!index.seeded());
+
+    index.record_full_scan(10_000);
+
+    assert!(index.seeded());
+    assert!(!index.full_scan_due(10_000, 60_000));
+    assert!(!index.full_scan_due(69_999, 60_000));
+    assert!(index.full_scan_due(70_000, 60_000));
+}

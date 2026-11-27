@@ -245,6 +245,7 @@ impl JobStoreShard {
                 expiry_ms,
                 started_at_ms: 0,
             };
+            self.leases.expect_written(&task_id, expiry_ms);
             batch.put(leased_task_key(&task_id), encode_lease(&record));
             batch.delete(&kv.key);
             leased.push(LeasedRefreshTask {
@@ -282,6 +283,9 @@ impl JobStoreShard {
                     },
                 )
                 .await?;
+            for refresh in &leased {
+                self.leases.confirm_written(&refresh.task_id, expiry_ms);
+            }
         }
         Ok(leased)
     }
@@ -718,6 +722,7 @@ impl JobStoreShard {
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
+        self.leases.release(task_id, decoded.expiry_ms());
 
         // Update the in-memory limit cache
         self.concurrency.cache_queue_limit(
@@ -763,6 +768,7 @@ impl JobStoreShard {
         };
 
         let decoded = decode_lease(value_bytes)?;
+        let lease_expiry_ms = decoded.expiry_ms();
         let tenant = decoded.tenant().to_string();
         let fb_lr = decoded.fb();
         let rfl = fb_lr.task_as_refresh_floating_limit().ok_or_else(|| {
@@ -839,6 +845,7 @@ impl JobStoreShard {
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
+        self.leases.release(task_id, lease_expiry_ms);
 
         if has_waiters {
             self.mark_refresh_pending(&task_group);

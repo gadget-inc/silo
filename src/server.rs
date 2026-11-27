@@ -32,6 +32,7 @@ use crate::factory::ShardFactory;
 use crate::job::{GubernatorAlgorithm, GubernatorRateLimit, JobStatusKind, RateLimitRetryPolicy};
 use crate::job_attempt::AttemptOutcome;
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError};
+use crate::lease_reaper::LeaseReaper;
 use crate::metrics::{CompactionSubmissionOutcome, Metrics};
 use crate::pb::silo_server::{Silo, SiloServer};
 use crate::pb::*;
@@ -2487,12 +2488,14 @@ where
         .set_serving::<SiloServer<SiloService>>()
         .await;
 
-    // Periodic reaper that iterates all shards every 1s for lease reaping.
+    // Lease reaper: once a second, start a reap pass on each open shard that
+    // has lease work due. Passes on different shards run concurrently.
     let (tick_tx, mut tick_rx) = broadcast::channel::<()>(1);
     let reaper_factory = factory.clone();
     let reaper_metrics = metrics.clone();
     let reaper: JoinHandle<()> = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut lease_reaper = LeaseReaper::new(reaper_metrics.clone());
         loop {
             tokio::select! {
                 biased;
@@ -2504,43 +2507,17 @@ where
                         m.set_coordination_shards_open(instances.len() as u64);
                     }
 
-                    // Reap every tenant's expired leases on each open shard
-                    for (shard_id, shard) in instances.iter() {
-                        let reap_start = std::time::Instant::now();
-                        let result = shard.reap_expired_leases().await;
-                        let shard_label = shard_id.to_string();
-                        if let Some(ref m) = reaper_metrics {
-                            m.record_lease_reaper_duration(
-                                &shard_label,
-                                reap_start.elapsed().as_secs_f64(),
-                            );
-                        }
-                        match result {
-                            Ok(reaped) => {
-                                if let Some(ref m) = reaper_metrics {
-                                    m.record_lease_reaper_reaped(&shard_label, reaped as u64);
-                                }
-                            }
-                            Err(e) => {
-                                if let Some(ref m) = reaper_metrics {
-                                    m.record_lease_reaper_error(&shard_label);
-                                }
-                                warn!(
-                                    shard = %shard_label,
-                                    error = %e,
-                                    "lease reaper failed"
-                                );
-                            }
-                        }
-                    }
+                    lease_reaper.tick(&instances, crate::job_store_shard::now_epoch_ms());
                 }
+                Some(_) = lease_reaper.join_next() => {}
                 _ = tick_rx.recv() => { break; }
             }
         }
+        lease_reaper.drain().await;
     });
 
     // Periodic SlateDB metrics scrape, decoupled from the reaper so a
-    // backpressured write in `reap_expired_leases` can't stall observability.
+    // backpressured write in a reap pass can't stall observability.
     let metrics_factory = factory.clone();
     let metrics_for_scrape = metrics.clone();
     let mut metrics_tick_rx = tick_tx.subscribe();

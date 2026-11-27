@@ -23,10 +23,36 @@ use crate::keys::{
     MetadataIndexValue, ParsedConcurrencyHolderKey, attempt_key, attempt_prefix,
     concurrency_holder_key, concurrency_holders_tenant_prefix, end_bound, floating_limit_state_key,
     idx_enqueue_time_key, idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key,
-    parse_concurrency_holder_key,
+    parse_concurrency_holder_key, parse_lease_key,
 };
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
+
+/// What one pass of the lease reaper over a shard did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeaseReapPass {
+    /// Expired leases reaped.
+    pub reaped: usize,
+    /// Whether the pass scanned the whole lease range.
+    pub full_scan: bool,
+    /// Lease rows read by key because the index reported them due.
+    pub checked: usize,
+    /// Leases a full scan found that the index did not hold, not counting
+    /// the scan that first seeds the index.
+    pub untracked: usize,
+}
+
+/// What the reaper found when it looked at one lease row.
+enum LeaseRow {
+    /// The row did not decode as a lease the reaper handles.
+    Unreadable,
+    /// The lease belongs to a tenant outside the shard's range.
+    Defunct,
+    /// The lease has not expired.
+    Live { expiry_ms: i64 },
+    /// The lease had expired and the reaper acted on it.
+    Reaped,
+}
 
 impl JobStoreShard {
     /// Heartbeat a lease to renew it if the worker id matches. Bumps expiry by DEFAULT_LEASE_MS.
@@ -84,6 +110,7 @@ impl JobStoreShard {
                 },
             )
             .await?;
+        self.leases.confirm_written(task_id, new_expiry_ms);
 
         // Check cancellation status to return in response
         // Worker discovers cancellation via heartbeat response per Alloy spec
@@ -118,6 +145,7 @@ impl JobStoreShard {
         let relative_attempt_number = decoded.relative_attempt_number();
         let held_queues_local = decoded.held_queues(); // Only allocation needed
         let task_group = decoded.task_group().to_string();
+        let lease_expiry_ms = decoded.expiry_ms();
 
         // Decrement active lease counter
         if let Some(ref m) = self.metrics {
@@ -502,6 +530,7 @@ impl JobStoreShard {
             return Err(e.into());
         }
         dst_events::confirm_write(write_op);
+        self.leases.release(task_id, lease_expiry_ms);
         self.mark_refresh_pending_groups(retry_scheduled_refreshes.task_groups());
         self.request_grants_for_yielded_queues(&retry_scheduled_refreshes);
         for (queue, grant_task_id) in &retry_grants {
@@ -538,12 +567,93 @@ impl JobStoreShard {
         Ok(())
     }
 
-    /// Scan all held leases and mark any expired ones as failed with a WORKER_CRASHED error code, or as Cancelled if the job was cancelled.
-    /// For RefreshFloatingLimit tasks, resets the floating limit state so it can be retried on next periodic refresh.
-    /// Skips and deletes leases for tenants outside the shard's range.
-    /// Returns the number of expired leases reaped.
+    /// Reap the leases whose expiry has passed, as [`Self::reap_due_leases_at`]
+    /// the current time.
+    pub async fn reap_due_leases(&self) -> Result<LeaseReapPass, JobStoreShardError> {
+        self.reap_due_leases_at(now_epoch_ms()).await
+    }
+
+    /// Reap the leases that have expired as of `now_ms`.
+    ///
+    /// The pass reads, by key, the lease rows the in-memory index reports
+    /// due, so it costs nothing while no lease has expired and its cost does
+    /// not depend on how many leases the shard has released. Once per
+    /// `lease_reaper_full_scan_interval_ms`, and on the first pass after the
+    /// shard opens, it scans the whole lease range instead: that seeds the
+    /// index, reaps any expired lease the index does not hold, and deletes
+    /// leases for tenants outside the shard's range.
+    ///
+    /// An expired lease fails its attempt with a WORKER_CRASHED error code,
+    /// or ends it Cancelled if the job was cancelled; an expired
+    /// RefreshFloatingLimit lease resets its floating limit so the refresh
+    /// can be scheduled again.
+    pub async fn reap_due_leases_at(
+        &self,
+        now_ms: i64,
+    ) -> Result<LeaseReapPass, JobStoreShardError> {
+        if self
+            .leases
+            .full_scan_due(now_ms, self.lease_reaper_full_scan_interval_ms)
+        {
+            return self.scan_and_reap_leases(now_ms).await;
+        }
+
+        let shard_range = self.get_range();
+        let mut pass = LeaseReapPass::default();
+        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
+        for due in self.leases.due(now_ms) {
+            let key = leased_task_key(&due.task_id);
+            pass.checked += 1;
+            let Some(value) = self.db.get(&key).await? else {
+                self.leases.release(&due.task_id, due.expiry_ms);
+                continue;
+            };
+            match self
+                .reap_lease_if_expired(&key, value, now_ms, &shard_range)
+                .await
+            {
+                LeaseRow::Live { expiry_ms } => {
+                    self.leases.confirm_written(&due.task_id, expiry_ms);
+                }
+                LeaseRow::Defunct => {
+                    self.leases.release(&due.task_id, due.expiry_ms);
+                    defunct_keys.push(key);
+                }
+                LeaseRow::Reaped => pass.reaped += 1,
+                LeaseRow::Unreadable => {}
+            }
+        }
+        self.delete_defunct_leases(defunct_keys).await;
+        Ok(pass)
+    }
+
+    /// Whether [`Self::reap_due_leases_at`] `now_ms` would read anything: a
+    /// full scan is due, or the index holds a lease that has expired.
+    pub fn lease_reap_is_due(&self, now_ms: i64) -> bool {
+        self.leases
+            .full_scan_due(now_ms, self.lease_reaper_full_scan_interval_ms)
+            || self
+                .leases
+                .next_expiry_ms()
+                .is_some_and(|expiry_ms| expiry_ms <= now_ms)
+    }
+
+    /// The number of leases the reaper's in-memory index holds.
+    pub fn tracked_lease_count(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Scan every lease row and reap the expired ones, whatever the reaper's
+    /// index holds. Returns the number of expired leases reaped.
     pub async fn reap_expired_leases(&self) -> Result<usize, JobStoreShardError> {
-        // Scan all lease keys using the binary prefix
+        Ok(self.scan_and_reap_leases(now_epoch_ms()).await?.reaped)
+    }
+
+    /// Scan the whole lease range: reap expired leases, delete leases for
+    /// tenants outside the shard's range, and add every other lease to the
+    /// index.
+    async fn scan_and_reap_leases(&self, now_ms: i64) -> Result<LeaseReapPass, JobStoreShardError> {
+        let seeded = self.leases.seeded();
         let start = crate::keys::leases_prefix();
         let end = crate::keys::end_bound(&start);
         let mut iter = self
@@ -551,110 +661,153 @@ impl JobStoreShard {
             .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
             .await?;
 
-        let now_ms = now_epoch_ms();
-        let mut reaped: usize = 0;
-
-        // Get the shard range for split-aware filtering
         let shard_range = self.get_range();
-
-        // Collect defunct lease keys to delete
+        let mut pass = LeaseReapPass {
+            full_scan: true,
+            ..Default::default()
+        };
         let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
 
         while let Some(kv) = iter.next().await? {
-            let decoded = match decode_lease(kv.value.clone()) {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-
-            // Check if lease's tenant is within shard range
-            let lease_tenant = decoded.tenant();
-
-            if !shard_range.contains_tenant(lease_tenant) {
-                // Lease is for a tenant outside our range - mark for deletion
-                debug!(
-                    key = ?kv.key,
-                    tenant = %lease_tenant,
-                    range = %shard_range,
-                    "deleting defunct lease (tenant outside shard range)"
-                );
-                defunct_keys.push(kv.key.to_vec());
-                continue;
-            }
-
-            // [SILO-REAP-1] Pre: Lease exists (we found it)
-            // [SILO-REAP-2] Pre: Check if lease has expired
-            if decoded.expiry_ms() > now_ms {
-                continue;
-            }
-
-            // Handle RefreshFloatingLimit tasks separately
-            if let Some((task_id, queue_key)) = decoded.refresh_floating_limit_info() {
-                let task_tenant = decoded.tenant();
-                let _ = self
-                    .reap_expired_refresh_task(task_tenant, task_id, queue_key, &decoded)
-                    .await;
-                reaped += 1;
-                continue;
-            }
-
-            // Get task_id and job_id using helper methods (for RunAttempt tasks)
-            let Some(task_id) = decoded.task_id() else {
-                continue; // Not a RunAttempt lease
-            };
-            let job_id = decoded.job_id().to_string();
-
-            // Check if job was cancelled - if so, report Cancelled instead of WORKER_CRASHED
-            let was_cancelled = self
-                .is_job_cancelled(lease_tenant, &job_id)
-                .await
-                .unwrap_or(false);
-
-            let outcome = if was_cancelled {
-                // Job was cancelled - report as Cancelled (clean termination)
-                AttemptOutcome::Cancelled
-            } else {
-                // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
-                // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
-                // SILO-REAP-4: Post: Set attempt status to AttemptFailed
-                let message = format!(
-                    "lease expired at {} (now {}), worker={}",
-                    decoded.expiry_ms(),
-                    now_ms,
-                    decoded.worker_id()
-                );
-                // Readers treat attempt error bytes as msgpack, so encode the
-                // message as a msgpack string rather than raw UTF-8.
-                let mut error = Vec::new();
-                rmp::encode::write_str(&mut error, &message)
-                    .expect("msgpack encoding into a Vec cannot fail");
-                AttemptOutcome::Error {
-                    error_code: "WORKER_CRASHED".to_string(),
-                    error,
+            let task_id = parse_lease_key(&kv.key).map(|parsed| parsed.task_id);
+            let tracked = task_id
+                .as_deref()
+                .is_some_and(|task_id| self.leases.contains(task_id));
+            let mut value = kv.value;
+            if seeded && !tracked {
+                // A lease the index does not hold was either written without
+                // the index hearing of it or released since the scan's
+                // snapshot. Only the first is still in the database.
+                match self.db.get(&kv.key).await? {
+                    Some(current) => value = current,
+                    None => continue,
                 }
+            }
+            match self
+                .reap_lease_if_expired(&kv.key, value, now_ms, &shard_range)
+                .await
+            {
+                LeaseRow::Live { expiry_ms } => {
+                    if let Some(task_id) = task_id.as_deref() {
+                        // The snapshot can trail a renewal, so only add or
+                        // lower the entry.
+                        self.leases.expect_written(task_id, expiry_ms);
+                    }
+                }
+                LeaseRow::Defunct => {
+                    defunct_keys.push(kv.key.to_vec());
+                    continue;
+                }
+                LeaseRow::Reaped => pass.reaped += 1,
+                LeaseRow::Unreadable => continue,
+            }
+            if seeded && !tracked {
+                pass.untracked += 1;
+            }
+        }
+
+        self.delete_defunct_leases(defunct_keys).await;
+        self.leases.record_full_scan(now_ms);
+        Ok(pass)
+    }
+
+    /// Deal with one lease row as of `now_ms`: reap it if it has expired.
+    async fn reap_lease_if_expired(
+        &self,
+        key: &[u8],
+        value: bytes::Bytes,
+        now_ms: i64,
+        shard_range: &crate::shard_range::ShardRange,
+    ) -> LeaseRow {
+        let Ok(decoded) = decode_lease(value) else {
+            return LeaseRow::Unreadable;
+        };
+
+        let lease_tenant = decoded.tenant();
+        if !shard_range.contains_tenant(lease_tenant) {
+            debug!(
+                key = ?key,
+                tenant = %lease_tenant,
+                range = %shard_range,
+                "deleting defunct lease (tenant outside shard range)"
+            );
+            return LeaseRow::Defunct;
+        }
+
+        // [SILO-REAP-1] Pre: Lease exists (we found it)
+        // [SILO-REAP-2] Pre: Check if lease has expired
+        if decoded.expiry_ms() > now_ms {
+            return LeaseRow::Live {
+                expiry_ms: decoded.expiry_ms(),
             };
-
-            // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
-            let _ = self.report_attempt_outcome(task_id, outcome).await;
-            reaped += 1;
         }
 
-        // Delete defunct leases from the database
-        if !defunct_keys.is_empty() {
-            let mut batch = WriteBatch::new();
-            for key in &defunct_keys {
-                batch.delete(key);
-            }
-            if let Err(e) = self.db.write(batch).await {
-                debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct leases");
-            } else {
-                debug!(
-                    count = defunct_keys.len(),
-                    "deleted defunct leases outside shard range"
-                );
-            }
+        // Handle RefreshFloatingLimit tasks separately
+        if let Some((task_id, queue_key)) = decoded.refresh_floating_limit_info() {
+            let _ = self
+                .reap_expired_refresh_task(lease_tenant, task_id, queue_key, &decoded)
+                .await;
+            return LeaseRow::Reaped;
         }
 
-        Ok(reaped)
+        // Get task_id and job_id using helper methods (for RunAttempt tasks)
+        let Some(task_id) = decoded.task_id() else {
+            return LeaseRow::Unreadable; // Not a RunAttempt lease
+        };
+        let job_id = decoded.job_id().to_string();
+
+        // Check if job was cancelled - if so, report Cancelled instead of WORKER_CRASHED
+        let was_cancelled = self
+            .is_job_cancelled(lease_tenant, &job_id)
+            .await
+            .unwrap_or(false);
+
+        let outcome = if was_cancelled {
+            // Job was cancelled - report as Cancelled (clean termination)
+            AttemptOutcome::Cancelled
+        } else {
+            // [SILO-REAP-3][SILO-REAP-4] Report as worker crashed
+            // SILO-REAP-3: Post: Set job status to Failed (via report_attempt_outcome)
+            // SILO-REAP-4: Post: Set attempt status to AttemptFailed
+            let message = format!(
+                "lease expired at {} (now {}), worker={}",
+                decoded.expiry_ms(),
+                now_ms,
+                decoded.worker_id()
+            );
+            // Readers treat attempt error bytes as msgpack, so encode the
+            // message as a msgpack string rather than raw UTF-8.
+            let mut error = Vec::new();
+            rmp::encode::write_str(&mut error, &message)
+                .expect("msgpack encoding into a Vec cannot fail");
+            AttemptOutcome::Error {
+                error_code: "WORKER_CRASHED".to_string(),
+                error,
+            }
+        };
+
+        // [SILO-REAP-REL] Release lease and update job/attempt status via report_attempt_outcome
+        let _ = self.report_attempt_outcome(task_id, outcome).await;
+        LeaseRow::Reaped
+    }
+
+    /// Delete lease rows that belong to tenants outside the shard's range.
+    async fn delete_defunct_leases(&self, defunct_keys: Vec<Vec<u8>>) {
+        if defunct_keys.is_empty() {
+            return;
+        }
+        let mut batch = WriteBatch::new();
+        for key in &defunct_keys {
+            batch.delete(key);
+        }
+        if let Err(e) = self.db.write(batch).await {
+            debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct leases");
+        } else {
+            debug!(
+                count = defunct_keys.len(),
+                "deleted defunct leases outside shard range"
+            );
+        }
     }
 
     /// Handle expiry of a RefreshFloatingLimit task lease.
@@ -683,6 +836,7 @@ impl JobStoreShard {
             let mut batch = WriteBatch::new();
             batch.delete(&lease_key);
             self.db.write(batch).await?;
+            self.leases.release(task_id, decoded.expiry_ms());
             return Ok(());
         };
 
@@ -703,6 +857,7 @@ impl JobStoreShard {
         batch.delete(&lease_key);
 
         self.db.write(batch).await?;
+        self.leases.release(task_id, decoded.expiry_ms());
 
         tracing::error!(
             tenant = %tenant,

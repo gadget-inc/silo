@@ -217,6 +217,8 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
             broker_full_rescan_interval_ms: silo::settings::DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS,
+            lease_reaper_full_scan_interval_ms:
+                silo::settings::DEFAULT_LEASE_REAPER_FULL_SCAN_INTERVAL_MS,
             enqueue_time_index_backfill: Default::default(),
         },
         ShardRange::full(),
@@ -273,6 +275,8 @@ pub async fn open_temp_shard_with_orphan_sweep(
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
             broker_full_rescan_interval_ms: silo::settings::DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS,
+            lease_reaper_full_scan_interval_ms:
+                silo::settings::DEFAULT_LEASE_REAPER_FULL_SCAN_INTERVAL_MS,
             enqueue_time_index_backfill: Default::default(),
         },
         range,
@@ -328,6 +332,8 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             broker_tombstone_revive_after_generations:
                 silo::settings::DEFAULT_BROKER_TOMBSTONE_REVIVE_AFTER_GENERATIONS,
             broker_full_rescan_interval_ms: silo::settings::DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS,
+            lease_reaper_full_scan_interval_ms:
+                silo::settings::DEFAULT_LEASE_REAPER_FULL_SCAN_INTERVAL_MS,
             enqueue_time_index_backfill: Default::default(),
         },
         ShardRange::full(),

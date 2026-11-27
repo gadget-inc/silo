@@ -244,6 +244,9 @@ pub struct Metrics {
     lease_reaper_scans_total: CounterVec,
     lease_reaper_leases_reaped_total: CounterVec,
     lease_reaper_errors_total: CounterVec,
+    lease_reaper_due_checks_total: CounterVec,
+    lease_reaper_untracked_leases_total: CounterVec,
+    lease_reaper_tracked_leases: GaugeVec,
 
     // Periodic full compaction
     periodic_full_compaction_submissions_total: CounterVec,
@@ -748,21 +751,46 @@ impl Metrics {
             .observe(latency_ms);
     }
 
-    /// Record lease reaper duration in seconds.
-    pub fn record_lease_reaper_duration(&self, shard: &str, duration_secs: f64) {
+    /// Record a lease reaper pass over a shard: how long it took, what it
+    /// read, and what it reaped.
+    pub fn record_lease_reaper_pass(
+        &self,
+        shard: &str,
+        duration_secs: f64,
+        pass: &crate::job_store_shard::LeaseReapPass,
+    ) {
         self.lease_reaper_duration
             .with_label_values(&[shard])
             .observe(duration_secs);
-        self.lease_reaper_scans_total
+        if pass.full_scan {
+            self.lease_reaper_scans_total
+                .with_label_values(&[shard])
+                .inc();
+        }
+        self.lease_reaper_due_checks_total
             .with_label_values(&[shard])
-            .inc();
-    }
-
-    /// Record the number of expired leases reaped during a scan.
-    pub fn record_lease_reaper_reaped(&self, shard: &str, count: u64) {
+            .inc_by(pass.checked as f64);
+        self.lease_reaper_untracked_leases_total
+            .with_label_values(&[shard])
+            .inc_by(pass.untracked as f64);
         self.lease_reaper_leases_reaped_total
             .with_label_values(&[shard])
-            .inc_by(count as f64);
+            .inc_by(pass.reaped as f64);
+    }
+
+    /// Set the number of leases the lease reaper's index holds for a shard.
+    pub fn set_lease_reaper_tracked_leases(&self, shard: &str, count: usize) {
+        self.lease_reaper_tracked_leases
+            .with_label_values(&[shard])
+            .set(count as f64);
+    }
+
+    /// Stop exporting a shard's tracked-lease count.
+    pub fn clear_lease_reaper_tracked_leases(&self, shard: &str) {
+        // `remove_label_values` errs when the series was never set.
+        let _ = self
+            .lease_reaper_tracked_leases
+            .remove_label_values(&[shard]);
     }
 
     /// Record a RunAttempt dispatch that wrote a lease over a still-live
@@ -2478,7 +2506,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         HistogramVec::new(
             HistogramOpts::new(
                 "silo_lease_reaper_duration_seconds",
-                "Duration of expired lease reaper scan operations",
+                "Duration of lease reaper passes that read lease rows: due leases by key, or the whole lease range on a full scan",
             )
             .buckets(SCAN_DURATION_BUCKETS.to_vec()),
             &["shard"],
@@ -2490,7 +2518,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         CounterVec::new(
             Opts::new(
                 "silo_lease_reaper_scans_total",
-                "Total number of expired lease reaper scan operations",
+                "Total number of lease reaper passes that scanned a shard's whole lease range",
             ),
             &["shard"],
         )?,
@@ -2513,6 +2541,39 @@ pub fn init() -> anyhow::Result<Metrics> {
             Opts::new(
                 "silo_lease_reaper_errors_total",
                 "Total number of expired lease reaper scan failures",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let lease_reaper_due_checks_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_lease_reaper_due_checks_total",
+                "Lease rows the lease reaper read by key because its in-memory index reported them due",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let lease_reaper_untracked_leases_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_lease_reaper_untracked_leases_total",
+                "Leases a periodic scan of the whole lease range found that the lease reaper's in-memory index did not hold",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let lease_reaper_tracked_leases = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_lease_reaper_tracked_leases",
+                "Number of leases held in the lease reaper's in-memory index",
             ),
             &["shard"],
         )?,
@@ -2867,6 +2928,9 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_scans_total,
         lease_reaper_leases_reaped_total,
         lease_reaper_errors_total,
+        lease_reaper_due_checks_total,
+        lease_reaper_untracked_leases_total,
+        lease_reaper_tracked_leases,
         periodic_full_compaction_submissions_total,
         concurrency_tickets_granted,
         concurrency_orphan_holders_purged,
