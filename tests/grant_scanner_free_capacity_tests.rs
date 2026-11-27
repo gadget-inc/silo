@@ -207,30 +207,49 @@ async fn backdate_last_refreshed(shard: &JobStoreShard, queue: &str) {
     shard.db().flush().await.expect("flush floating state");
 }
 
-/// Write `count` request rows on `queue` for jobs that do not exist, with
-/// their requester counter increments. They sort ahead of any row written
-/// at `before_ms` or later, and a scanner pass deletes each one it reaches.
-async fn write_stale_requests(shard: &JobStoreShard, queue: &str, count: usize, before_ms: i64) {
+/// A kind of request row the scanner deletes without granting.
+#[derive(Clone, Copy)]
+enum StaleRow {
+    /// A well-formed request for a job that does not exist.
+    MissingJob,
+    /// A request whose value does not decode, so the pass learns nothing
+    /// about the queue from it, its capacity included.
+    Undecodable,
+}
+
+/// Write `count` request rows of `kind` on `queue`, with their requester
+/// counter increments. They sort ahead of any row written at `before_ms` or
+/// later, and a scanner pass deletes each one it reaches.
+async fn write_stale_requests(
+    shard: &JobStoreShard,
+    queue: &str,
+    kind: StaleRow,
+    count: usize,
+    before_ms: i64,
+) {
     let mut batch = WriteBatch::new();
     for i in 0..count {
         let start_time_ms = before_ms - 10_000 + i as i64;
         let job_id = format!("missing-job-{i:04}");
-        let action = ConcurrencyAction::EnqueueTask {
-            start_time_ms,
-            priority: PRIORITY,
-            job_id: job_id.clone(),
-            attempt_number: 1,
-            relative_attempt_number: 1,
-            task_group: TASK_GROUP.to_string(),
-            limit_index: 0,
-            held_queues: Vec::new(),
-            task_id: format!("missing-task-{i:04}"),
-            limits: vec![fixed_limit(queue, 4)],
-        };
-        batch.put(
-            concurrency_request_key(TENANT, queue, start_time_ms, PRIORITY, &job_id, 1, "a"),
-            encode_concurrency_action(&action),
-        );
+        let key = concurrency_request_key(TENANT, queue, start_time_ms, PRIORITY, &job_id, 1, "a");
+        match kind {
+            StaleRow::MissingJob => {
+                let action = ConcurrencyAction::EnqueueTask {
+                    start_time_ms,
+                    priority: PRIORITY,
+                    job_id: job_id.clone(),
+                    attempt_number: 1,
+                    relative_attempt_number: 1,
+                    task_group: TASK_GROUP.to_string(),
+                    limit_index: 0,
+                    held_queues: Vec::new(),
+                    task_id: format!("missing-task-{i:04}"),
+                    limits: vec![fixed_limit(queue, 4)],
+                };
+                batch.put(key, encode_concurrency_action(&action));
+            }
+            StaleRow::Undecodable => batch.put(key, b"not a concurrency action"),
+        }
     }
     batch.merge(
         concurrency_requester_counter_key(TENANT, queue),
@@ -521,12 +540,23 @@ async fn jobs_parked_on_a_floating_limit_start_and_their_first_queue_turns_over(
 /// slot still goes to the first live waiter on a following iteration.
 #[silo::test]
 async fn slot_is_filled_after_a_pass_spends_its_walk_budget_on_stale_requests() {
+    assert_slot_is_filled_behind_a_stale_front("stale-front", StaleRow::MissingJob).await;
+}
+
+/// The same release, with a front of request rows that do not decode: the
+/// first pass deletes its walk budget of them without ever learning the
+/// queue's capacity, and the freed slot is still filled.
+#[silo::test]
+async fn slot_is_filled_after_a_pass_spends_its_walk_budget_on_undecodable_requests() {
+    assert_slot_is_filled_behind_a_stale_front("undecodable-front", StaleRow::Undecodable).await;
+}
+
+async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow) {
     const MAX: u32 = 4;
     const STALE: usize = WALK_BUDGET + 4;
     const WAITERS: usize = 3;
 
     let (_tmp, shard) = open_shard_with_scanner_stopped().await;
-    let queue = "stale-front";
     let now = now_ms();
 
     for i in 0..MAX as usize {
@@ -538,7 +568,7 @@ async fn slot_is_filled_after_a_pass_spends_its_walk_budget_on_stale_requests() 
         )
         .await;
     }
-    write_stale_requests(&shard, queue, STALE, now).await;
+    write_stale_requests(&shard, queue, kind, STALE, now).await;
     for i in 0..WAITERS {
         enqueue(
             &shard,

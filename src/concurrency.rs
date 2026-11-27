@@ -2478,14 +2478,26 @@ impl ConcurrencyManager {
     /// queues, and still serves every hot-lane nudge. A queue working
     /// through a large backlog fills one chunk per iteration until it is
     /// full or its eligible waiters run out.
-    fn request_unfilled_capacity_pass(&self, tenant: &str, queue: &str, capacity: usize) {
-        let free = self
-            .scanner_effective_capacity(capacity)
-            .saturating_sub(self.counts.holder_count(tenant, queue));
-        if free == 0 {
-            return;
-        }
-        let count = free.min(self.grant_scanner_commit_chunk_size);
+    ///
+    /// `capacity` is the queue's capacity as the pass resolved it, or `None`
+    /// when the pass never reached a row it could decode (every row it
+    /// walked was malformed and deleted). With no capacity to compare
+    /// against, the follow-up is queued regardless and resolves the capacity
+    /// from the first decodable row it reaches.
+    fn request_unfilled_capacity_pass(&self, tenant: &str, queue: &str, capacity: Option<usize>) {
+        let chunk = self.grant_scanner_commit_chunk_size;
+        let count = match capacity {
+            Some(capacity) => {
+                let free = self
+                    .scanner_effective_capacity(capacity)
+                    .saturating_sub(self.counts.holder_count(tenant, queue));
+                if free == 0 {
+                    return;
+                }
+                free.min(chunk)
+            }
+            None => chunk,
+        };
         self.request_grant_count_cold(tenant, queue, u32::try_from(count).unwrap_or(u32::MAX));
         if let Some(ref m) = self.metrics {
             m.record_concurrency_grant_unfilled_capacity_pass(&self.shard);
@@ -3812,10 +3824,12 @@ impl ConcurrencyManager {
                         // follow-up pass retries from that candidate; if it
                         // fails again first thing, that pass changes nothing
                         // and queues no further one.
-                        if (total_granted > 0 || total_stale_deleted > 0)
-                            && let Some((capacity, _)) = max_concurrency
-                        {
-                            self.request_unfilled_capacity_pass(tenant, queue, capacity);
+                        if total_granted > 0 || total_stale_deleted > 0 {
+                            self.request_unfilled_capacity_pass(
+                                tenant,
+                                queue,
+                                max_concurrency.map(|(capacity, _)| capacity),
+                            );
                         }
                         record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted;
@@ -3942,10 +3956,7 @@ impl ConcurrencyManager {
         // (every candidate deferred or unreadable) would be walked again to
         // the same end, so it is left to the periodic sweep.
         let made_progress = total_granted > 0 || total_stale_deleted > 0;
-        if made_progress
-            && !capacity_exhausted
-            && let Some((capacity, _)) = max_concurrency
-        {
+        if made_progress && !capacity_exhausted {
             let rows_unreached = if budget_exhausted || walk_interrupted {
                 true
             } else if iter_exhausted {
@@ -3972,7 +3983,11 @@ impl ConcurrencyManager {
                 }
             };
             if rows_unreached {
-                self.request_unfilled_capacity_pass(tenant, queue, capacity);
+                self.request_unfilled_capacity_pass(
+                    tenant,
+                    queue,
+                    max_concurrency.map(|(capacity, _)| capacity),
+                );
             }
         }
 
