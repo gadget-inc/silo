@@ -531,8 +531,9 @@ pub struct DatabaseTemplate {
     /// scan floor to the row. A job granted a concurrency slot after waiting
     /// keeps its original start time, so its task row can be hours old when
     /// it is written; reading it by key keeps the scan's range, and so its
-    /// cost, to recent writes. `u64::MAX` makes every row lower the floor.
-    /// Defaults to 1000.
+    /// cost, to recent writes. `9223372036854775807`, the largest integer
+    /// a TOML file can hold, makes every row lower the floor. Defaults to
+    /// 1000.
     #[serde(default = "default_broker_keyed_read_min_lag_ms")]
     pub broker_keyed_read_min_lag_ms: u64,
     /// How many task keys a broker holds for reading by key. When that many

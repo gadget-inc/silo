@@ -127,7 +127,8 @@ pub struct BrokerSettings {
     pub full_rescan_interval: Duration,
     /// How far behind the current time a task row's start time has to be
     /// for the row to be read by its key instead of lowering the scan floor.
-    /// `u64::MAX` makes every row lower the floor.
+    /// No row is older than `i64::MAX` ms, so that value or a larger one
+    /// makes every row lower the floor.
     pub keyed_read_min_lag_ms: u64,
     /// How many task keys a broker holds for reading by key. With that many
     /// waiting, a further old row lowers the floor instead.
@@ -1487,8 +1488,8 @@ impl TaskBrokerRegistry {
     }
 
     /// Record the committed task row at `task_key` with its task group's
-    /// broker. A row due now is noted for the next scan (read by its key when
-    /// its start time is old, by lowering the scan floor when it is recent)
+    /// broker. A row due now is noted for the next scan (by holding its key
+    /// when its start time is old, by lowering the scan floor when it is recent)
     /// and the scanner is woken; a future-dated row lowers the broker's
     /// recorded next-ready time so it is scanned for once it becomes due.
     ///
@@ -1520,15 +1521,16 @@ impl TaskBrokerRegistry {
 
     /// Record that the task row at `task_key` is about to be written, so a
     /// scan that sees the row while its write awaits durability buffers it:
-    /// its key is noted for reading when its start time is old, and the scan
-    /// floor of its task group's broker is lowered to it otherwise.
+    /// its key is held by its task group's broker when its start time is
+    /// old, and the broker's scan floor is lowered to it otherwise.
     ///
     /// Call before the write is issued; [`Self::notify_task_written`] still
     /// follows once the write is durable. A write that fails leaves a
-    /// lowered floor, which costs one scan a few extra reads, or a noted key,
-    /// which costs one point read and is dropped by the next scan of the
-    /// whole range. A broker that does not exist yet scans its whole range
-    /// first and needs neither.
+    /// lowered floor, which costs one scan a few extra reads, or a held key,
+    /// which costs at most one point read and is dropped by the next scan
+    /// whose range covers it, the periodic scan of the whole range at the
+    /// latest. A broker that does not exist yet scans its whole range first
+    /// and needs neither.
     pub fn expect_task_written(&self, task_key: &[u8]) {
         if let Some(parsed) = parse_task_key(task_key)
             && let Some(broker) = self.brokers.get(&parsed.task_group)

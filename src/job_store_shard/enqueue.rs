@@ -711,7 +711,7 @@ impl JobStoreShard {
     /// optimization. If granted, it proceeds to the next limit (iteratively).
     ///
     /// Returns all grants made for potential rollback if DB write fails, plus
-    /// the concrete task-key timestamp when this walk wrote a DB task.
+    /// the task row this walk wrote, if it wrote one: its key and start time.
     ///
     /// **Error semantics:** if the walk errors mid-chain (e.g. a db.get for
     /// floating-limit state fails between an immediate grant and the next
