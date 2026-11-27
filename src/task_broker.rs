@@ -1056,8 +1056,10 @@ impl TaskBroker {
             );
             match outcome {
                 NoteOutcome::Noted | NoteOutcome::AlreadyRead => return,
+                // Counted per row: a row is noted before its write and
+                // again once it is durable.
                 NoteOutcome::Full => {
-                    if let Some(ref m) = self.metrics {
+                    if durable && let Some(ref m) = self.metrics {
                         m.record_broker_keyed_read_overflow(&self.shard_name, &self.task_group);
                     }
                 }
@@ -2739,7 +2741,8 @@ mod keyed_read_tests {
     }
 
     /// With as many keys waiting as the broker holds, a further old row
-    /// lowers the floor and is still buffered.
+    /// lowers the floor and is still buffered. It is counted once, though
+    /// it is noted both before its write and after.
     #[tokio::test]
     async fn old_row_lowers_the_floor_when_no_more_keys_can_wait() {
         let h = harness_with(
@@ -2756,7 +2759,9 @@ mod keyed_read_tests {
         let mut keys = Vec::new();
         for (i, job_id) in ["a", "b", "c"].into_iter().enumerate() {
             let start_ms = now_ms - HOUR_MS + i as i64;
-            let key = h.put(job_id, start_ms).await;
+            let key = key_for(job_id, start_ms);
+            h.broker.note_task_key(&key, start_ms, now_ms, false);
+            h.put(job_id, start_ms).await;
             h.broker.note_task_key(&key, start_ms, now_ms, true);
             keys.push(key);
         }
