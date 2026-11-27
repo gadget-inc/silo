@@ -230,6 +230,9 @@ async fn test_metrics_all_recording_methods() {
     // record_grpc_duration
     metrics.record_grpc_duration("Enqueue", 0.05);
 
+    // grpc_in_flight: counted for as long as the guard is alive
+    let _enqueue_in_flight = metrics.grpc_in_flight("Enqueue");
+
     // record_job_wait_time
     metrics.record_job_wait_time("0", "default", 1.5);
 
@@ -325,6 +328,14 @@ async fn test_metrics_all_recording_methods() {
     assert!(
         body_str.contains("silo_grpc_request_duration_seconds"),
         "should contain gRPC duration metric"
+    );
+
+    // Verify the gRPC in-flight gauge counts the held guard
+    let grpc_in_flight = find_line(&["silo_grpc_requests_in_flight", "method=\"Enqueue\""]);
+    assert!(
+        grpc_in_flight.as_ref().is_some_and(|l| l.ends_with(" 1")),
+        "should have 1 Enqueue call in flight, found: {:?}",
+        grpc_in_flight
     );
 
     // Verify job wait time histogram was recorded
