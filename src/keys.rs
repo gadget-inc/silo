@@ -702,6 +702,35 @@ pub fn concurrency_request_band_start(tenant: &str, queue: &str, band: u8) -> Ve
     )
 }
 
+/// First key of `band` at `start_time_ms` in the queue whose request prefix
+/// ([`concurrency_request_prefix`]) is `queue_prefix`: every row of a lower
+/// band, and every row of the band with an earlier start time, sorts before
+/// it.
+pub fn concurrency_request_order_start(
+    queue_prefix: &[u8],
+    band: u8,
+    start_time_ms: i64,
+) -> Vec<u8> {
+    let order = ((band as u64) << 56) | concurrency_request_start_field(start_time_ms);
+    let mut key = Vec::with_capacity(queue_prefix.len() + 8);
+    key.extend_from_slice(queue_prefix);
+    key.extend_from_slice(&order.to_be_bytes());
+    key
+}
+
+/// Band and start time of a request key, read from its ordering field alone.
+/// `prefix_len` is the length of the key's queue prefix
+/// ([`concurrency_request_prefix`]). `None` when the key is too short to
+/// hold an ordering field.
+pub fn concurrency_request_key_order(key: &[u8], prefix_len: usize) -> Option<(u8, u64)> {
+    let field: [u8; 8] = key
+        .get(prefix_len..prefix_len.checked_add(8)?)?
+        .try_into()
+        .ok()?;
+    let order = u64::from_be_bytes(field);
+    Some(((order >> 56) as u8, order & CONCURRENCY_REQUEST_START_MASK))
+}
+
 /// Prefix for scanning all requests for a tenant/queue.
 pub fn concurrency_request_prefix(tenant: &str, queue: &str) -> Vec<u8> {
     encode_with_prefix(prefix::CONCURRENCY_REQUEST, &(tenant, queue))

@@ -140,6 +140,35 @@ impl FloatingWaiterProbeResult {
     }
 }
 
+/// What became of a request row a grant-scanner pass read by key from below
+/// its queue's floor, recorded as the `outcome` label on
+/// `silo_concurrency_request_noted_reads_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestNotedReadOutcome {
+    /// The pass granted the request.
+    Granted,
+    /// The row was deleted without a grant.
+    Deleted,
+    /// The pass read the row and left it in place.
+    Left,
+    /// No row, and the key was retired.
+    Missing,
+    /// No row yet, and the key stays noted.
+    Pending,
+}
+
+impl RequestNotedReadOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestNotedReadOutcome::Granted => "granted",
+            RequestNotedReadOutcome::Deleted => "deleted",
+            RequestNotedReadOutcome::Left => "left",
+            RequestNotedReadOutcome::Missing => "missing",
+            RequestNotedReadOutcome::Pending => "pending",
+        }
+    }
+}
+
 /// Result of one periodic full-compaction submission, recorded as the
 /// `outcome` label on `silo_periodic_full_compaction_submissions_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +319,12 @@ pub struct Metrics {
     /// Grant-scanner candidates skipped because their request row was gone
     /// by the time the scanner re-read it.
     concurrency_grant_vanished_requests: CounterVec,
+    concurrency_request_floor_lag_ms: HistogramVec,
+    concurrency_request_noted_reads: CounterVec,
+    concurrency_request_noted_keys: GaugeVec,
+    concurrency_request_noted_overflows: CounterVec,
+    concurrency_request_floor_rebuild_rows: CounterVec,
+    concurrency_request_writes_abandoned: CounterVec,
     /// Floating limit refreshes forced open after the outstanding-refresh flag
     /// was found stale, labelled by `reason`.
     floating_limit_refresh_resets: CounterVec,
@@ -1029,6 +1064,71 @@ impl Metrics {
     /// deleted after the pass began: no grant, no holder, no counter change.
     pub fn record_concurrency_grant_vanished_request(&self, shard: &str) {
         self.concurrency_grant_vanished_requests
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record how far behind the present a grant-scanner pass started
+    /// reading: the age of its queue's request floor, or zero when it read
+    /// from the queue's prefix.
+    pub fn record_concurrency_request_floor_lag(&self, shard: &str, lag_ms: u64) {
+        self.concurrency_request_floor_lag_ms
+            .with_label_values(&[shard])
+            .observe(lag_ms as f64);
+    }
+
+    /// Record `count` request rows a grant-scanner pass read by key from
+    /// below its queue's floor, by what became of them.
+    pub fn record_concurrency_request_noted_reads(
+        &self,
+        shard: &str,
+        outcome: RequestNotedReadOutcome,
+        count: u64,
+    ) {
+        if count > 0 {
+            self.concurrency_request_noted_reads
+                .with_label_values(&[shard, outcome.as_str()])
+                .inc_by(count as f64);
+        }
+    }
+
+    /// Set the number of request keys the shard's queues hold noted.
+    pub fn set_concurrency_request_noted_keys(&self, shard: &str, count: usize) {
+        self.concurrency_request_noted_keys
+            .with_label_values(&[shard])
+            .set(count as f64);
+    }
+
+    /// Remove the noted-keys gauge of a shard this node has closed.
+    pub fn clear_concurrency_request_noted_keys(&self, shard: &str) {
+        // `remove_label_values` errs when the series was never set.
+        let _ = self
+            .concurrency_request_noted_keys
+            .remove_label_values(&[shard]);
+    }
+
+    /// Record a request row write that lowered its queue's floor because
+    /// the queue already held its limit of noted keys.
+    pub fn record_concurrency_request_noted_overflow(&self, shard: &str) {
+        self.concurrency_request_noted_overflows
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record `count` request rows a pass reading from the prefix found
+    /// below the floor it dropped with no note for them.
+    pub fn record_concurrency_request_floor_rebuild_rows(&self, shard: &str, count: u64) {
+        if count > 0 {
+            self.concurrency_request_floor_rebuild_rows
+                .with_label_values(&[shard])
+                .inc_by(count as f64);
+        }
+    }
+
+    /// Record a request row write whose tracker was dropped before its
+    /// batch was confirmed committed.
+    pub fn record_concurrency_request_write_abandoned(&self, shard: &str) {
+        self.concurrency_request_writes_abandoned
             .with_label_values(&[shard])
             .inc();
     }
@@ -2887,6 +2987,82 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_request_floor_lag_ms = register(
+        &registry,
+        HistogramVec::new(
+            HistogramOpts::new(
+                "silo_concurrency_request_floor_lag_ms",
+                "For each grant-scanner pass that reads request rows, how far in the past (ms) the request floor it started from lies; 0 when it read from the queue's prefix",
+            )
+            .buckets(vec![
+                0.0,
+                1_000.0,
+                10_000.0,
+                60_000.0,
+                600_000.0,
+                3_600_000.0,
+                21_600_000.0,
+                86_400_000.0,
+            ]),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_request_noted_reads = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_request_noted_reads_total",
+                "Request rows grant-scanner passes read by key from below a queue's request floor, by outcome: granted, deleted, left (in place), missing (no row, key retired), pending (no row yet, key kept)",
+            ),
+            &["shard", "outcome"],
+        )?,
+    );
+
+    let concurrency_request_noted_keys = register(
+        &registry,
+        GaugeVec::new(
+            Opts::new(
+                "silo_concurrency_request_noted_keys",
+                "Request keys the shard's concurrency queues hold noted: rows below a request floor, and rows whose write has not settled",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_request_noted_overflows = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_request_noted_overflows_total",
+                "Request row writes that lowered a queue's request floor because the queue already held grant_scanner_request_noted_max_keys noted keys",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_request_floor_rebuild_rows = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_request_floor_rebuild_rows_total",
+                "Request rows a pass reading from the queue's prefix found below the request floor it dropped with no note for them; should stay at zero",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_request_writes_abandoned = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_request_writes_abandoned_total",
+                "Request row writes whose batch was not confirmed committed: it failed, was retried under a new key, or its future was dropped",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let floating_limit_refresh_resets = register(
         &registry,
         CounterVec::new(
@@ -3049,6 +3225,12 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_pending_grants,
         concurrency_grant_next_hop_skips,
         concurrency_grant_vanished_requests,
+        concurrency_request_floor_lag_ms,
+        concurrency_request_noted_reads,
+        concurrency_request_noted_keys,
+        concurrency_request_noted_overflows,
+        concurrency_request_floor_rebuild_rows,
+        concurrency_request_writes_abandoned,
         floating_limit_refresh_resets,
         floating_waiter_probes,
         slatedb_durable_seq,

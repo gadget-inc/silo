@@ -887,7 +887,7 @@ impl JobStoreShard {
             state.batch.delete(task_key);
             state.ack_deleted(task_key);
             let mut writer = DbWriteBatcher::new(&self.db, &mut state.batch);
-            self.concurrency.append_request_edits(
+            let request_write = self.concurrency.append_request_edits(
                 &mut writer,
                 &tenant,
                 &queue,
@@ -902,6 +902,7 @@ impl JobStoreShard {
                 &task_id,
                 &limits,
             )?;
+            state.scheduled_refreshes.track_request_write(request_write);
             // The ticket just became a waiter on this queue. Its request row
             // sits in the uncommitted batch, invisible to the durable waiter
             // probe, so the ticket supplies the waiter signal directly (as

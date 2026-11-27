@@ -26,6 +26,7 @@ pub mod pb_convert;
 pub mod placement_metrics;
 #[cfg(feature = "server")]
 pub mod query;
+pub mod request_floor;
 pub mod retry;
 pub mod routing_client;
 pub mod settings;

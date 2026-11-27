@@ -544,6 +544,13 @@ impl JobStoreShard {
                     priority_ordered_requests: cfg.concurrency_request_priority_order,
                     live_headroom_fraction: cfg.grant_scanner_live_headroom_fraction,
                     commit_chunk_size: cfg.grant_scanner_commit_chunk_size,
+                    request_floor: cfg.grant_scanner_request_floor,
+                    request_floor_min_lag_ms: cfg.grant_scanner_request_floor_min_lag_ms,
+                    request_noted_max_keys: cfg.grant_scanner_request_noted_max_keys,
+                    request_floor_rebuild_interval_ms: cfg
+                        .grant_scanner_request_floor_rebuild_interval_ms,
+                    request_write_abandon_grace_ms:
+                        crate::concurrency::DEFAULT_REQUEST_WRITE_ABANDON_GRACE_MS,
                 },
                 concurrency_reconcile_scan_slice: cfg.concurrency_reconcile_scan_slice,
                 holder_drift_scan_slice: cfg.holder_drift_scan_slice,
@@ -944,6 +951,9 @@ impl JobStoreShard {
         self.db.close().await.map_err(JobStoreShardError::from)?;
         self.close_completed
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(ref m) = self.metrics {
+            m.clear_concurrency_request_noted_keys(&self.name);
+        }
         tracing::debug!(
             shard = %self.name,
             elapsed_ms = db_close_started.elapsed().as_millis() as u64,
@@ -1654,6 +1664,37 @@ impl JobStoreShard {
     #[doc(hidden)]
     pub fn set_grant_scan_hook_for_test(&self, hook: Option<crate::concurrency::GrantScanHook>) {
         self.concurrency.set_grant_scan_hook_for_test(hook);
+    }
+
+    /// Test-only: install or clear the observer that receives the trace of
+    /// every read of a concurrency queue's request rows: which keys the read
+    /// fetched one by one, and where its range scan opened, sought and
+    /// stepped.
+    #[doc(hidden)]
+    pub fn set_request_read_observer_for_test(
+        &self,
+        observer: Option<crate::request_floor::RequestReadObserver>,
+    ) {
+        self.concurrency
+            .set_request_read_observer_for_test(observer);
+    }
+
+    /// Test-only: the task group of `(tenant, queue_key)`'s head waiting
+    /// request, as the scanner-originated floating refresh reads it.
+    #[doc(hidden)]
+    pub async fn peek_head_waiting_request_task_group_for_test(
+        &self,
+        tenant: &str,
+        queue_key: &str,
+    ) -> Result<Option<String>, JobStoreShardError> {
+        self.peek_head_waiting_request_task_group(tenant, queue_key)
+            .await
+    }
+
+    /// Test-only: the request floors of this shard's concurrency queues.
+    #[doc(hidden)]
+    pub fn request_floors_for_test(&self) -> Arc<crate::request_floor::RequestFloors> {
+        Arc::clone(self.concurrency.request_floors())
     }
 
     /// Test-only: install or clear a hook the enqueue chain awaits after a

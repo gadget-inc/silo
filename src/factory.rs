@@ -510,6 +510,14 @@ impl ShardFactory {
                             priority_ordered_requests: template.concurrency_request_priority_order,
                             live_headroom_fraction: template.grant_scanner_live_headroom_fraction,
                             commit_chunk_size: template.grant_scanner_commit_chunk_size,
+                            request_floor: template.grant_scanner_request_floor,
+                            request_floor_min_lag_ms: template
+                                .grant_scanner_request_floor_min_lag_ms,
+                            request_noted_max_keys: template.grant_scanner_request_noted_max_keys,
+                            request_floor_rebuild_interval_ms: template
+                                .grant_scanner_request_floor_rebuild_interval_ms,
+                            request_write_abandon_grace_ms:
+                                crate::concurrency::DEFAULT_REQUEST_WRITE_ABANDON_GRACE_MS,
                         },
                         concurrency_reconcile_scan_slice: template.concurrency_reconcile_scan_slice,
                         holder_drift_scan_slice: template.holder_drift_scan_slice,
@@ -1544,6 +1552,14 @@ impl ShardFactory {
                     priority_ordered_requests: self.template.concurrency_request_priority_order,
                     live_headroom_fraction: self.template.grant_scanner_live_headroom_fraction,
                     commit_chunk_size: self.template.grant_scanner_commit_chunk_size,
+                    request_floor: self.template.grant_scanner_request_floor,
+                    request_floor_min_lag_ms: self.template.grant_scanner_request_floor_min_lag_ms,
+                    request_noted_max_keys: self.template.grant_scanner_request_noted_max_keys,
+                    request_floor_rebuild_interval_ms: self
+                        .template
+                        .grant_scanner_request_floor_rebuild_interval_ms,
+                    request_write_abandon_grace_ms:
+                        crate::concurrency::DEFAULT_REQUEST_WRITE_ABANDON_GRACE_MS,
                 },
                 concurrency_reconcile_scan_slice: self.template.concurrency_reconcile_scan_slice,
                 holder_drift_scan_slice: self.template.holder_drift_scan_slice,
