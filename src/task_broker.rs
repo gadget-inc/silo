@@ -41,6 +41,33 @@ struct AckTombstone {
     last_seen: u64,
 }
 
+/// What became of a task row the broker read from the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOutcome {
+    /// The row was added to the buffer.
+    Inserted,
+    /// The buffer already holds the row.
+    AlreadyBuffered,
+    /// A dequeue has claimed the row and not yet committed or released it.
+    InFlight,
+    /// An ack tombstone suppresses the row: a dequeue deleted it durably.
+    Tombstone,
+    /// The row belongs to a tenant outside the shard's range and is to be
+    /// deleted.
+    Defunct,
+    /// The row does not decode as a task.
+    Malformed,
+}
+
+/// The result of offering a row to the buffer.
+#[derive(Debug, Clone, Copy)]
+struct OfferedRow {
+    outcome: RowOutcome,
+    /// The row's ack tombstone had aged past the revive bound and a point
+    /// read found the row still present, so the tombstone was dropped.
+    revived: bool,
+}
+
 /// A single per-task-group broker that scans only its own key range.
 ///
 /// - Maintains a sorted buffer of ready tasks using a skiplist keyed by the task key bytes.
@@ -282,102 +309,32 @@ impl TaskBroker {
             // defunct, or malformed. A later scan need not read it again.
             consumed_through_ms = Some(parsed_key.start_time_ms as i64);
 
-            let key_bytes = kv.key.to_vec();
-
-            // [SILO-SCAN-3] Skip inflight tasks
-            if self.inflight.lock().unwrap().contains(&key_bytes) {
-                skipped_inflight += 1;
-                continue;
+            let offered = self.offer_row(kv.key.to_vec(), kv.value, generation).await;
+            if offered.revived {
+                revived += 1;
             }
+            match offered.outcome {
+                RowOutcome::Inserted => {
+                    inserted += 1;
+                    if cleared_floor_ms
+                        .is_some_and(|cleared_ms| (parsed_key.start_time_ms as i64) < cleared_ms)
+                    {
+                        inserted_below_floor += 1;
+                    }
 
-            // Skip keys that were recently durably acked to avoid stale scan re-inserts.
-            // Refresh last_seen so persistent stale observations extend suppression.
-            let tombstone_age = {
-                let mut tombstones = self.ack_tombstones.lock().unwrap();
-                tombstones.get_mut(&key_bytes).map(|tombstone| {
-                    tombstone.last_seen = generation;
-                    generation.saturating_sub(tombstone.inserted_at)
-                })
-            };
-            let mut value = kv.value;
-            if let Some(age) = tombstone_age {
-                if age <= self.tombstone_revive_after_generations {
-                    skipped_tombstone += 1;
-                    continue;
-                }
-                // A key re-observed past the bound is either a stale scan or a
-                // row rewritten under the same key after the delete. A point get
-                // sees a fresher view than the range scan that yielded the key;
-                // the guard is not held across it.
-                match self.db.get(&key_bytes).await {
-                    Ok(Some(durable)) => {
-                        self.ack_tombstones.lock().unwrap().remove(&key_bytes);
-                        revived += 1;
-                        value = durable;
-                    }
-                    Ok(None) => {
-                        // The delete is confirmed. Re-arm the bound so a stale
-                        // scan costs one point read per bound window, not one
-                        // per generation.
-                        if let Some(tombstone) =
-                            self.ack_tombstones.lock().unwrap().get_mut(&key_bytes)
-                        {
-                            tombstone.inserted_at = generation;
-                        }
-                        skipped_tombstone += 1;
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "tombstone revive point read failed; keeping suppression");
-                        skipped_tombstone += 1;
-                        continue;
+                    // Yield periodically to avoid starving other tasks
+                    if inserted % 16 == 0 {
+                        tokio::task::yield_now().await;
                     }
                 }
-            }
-
-            let decoded = match decode_task_validated(value) {
-                Ok(t) => t,
-                Err(_) => continue, // Skip malformed tasks
-            };
-
-            // Check if task's tenant is within shard range
-            let task_tenant = decoded.tenant();
-
-            if !self.range.contains_tenant(task_tenant) {
-                // Task is for a tenant outside our range - mark for deletion
-                defunct_keys.push(kv.key.to_vec());
-                skipped_defunct += 1;
-                debug!(
-                    task_group = %parsed_key.task_group,
-                    job_id = %parsed_key.job_id,
-                    tenant = %task_tenant,
-                    range = %self.range,
-                    "skipping defunct task (tenant outside shard range)"
-                );
-                continue;
-            }
-
-            let entry = BrokerTask {
-                key: key_bytes.clone(),
-                decoded,
-            };
-
-            // [SILO-SCAN-2] Insert into buffer if not already present
-            if self.buffer.get(&key_bytes).is_none() {
-                self.buffer.insert(key_bytes, entry);
-                inserted += 1;
-                if cleared_floor_ms
-                    .is_some_and(|cleared_ms| (parsed_key.start_time_ms as i64) < cleared_ms)
-                {
-                    inserted_below_floor += 1;
+                RowOutcome::AlreadyBuffered => skipped_already_buffered += 1,
+                RowOutcome::InFlight => skipped_inflight += 1,
+                RowOutcome::Tombstone => skipped_tombstone += 1,
+                RowOutcome::Defunct => {
+                    defunct_keys.push(kv.key.to_vec());
+                    skipped_defunct += 1;
                 }
-
-                // Yield periodically to avoid starving other tasks
-                if inserted % 16 == 0 {
-                    tokio::task::yield_now().await;
-                }
-            } else {
-                skipped_already_buffered += 1;
+                RowOutcome::Malformed => {}
             }
         }
 
@@ -443,6 +400,99 @@ impl TaskBroker {
         }
 
         inserted
+    }
+
+    /// Decide what becomes of a task row that was just read from the
+    /// database, buffering it when it is this shard's to run and nothing
+    /// else holds it. Whatever the outcome, the row is dealt with for good:
+    /// a later scan need not read it again.
+    async fn offer_row(
+        &self,
+        key: Vec<u8>,
+        mut value: slatedb::bytes::Bytes,
+        generation: u64,
+    ) -> OfferedRow {
+        let mut revived = false;
+
+        // [SILO-SCAN-3] Skip inflight tasks
+        if self.inflight.lock().unwrap().contains(&key) {
+            return OfferedRow {
+                outcome: RowOutcome::InFlight,
+                revived,
+            };
+        }
+
+        // Skip keys that were recently durably acked to avoid stale re-inserts.
+        // Refresh last_seen so persistent stale observations extend suppression.
+        let tombstone_age = {
+            let mut tombstones = self.ack_tombstones.lock().unwrap();
+            tombstones.get_mut(&key).map(|tombstone| {
+                tombstone.last_seen = generation;
+                generation.saturating_sub(tombstone.inserted_at)
+            })
+        };
+        if let Some(age) = tombstone_age {
+            let suppressed = OfferedRow {
+                outcome: RowOutcome::Tombstone,
+                revived,
+            };
+            if age <= self.tombstone_revive_after_generations {
+                return suppressed;
+            }
+            // A key re-observed past the bound is either a stale read or a
+            // row rewritten under the same key after the delete. A point get
+            // sees a fresher view than the read that yielded the key; the
+            // guard is not held across it.
+            match self.db.get(&key).await {
+                Ok(Some(durable)) => {
+                    self.ack_tombstones.lock().unwrap().remove(&key);
+                    revived = true;
+                    value = durable;
+                }
+                Ok(None) => {
+                    // The delete is confirmed. Re-arm the bound so a stale
+                    // read costs one point read per bound window, not one
+                    // per generation.
+                    if let Some(tombstone) = self.ack_tombstones.lock().unwrap().get_mut(&key) {
+                        tombstone.inserted_at = generation;
+                    }
+                    return suppressed;
+                }
+                Err(e) => {
+                    debug!(error = %e, "tombstone revive point read failed; keeping suppression");
+                    return suppressed;
+                }
+            }
+        }
+        let outcome = |outcome| OfferedRow { outcome, revived };
+
+        let Ok(decoded) = decode_task_validated(value) else {
+            return outcome(RowOutcome::Malformed);
+        };
+
+        // A task for a tenant outside the shard's range is the caller's to
+        // delete.
+        let task_tenant = decoded.tenant();
+        if !self.range.contains_tenant(task_tenant) {
+            debug!(
+                task_group = %self.task_group,
+                tenant = %task_tenant,
+                range = %self.range,
+                "skipping defunct task (tenant outside shard range)"
+            );
+            return outcome(RowOutcome::Defunct);
+        }
+
+        // [SILO-SCAN-2] Insert into buffer if not already present
+        if self.buffer.get(&key).is_some() {
+            return outcome(RowOutcome::AlreadyBuffered);
+        }
+        let entry = BrokerTask {
+            key: key.clone(),
+            decoded,
+        };
+        self.buffer.insert(key, entry);
+        outcome(RowOutcome::Inserted)
     }
 
     /// Take the cursor for a scan that is about to create its iterator. A
