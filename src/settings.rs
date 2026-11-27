@@ -329,7 +329,9 @@ fn default_broker_full_rescan_interval_ms() -> u64 {
 /// reaper scans a shard's whole lease range instead of reading only the
 /// leases its in-memory index reports due. Every writer of a lease row adds
 /// it to the index; the full scan bounds how long a lease a writer failed to
-/// add can stay expired without being reaped.
+/// add can stay expired without being reaped. Each shard takes its scans at
+/// its own offset within the interval, so the shards a node opens together
+/// do not all scan on the same reaper tick.
 pub const DEFAULT_LEASE_REAPER_FULL_SCAN_INTERVAL_MS: u64 = 60_000;
 
 fn default_lease_reaper_full_scan_interval_ms() -> u64 {
@@ -502,7 +504,11 @@ pub struct DatabaseTemplate {
     /// How often (ms) the lease reaper scans the shard's whole lease range.
     /// Between those scans it reads only the leases its in-memory index
     /// reports due, so the scan bounds how long an expired lease missing from
-    /// the index can wait. Zero scans on every pass. Defaults to 60000.
+    /// the index can wait. A shard scans on its first pass after opening,
+    /// again after an offset derived from its name that is at most one
+    /// interval, and once per interval from there, so the shards on a node
+    /// spread their scans across the interval. Zero scans on every pass.
+    /// Defaults to 60000.
     #[serde(default = "default_lease_reaper_full_scan_interval_ms")]
     pub lease_reaper_full_scan_interval_ms: u64,
     /// When set, jobs that finished successfully (Succeeded) have all of their

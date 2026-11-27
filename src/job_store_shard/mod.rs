@@ -164,8 +164,10 @@ pub struct OpenShardOptions {
     /// starting at the scan floor. Populated from
     /// `DatabaseConfig::broker_full_rescan_interval_ms`.
     pub broker_full_rescan_interval_ms: u64,
-    /// How often the lease reaper scans the whole lease range instead of
-    /// reading only the leases its index reports due. Populated from
+    /// The longest the lease reaper goes between scans of the whole lease
+    /// range, which it runs instead of reading only the leases its index
+    /// reports due. The shard's name sets where in the interval its scans
+    /// fall. Populated from
     /// `DatabaseConfig::lease_reaper_full_scan_interval_ms`.
     pub lease_reaper_full_scan_interval_ms: u64,
     /// One-shot backfill of the enqueue-time index for pre-existing jobs.
@@ -332,8 +334,6 @@ pub struct JobStoreShard {
     /// writers add to it before they commit, so the reaper reads only due
     /// leases between its scans of the whole lease range.
     pub(crate) leases: crate::lease_index::LeaseIndex,
-    /// How often (ms) the lease reaper scans the whole lease range.
-    lease_reaper_full_scan_interval_ms: i64,
     /// Serializes requester counter recounts from snapshot to commit. A
     /// recount's correction is a delta computed at its snapshot, so two
     /// recounts of one queue that overlap would both merge the same delta.
@@ -703,6 +703,11 @@ impl JobStoreShard {
             std::time::Duration::from_millis(broker_full_rescan_interval_ms),
         );
 
+        let lease_full_scan_schedule = crate::lease_index::FullScanSchedule::for_shard(
+            &name,
+            i64::try_from(lease_reaper_full_scan_interval_ms).unwrap_or(i64::MAX),
+        );
+
         let shard = Arc::new(Self {
             name,
             db,
@@ -739,9 +744,7 @@ impl JobStoreShard {
                 .unwrap_or(i64::MAX),
             refresh_pending_groups: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             refresh_drain_lock: tokio::sync::Mutex::new(()),
-            leases: crate::lease_index::LeaseIndex::default(),
-            lease_reaper_full_scan_interval_ms: i64::try_from(lease_reaper_full_scan_interval_ms)
-                .unwrap_or(i64::MAX),
+            leases: crate::lease_index::LeaseIndex::new(lease_full_scan_schedule),
             requester_recount_lock: tokio::sync::Mutex::new(()),
             enqueue_time_index_backfill,
             listing_index_version: AtomicU8::new(0),

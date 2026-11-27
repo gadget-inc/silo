@@ -25,7 +25,7 @@ use crate::keys::{
     idx_enqueue_time_key, idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key,
     parse_concurrency_holder_key, parse_lease_key,
 };
-use crate::lease_index::ScannedLease;
+use crate::lease_index::{FullScanSchedule, ScannedLease};
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
 
@@ -585,11 +585,11 @@ impl JobStoreShard {
     ///
     /// The pass reads, by key, the lease rows the in-memory index reports
     /// due, so it costs nothing while no lease has expired and its cost does
-    /// not depend on how many leases the shard has released. Once per
-    /// `lease_reaper_full_scan_interval_ms`, and on the first pass after the
-    /// shard opens, it scans the whole lease range instead: that seeds the
-    /// index, reaps any expired lease the index does not hold, and deletes
-    /// leases for tenants outside the shard's range.
+    /// not depend on how many leases the shard has released. On the first
+    /// pass after the shard opens, and then as the shard's
+    /// [`FullScanSchedule`] says, it scans the whole lease range instead:
+    /// that seeds the index, reaps any expired lease the index does not
+    /// hold, and deletes leases for tenants outside the shard's range.
     ///
     /// An expired lease fails its attempt with a WORKER_CRASHED error code,
     /// or ends it Cancelled if the job was cancelled; an expired
@@ -599,10 +599,7 @@ impl JobStoreShard {
         &self,
         now_ms: i64,
     ) -> Result<LeaseReapPass, JobStoreShardError> {
-        if self
-            .leases
-            .full_scan_due(now_ms, self.lease_reaper_full_scan_interval_ms)
-        {
+        if self.leases.full_scan_due(now_ms) {
             return self.scan_and_reap_leases(now_ms).await;
         }
 
@@ -640,12 +637,22 @@ impl JobStoreShard {
     /// Whether [`Self::reap_due_leases_at`] `now_ms` would read anything: a
     /// full scan is due, or the index holds a lease that has expired.
     pub fn lease_reap_is_due(&self, now_ms: i64) -> bool {
-        self.leases
-            .full_scan_due(now_ms, self.lease_reaper_full_scan_interval_ms)
+        self.leases.full_scan_due(now_ms)
             || self
                 .leases
                 .next_expiry_ms()
                 .is_some_and(|expiry_ms| expiry_ms <= now_ms)
+    }
+
+    /// When this shard's reaper scans the whole lease range.
+    pub fn lease_full_scan_schedule(&self) -> FullScanSchedule {
+        self.leases.full_scan_schedule()
+    }
+
+    /// When the reaper's next scan of the whole lease range is due. `None`
+    /// until the first pass after the shard opens has run its scan.
+    pub fn next_lease_full_scan_ms(&self) -> Option<i64> {
+        self.leases.next_full_scan_ms()
     }
 
     /// The number of leases the reaper's in-memory index holds.

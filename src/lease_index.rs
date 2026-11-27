@@ -16,6 +16,74 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::job_store_shard::shard_name_jitter_ms;
+
+/// When a shard's whole lease range is scanned: on the first pass after the
+/// shard opens, `first_period_ms` after that, and once per `interval_ms`
+/// from there. The first period is at most one interval and differs between
+/// shards, so shards that open together scan at different times while no
+/// shard waits longer than the interval between two scans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FullScanSchedule {
+    interval_ms: i64,
+    first_period_ms: i64,
+}
+
+impl FullScanSchedule {
+    /// A schedule whose first period is `offset_ms`, taken modulo the
+    /// interval, shorter than `interval_ms`. An interval of zero or less
+    /// scans on every pass.
+    pub fn new(interval_ms: i64, offset_ms: i64) -> Self {
+        let interval_ms = interval_ms.max(0);
+        let offset_ms = offset_ms.checked_rem_euclid(interval_ms).unwrap_or(0);
+        Self {
+            interval_ms,
+            first_period_ms: interval_ms - offset_ms,
+        }
+    }
+
+    /// The schedule of the shard named `shard_name`. Its offset is a hash of
+    /// the name: the same on every run, and spread across the interval from
+    /// one shard to the next.
+    pub fn for_shard(shard_name: &str, interval_ms: i64) -> Self {
+        let offset_ms = shard_name_jitter_ms(shard_name, u64::try_from(interval_ms).unwrap_or(0));
+        Self::new(interval_ms, i64::try_from(offset_ms).unwrap_or(0))
+    }
+
+    pub fn interval_ms(&self) -> i64 {
+        self.interval_ms
+    }
+
+    /// How long after the scan that seeds the index the next one is due.
+    pub fn first_period_ms(&self) -> i64 {
+        self.first_period_ms
+    }
+
+    fn scans_every_pass(&self) -> bool {
+        self.interval_ms <= 0
+    }
+
+    /// When the scan after one at `scan_ms` is due, for a shard first
+    /// scanned at `first_scan_ms`: the earliest slot later than `scan_ms`.
+    /// Slots start one first period after the first scan and repeat every
+    /// interval, so a scan that runs late does not move the ones after it.
+    fn next_after(&self, first_scan_ms: i64, scan_ms: i64) -> i64 {
+        let first_slot_ms = first_scan_ms.saturating_add(self.first_period_ms);
+        if scan_ms < first_slot_ms {
+            return first_slot_ms;
+        }
+        let Some(into_period_ms) = scan_ms
+            .saturating_sub(first_slot_ms)
+            .checked_rem(self.interval_ms)
+        else {
+            return scan_ms;
+        };
+        scan_ms
+            .saturating_sub(into_period_ms)
+            .saturating_add(self.interval_ms)
+    }
+}
+
 /// A lease whose indexed expiry has passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueLease {
@@ -38,6 +106,7 @@ pub enum ScannedLease {
 
 #[derive(Debug, Default)]
 pub struct LeaseIndex {
+    schedule: FullScanSchedule,
     inner: Mutex<Inner>,
 }
 
@@ -45,7 +114,10 @@ pub struct LeaseIndex {
 struct Inner {
     expiry_by_task: HashMap<Arc<str>, i64>,
     by_expiry: BTreeSet<(i64, Arc<str>)>,
-    last_full_scan_ms: Option<i64>,
+    /// When the first scan of the whole lease range started.
+    first_full_scan_ms: Option<i64>,
+    /// When the next scan of the whole lease range is due.
+    next_full_scan_ms: Option<i64>,
     /// How many [`FullScan`]s are open.
     open_scans: usize,
     /// Leases released while a full scan was open.
@@ -143,6 +215,14 @@ impl Drop for FullScan<'_> {
 }
 
 impl LeaseIndex {
+    /// An empty index whose whole-range scans follow `schedule`.
+    pub fn new(schedule: FullScanSchedule) -> Self {
+        Self {
+            schedule,
+            inner: Mutex::default(),
+        }
+    }
+
     /// The state is plain data that every method leaves consistent, so a
     /// lock poisoned by a panicking holder is still safe to read.
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -214,18 +294,32 @@ impl LeaseIndex {
 
     /// Whether a scan of the whole lease range has ever fed the index.
     pub fn seeded(&self) -> bool {
-        self.lock().last_full_scan_ms.is_some()
+        self.lock().first_full_scan_ms.is_some()
+    }
+
+    pub fn full_scan_schedule(&self) -> FullScanSchedule {
+        self.schedule
+    }
+
+    /// When the next scan of the whole lease range is due. `None` until a
+    /// first scan has seeded the index: that one is due at once.
+    pub fn next_full_scan_ms(&self) -> Option<i64> {
+        self.lock().next_full_scan_ms
     }
 
     /// Whether the whole lease range should be scanned at `now_ms`: always
-    /// until a first scan has seeded the index, then once per `interval_ms`.
-    pub fn full_scan_due(&self, now_ms: i64, interval_ms: i64) -> bool {
-        let last_full_scan_ms = self.lock().last_full_scan_ms;
-        last_full_scan_ms.is_none_or(|last_ms| now_ms.saturating_sub(last_ms) >= interval_ms)
+    /// until a first scan has seeded the index, then as the schedule says.
+    pub fn full_scan_due(&self, now_ms: i64) -> bool {
+        self.schedule.scans_every_pass()
+            || self
+                .next_full_scan_ms()
+                .is_none_or(|due_ms| now_ms >= due_ms)
     }
 
     /// Record that a scan of the whole lease range started at `now_ms`.
     pub fn record_full_scan(&self, now_ms: i64) {
-        self.lock().last_full_scan_ms = Some(now_ms);
+        let mut inner = self.lock();
+        let first_scan_ms = *inner.first_full_scan_ms.get_or_insert(now_ms);
+        inner.next_full_scan_ms = Some(self.schedule.next_after(first_scan_ms, now_ms));
     }
 }

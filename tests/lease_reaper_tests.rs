@@ -47,11 +47,51 @@ async fn lease_jobs(shard: &JobStoreShard, prefix: &str, count: usize) -> Vec<St
     dequeue_task_ids_until(shard, "worker", "default", count).await
 }
 
-/// Run the pass that seeds the index, which scans the whole lease range.
+/// Run the pass that seeds the index and the shard's first periodic full
+/// scan, timed so that scan lands now. Returns its time: the shard's next
+/// full scan is due one interval later.
 async fn seed(shard: &JobStoreShard) -> i64 {
     let now = now_ms();
-    let pass = shard.reap_due_leases_at(now).await.expect("seeding pass");
-    assert!(pass.full_scan, "the first pass scans the whole lease range");
+    let opened_at = now - shard.lease_full_scan_schedule().first_period_ms();
+    let seeding = shard
+        .reap_due_leases_at(opened_at)
+        .await
+        .expect("seeding pass");
+    assert!(
+        seeding.full_scan,
+        "the first pass scans the whole lease range"
+    );
+    assert_eq!(shard.next_lease_full_scan_ms(), Some(now));
+    let first_periodic = shard.reap_due_leases_at(now).await.expect("periodic pass");
+    assert!(first_periodic.full_scan);
+    assert_eq!(
+        shard.next_lease_full_scan_ms(),
+        Some(now + FULL_SCAN_INTERVAL_MS)
+    );
+    now
+}
+
+/// Tick `reaper` through the shard's seeding scan and first periodic full
+/// scan, timed so that scan lands now. Returns its time: the shard's next
+/// full scan is due one interval later.
+async fn seed_with_reaper(
+    reaper: &mut LeaseReaper,
+    shards: &HashMap<ShardId, Arc<JobStoreShard>>,
+    shard: &JobStoreShard,
+) -> i64 {
+    let now = now_ms();
+    reaper.tick(
+        shards,
+        now - shard.lease_full_scan_schedule().first_period_ms(),
+    );
+    reaper.drain().await;
+    assert_eq!(shard.next_lease_full_scan_ms(), Some(now));
+    reaper.tick(shards, now);
+    reaper.drain().await;
+    assert_eq!(
+        shard.next_lease_full_scan_ms(),
+        Some(now + FULL_SCAN_INTERVAL_MS)
+    );
     now
 }
 
@@ -455,7 +495,9 @@ async fn an_expired_refresh_lease_is_reaped_by_key() {
 #[silo::test]
 async fn the_seeding_scan_indexes_leases_already_held() {
     let (_tmp, shard) = open_temp_shard().await;
-    let expiry_ms = now_ms() + 5_000;
+    let seeded_at = now_ms();
+    // The lease expires just before the shard's first periodic full scan.
+    let expiry_ms = seeded_at + shard.lease_full_scan_schedule().first_period_ms() - 1;
     write_run_attempt_lease(
         &shard,
         "worker",
@@ -469,7 +511,7 @@ async fn the_seeding_scan_indexes_leases_already_held() {
     .await;
     assert_eq!(shard.tracked_lease_count(), 0);
 
-    let seeding = shard.reap_due_leases_at(now_ms()).await.expect("seed");
+    let seeding = shard.reap_due_leases_at(seeded_at).await.expect("seed");
 
     assert_eq!(
         seeding,
@@ -834,6 +876,124 @@ async fn a_forced_full_reap_finds_a_lease_expired_behind_the_index() {
     assert_eq!(shard.tracked_lease_count(), 0);
 }
 
+/// Shards that open on the same reaper tick do not share a phase: each
+/// comes due for its next full scan at its own time, no more than one
+/// interval after the scan that seeded it.
+#[silo::test]
+async fn shards_seeded_together_come_due_for_a_full_scan_at_different_times() {
+    let range = ShardRange::full();
+    let (_tmp_a, shard_a) = open_temp_shard_with_name("shard-a", &range).await;
+    let (_tmp_b, shard_b) = open_temp_shard_with_name("shard-b", &range).await;
+    let seeded_at = now_ms();
+    for shard in [&shard_a, &shard_b] {
+        assert_eq!(shard.next_lease_full_scan_ms(), None);
+        let seeding = shard.reap_due_leases_at(seeded_at).await.expect("seed");
+        assert!(seeding.full_scan);
+    }
+
+    let due_a = shard_a.next_lease_full_scan_ms().expect("seeded");
+    let due_b = shard_b.next_lease_full_scan_ms().expect("seeded");
+
+    assert!(
+        (due_a - due_b).abs() >= 1_000,
+        "the reaper ticks once a second, and {due_a} and {due_b} share a tick"
+    );
+    for (shard, due_ms) in [(&shard_a, due_a), (&shard_b, due_b)] {
+        assert!(due_ms > seeded_at);
+        assert!(due_ms <= seeded_at + FULL_SCAN_INTERVAL_MS);
+        assert!(!shard.lease_reap_is_due(due_ms - 1));
+        assert!(shard.lease_reap_is_due(due_ms));
+        let before = shard.reap_due_leases_at(due_ms - 1).await.expect("pass");
+        assert!(!before.full_scan);
+        let at = shard.reap_due_leases_at(due_ms).await.expect("pass");
+        assert!(at.full_scan);
+    }
+}
+
+/// After the period that follows the seeding scan, a shard's full scans are
+/// one interval apart, and the reaper is told a pass is due exactly when
+/// the pass would scan.
+#[silo::test]
+async fn after_its_first_period_a_shards_full_scans_are_one_interval_apart() {
+    let (_tmp, shard) = open_temp_shard_with_name("shard-a", &ShardRange::full()).await;
+    let seeded_at = now_ms();
+    shard.reap_due_leases_at(seeded_at).await.expect("seed");
+    let first = shard.next_lease_full_scan_ms().expect("seeded");
+    assert!(
+        first - seeded_at < FULL_SCAN_INTERVAL_MS,
+        "this shard's first period is shorter than the interval"
+    );
+
+    let mut due_ms = first;
+    for _ in 0..3 {
+        assert!(!shard.lease_reap_is_due(due_ms - 1));
+        let before = shard.reap_due_leases_at(due_ms - 1).await.expect("pass");
+        assert!(!before.full_scan);
+        assert!(shard.lease_reap_is_due(due_ms));
+        let at = shard.reap_due_leases_at(due_ms).await.expect("pass");
+        assert!(at.full_scan);
+
+        let next_ms = shard.next_lease_full_scan_ms().expect("seeded");
+        assert_eq!(next_ms, due_ms + FULL_SCAN_INTERVAL_MS);
+        due_ms = next_ms;
+    }
+}
+
+/// A full scan that runs late is followed by one less than an interval
+/// later, so two scans of a shard are never more than an interval apart.
+#[silo::test]
+async fn a_late_full_scan_is_followed_within_one_interval() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let seeded_at = seed(&shard).await;
+    let slot_ms = seeded_at + FULL_SCAN_INTERVAL_MS;
+
+    let late = shard
+        .reap_due_leases_at(slot_ms + 2_500)
+        .await
+        .expect("late pass");
+
+    assert!(late.full_scan);
+    assert_eq!(
+        shard.next_lease_full_scan_ms(),
+        Some(slot_ms + FULL_SCAN_INTERVAL_MS)
+    );
+}
+
+/// With an interval of zero every pass scans the whole lease range.
+#[silo::test]
+async fn an_interval_of_zero_scans_on_every_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = silo::settings::DatabaseConfig {
+        name: "every-pass".to_string(),
+        backend: silo::settings::Backend::Fs,
+        path: tmp.path().to_string_lossy().to_string(),
+        slatedb: Some(fast_flush_slatedb_settings()),
+        lease_reaper_full_scan_interval_ms: 0,
+        ..Default::default()
+    };
+    let shard = JobStoreShard::open(
+        &cfg,
+        silo::gubernator::MockGubernatorClient::new_arc(),
+        None,
+        ShardRange::full(),
+    )
+    .await
+    .expect("open shard");
+    let now = now_ms();
+
+    for pass_ms in [now, now, now + 1, now + 1_000, now + 1_001] {
+        assert!(shard.lease_reap_is_due(pass_ms));
+        let pass = shard.reap_due_leases_at(pass_ms).await.expect("pass");
+        assert_eq!(
+            pass,
+            LeaseReapPass {
+                full_scan: true,
+                ..Default::default()
+            }
+        );
+    }
+}
+
 fn reaper_metric(metrics: &silo::metrics::Metrics, name: &str) -> f64 {
     metric_value_or_zero(&gather_metrics_text(metrics), &[name, "shard=\""])
 }
@@ -920,6 +1080,11 @@ async fn ticks_with_nothing_due_record_no_scans() {
     );
 
     lease_jobs(&shard, "idle", 3).await;
+    let first_period_ms = shard.lease_full_scan_schedule().first_period_ms();
+    assert!(
+        first_period_ms > 5_000,
+        "five ticks fit in the first period"
+    );
     for second in 1..=5 {
         reaper.tick(&shards, now + second * 1_000);
         reaper.drain().await;
@@ -945,8 +1110,8 @@ async fn a_tick_past_an_expiry_reaps_and_records_the_pass() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
     let shards = HashMap::from([(ShardId::new(), Arc::clone(&shard))]);
     let mut reaper = LeaseReaper::new(Some(metrics.clone()));
-    reaper.tick(&shards, now_ms());
-    reaper.drain().await;
+    seed_with_reaper(&mut reaper, &shards, &shard).await;
+    let scans_before = reaper_metric(&metrics, "silo_lease_reaper_scans_total");
     let task_ids = lease_jobs(&shard, "crashed", 2).await;
     let mut latest_expiry_ms = 0;
     for task_id in &task_ids {
@@ -966,7 +1131,8 @@ async fn a_tick_past_an_expiry_reaps_and_records_the_pass() {
     );
     assert_eq!(
         reaper_metric(&metrics, "silo_lease_reaper_scans_total"),
-        1.0
+        scans_before,
+        "the pass at the expiry reads by key"
     );
     assert_eq!(count_lease_keys(shard.db()).await, 0);
 }
@@ -977,9 +1143,8 @@ async fn a_full_scan_tick_counts_untracked_leases() {
     let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
     let shards = HashMap::from([(ShardId::new(), Arc::clone(&shard))]);
     let mut reaper = LeaseReaper::new(Some(metrics.clone()));
-    let now = now_ms();
-    reaper.tick(&shards, now);
-    reaper.drain().await;
+    let now = seed_with_reaper(&mut reaper, &shards, &shard).await;
+    let scans_before = reaper_metric(&metrics, "silo_lease_reaper_scans_total");
     write_run_attempt_lease(
         &shard,
         "worker",
@@ -992,12 +1157,19 @@ async fn a_full_scan_tick_counts_untracked_leases() {
     )
     .await;
 
+    reaper.tick(&shards, now + FULL_SCAN_INTERVAL_MS - 1);
+    reaper.drain().await;
+    assert_eq!(
+        reaper_metric(&metrics, "silo_lease_reaper_scans_total"),
+        scans_before
+    );
+
     reaper.tick(&shards, now + FULL_SCAN_INTERVAL_MS);
     reaper.drain().await;
 
     assert_eq!(
         reaper_metric(&metrics, "silo_lease_reaper_scans_total"),
-        2.0
+        scans_before + 1.0
     );
     assert_eq!(
         reaper_metric(&metrics, "silo_lease_reaper_untracked_leases_total"),

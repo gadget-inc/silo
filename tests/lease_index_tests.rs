@@ -1,7 +1,7 @@
 //! Tests for the in-memory lease index: which leases it reports due, and how
 //! writes, renewals and releases move an entry.
 
-use silo::lease_index::{LeaseIndex, ScannedLease};
+use silo::lease_index::{FullScanSchedule, LeaseIndex, ScannedLease};
 
 fn due_ids(index: &LeaseIndex, now_ms: i64) -> Vec<String> {
     index
@@ -232,17 +232,114 @@ fn releases_stay_recorded_until_the_last_overlapping_full_scan_ends() {
 
 #[test]
 fn a_full_scan_is_due_before_the_first_and_again_after_the_interval() {
-    let index = LeaseIndex::default();
-    assert!(
-        index.full_scan_due(0, 60_000),
-        "nothing has seeded the index"
-    );
+    let index = LeaseIndex::new(FullScanSchedule::new(60_000, 0));
+    assert!(index.full_scan_due(0), "nothing has seeded the index");
     assert!(!index.seeded());
+    assert_eq!(index.next_full_scan_ms(), None);
 
     index.record_full_scan(10_000);
 
     assert!(index.seeded());
-    assert!(!index.full_scan_due(10_000, 60_000));
-    assert!(!index.full_scan_due(69_999, 60_000));
-    assert!(index.full_scan_due(70_000, 60_000));
+    assert_eq!(index.next_full_scan_ms(), Some(70_000));
+    assert!(!index.full_scan_due(10_000));
+    assert!(!index.full_scan_due(69_999));
+    assert!(index.full_scan_due(70_000));
+}
+
+/// The offset shortens the period after the seeding scan and no other.
+#[test]
+fn an_offset_shortens_only_the_first_period() {
+    let schedule = FullScanSchedule::new(60_000, 45_000);
+    assert_eq!(schedule.interval_ms(), 60_000);
+    assert_eq!(schedule.first_period_ms(), 15_000);
+    let index = LeaseIndex::new(schedule);
+
+    index.record_full_scan(10_000);
+    assert!(!index.full_scan_due(24_999));
+    assert!(index.full_scan_due(25_000));
+
+    index.record_full_scan(25_000);
+    assert_eq!(index.next_full_scan_ms(), Some(85_000));
+    assert!(!index.full_scan_due(84_999));
+    assert!(index.full_scan_due(85_000));
+
+    index.record_full_scan(85_000);
+    assert_eq!(index.next_full_scan_ms(), Some(145_000));
+}
+
+#[test]
+fn a_first_period_is_never_longer_than_the_interval_or_empty() {
+    for offset_ms in [0, 1, 59_999, 60_000, 60_001, 1_000_000, -1] {
+        let first_period_ms = FullScanSchedule::new(60_000, offset_ms).first_period_ms();
+        assert!(
+            (1..=60_000).contains(&first_period_ms),
+            "offset {offset_ms} gives a first period of {first_period_ms}"
+        );
+    }
+    assert_eq!(FullScanSchedule::new(60_000, 0).first_period_ms(), 60_000);
+    assert_eq!(
+        FullScanSchedule::new(60_000, 60_001).first_period_ms(),
+        59_999
+    );
+}
+
+/// Scans sit on slots one interval apart, so a scan that runs late is
+/// followed by one less than an interval later, never more.
+#[test]
+fn a_late_full_scan_does_not_move_the_scans_after_it() {
+    let index = LeaseIndex::new(FullScanSchedule::new(60_000, 45_000));
+    index.record_full_scan(10_000);
+
+    index.record_full_scan(27_500);
+    assert_eq!(index.next_full_scan_ms(), Some(85_000));
+
+    index.record_full_scan(150_000);
+    assert_eq!(index.next_full_scan_ms(), Some(205_000));
+}
+
+/// A scan forced before the first slot leaves that slot where it is.
+#[test]
+fn a_full_scan_before_the_first_slot_keeps_the_slot() {
+    let index = LeaseIndex::new(FullScanSchedule::new(60_000, 45_000));
+    index.record_full_scan(10_000);
+
+    index.record_full_scan(12_000);
+
+    assert_eq!(index.next_full_scan_ms(), Some(25_000));
+}
+
+#[test]
+fn an_interval_of_zero_scans_on_every_pass() {
+    let index = LeaseIndex::new(FullScanSchedule::new(0, 7));
+    assert!(index.full_scan_due(5_000));
+
+    index.record_full_scan(5_000);
+
+    assert!(index.seeded());
+    assert!(index.full_scan_due(5_000));
+    assert!(index.full_scan_due(4_000));
+    assert!(index.full_scan_due(5_001));
+}
+
+#[test]
+fn shards_with_different_names_get_different_first_periods() {
+    let periods: Vec<i64> = ["shard-a", "shard-b", "shard-c", "shard-d"]
+        .iter()
+        .map(|name| FullScanSchedule::for_shard(name, 60_000).first_period_ms())
+        .collect();
+
+    for (i, period_ms) in periods.iter().enumerate() {
+        assert!((1..=60_000).contains(period_ms), "{periods:?}");
+        for other_ms in &periods[i + 1..] {
+            assert!(
+                (period_ms - other_ms).abs() >= 1_000,
+                "first periods fall on the same reaper tick: {periods:?}"
+            );
+        }
+    }
+    assert_eq!(
+        FullScanSchedule::for_shard("shard-a", 60_000),
+        FullScanSchedule::for_shard("shard-a", 60_000),
+        "a shard's schedule is the same every time it opens"
+    );
 }
