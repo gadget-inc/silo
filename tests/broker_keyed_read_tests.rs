@@ -23,11 +23,16 @@ const HOUR_MS: i64 = 3_600_000;
 /// lowers the scan floor.
 const LOWER_THE_FLOOR: u64 = u64::MAX;
 
+/// A full rescan interval no test run reaches. A full rescan reads the whole
+/// range again, which would add to the reads these tests count.
+const NO_FULL_RESCAN_MS: u64 = 24 * HOUR_MS as u64;
+
 async fn open_shard(
     keyed_read_min_lag_ms: u64,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>, Metrics) {
     open_temp_shard_with_metrics_and_config(|cfg| {
-        cfg.broker_keyed_read_min_lag_ms = keyed_read_min_lag_ms
+        cfg.broker_keyed_read_min_lag_ms = keyed_read_min_lag_ms;
+        cfg.broker_full_rescan_interval_ms = NO_FULL_RESCAN_MS;
     })
     .await
 }

@@ -2336,16 +2336,110 @@ mod keyed_read_tests {
     use crate::codec::encode_task;
     use crate::instrumented_db::InstrumentedDb;
     use crate::job_store_shard::now_epoch_ms;
-    use crate::shard_range::ShardRange;
+    use crate::shard_range::{ShardRange, hash_tenant};
     use crate::task::Task;
     use crate::task_broker::*;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::path::Path as ObjPath;
+    use slatedb::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    };
 
     const HOUR_MS: i64 = 3_600_000;
     const LAG_MS: u64 = 1_000;
+    const TENANT: &str = "-";
 
     struct Harness {
         broker: Arc<TaskBroker>,
         metrics: Metrics,
+        /// Set to make the object store refuse every write from then on.
+        refuse_writes: Arc<AtomicBool>,
+    }
+
+    /// An in-memory object store that refuses writes on demand, with an
+    /// error SlateDB does not retry.
+    #[derive(Debug)]
+    struct RefusingStore {
+        inner: InMemory,
+        refuse_writes: Arc<AtomicBool>,
+    }
+
+    impl std::fmt::Display for RefusingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RefusingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RefusingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if self.refuse_writes.load(Ordering::SeqCst) {
+                return Err(slatedb::object_store::Error::AlreadyExists {
+                    path: location.to_string(),
+                    source: "writes are refused".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A shard range that every tenant but [`TENANT`] may fall in.
+    fn range_without_the_tenant() -> ShardRange {
+        ShardRange::new("", hash_tenant(TENANT))
     }
 
     fn settings(keyed_read_min_lag_ms: u64) -> BrokerSettings {
@@ -2358,7 +2452,20 @@ mod keyed_read_tests {
     }
 
     async fn harness_with(settings: BrokerSettings, scan_batch: usize) -> Harness {
-        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        harness_built(settings, 8192, scan_batch, ShardRange::full()).await
+    }
+
+    async fn harness_built(
+        settings: BrokerSettings,
+        target_buffer: usize,
+        scan_batch: usize,
+        range: ShardRange,
+    ) -> Harness {
+        let refuse_writes = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(RefusingStore {
+            inner: InMemory::new(),
+            refuse_writes: Arc::clone(&refuse_writes),
+        });
         let db = slatedb::DbBuilder::new("test", store)
             .build()
             .await
@@ -2370,12 +2477,16 @@ mod keyed_read_tests {
             db,
             "shard".to_string(),
             Some(metrics.clone()),
-            ShardRange::full(),
+            range,
             settings,
-            8192,
+            target_buffer,
             scan_batch,
         );
-        Harness { broker, metrics }
+        Harness {
+            broker,
+            metrics,
+            refuse_writes,
+        }
     }
 
     async fn harness() -> Harness {
@@ -2449,7 +2560,7 @@ mod keyed_read_tests {
     fn run_attempt(job_id: &str) -> Task {
         Task::RunAttempt {
             id: format!("task-{job_id}"),
-            tenant: "-".to_string(),
+            tenant: TENANT.to_string(),
             job_id: job_id.to_string(),
             attempt_number: 1,
             relative_attempt_number: 1,
@@ -2648,6 +2759,10 @@ mod keyed_read_tests {
             .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
         assert_eq!(h.scan(now_ms).await, 0);
         assert_eq!(h.broker.noted_key_count(), 1);
+        assert_eq!(
+            h.metric("silo_broker_noted_keys", &[("task_group", "tg")]),
+            1.0
+        );
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(h.scan(now_ms).await, 0);
@@ -2974,6 +3089,148 @@ mod keyed_read_tests {
         assert_eq!(h.claim_all(), vec![key]);
     }
 
+    /// A scan of the whole range that stops at its batch limit leaves its
+    /// floor at the last row it read, so the next scan's range reads the
+    /// rows it did not reach, whether or not their keys were noted.
+    #[tokio::test]
+    async fn whole_range_scan_stopping_at_its_batch_limit_leaves_the_rest_to_the_next_scan() {
+        let h = harness_with(
+            BrokerSettings {
+                full_rescan_interval: Duration::from_millis(50),
+                ..settings(LAG_MS)
+            },
+            1,
+        )
+        .await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let older = h.put("older", now_ms - HOUR_MS).await;
+        h.broker
+            .note_task_key(&older, now_ms - HOUR_MS, now_ms, true);
+        let newer = h.put("newer", now_ms - HOUR_MS + 5).await;
+        h.broker
+            .note_task_key(&newer, now_ms - HOUR_MS + 5, now_ms, true);
+        assert_eq!(h.broker.noted_key_count(), 2);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(
+            h.metric("silo_broker_full_rescans_total", &[("task_group", "tg")]),
+            1.0
+        );
+        assert_eq!(h.keyed_reads("inserted"), 0.0);
+        assert_eq!(h.claim_all(), vec![older]);
+        assert_eq!(
+            h.broker.scan_floor_ms(),
+            Some(now_ms - HOUR_MS),
+            "the floor stops at the row the scan read"
+        );
+        assert_eq!(h.broker.next_ready_at_ms(), 0);
+        assert_eq!(
+            h.broker.noted_key_count(),
+            0,
+            "the row the scan did not reach is at or above its floor"
+        );
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![newer]);
+        assert_eq!(h.keyed_reads("inserted"), 0.0);
+        assert_eq!(
+            h.metric(
+                "silo_broker_full_rescan_inserted_total",
+                &[("task_group", "tg")]
+            ),
+            0.0
+        );
+    }
+
+    /// A keyed row for a tenant outside the shard's range is deleted, and
+    /// its key is dropped once the delete has landed.
+    #[tokio::test]
+    async fn noted_key_of_a_defunct_row_is_dropped_once_the_row_is_deleted() {
+        let h = harness_built(settings(LAG_MS), 8192, 4096, range_without_the_tenant()).await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = h.put("defunct", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.keyed_reads("defunct"), 1.0);
+        assert_eq!(h.broker.buffer_len(), 0);
+        assert!(
+            h.broker.db.get(&key).await.expect("read row").is_none(),
+            "the defunct row is deleted"
+        );
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.broker.next_ready_at_ms(), i64::MAX);
+    }
+
+    /// While the delete of a keyed defunct row fails, the scan keeps the
+    /// floor it started from and the key, and nudges keep scanning, so the
+    /// row is read and its delete tried again.
+    #[tokio::test]
+    async fn noted_key_of_a_defunct_row_is_kept_while_its_delete_fails() {
+        let h = harness_built(settings(LAG_MS), 8192, 4096, range_without_the_tenant()).await;
+        let now_ms = now_epoch_ms();
+        assert_eq!(h.scan(now_ms).await, 0);
+
+        let key = h.put("defunct", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        h.refuse_writes.store(true, Ordering::SeqCst);
+        assert_eq!(h.scan(now_ms + 1_000).await, 0);
+        assert_eq!(h.keyed_reads("defunct"), 1.0);
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert_eq!(
+            h.broker.scan_floor_ms(),
+            Some(now_ms),
+            "the floor stays where the scan started"
+        );
+        assert_eq!(h.broker.next_ready_at_ms(), 0);
+    }
+
+    /// Noted keys are not read while the buffer is full, and reading stops
+    /// when it fills. The keys left stay held and keep nudges scanning.
+    #[tokio::test]
+    async fn noted_keys_wait_for_room_in_the_buffer() {
+        let h = harness_built(settings(LAG_MS), 2, 4096, ShardRange::full()).await;
+        let now_ms = now_epoch_ms();
+        let live = [
+            h.put("live-0", now_ms - 10).await,
+            h.put("live-1", now_ms - 9).await,
+        ];
+        assert_eq!(h.scan(now_ms).await, 2);
+        assert_eq!(h.broker.buffer_len(), 2);
+
+        let older = h.put("older", now_ms - HOUR_MS).await;
+        h.broker
+            .note_task_key(&older, now_ms - HOUR_MS, now_ms, true);
+        let newer = h.put("newer", now_ms - HOUR_MS + 5).await;
+        h.broker
+            .note_task_key(&newer, now_ms - HOUR_MS + 5, now_ms, true);
+
+        // No room: nothing is read.
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.broker.noted_key_count(), 2);
+        assert_eq!(h.broker.buffer_len(), 2);
+        assert_eq!(h.broker.next_ready_at_ms(), 0);
+        assert_eq!(h.keyed_reads("inserted"), 0.0);
+
+        // Room for one: the older key is read and the buffer is full again.
+        assert_eq!(h.broker.claim_ready(1).len(), 1);
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.keyed_reads("inserted"), 1.0);
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert_eq!(h.broker.buffer_len(), 2);
+        assert_eq!(h.broker.next_ready_at_ms(), 0);
+        assert_eq!(h.claim_all(), vec![older, live[1].clone()]);
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.claim_all(), vec![newer]);
+    }
+
     /// A task group with more ready rows than a scan reads has a floor that
     /// lags behind the unread ones. A row noted above that floor is left to
     /// the range scan, so the older unread rows are buffered first and tasks
@@ -3020,6 +3277,48 @@ mod keyed_read_tests {
         assert_eq!(h.broker.noted_key_count(), 0);
         assert_eq!(h.broker.next_ready_at_ms(), i64::MAX);
         assert!(!h.broker.nudge(now_ms));
+    }
+
+    /// A key noted while a scan runs outlives the scan, though it sorts in
+    /// the scan's range: the range had passed where the row sorts before the
+    /// row was written. The next scan reads it by key.
+    #[tokio::test]
+    async fn key_noted_while_a_scan_runs_outlives_the_scan() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        let mut live = WriteBatch::new();
+        for i in 0..32 {
+            let job_id = format!("live-{i:02}");
+            live.put(
+                key_for(&job_id, now_ms - 10),
+                encode_task(&run_attempt(&job_id)),
+            );
+        }
+        h.broker.db.write(live).await.expect("write live rows");
+
+        // A scan yields after every 16 rows it buffers. Run this one until
+        // it is partway through its range.
+        let scan = h.scan(now_ms);
+        tokio::pin!(scan);
+        while h.broker.buffer_len() < 16 {
+            assert!(
+                futures::poll!(scan.as_mut()).is_pending(),
+                "the scan is still running"
+            );
+            tokio::task::yield_now().await;
+        }
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+
+        assert_eq!(scan.await, 32);
+        assert_eq!(h.broker.scan_floor_ms(), Some(now_ms));
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert_eq!(h.broker.next_ready_at_ms(), 0);
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.keyed_reads("inserted"), 1.0);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.claim_all().first(), Some(&key));
     }
 
     /// A durable key noted while a scan runs stays held, because the scan's
