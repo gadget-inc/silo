@@ -1643,11 +1643,11 @@ impl TaskBrokerRegistry {
 
 #[cfg(test)]
 mod inflight_release_tests {
-    use super::*;
     use crate::codec::encode_task;
     use crate::instrumented_db::InstrumentedDb;
     use crate::shard_range::ShardRange;
     use crate::task::Task;
+    use crate::task_broker::*;
 
     async fn empty_broker() -> Arc<TaskBroker> {
         broker_with_revive_bound(TaskBroker::ACK_TOMBSTONE_RETAIN_GENERATIONS).await
@@ -1784,12 +1784,12 @@ mod inflight_release_tests {
 
 #[cfg(test)]
 mod scan_gating_tests {
-    use super::*;
     use crate::codec::encode_task;
     use crate::instrumented_db::InstrumentedDb;
     use crate::job_store_shard::now_epoch_ms;
     use crate::shard_range::ShardRange;
     use crate::task::Task;
+    use crate::task_broker::*;
 
     async fn broker_with_scan_batch(scan_batch: usize) -> Arc<TaskBroker> {
         let store = Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -2302,12 +2302,12 @@ mod scan_gating_tests {
 
 #[cfg(test)]
 mod keyed_read_tests {
-    use super::*;
     use crate::codec::encode_task;
     use crate::instrumented_db::InstrumentedDb;
     use crate::job_store_shard::now_epoch_ms;
     use crate::shard_range::ShardRange;
     use crate::task::Task;
+    use crate::task_broker::*;
 
     const HOUR_MS: i64 = 3_600_000;
     const LAG_MS: u64 = 1_000;
