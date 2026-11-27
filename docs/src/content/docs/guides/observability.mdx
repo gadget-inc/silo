@@ -35,12 +35,14 @@ These metrics track jobs as they flow through the system.
 | `silo_job_attempts_total` | Counter | `shard`, `task_group`, `is_retry` | Total job attempts started. `is_retry=true` for attempts after the first |
 | `silo_job_wait_time_seconds` | Histogram | `shard`, `task_group` | Time jobs spent in queue before being dequeued (enqueue to dequeue latency) |
 | `silo_job_attempt_reads_total` | Counter | `shard`, `source` | Reads of a job's attempt rows. Source is `keys` (point reads of the job's attempt keys) or `scan` (a scan of the job's attempt prefix) |
+| `silo_job_attempt_bound_regressions_total` | Counter | `shard` | Status writes that carried a lower attempt bound than the record they replaced. The stored bound is kept. Should stay at 0 |
 
 **Key insights:**
 - Compare `silo_jobs_enqueued_total` vs `silo_jobs_dequeued_total` to detect queue buildup
 - High `silo_job_wait_time_seconds` indicates workers can't keep up with incoming jobs
 - Track `is_retry=true` in `silo_job_attempts_total` to monitor retry rates
 - `silo_job_attempt_reads_total{source="scan"}` counts the attempt reads that opened a SlateDB scan: `GetJob`, `GetJobResult`, restart or a terminal outcome on a job whose status record carries no attempt number, a job with more than 32 attempts, and every reimport that lands a job in a terminal status. It should be a small fraction of `source="keys"`
+- `silo_job_attempt_bound_regressions_total` should stay at 0. Attempt rows are read by key up to the attempt number in the job's status record, and every status write keeps that number at or above the stored one. A count means a write tried to lower it, which happens when a task for an attempt below the job's highest is dispatched; the job is named in a warning log, and its attempts stay readable because the stored number is kept
 
 ### Lease Metrics
 

@@ -6,9 +6,9 @@ mod test_helpers;
 
 use std::time::Duration;
 
-use silo::codec::encode_job_status;
+use silo::codec::{encode_attempt, encode_job_status};
 use silo::job::{JobStatus, JobStatusKind};
-use silo::job_attempt::{AttemptOutcome, AttemptStatus};
+use silo::job_attempt::{AttemptOutcome, AttemptStatus, JobAttempt};
 use silo::job_store_shard::import::{ImportJobParams, ImportedAttempt, ImportedAttemptStatus};
 use silo::job_store_shard::{ATTEMPT_POINT_READ_LIMIT, JobStoreShard};
 use silo::keys::{attempt_key, job_status_key};
@@ -848,4 +848,182 @@ async fn restarting_a_job_with_no_attempt_number_scans_for_its_attempts() {
     let restarted = status(&shard, &job_id).await;
     assert_eq!(restarted.current_attempt, Some(2));
     assert!(attempt_reads(&metrics, "scan") >= 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// The attempt bound from one status record to the next
+// ---------------------------------------------------------------------------
+
+/// How many status writes carried a lower attempt bound than the record
+/// they replaced.
+fn attempt_bound_regressions(metrics: &Metrics) -> f64 {
+    metric_value_or_zero(
+        &gather_metrics_text(metrics),
+        &["silo_job_attempt_bound_regressions_total", "shard=\"test\""],
+    )
+}
+
+async fn enqueue_job(
+    shard: &JobStoreShard,
+    start_at_ms: i64,
+    retry_policy: Option<RetryPolicy>,
+) -> String {
+    shard
+        .enqueue(
+            TENANT,
+            None,
+            10u8,
+            start_at_ms,
+            retry_policy,
+            msgpack_payload(&serde_json::json!({})),
+            vec![],
+            None,
+            "default",
+        )
+        .await
+        .expect("enqueue")
+}
+
+async fn report_failure(shard: &JobStoreShard, task_id: &str) {
+    shard
+        .report_attempt_outcome(
+            task_id,
+            AttemptOutcome::Error {
+                error_code: "TEST".to_string(),
+                error: b"boom".to_vec(),
+            },
+        )
+        .await
+        .expect("report failure");
+}
+
+async fn report_success(shard: &JobStoreShard, task_id: &str) {
+    shard
+        .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![1] })
+        .await
+        .expect("report success");
+}
+
+/// A job with attempt rows 1, 3 and 4, a stored bound of 4, and a pending
+/// task for attempt 2: the state a task for an attempt below the job's
+/// highest leaves behind when it is dispatched.
+async fn job_with_a_pending_attempt_below_its_rows(shard: &JobStoreShard, job_id: &str) {
+    import_with_failed_attempts(shard, job_id, 1).await;
+    let mut stored = status(shard, job_id).await;
+    assert_eq!(stored.current_attempt, Some(2));
+    stored.latest_attempt = Some(4);
+
+    let mut batch = WriteBatch::new();
+    for attempt_number in [3, 4] {
+        let attempt = JobAttempt {
+            job_id: job_id.to_string(),
+            attempt_number,
+            relative_attempt_number: attempt_number,
+            task_id: format!("task-{attempt_number}"),
+            started_at_ms: 1_700_000_002_000,
+            status: AttemptStatus::Failed {
+                finished_at_ms: 1_700_000_003_000,
+                error_code: "ERR".to_string(),
+                error: vec![1, 2, 3],
+            },
+        };
+        batch.put(
+            attempt_key(TENANT, job_id, attempt_number),
+            encode_attempt(&attempt),
+        );
+    }
+    batch.put(job_status_key(TENANT, job_id), encode_job_status(&stored));
+    shard.db().write(batch).await.expect("write rows");
+}
+
+#[silo::test]
+async fn a_status_write_below_the_stored_attempt_bound_keeps_the_stored_bound() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    job_with_a_pending_attempt_below_its_rows(&shard, "job").await;
+    assert_eq!(attempt_bound_regressions(&metrics), 0.0);
+
+    dequeue_one(&shard).await;
+
+    let running = status(&shard, "job").await;
+    assert_eq!(running.kind, JobStatusKind::Running);
+    assert_eq!(running.highest_attempt(), Some(4));
+    assert_eq!(attempt_bound_regressions(&metrics), 1.0);
+}
+
+#[silo::test]
+async fn attempts_above_a_dispatched_attempt_are_still_read() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    job_with_a_pending_attempt_below_its_rows(&shard, "job").await;
+    dequeue_one(&shard).await;
+
+    let attempts = shard
+        .get_job_attempts(TENANT, "job")
+        .await
+        .expect("attempts");
+
+    assert_eq!(attempt_numbers(&attempts), [1, 2, 3, 4]);
+    assert_eq!(attempt_reads(&metrics, "scan"), 0.0);
+}
+
+#[silo::test]
+async fn a_job_that_retries_and_succeeds_never_lowers_its_attempt_bound() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let job_id = enqueue_job(&shard, now_ms(), Some(retry_policy(1))).await;
+
+    let task_id = dequeue_one(&shard).await;
+    report_failure(&shard, &task_id).await;
+    assert_eq!(status(&shard, &job_id).await.kind, JobStatusKind::Scheduled);
+    let task_id = dequeue_one(&shard).await;
+    report_success(&shard, &task_id).await;
+
+    let succeeded = status(&shard, &job_id).await;
+    assert_eq!(succeeded.kind, JobStatusKind::Succeeded);
+    assert_eq!(succeeded.highest_attempt(), Some(2));
+    assert_eq!(attempt_bound_regressions(&metrics), 0.0);
+}
+
+#[silo::test]
+async fn a_job_that_fails_and_is_restarted_never_lowers_its_attempt_bound() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let job_id = enqueue_job(&shard, now_ms(), None).await;
+
+    let task_id = dequeue_one(&shard).await;
+    report_failure(&shard, &task_id).await;
+    assert_eq!(status(&shard, &job_id).await.kind, JobStatusKind::Failed);
+    shard.restart_job(TENANT, &job_id).await.expect("restart");
+    let task_id = dequeue_one(&shard).await;
+    report_success(&shard, &task_id).await;
+
+    let succeeded = status(&shard, &job_id).await;
+    assert_eq!(succeeded.kind, JobStatusKind::Succeeded);
+    assert_eq!(succeeded.highest_attempt(), Some(2));
+    assert_eq!(attempt_bound_regressions(&metrics), 0.0);
+}
+
+/// Expediting a job, cancelling it between attempts, restarting it and
+/// leasing it by id each write a status record whose bound is the stored
+/// one or the next attempt's.
+#[silo::test]
+async fn expedite_cancel_restart_and_lease_by_id_never_lower_the_attempt_bound() {
+    let (_tmp, shard, metrics) = open_temp_shard_with_metrics().await;
+    let far_future_ms = now_ms() + 3_600_000;
+    let job_id = enqueue_job(&shard, far_future_ms, Some(retry_policy(3))).await;
+
+    shard.expedite_job(TENANT, &job_id).await.expect("expedite");
+    assert_eq!(status(&shard, &job_id).await.highest_attempt(), Some(0));
+    let task_id = dequeue_one(&shard).await;
+    report_failure(&shard, &task_id).await;
+    shard.cancel_job(TENANT, &job_id).await.expect("cancel");
+    assert_eq!(status(&shard, &job_id).await.highest_attempt(), Some(1));
+    shard.restart_job(TENANT, &job_id).await.expect("restart");
+    assert_eq!(status(&shard, &job_id).await.highest_attempt(), Some(1));
+    let leased = shard
+        .lease_task(TENANT, &job_id, "worker")
+        .await
+        .expect("lease by id");
+    assert_eq!(status(&shard, &job_id).await.highest_attempt(), Some(2));
+    report_success(&shard, leased.attempt().task_id()).await;
+
+    assert_eq!(status(&shard, &job_id).await.highest_attempt(), Some(2));
+    assert_eq!(attempt_bound_regressions(&metrics), 0.0);
 }

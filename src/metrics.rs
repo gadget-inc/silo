@@ -283,6 +283,7 @@ pub struct Metrics {
 
     // Attempt row reads
     job_attempt_reads_total: CounterVec,
+    job_attempt_bound_regressions_total: CounterVec,
 
     // Periodic full compaction
     periodic_full_compaction_submissions_total: CounterVec,
@@ -924,6 +925,14 @@ impl Metrics {
     ) {
         self.job_attempt_reads_total
             .with_label_values(&[shard, source.as_str()])
+            .inc();
+    }
+
+    /// Record one status write that carried a lower attempt bound than the
+    /// record it replaced.
+    pub fn record_job_attempt_bound_regression(&self, shard: &str) {
+        self.job_attempt_bound_regressions_total
+            .with_label_values(&[shard])
             .inc();
     }
 
@@ -2777,6 +2786,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let job_attempt_bound_regressions_total = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_job_attempt_bound_regressions_total",
+                "Status writes that carried a lower attempt bound than the record they replaced; the stored bound is kept",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let lease_reaper_untracked_leases_total = register(
         &registry,
         CounterVec::new(
@@ -3232,6 +3252,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         lease_reaper_untracked_leases_total,
         lease_reaper_tracked_leases,
         job_attempt_reads_total,
+        job_attempt_bound_regressions_total,
         periodic_full_compaction_submissions_total,
         concurrency_tickets_granted,
         concurrency_orphan_holders_purged,

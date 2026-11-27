@@ -1129,6 +1129,12 @@ impl JobStoreShard {
     /// The new record carries the job's enqueue time and priority: from the
     /// previous status record when it has them, else from `job_metric_info`,
     /// else from the same single `JOB_INFO` read.
+    ///
+    /// The new record's [`JobStatus::highest_attempt`] is never below the
+    /// previous record's. When `new_status` would lower it, the record is
+    /// written with the previous bound as its `latest_attempt`, and the
+    /// write is counted and logged. A record on either side that carries no
+    /// bound is left alone.
     pub(crate) async fn set_job_status_with_index_opts<W: WriteBatcher>(
         &self,
         writer: &mut W,
@@ -1153,6 +1159,26 @@ impl JobStoreShard {
         } else {
             None
         };
+
+        // Attempt rows are read by key up to the bound a status record
+        // gives, so a record never carries a lower bound than the one it
+        // replaces: a row above it would be left out of every read.
+        if let Some(stored_bound) = old_status.as_ref().and_then(JobStatus::highest_attempt)
+            && let Some(written_bound) = new_status.highest_attempt()
+            && stored_bound > written_bound
+        {
+            new_status.latest_attempt = Some(stored_bound);
+            if let Some(ref m) = self.metrics {
+                m.record_job_attempt_bound_regression(&self.name);
+            }
+            tracing::warn!(
+                tenant = %tenant,
+                job_id = %job_id,
+                stored_bound,
+                written_bound,
+                "status write carried a lower attempt bound than the stored record; kept the stored bound",
+            );
+        }
 
         let old_kind = old_status.as_ref().map(|old| old.kind);
         let new_kind = new_status.kind;

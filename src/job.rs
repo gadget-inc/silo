@@ -210,8 +210,9 @@ pub struct JobStatus {
     pub priority: Option<u8>,
     /// The highest attempt number the job has an attempt row for. Present on
     /// records written when an attempt starts or finishes (Running, and the
-    /// terminal status an attempt's outcome sets); absent on records stored
-    /// without it. See [`JobStatus::highest_attempt`].
+    /// terminal status an attempt's outcome sets) and on a record that
+    /// replaces one bounding the rows higher than it would; absent on
+    /// records stored without it. See [`JobStatus::highest_attempt`].
     pub latest_attempt: Option<u32>,
 }
 
