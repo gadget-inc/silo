@@ -131,13 +131,12 @@ pub struct ResumeChainParams {
 }
 
 /// A grant the scanner has reserved and written into the current chunk's
-/// batch: the chain's task id, its task group, the job's original start
-/// time, and the key of the task row the resumed chain wrote. A chain that
-/// parked on a later concurrency limit wrote no task row and has no key.
+/// batch: the chain's task id, its task group, and the key of the task row
+/// the resumed chain wrote. A chain that parked on a later concurrency limit
+/// wrote no task row and has no key.
 struct ChunkGrant {
     task_id: String,
     task_group: String,
-    start_time_ms: i64,
     task_key: Option<Vec<u8>>,
 }
 
@@ -2482,30 +2481,25 @@ impl ConcurrencyManager {
                     // serializes other queues behind the busiest one. With
                     // `buffer_unordered`, a slow pass occupies exactly one slot
                     // while the remaining slots keep draining the other queues.
-                    let granted: Vec<Vec<(String, i64)>> =
-                        futures::stream::iter(work.into_values())
-                            .map(|(tenant, queue, count)| {
-                                let mgr = Arc::clone(&mgr);
-                                let db = Arc::clone(&db);
-                                let range = range.clone();
-                                async move {
-                                    mgr.process_grants(&db, &range, &tenant, &queue, count)
-                                        .await
-                                }
-                            })
-                            .buffer_unordered(mgr.grant_scanner_concurrency)
-                            .collect()
-                            .await;
+                    let granted: Vec<Vec<String>> = futures::stream::iter(work.into_values())
+                        .map(|(tenant, queue, count)| {
+                            let mgr = Arc::clone(&mgr);
+                            let db = Arc::clone(&db);
+                            let range = range.clone();
+                            async move {
+                                mgr.process_grants(&db, &range, &tenant, &queue, count)
+                                    .await
+                            }
+                        })
+                        .buffer_unordered(mgr.grant_scanner_concurrency)
+                        .collect()
+                        .await;
                     // Canonicalize: `buffer_unordered` collects in completion
                     // order, which depends on scheduling. Collecting into an
                     // ordered set makes the broker wake sequence a pure
                     // function of the granted *set*, keeping downstream
                     // behavior independent of interleaving for DST.
-                    let granted_groups: BTreeSet<String> = granted
-                        .into_iter()
-                        .flatten()
-                        .map(|(task_group, _)| task_group)
-                        .collect();
+                    let granted_groups: BTreeSet<String> = granted.into_iter().flatten().collect();
 
                     // Wake only the brokers whose task groups received grants.
                     // Each chunk's commit has already told the brokers which
@@ -2664,8 +2658,7 @@ impl ConcurrencyManager {
 
     /// Process pending grant requests for a single (tenant, queue).
     /// Scans up to `count` pending requests and grants those for which capacity exists.
-    /// Returns one `(task_group, start_time_ms)` per grant: the task group of
-    /// the granted chain and the start time of the task row it wrote.
+    /// Returns the task group of each granted chain, one entry per grant.
     ///
     /// Optimized for throughput: scans candidates in batches, batch-validates their
     /// status concurrently, reserves in-memory slots, then writes all grants plus
@@ -2679,7 +2672,7 @@ impl ConcurrencyManager {
         tenant: &str,
         queue: &str,
         count: u32,
-    ) -> Vec<(String, i64)> {
+    ) -> Vec<String> {
         let invocation_started = std::time::Instant::now();
         // Invocation-level accounting, recorded once at every exit path
         // (including precheck skips) so invocation rate and per-invocation
@@ -2815,7 +2808,7 @@ impl ConcurrencyManager {
         }
 
         let mut max_concurrency: Option<(usize, ConcurrencyLimitType)> = None;
-        let mut all_granted: Vec<(String, i64)> = Vec::new();
+        let mut all_granted: Vec<String> = Vec::new();
         let mut total_granted: usize = 0;
         let mut iter_exhausted = false;
         let mut capacity_exhausted = false;
@@ -3579,7 +3572,6 @@ impl ConcurrencyManager {
                 chunk_grants.push(ChunkGrant {
                     task_id: req.task_id.clone(),
                     task_group: req.task_group.clone(),
-                    start_time_ms: req.start_time_ms,
                     task_key,
                 });
 
@@ -3615,11 +3607,7 @@ impl ConcurrencyManager {
                     }
                     total_granted += chunk_grants.len();
                     total_stale_deleted += stale_deletes;
-                    all_granted.extend(
-                        chunk_grants
-                            .drain(..)
-                            .map(|grant| (grant.task_group, grant.start_time_ms)),
-                    );
+                    all_granted.extend(chunk_grants.drain(..).map(|grant| grant.task_group));
                     chunk_reservations.clear();
                     chunk_materialized.clear();
                     chunk_now = crate::job_store_shard::now_epoch_ms();
@@ -3665,11 +3653,7 @@ impl ConcurrencyManager {
             }
             total_granted += chunk_grants.len();
             total_stale_deleted += stale_deletes;
-            all_granted.extend(
-                chunk_grants
-                    .into_iter()
-                    .map(|grant| (grant.task_group, grant.start_time_ms)),
-            );
+            all_granted.extend(chunk_grants.into_iter().map(|grant| grant.task_group));
             chunk_materialized.clear();
         }
 

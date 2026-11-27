@@ -18,7 +18,7 @@ use crate::codec::{DecodedTask, decode_task_validated};
 use crate::keys::{end_bound, parse_task_key, task_group_prefix, task_group_time_prefix};
 use crate::metrics::Metrics;
 use crate::shard_range::ShardRange;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// A task entry stored in the in-memory broker buffer.
 ///
@@ -1499,6 +1499,7 @@ impl TaskBrokerRegistry {
     /// needs noting on a broker that already exists.
     pub fn notify_task_written(&self, task_key: &[u8]) {
         let Some(parsed) = parse_task_key(task_key) else {
+            Self::report_unparsed_key(task_key);
             return;
         };
         let start_time_ms = parsed.start_time_ms as i64;
@@ -1532,9 +1533,11 @@ impl TaskBrokerRegistry {
     /// latest. A broker that does not exist yet scans its whole range first
     /// and needs neither.
     pub fn expect_task_written(&self, task_key: &[u8]) {
-        if let Some(parsed) = parse_task_key(task_key)
-            && let Some(broker) = self.brokers.get(&parsed.task_group)
-        {
+        let Some(parsed) = parse_task_key(task_key) else {
+            Self::report_unparsed_key(task_key);
+            return;
+        };
+        if let Some(broker) = self.brokers.get(&parsed.task_group) {
             let start_time_ms = parsed.start_time_ms as i64;
             let now_ms = crate::job_store_shard::now_epoch_ms();
             if start_time_ms <= now_ms {
@@ -1543,6 +1546,17 @@ impl TaskBrokerRegistry {
                 broker.note_task_written(start_time_ms);
             }
         }
+    }
+
+    /// A writer passed a key that does not parse as a task key. It names no
+    /// task group, so no broker can be told or woken, and the row the writer
+    /// wrote waits for its broker's next scan of the whole range.
+    fn report_unparsed_key(task_key: &[u8]) {
+        warn!(
+            key = ?task_key,
+            "broker was given a key that is not a task key; the row written waits for a full rescan"
+        );
+        debug_assert!(false, "not a task key: {task_key:?}");
     }
 
     /// [`Self::expect_task_written`] for several task rows at once.

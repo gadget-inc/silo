@@ -1647,9 +1647,6 @@ impl JobStoreShard {
         self.concurrency
             .process_grants(&self.db, &range, tenant, queue, count)
             .await
-            .into_iter()
-            .map(|(task_group, _)| task_group)
-            .collect()
     }
 
     /// Test-only: install or clear the grant scanner's per-batch hook. See
