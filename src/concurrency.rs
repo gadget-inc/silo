@@ -1262,6 +1262,17 @@ pub struct ConcurrencyManager {
     request_read_observer_for_test: Mutex<Option<RequestReadObserver>>,
 }
 
+/// One candidate's durable duplicate-materialization check, as owned inputs
+/// to `live_terminal_row_exists`: the task rows of `(job_id, attempt_number)`
+/// at each of `start_times`.
+struct TerminalRowLookup {
+    task_group: String,
+    priority: u8,
+    job_id: String,
+    attempt_number: u32,
+    start_times: Vec<i64>,
+}
+
 /// Memoized per-hop durable reads for `next_hop_should_skip`, keyed by the
 /// next hop's queue name for the duration of one `process_grants` invocation.
 /// The two point reads (floating state row, requester counter) are per-hop and
@@ -2932,12 +2943,13 @@ impl ConcurrencyManager {
         let mut total_stale_deleted: usize = 0;
         let mut budget_exhausted = false;
         let chain_resumer = self.chain_resumer();
-        // Duplicate-materialization guard, same-batch half: (job_id, attempt)
-        // pairs whose chain this invocation has already resumed into a chunk
-        // batch that is not yet committed — invisible to the durable check.
-        // Cleared at every `commit_grant_chunk`, after which the durable check
-        // sees the committed rows.
-        let mut chunk_materialized: HashSet<(String, u32)> = HashSet::new();
+        // Duplicate-materialization guard, in-memory half: (job_id, attempt)
+        // pairs whose chain this invocation has already resumed. The durable
+        // half is read for a window of candidates at a time, ahead of the
+        // grants made within that window, so it cannot see them — whether
+        // they sit in an uncommitted chunk batch or a chunk committed since
+        // the read. Bounded by the grants one invocation can make.
+        let mut materialized_attempts: HashSet<(String, u32)> = HashSet::new();
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
         // granted `count` requests, or hit the end / capacity limit. Each pass
@@ -3470,10 +3482,77 @@ impl ConcurrencyManager {
             let mut chunk_reservations: Vec<(String, String)> = Vec::new();
             let mut chunk_stale = stale_and_corrupt_count;
             let mut chunk_now = crate::job_store_shard::now_epoch_ms();
-            for req in &valid_requests {
+            // Durable half of the duplicate-materialization guard, read ahead
+            // of the serial loop for a window of candidates at once. Each
+            // check is a prefix scan of the task keyspace, which costs an
+            // object-store round trip whenever the candidate's block is not
+            // cached; reading a window concurrently pays that latency once
+            // per window instead of once per candidate. A window covers at
+            // most one commit chunk and no more candidates than the queue has
+            // free slots, so a pass that can grant one request reads one
+            // check. `None` marks a candidate already in
+            // `materialized_attempts` when its window was read.
+            let mut terminal_row_checks: VecDeque<Option<Result<bool, slatedb::Error>>> =
+                VecDeque::new();
+            for (index, req) in valid_requests.iter().enumerate() {
                 if total_granted + chunk_grants.len() >= count as usize {
                     break;
                 }
+
+                if terminal_row_checks.is_empty() {
+                    let free_slots = limit
+                        .saturating_sub(self.counts.holder_count(tenant, queue))
+                        .max(1);
+                    let window_end = index
+                        .saturating_add(free_slots.min(self.grant_scanner_commit_chunk_size))
+                        .min(valid_requests.len());
+                    // Owned lookups: the async closures below capture by move,
+                    // and borrowing `valid_requests` across the stream's await
+                    // points trips HRTB inference.
+                    let lookups: Vec<Option<TerminalRowLookup>> = valid_requests
+                        .get(index..window_end)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|candidate| {
+                            let (job_id, attempt_number) =
+                                (candidate.job_id.clone(), candidate.attempt_number);
+                            if materialized_attempts.contains(&(job_id.clone(), attempt_number)) {
+                                return None;
+                            }
+                            let mut start_times = vec![candidate.start_time_ms];
+                            if let Some(s) = candidate.status_start_ms {
+                                start_times.push(s);
+                            }
+                            Some(TerminalRowLookup {
+                                task_group: candidate.task_group.clone(),
+                                priority: candidate.priority,
+                                job_id,
+                                attempt_number,
+                                start_times,
+                            })
+                        })
+                        .collect();
+                    terminal_row_checks =
+                        futures::stream::iter(lookups.into_iter().map(|lookup| async move {
+                            let lookup = lookup?;
+                            Some(
+                                live_terminal_row_exists(
+                                    db,
+                                    &lookup.task_group,
+                                    lookup.priority,
+                                    &lookup.job_id,
+                                    lookup.attempt_number,
+                                    &lookup.start_times,
+                                    &[],
+                                )
+                                .await,
+                            )
+                        }))
+                        .buffered(self.grant_scanner_buffer_size)
+                        .collect()
+                        .await;
+                }
+                let terminal_row_check = terminal_row_checks.pop_front().flatten();
 
                 // The scan iterator is a snapshot taken when the invocation
                 // began, and the status row that validated this candidate was
@@ -3521,32 +3600,18 @@ impl ConcurrencyManager {
                 // Duplicate-materialization guard: at most one live terminal
                 // task row per (job_id, attempt). A request row whose attempt
                 // already has a live RunAttempt / CheckRateLimit — either
-                // durably (an earlier grant, a replayed conversion) or in this
-                // chunk's uncommitted batch — is a second grant source for the
-                // same chain; granting it would materialize a duplicate row at
-                // a fresh epoch and dispatch the attempt twice. Delete it like
-                // any other stale request.
+                // durably (an earlier grant, a replayed conversion) or from a
+                // grant this invocation made — is a second grant source for
+                // the same chain; granting it would materialize a duplicate
+                // row at a fresh epoch and dispatch the attempt twice. Delete
+                // it like any other stale request.
                 let attempt_key = (req.job_id.clone(), req.attempt_number);
-                let already_materialized = if chunk_materialized.contains(&attempt_key) {
+                let already_materialized = if materialized_attempts.contains(&attempt_key) {
                     true
                 } else {
-                    let mut starts = vec![req.start_time_ms];
-                    if let Some(s) = req.status_start_ms {
-                        starts.push(s);
-                    }
-                    match live_terminal_row_exists(
-                        db,
-                        &req.task_group,
-                        req.priority,
-                        &req.job_id,
-                        req.attempt_number,
-                        &starts,
-                        &[],
-                    )
-                    .await
-                    {
-                        Ok(exists) => exists,
-                        Err(e) => {
+                    match terminal_row_check {
+                        Some(Ok(exists)) => exists,
+                        Some(Err(e)) => {
                             tracing::warn!(
                                 error = %e,
                                 job_id = %req.job_id,
@@ -3555,6 +3620,10 @@ impl ConcurrencyManager {
                             );
                             continue;
                         }
+                        // No durable read was made for this candidate because
+                        // its attempt was already in `materialized_attempts`,
+                        // which only grows.
+                        None => true,
                     }
                 };
                 if already_materialized {
@@ -3685,7 +3754,7 @@ impl ConcurrencyManager {
                     }
                 };
 
-                chunk_materialized.insert(attempt_key);
+                materialized_attempts.insert(attempt_key);
                 chunk_grants.push(ChunkGrant {
                     task_id: req.task_id.clone(),
                     task_group: req.task_group.clone(),
@@ -3730,7 +3799,6 @@ impl ConcurrencyManager {
                     total_stale_deleted += stale_deletes;
                     all_granted.extend(chunk_grants.drain(..).map(|grant| grant.task_group));
                     chunk_reservations.clear();
-                    chunk_materialized.clear();
                     chunk_now = crate::job_store_shard::now_epoch_ms();
                 }
             }
@@ -3779,7 +3847,6 @@ impl ConcurrencyManager {
             total_granted += chunk_grants.len();
             total_stale_deleted += stale_deletes;
             all_granted.extend(chunk_grants.into_iter().map(|grant| grant.task_group));
-            chunk_materialized.clear();
         }
 
         // No silent cap: surface invocations that yielded on the scan budget so
