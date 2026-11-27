@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 use std::str;
 use std::sync::{
     Arc, Mutex,
@@ -165,10 +166,12 @@ impl BrokerSettings {
 /// - Every writer of a task row tells the broker the row's key. A row with a
 ///   recent start time lowers the floor to it. A row with an old start time
 ///   (a job granted a concurrency slot after waiting keeps its original one)
-///   is read by its key at the next scan and leaves the floor alone, so a
-///   scan's range covers recent writes whatever the age of the rows being
-///   written. A periodic full-range scan bounds the cost of a writer that
-///   told the broker nothing.
+///   leaves the floor alone and its key is held: a scan reads by key the
+///   held keys that sort below its floor and leaves the rest to its range.
+///   So a scan's range covers recent writes whatever the age of the rows
+///   being written, and no row is buffered ahead of older unread ones. A
+///   periodic full-range scan bounds the cost of a writer that told the
+///   broker nothing.
 pub struct TaskBroker {
     // The task group this broker is responsible for
     task_group: String,
@@ -302,10 +305,11 @@ impl TaskBroker {
 
     /// Scan tasks from DB and insert into buffer, skipping future tasks and inflight ones.
     ///
-    /// Reads the rows noted for reading by key, then the range from the scan
-    /// floor (the whole range when a full rescan is due), and records in the
-    /// cursor why the scan stopped (which gates the nudges that empty polls
-    /// send, see `nudge`) and the new floor.
+    /// Reads the rows noted for reading by key that sort below the scan
+    /// floor, then the range from the floor (the whole range when a full
+    /// rescan is due), and records in the cursor why the scan stopped (which
+    /// gates the nudges that empty polls send, see `nudge`) and the new
+    /// floor.
     async fn scan_tasks(&self, now_ms: i64, generation: u64) -> usize {
         // Clear `dirty` and read the cursor before the iterator is created: a
         // write or note that lands after this point may describe a row the
@@ -324,18 +328,6 @@ impl TaskBroker {
             m.set_broker_scan_floor_lag_ms(&self.shard_name, &self.task_group, lag_ms as u64);
         }
 
-        // Rows noted for reading by key sort below the floor, where the range
-        // scan does not look. A scan of the whole range reads them anyway.
-        let keyed = if floor_ms.is_some() {
-            self.read_noted_keys(generation).await
-        } else {
-            KeyedReads::default()
-        };
-
-        // Collect keys to delete for defunct tasks (outside shard range)
-        let mut defunct_keys: Vec<Vec<u8>> =
-            keyed.defunct.iter().map(|(key, _)| key.clone()).collect();
-
         // [SILO-SCAN-1] Scan only this task group's key range, from the floor
         let prefix = task_group_prefix(&self.task_group);
         let end = end_bound(&prefix);
@@ -343,11 +335,22 @@ impl TaskBroker {
             Some(floor_ms) => task_group_time_prefix(&self.task_group, floor_ms),
             None => prefix,
         };
+
+        // A noted key that sorts below the floor is where the range does not
+        // look, and its row is older than every row the range has left to
+        // read. A noted key at or above the floor is left to the range, so a
+        // row is never buffered ahead of older rows that are still unread.
+        let keyed = self.read_noted_keys(&start, generation).await;
+
+        // Collect keys to delete for defunct tasks (outside shard range)
+        let mut defunct_keys: Vec<Vec<u8>> =
+            keyed.defunct.iter().map(|(key, _)| key.clone()).collect();
+
         // A range that fails to open is a scan that read nothing and stopped
         // with ready rows possibly remaining.
         let mut iter = self
             .db
-            .scan_with_options::<Vec<u8>, _>(start..end, &crate::scan_options())
+            .scan_with_options::<Vec<u8>, _>(start.clone()..end, &crate::scan_options())
             .await
             .ok();
 
@@ -480,13 +483,17 @@ impl TaskBroker {
                     cursor.noted.remove_unchanged(key, *noted_at);
                 }
             }
-            // A scan of the whole range that read to its end read the row
-            // of every key noted before it began, and found no row for a
-            // key whose write never happened. A key noted since may
-            // describe a row the scan's view does not include.
-            if floor_ms.is_none() && read_to_the_end {
-                cursor.noted.remove_noted_through(keys_noted_before);
-            }
+            // A key at or above the floor this scan started from, noted
+            // before it began, needs no point read: its row was in the
+            // range's view, so this scan dealt with it or stopped short of
+            // it, and the floor a scan leaves is never above a row it could
+            // see and did not deal with. A key whose write never happened
+            // has no row to find. A key noted since may describe a row the
+            // range's view did not include, so it stays until a scan that
+            // began after its note has run.
+            cursor
+                .noted
+                .remove_from_noted_through(&start, keys_noted_before);
             cursor.noted.len()
         };
         self.record_scan_stop(stop, skipped_tombstone, notes_before, new_floor_ms);
@@ -526,14 +533,20 @@ impl TaskBroker {
         inserted
     }
 
-    /// Read the row of each key noted for reading by key and offer it to the
-    /// buffer, in key order, until the scan's batch or the buffer is full.
-    async fn read_noted_keys(&self, generation: u64) -> KeyedReads {
+    /// Read the row of each noted key that sorts below `range_start`, where
+    /// the scan's range begins, and offer it to the buffer, in key order,
+    /// until the scan's batch or the buffer is full.
+    async fn read_noted_keys(&self, range_start: &[u8], generation: u64) -> KeyedReads {
         let mut reads = KeyedReads::default();
         if self.buffer.len() >= self.target_buffer {
             return reads;
         }
-        let noted = self.cursor.lock().unwrap().noted.readable(self.scan_batch);
+        let noted = self
+            .cursor
+            .lock()
+            .unwrap()
+            .noted
+            .readable_below(range_start, self.scan_batch);
         for (key, noted) in noted {
             if reads.counts.inserted as usize >= self.scan_batch
                 || self.buffer.len() >= self.target_buffer
@@ -1018,9 +1031,10 @@ impl TaskBroker {
     /// waking the scanner.
     ///
     /// A row whose start time is more than the keyed-read lag behind
-    /// `now_ms` is read by its key at the next scan, and the floor stays
-    /// where it is: lowering it would make one scan step over every row and
-    /// tombstone from that start time to now. The row's age decides, not its
+    /// `now_ms` has its key held for the next scan, which reads it by key
+    /// when it sorts below the floor, and the floor stays where it is:
+    /// lowering it would make one scan step over every row and tombstone
+    /// from that start time to now. The row's age decides, not its
     /// distance below the floor, so an old row never holds the floor back,
     /// whether the floor is at the current time, is itself old, or is absent
     /// while a scan of the whole range runs. A recent row lowers the floor,
@@ -1111,9 +1125,10 @@ impl TaskBroker {
         } else {
             cursor.at_ms = cursor.at_ms.min(next_ready_at_ms);
         }
-        // A key whose write is durable and whose row has not been read is a
-        // row a scan can buffer now: the scan ran out of room, the read
-        // failed, or the key was noted while the scan ran.
+        // A durable key still held is a row a scan can buffer now. It sorts
+        // below the floor and the scan ran out of room, its read failed or
+        // its defunct row's delete did; or it was noted while the scan ran,
+        // and the next scan reads it by key or drops it as its range's.
         if cursor.noted.has_durable() {
             cursor.at_ms = 0;
         }
@@ -1226,12 +1241,13 @@ impl NotedKeys {
         NoteOutcome::Noted
     }
 
-    /// Up to `limit` keys worth reading now, in key order, each with its
-    /// entry as it stands: every durable key, and every key not yet durable
-    /// that has not been read since it was noted.
-    fn readable(&self, limit: usize) -> Vec<(Vec<u8>, NotedKey)> {
+    /// Up to `limit` keys that sort below `bound` and are worth reading
+    /// now, in key order, each with its entry as it stands: every durable
+    /// key, and every key not yet durable that has not been read since it
+    /// was noted.
+    fn readable_below(&self, bound: &[u8], limit: usize) -> Vec<(Vec<u8>, NotedKey)> {
         self.keys
-            .iter()
+            .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(bound)))
             .filter(|(_, noted)| noted.durable || !noted.probed)
             .take(limit)
             .map(|(key, noted)| (key.clone(), *noted))
@@ -1261,10 +1277,22 @@ impl NotedKeys {
         }
     }
 
-    /// Drop every key last noted at or before `notes`.
-    fn remove_noted_through(&mut self, notes: u64) {
-        self.keys.retain(|_, noted| noted.noted_at > notes);
-        self.durable = self.keys.values().filter(|noted| noted.durable).count();
+    /// Drop every key that sorts at or above `from` and was last noted at
+    /// or before `notes`.
+    fn remove_from_noted_through(&mut self, from: &[u8], notes: u64) {
+        let dropped: Vec<Vec<u8>> = self
+            .keys
+            .range::<[u8], _>((Bound::Included(from), Bound::Unbounded))
+            .filter(|(_, noted)| noted.noted_at <= notes)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in dropped {
+            if let Some(noted) = self.keys.remove(&key)
+                && noted.durable
+            {
+                self.durable -= 1;
+            }
+        }
     }
 
     fn contains(&self, key: &[u8]) -> bool {
@@ -1317,8 +1345,9 @@ struct ScanCursor {
     pending_floor_ms: Option<i64>,
     /// When the floor was last cleared for a full-range scan.
     last_full_scan: Instant,
-    /// The keys of rows too old to lower the floor for, which the next scan
-    /// reads by key. Noting one leaves `note_generation` and
+    /// The keys of rows too old to lower the floor for. A scan reads by key
+    /// the ones that sort below its floor and leaves the rest to its range.
+    /// Noting one leaves `note_generation` and
     /// `pending_floor_ms` alone: the key itself is what a scan that
     /// overlapped the note leaves behind.
     noted: NotedKeys,
@@ -2783,7 +2812,13 @@ mod keyed_read_tests {
         h.broker
             .note_task_key(&key, now_ms - HOUR_MS, now_ms, false);
         // The scan takes the key to read while its write is not durable...
-        let to_read = h.broker.cursor.lock().unwrap().noted.readable(10);
+        let to_read = h
+            .broker
+            .cursor
+            .lock()
+            .unwrap()
+            .noted
+            .readable_below(&[0xff], 10);
         assert_eq!(to_read.len(), 1);
         let (read_key, noted) = to_read[0].clone();
         assert!(!noted.durable);
@@ -2816,44 +2851,74 @@ mod keyed_read_tests {
     fn result_of_a_read_applies_only_to_the_note_it_was_issued_under() {
         let mut noted = NotedKeys::default();
         assert_eq!(noted.note(b"k", true, false, 8), NoteOutcome::Noted);
-        let issued_under = noted.readable(8)[0].1.noted_at;
+        let issued_under = noted.readable_below(b"z", 8)[0].1.noted_at;
         assert_eq!(noted.note(b"k", true, false, 8), NoteOutcome::Noted);
 
         noted.remove_unchanged(b"k", issued_under);
         assert!(noted.contains(b"k"));
         assert!(noted.has_durable());
 
-        let current = noted.readable(8)[0].1.noted_at;
+        let current = noted.readable_below(b"z", 8)[0].1.noted_at;
         noted.remove_unchanged(b"k", current);
         assert!(!noted.contains(b"k"));
         assert!(!noted.has_durable());
 
         assert_eq!(noted.note(b"p", false, false, 8), NoteOutcome::Noted);
-        let issued_under = noted.readable(8)[0].1.noted_at;
+        let issued_under = noted.readable_below(b"z", 8)[0].1.noted_at;
         assert_eq!(noted.note(b"p", false, false, 8), NoteOutcome::Noted);
         noted.mark_probed_unchanged(b"p", issued_under);
-        assert_eq!(noted.readable(8).len(), 1, "still read by the next scan");
+        assert_eq!(
+            noted.readable_below(b"z", 8).len(),
+            1,
+            "still read by the next scan"
+        );
     }
 
-    /// A scan of the whole range drops the keys noted before it began and
-    /// keeps the ones noted while it ran.
+    /// A scan drops the keys at or above where its range starts that were
+    /// noted before it began. It keeps the ones noted while it ran, and the
+    /// ones below its range, which only a point read settles.
     #[test]
-    fn keys_noted_during_a_scan_of_the_whole_range_are_kept() {
+    fn scan_drops_the_keys_in_its_range_that_were_noted_before_it_began() {
         let mut noted = NotedKeys::default();
-        assert_eq!(noted.note(b"before", true, false, 8), NoteOutcome::Noted);
-        assert_eq!(noted.note(b"expected", false, false, 8), NoteOutcome::Noted);
+        assert_eq!(noted.note(b"a-below", true, false, 8), NoteOutcome::Noted);
+        assert_eq!(noted.note(b"m-before", true, false, 8), NoteOutcome::Noted);
+        assert_eq!(
+            noted.note(b"m-expected", false, false, 8),
+            NoteOutcome::Noted
+        );
+        assert_eq!(noted.note(b"m-never", false, false, 8), NoteOutcome::Noted);
         let scan_began = noted.notes;
-        assert_eq!(noted.note(b"during", true, false, 8), NoteOutcome::Noted);
+        assert_eq!(noted.note(b"m-during", true, false, 8), NoteOutcome::Noted);
         // Reported durable while the scan ran: its row may not be in the
         // scan's view.
-        assert_eq!(noted.note(b"expected", true, false, 8), NoteOutcome::Noted);
+        assert_eq!(
+            noted.note(b"m-expected", true, false, 8),
+            NoteOutcome::Noted
+        );
 
-        noted.remove_noted_through(scan_began);
-        assert!(!noted.contains(b"before"));
-        assert!(noted.contains(b"during"));
-        assert!(noted.contains(b"expected"));
-        assert_eq!(noted.len(), 2);
+        noted.remove_from_noted_through(b"m", scan_began);
+        assert!(noted.contains(b"a-below"));
+        assert!(!noted.contains(b"m-before"));
+        assert!(!noted.contains(b"m-never"));
+        assert!(noted.contains(b"m-during"));
+        assert!(noted.contains(b"m-expected"));
+        assert_eq!(noted.len(), 3);
         assert!(noted.has_durable());
+
+        // A scan of the whole range starts below every key.
+        let scan_began = noted.notes;
+        noted.remove_from_noted_through(b"", scan_began);
+        assert_eq!(noted.len(), 0);
+        assert!(!noted.has_durable());
+
+        assert_eq!(noted.note(b"b", true, false, 8), NoteOutcome::Noted);
+        assert_eq!(noted.note(b"c", true, false, 8), NoteOutcome::Noted);
+        let below_c: Vec<Vec<u8>> = noted
+            .readable_below(b"c", 8)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(below_c, vec![b"b".to_vec()], "the bound is exclusive");
     }
 
     /// An old row noted while a scan of the whole range runs (when there is
@@ -2901,6 +2966,83 @@ mod keyed_read_tests {
         assert_eq!(h.broker.noted_key_count(), 1);
 
         assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.claim_all(), vec![key]);
+    }
+
+    /// A task group with more ready rows than a scan reads has a floor that
+    /// lags behind the unread ones. A row noted above that floor is left to
+    /// the range scan, so the older unread rows are buffered first and tasks
+    /// are claimed in start time order.
+    #[tokio::test]
+    async fn key_above_a_lagging_floor_is_left_to_the_range_scan() {
+        let h = harness_with(settings(LAG_MS), 2).await;
+        let now_ms = now_epoch_ms();
+        let backlog_ms = now_ms - 2 * HOUR_MS;
+        let mut expected = Vec::new();
+        for i in 0..5 {
+            expected.push(h.put(&format!("backlog-{i}"), backlog_ms + i).await);
+        }
+        assert_eq!(h.scan(now_ms).await, 2);
+        assert_eq!(h.broker.scan_floor_ms(), Some(backlog_ms + 1));
+        let mut claimed = h.claim_all();
+
+        let granted = h.put("granted", now_ms - HOUR_MS).await;
+        h.broker
+            .note_task_key(&granted, now_ms - HOUR_MS, now_ms, true);
+        expected.push(granted);
+
+        assert_eq!(h.scan(now_ms).await, 2);
+        let oldest_unread = h.claim_all();
+        assert_eq!(
+            oldest_unread,
+            expected[2..4],
+            "the scan buffered the two oldest unread rows"
+        );
+        claimed.extend(oldest_unread);
+        assert_eq!(h.broker.scan_floor_ms(), Some(backlog_ms + 3));
+        assert_eq!(
+            h.broker.noted_key_count(),
+            0,
+            "the floor the scan left is below the row, so its range finds it"
+        );
+        for _ in 0..3 {
+            h.scan(now_ms).await;
+            claimed.extend(h.claim_all());
+        }
+
+        assert_eq!(claimed, expected, "claimed in start time order");
+        assert_eq!(h.keyed_reads("inserted"), 0.0);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.broker.next_ready_at_ms(), i64::MAX);
+        assert!(!h.broker.nudge(now_ms));
+    }
+
+    /// A durable key noted while a scan runs stays held, because the scan's
+    /// view may not include its row, and keeps nudges scanning. When it sorts
+    /// at or above the floor that scan leaves, the next scan's range reads
+    /// the row: the key is dropped without a point read and nudges stop.
+    #[tokio::test]
+    async fn key_noted_during_a_scan_above_its_floor_is_settled_by_the_next_scan() {
+        let h = harness().await;
+        let now_ms = now_epoch_ms();
+        let floor_ms = now_ms - 2 * HOUR_MS;
+        assert_eq!(h.scan(floor_ms).await, 0);
+
+        let start = h.broker.begin_scan_cursor();
+        let key = h.put("waited", now_ms - HOUR_MS).await;
+        h.broker.note_task_key(&key, now_ms - HOUR_MS, now_ms, true);
+        h.broker
+            .record_scan_stop(ScanStop::EndOfRange, 0, start.notes_before, Some(floor_ms));
+        assert_eq!(h.broker.noted_key_count(), 1);
+        assert!(h.broker.nudge(now_ms));
+
+        assert_eq!(h.scan(now_ms).await, 1);
+        assert_eq!(h.range_reads("inserted"), 1.0);
+        assert_eq!(h.keyed_reads("inserted"), 0.0);
+        assert_eq!(h.broker.noted_key_count(), 0);
+        assert_eq!(h.broker.next_ready_at_ms(), i64::MAX);
+        assert_eq!(h.scan(now_ms).await, 0);
+        assert_eq!(h.keyed_reads("already_buffered"), 0.0);
         assert_eq!(h.claim_all(), vec![key]);
     }
 
