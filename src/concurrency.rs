@@ -3651,6 +3651,12 @@ impl ConcurrencyManager {
                             })
                         })
                         .collect();
+                    if let Some(ref m) = self.metrics {
+                        m.record_concurrency_grant_duplicate_checks(
+                            &self.shard,
+                            lookups.iter().flatten().count(),
+                        );
+                    }
                     terminal_row_checks =
                         futures::stream::iter(lookups.into_iter().map(|lookup| async move {
                             let lookup = lookup?;

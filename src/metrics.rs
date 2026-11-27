@@ -319,6 +319,9 @@ pub struct Metrics {
     /// Follow-up passes the grant scanner queued for a queue it left with
     /// free capacity and request rows it did not reach.
     concurrency_grant_unfilled_capacity_passes: CounterVec,
+    /// Task-keyspace scans the grant scanner ran to check candidates for an
+    /// attempt that is already materialized.
+    concurrency_grant_duplicate_checks: CounterVec,
     /// Grant-scanner candidates skipped because their request row was gone
     /// by the time the scanner re-read it.
     concurrency_grant_vanished_requests: CounterVec,
@@ -1069,6 +1072,14 @@ impl Metrics {
         self.concurrency_grant_unfilled_capacity_passes
             .with_label_values(&[shard])
             .inc();
+    }
+
+    /// Record `checks` task-keyspace scans the grant scanner ran to check
+    /// candidates for an attempt that is already materialized.
+    pub fn record_concurrency_grant_duplicate_checks(&self, shard: &str, checks: usize) {
+        self.concurrency_grant_duplicate_checks
+            .with_label_values(&[shard])
+            .inc_by(checks as f64);
     }
 
     /// Record a grant-scanner candidate skipped because its request row was
@@ -2998,6 +3009,17 @@ pub fn init() -> anyhow::Result<Metrics> {
         )?,
     );
 
+    let concurrency_grant_duplicate_checks = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_grant_duplicate_checks_total",
+                "Task-keyspace scans the grant scanner ran to check candidates for an attempt that is already materialized",
+            ),
+            &["shard"],
+        )?,
+    );
+
     let concurrency_grant_vanished_requests = register(
         &registry,
         CounterVec::new(
@@ -3247,6 +3269,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_pending_grants,
         concurrency_grant_next_hop_skips,
         concurrency_grant_unfilled_capacity_passes,
+        concurrency_grant_duplicate_checks,
         concurrency_grant_vanished_requests,
         concurrency_request_floor_lag_ms,
         concurrency_request_noted_reads,

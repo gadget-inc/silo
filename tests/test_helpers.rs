@@ -199,6 +199,23 @@ pub async fn open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
     grant_scanner: silo::concurrency::GrantScannerConfig,
     interval_ms: u64,
 ) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
+    open_temp_shard_with_scanner_config_reconcile_interval_ms_and_metrics(
+        grant_scanner,
+        interval_ms,
+        None,
+    )
+    .await
+}
+
+/// Open a temp shard with a custom grant scanner config, a concurrency
+/// reconcile interval, and an optional Metrics registry for the shard to
+/// record into.
+#[allow(dead_code)]
+pub async fn open_temp_shard_with_scanner_config_reconcile_interval_ms_and_metrics(
+    grant_scanner: silo::concurrency::GrantScannerConfig,
+    interval_ms: u64,
+    metrics: Option<silo::metrics::Metrics>,
+) -> (tempfile::TempDir, std::sync::Arc<JobStoreShard>) {
     let rate_limiter = MockGubernatorClient::new_arc();
     let tmp = tempfile::tempdir().unwrap();
     let resolved = resolve_object_store(&Backend::Fs, tmp.path().to_string_lossy().as_ref())
@@ -213,7 +230,7 @@ pub async fn open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
             slatedb_settings: Some(fast_flush_slatedb_settings()),
             memory_cache: None,
             rate_limiter,
-            metrics: None,
+            metrics,
             concurrency_reconcile_interval: Duration::from_millis(interval_ms.max(1)),
             counter_reconciliation_seconds: None,
             hydrate_all_at_startup: false,

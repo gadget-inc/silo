@@ -630,6 +630,71 @@ async fn pass_reads_wider_batches_while_it_finds_nothing_to_grant() {
     );
 }
 
+/// A pass asked for one grant widens its read past three stale rows and
+/// holds four live waiters on a queue with four free slots. It runs one
+/// duplicate check, for the one grant it makes.
+#[silo::test]
+async fn one_grant_pass_runs_one_duplicate_check_however_many_candidates_it_holds() {
+    // The stale rows written by `write_stale_requests` carry a limit of 4,
+    // and a pass takes the queue's capacity from the first row it decodes.
+    const MAX: u32 = 4;
+    const STALE: usize = 3;
+    const WAITERS: usize = 5;
+    const DUPLICATE_CHECKS: &str = "silo_concurrency_grant_duplicate_checks_total";
+
+    let metrics = silo::metrics::init().expect("init metrics");
+    let (_tmp, shard) = open_temp_shard_with_scanner_config_reconcile_interval_ms_and_metrics(
+        small_scanner_config(),
+        NO_SWEEP_INTERVAL_MS,
+        Some(metrics.clone()),
+    )
+    .await;
+    shard.stop_grant_scanner();
+    let queue = "one-grant-wide-read";
+    let now = now_ms();
+
+    // Arrivals join the waiters behind the future waiter, so no slot is held.
+    write_future_waiter(&shard, queue, MAX).await;
+    write_stale_requests(&shard, queue, StaleRow::MissingJob, STALE, now).await;
+    for i in 0..WAITERS {
+        enqueue(
+            &shard,
+            &format!("waiter-{i}"),
+            vec![fixed_limit(queue, MAX)],
+            now,
+        )
+        .await;
+    }
+    let discarded = shard.take_pending_grant_batch_for_test();
+    assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
+    assert_eq!(holders(&shard, queue), 0);
+    assert_eq!(
+        metric_value_or_zero(&gather_metrics_text(&metrics), &[DUPLICATE_CHECKS]),
+        0.0
+    );
+
+    // Reads of 1 and 2 rows cover the stale rows; the third read holds four
+    // waiters.
+    shard.seed_hot_pending_grant_for_test(TENANT, queue, 1);
+    let taken = run_scanner_iteration(&shard).await;
+    assert_eq!(taken, vec![(queue.to_string(), 1)]);
+    assert_eq!(holders(&shard, queue), 1);
+    assert_eq!(
+        requester_count(&shard, queue).await,
+        WAITERS as i64,
+        "the stale rows are deleted, one waiter is granted, and the future waiter stays"
+    );
+    assert_eq!(
+        metric_value_or_zero(&gather_metrics_text(&metrics), &[DUPLICATE_CHECKS]),
+        1.0
+    );
+    assert_eq!(
+        shard.pending_grant_count_for_test(TENANT, queue),
+        MAX - 1,
+        "the waiters the pass held but did not grant get a follow-up for the free slots"
+    );
+}
+
 async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow) {
     const MAX: u32 = 4;
     const STALE: usize = WALK_BUDGET + 4;
