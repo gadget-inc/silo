@@ -1,0 +1,325 @@
+//! In-memory index of a shard's leases, ordered by expiry.
+//!
+//! The durable lease row is the authority on whether a lease has expired. An
+//! entry only says when the reaper should read that row: an entry that is
+//! early or left behind costs one point read, while a lease with no entry
+//! waits for the reaper's periodic scan of the whole lease range. Writers
+//! therefore add or lower an entry before their write commits
+//! ([`LeaseIndex::expect_written`]), and raise or remove one only after it
+//! has ([`LeaseIndex::confirm_written`], [`LeaseIndex::release`]).
+//!
+//! A scan of the whole lease range reads rows from a snapshot, so a row it
+//! yields may have been deleted since. While a [`FullScan`] is open the
+//! index remembers which leases were released, and the scan adds no entry
+//! for those.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use crate::job_store_shard::shard_name_jitter_ms;
+
+/// When a shard's whole lease range is scanned: on the first pass after the
+/// shard opens, `first_period_ms` after that, and once per `interval_ms`
+/// from there. The first period is at most one interval and differs between
+/// shards, so shards that open together scan at different times while no
+/// shard waits longer than the interval between two scans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FullScanSchedule {
+    interval_ms: i64,
+    first_period_ms: i64,
+}
+
+impl FullScanSchedule {
+    /// A schedule whose first period is `offset_ms`, taken modulo the
+    /// interval, shorter than `interval_ms`. An interval of zero or less
+    /// scans on every pass.
+    pub fn new(interval_ms: i64, offset_ms: i64) -> Self {
+        let interval_ms = interval_ms.max(0);
+        let offset_ms = offset_ms.checked_rem_euclid(interval_ms).unwrap_or(0);
+        Self {
+            interval_ms,
+            first_period_ms: interval_ms - offset_ms,
+        }
+    }
+
+    /// The schedule of the shard named `shard_name`. Its offset is a hash of
+    /// the name: the same on every run, and spread across the interval from
+    /// one shard to the next.
+    pub fn for_shard(shard_name: &str, interval_ms: i64) -> Self {
+        let offset_ms = shard_name_jitter_ms(shard_name, u64::try_from(interval_ms).unwrap_or(0));
+        Self::new(interval_ms, i64::try_from(offset_ms).unwrap_or(0))
+    }
+
+    pub fn interval_ms(&self) -> i64 {
+        self.interval_ms
+    }
+
+    /// How long after the scan that seeds the index the next one is due.
+    pub fn first_period_ms(&self) -> i64 {
+        self.first_period_ms
+    }
+
+    fn scans_every_pass(&self) -> bool {
+        self.interval_ms <= 0
+    }
+
+    /// When the scan after one at `scan_ms` is due, for a shard first
+    /// scanned at `first_scan_ms`: the earliest slot later than `scan_ms`.
+    /// Slots start one first period after the first scan and repeat every
+    /// interval, so a scan that runs late does not move the ones after it.
+    fn next_after(&self, first_scan_ms: i64, scan_ms: i64) -> i64 {
+        let first_slot_ms = first_scan_ms.saturating_add(self.first_period_ms);
+        if scan_ms < first_slot_ms {
+            return first_slot_ms;
+        }
+        let Some(into_period_ms) = scan_ms
+            .saturating_sub(first_slot_ms)
+            .checked_rem(self.interval_ms)
+        else {
+            return scan_ms;
+        };
+        scan_ms
+            .saturating_sub(into_period_ms)
+            .saturating_add(self.interval_ms)
+    }
+}
+
+/// A lease whose indexed expiry has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueLease {
+    pub task_id: String,
+    /// The expiry the index held when the lease was reported due.
+    pub expiry_ms: i64,
+}
+
+/// What the index knows of a lease whose row a full scan read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannedLease {
+    /// The index holds an entry for the lease, at `expiry_ms`.
+    Tracked { expiry_ms: i64 },
+    /// The lease was released after the scan began and the index holds no
+    /// entry for it, so the row the scan read has been deleted.
+    Released,
+    /// The index has not heard of the lease.
+    Untracked,
+}
+
+#[derive(Debug, Default)]
+pub struct LeaseIndex {
+    schedule: FullScanSchedule,
+    inner: Mutex<Inner>,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    expiry_by_task: HashMap<Arc<str>, i64>,
+    by_expiry: BTreeSet<(i64, Arc<str>)>,
+    /// When the first scan of the whole lease range started.
+    first_full_scan_ms: Option<i64>,
+    /// When the next scan of the whole lease range is due.
+    next_full_scan_ms: Option<i64>,
+    /// How many [`FullScan`]s are open.
+    open_scans: usize,
+    /// Leases released while a full scan was open.
+    released_during_scan: HashSet<Arc<str>>,
+}
+
+impl Inner {
+    fn set(&mut self, task_id: &str, expiry_ms: i64) -> bool {
+        if let Some((task, current)) = self.expiry_by_task.get_key_value(task_id) {
+            let (task, current) = (Arc::clone(task), *current);
+            if current != expiry_ms {
+                self.by_expiry.remove(&(current, Arc::clone(&task)));
+                self.by_expiry.insert((expiry_ms, Arc::clone(&task)));
+                self.expiry_by_task.insert(task, expiry_ms);
+            }
+            return true;
+        }
+        let task: Arc<str> = Arc::from(task_id);
+        self.by_expiry.insert((expiry_ms, Arc::clone(&task)));
+        self.expiry_by_task.insert(task, expiry_ms);
+        false
+    }
+
+    /// Drop the entry for `task_id` if it holds `expiry_ms`, and remember
+    /// the release for any full scan that is open.
+    fn release(&mut self, task_id: &str, expiry_ms: i64) {
+        let entry = self
+            .expiry_by_task
+            .get_key_value(task_id)
+            .map(|(task, indexed_ms)| (Arc::clone(task), *indexed_ms));
+        if self.open_scans > 0 {
+            let task = entry
+                .as_ref()
+                .map_or_else(|| Arc::from(task_id), |(task, _)| Arc::clone(task));
+            self.released_during_scan.insert(task);
+        }
+        let Some((task, indexed_ms)) = entry else {
+            return;
+        };
+        if indexed_ms == expiry_ms {
+            self.by_expiry.remove(&(expiry_ms, Arc::clone(&task)));
+            self.expiry_by_task.remove(&task);
+        }
+    }
+
+    fn scanned(&self, task_id: &str) -> ScannedLease {
+        if let Some(expiry_ms) = self.expiry_by_task.get(task_id) {
+            ScannedLease::Tracked {
+                expiry_ms: *expiry_ms,
+            }
+        } else if self.released_during_scan.contains(task_id) {
+            ScannedLease::Released
+        } else {
+            ScannedLease::Untracked
+        }
+    }
+}
+
+/// A scan of the whole lease range in progress. While one is open the index
+/// records every release, so the scan can tell a lease it has not heard of
+/// from one whose row was deleted after the scan's snapshot. Open it before
+/// the scan's iterator.
+#[derive(Debug)]
+pub struct FullScan<'a> {
+    index: &'a LeaseIndex,
+}
+
+impl FullScan<'_> {
+    /// What the index knows of a lease whose row the scan read.
+    pub fn lookup(&self, task_id: &str) -> ScannedLease {
+        self.index.lock().scanned(task_id)
+    }
+
+    /// Add a live lease row the scan read. A lease the index already holds
+    /// keeps the entry its writer gave it, and a lease released since the
+    /// scan began gets none. Returns whether an entry was added.
+    pub fn seed(&self, task_id: &str, expiry_ms: i64) -> bool {
+        let mut inner = self.index.lock();
+        if inner.scanned(task_id) != ScannedLease::Untracked {
+            return false;
+        }
+        inner.set(task_id, expiry_ms);
+        true
+    }
+}
+
+impl Drop for FullScan<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.index.lock();
+        inner.open_scans = inner.open_scans.saturating_sub(1);
+        if inner.open_scans == 0 {
+            inner.released_during_scan = HashSet::new();
+        }
+    }
+}
+
+impl LeaseIndex {
+    /// An empty index whose whole-range scans follow `schedule`.
+    pub fn new(schedule: FullScanSchedule) -> Self {
+        Self {
+            schedule,
+            inner: Mutex::default(),
+        }
+    }
+
+    /// The state is plain data that every method leaves consistent, so a
+    /// lock poisoned by a panicking holder is still safe to read.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Note a lease row about to be written with `expiry_ms`. Call before the
+    /// write commits. An entry that already expires earlier is kept, so the
+    /// reaper never looks later than a row that may still be durable needs.
+    pub fn expect_written(&self, task_id: &str, expiry_ms: i64) {
+        let mut inner = self.lock();
+        let earliest = inner
+            .expiry_by_task
+            .get(task_id)
+            .map_or(expiry_ms, |current| expiry_ms.min(*current));
+        inner.set(task_id, earliest);
+    }
+
+    /// Record `expiry_ms` as the expiry of a durable lease row: a write or
+    /// renewal that has committed, or a row just read. Returns whether the
+    /// index already held the lease.
+    pub fn confirm_written(&self, task_id: &str, expiry_ms: i64) -> bool {
+        self.lock().set(task_id, expiry_ms)
+    }
+
+    /// Drop the entry for a lease row that was deleted, or found absent,
+    /// while the index held `expiry_ms` for it. An entry holding any other
+    /// expiry belongs to a newer write of the same task id and stays.
+    pub fn release(&self, task_id: &str, expiry_ms: i64) {
+        self.lock().release(task_id, expiry_ms);
+    }
+
+    /// Open a scan of the whole lease range. Call before opening the scan's
+    /// iterator, so every release the iterator's snapshot can miss is
+    /// recorded.
+    pub fn begin_full_scan(&self) -> FullScan<'_> {
+        self.lock().open_scans += 1;
+        FullScan { index: self }
+    }
+
+    /// Leases whose indexed expiry is at or before `now_ms`, earliest first.
+    pub fn due(&self, now_ms: i64) -> Vec<DueLease> {
+        self.lock()
+            .by_expiry
+            .iter()
+            .take_while(|(expiry_ms, _)| *expiry_ms <= now_ms)
+            .map(|(expiry_ms, task)| DueLease {
+                task_id: task.to_string(),
+                expiry_ms: *expiry_ms,
+            })
+            .collect()
+    }
+
+    /// The earliest indexed expiry, if the index holds any lease.
+    pub fn next_expiry_ms(&self) -> Option<i64> {
+        self.lock()
+            .by_expiry
+            .first()
+            .map(|(expiry_ms, _)| *expiry_ms)
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().expiry_by_task.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether a scan of the whole lease range has ever fed the index.
+    pub fn seeded(&self) -> bool {
+        self.lock().first_full_scan_ms.is_some()
+    }
+
+    pub fn full_scan_schedule(&self) -> FullScanSchedule {
+        self.schedule
+    }
+
+    /// When the next scan of the whole lease range is due. `None` until a
+    /// first scan has seeded the index: that one is due at once.
+    pub fn next_full_scan_ms(&self) -> Option<i64> {
+        self.lock().next_full_scan_ms
+    }
+
+    /// Whether the whole lease range should be scanned at `now_ms`: always
+    /// until a first scan has seeded the index, then as the schedule says.
+    pub fn full_scan_due(&self, now_ms: i64) -> bool {
+        self.schedule.scans_every_pass()
+            || self
+                .next_full_scan_ms()
+                .is_none_or(|due_ms| now_ms >= due_ms)
+    }
+
+    /// Record that a scan of the whole lease range started at `now_ms`.
+    pub fn record_full_scan(&self, now_ms: i64) {
+        let mut inner = self.lock();
+        let first_scan_ms = *inner.first_full_scan_ms.get_or_insert(now_ms);
+        inner.next_full_scan_ms = Some(self.schedule.next_after(first_scan_ms, now_ms));
+    }
+}

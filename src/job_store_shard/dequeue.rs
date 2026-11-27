@@ -55,6 +55,9 @@ struct DequeueIterationState {
     /// double-dispatch detection guard consults this set to catch a repeat
     /// of the same task id within one dequeue call.
     leased_task_ids: HashSet<String>,
+    /// Task ids of every lease row put into this iteration's batch, for the
+    /// lease index to confirm once the batch commits.
+    leases_written: Vec<String>,
     /// `(tenant, job_id, attempt)` tuples whose chain this iteration has
     /// already continued into the uncommitted batch — including delivering
     /// its RunAttempt. The same-batch half of the duplicate-materialization
@@ -87,6 +90,7 @@ impl DequeueIterationState {
             holder_releases: Vec::new(),
             converted_requests: Vec::new(),
             leased_task_ids: HashSet::new(),
+            leases_written: Vec::new(),
             materialized_attempts: HashSet::new(),
             scheduled_refreshes: ScheduledRefreshes::default(),
             followup_task_start_ms: None,
@@ -482,6 +486,9 @@ impl JobStoreShard {
                 return Err(JobStoreShardError::from(e));
             }
             dst_events::confirm_write(write_op);
+            for task_id in &state.leases_written {
+                self.leases.confirm_written(task_id, expiry_ms);
+            }
             self.mark_refresh_pending_groups(state.scheduled_refreshes.task_groups());
             self.request_grants_for_yielded_queues(&state.scheduled_refreshes);
 
@@ -605,6 +612,7 @@ impl JobStoreShard {
             started_at_ms: now_ms,
         };
         let leased_value = encode_lease(&record);
+        self.leases.expect_written(task_id, expiry_ms);
         batch.put(&lease_key, &leased_value);
 
         // [SILO-DEQ-6] Mark job as running
@@ -1387,6 +1395,8 @@ impl JobStoreShard {
             started_at_ms: 0, // not applicable for RefreshFloatingLimit tasks
         };
         let leased_value = encode_lease(&record);
+        self.leases.expect_written(task_id, expiry_ms);
+        state.leases_written.push(task_id.to_string());
         state.batch.put(&lease_key, &leased_value);
         state.batch.delete(task_key);
 
@@ -1573,6 +1583,7 @@ impl JobStoreShard {
             return Ok(());
         }
         state.leased_task_ids.insert(task_id.to_string());
+        state.leases_written.push(task_id.to_string());
         // Delivery is this batch materializing (and dispatching) the attempt.
         // Recording it in the seen-set is what keeps a co-claimed duplicate
         // grant source from re-continuing the chain: this row is about to be

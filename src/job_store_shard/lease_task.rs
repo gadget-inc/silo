@@ -194,6 +194,7 @@ impl JobStoreShard {
             started_at_ms: now_ms,
         };
         let leased_value = encode_lease(&record);
+        self.leases.expect_written(&new_task_id, expiry_ms);
         txn.put(&lease_key, &leased_value)?;
 
         // Write attempt record
@@ -201,7 +202,7 @@ impl JobStoreShard {
             job_id: id.to_string(),
             attempt_number,
             relative_attempt_number: attempt_number,
-            task_id: new_task_id,
+            task_id: new_task_id.clone(),
             started_at_ms: now_ms,
             status: AttemptStatus::Running,
         };
@@ -234,6 +235,7 @@ impl JobStoreShard {
             }
             return Err(e.into());
         }
+        self.leases.confirm_written(&new_task_id, expiry_ms);
 
         // Post-commit: evict old task key from broker buffer and wake broker
         self.brokers.evict_keys(&[old_task_key]);

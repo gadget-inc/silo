@@ -325,6 +325,19 @@ fn default_broker_full_rescan_interval_ms() -> u64 {
     DEFAULT_BROKER_FULL_RESCAN_INTERVAL_MS
 }
 
+/// Default for `lease_reaper_full_scan_interval_ms`: how often the lease
+/// reaper scans a shard's whole lease range instead of reading only the
+/// leases its in-memory index reports due. Every writer of a lease row adds
+/// it to the index; the full scan bounds how long a lease a writer failed to
+/// add can stay expired without being reaped. Each shard takes its scans at
+/// its own offset within the interval, so the shards a node opens together
+/// do not all scan on the same reaper tick.
+pub const DEFAULT_LEASE_REAPER_FULL_SCAN_INTERVAL_MS: u64 = 60_000;
+
+fn default_lease_reaper_full_scan_interval_ms() -> u64 {
+    DEFAULT_LEASE_REAPER_FULL_SCAN_INTERVAL_MS
+}
+
 /// Default for `grant_scanner_commit_chunk_size`: max grants a
 /// `process_grants` pass accumulates before committing their edits durably
 /// and waking the granted task groups' brokers. Smaller chunks stream grants
@@ -488,6 +501,16 @@ pub struct DatabaseTemplate {
     /// without telling the broker can wait. Defaults to 60000.
     #[serde(default = "default_broker_full_rescan_interval_ms")]
     pub broker_full_rescan_interval_ms: u64,
+    /// How often (ms) the lease reaper scans the shard's whole lease range.
+    /// Between those scans it reads only the leases its in-memory index
+    /// reports due, so the scan bounds how long an expired lease missing from
+    /// the index can wait. A shard scans on its first pass after opening,
+    /// again after an offset derived from its name that is at most one
+    /// interval, and once per interval from there, so the shards on a node
+    /// spread their scans across the interval. Zero scans on every pass.
+    /// Defaults to 60000.
+    #[serde(default = "default_lease_reaper_full_scan_interval_ms")]
+    pub lease_reaper_full_scan_interval_ms: u64,
     /// When set, jobs that finished successfully (Succeeded) have all of their
     /// associated KV records re-put with a SlateDB row TTL expiring this many
     /// seconds in the future. `None` (the default) disables the behaviour for
@@ -598,6 +621,7 @@ impl Default for DatabaseTemplate {
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
             broker_full_rescan_interval_ms: default_broker_full_rescan_interval_ms(),
+            lease_reaper_full_scan_interval_ms: default_lease_reaper_full_scan_interval_ms(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             periodic_full_compaction_s: None,
@@ -1074,6 +1098,11 @@ pub struct DatabaseConfig {
     /// Defaults to 60000.
     #[serde(default = "default_broker_full_rescan_interval_ms")]
     pub broker_full_rescan_interval_ms: u64,
+    /// How often (ms) the lease reaper scans the shard's whole lease range.
+    /// See `DatabaseTemplate::lease_reaper_full_scan_interval_ms` for
+    /// details. Defaults to 60000.
+    #[serde(default = "default_lease_reaper_full_scan_interval_ms")]
+    pub lease_reaper_full_scan_interval_ms: u64,
     /// TTL (seconds) applied to Succeeded jobs' associated records. See
     /// `DatabaseTemplate::completed_job_expire_s` for details.
     #[serde(default)]
@@ -1138,6 +1167,7 @@ impl Default for DatabaseConfig {
             broker_tombstone_revive_after_generations:
                 default_broker_tombstone_revive_after_generations(),
             broker_full_rescan_interval_ms: default_broker_full_rescan_interval_ms(),
+            lease_reaper_full_scan_interval_ms: default_lease_reaper_full_scan_interval_ms(),
             completed_job_expire_s: None,
             terminal_job_expire_s: None,
             count_from_status_counters: default_count_from_status_counters(),
@@ -1430,6 +1460,7 @@ mod tests {
         assert_eq!(template.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(template.broker_tombstone_revive_after_generations, 64);
         assert_eq!(template.broker_full_rescan_interval_ms, 60_000);
+        assert_eq!(template.lease_reaper_full_scan_interval_ms, 60_000);
 
         let config: DatabaseConfig = toml::from_str(
             r#"
@@ -1443,5 +1474,6 @@ mod tests {
         assert_eq!(config.floating_refresh_stale_max_ms, 3_600_000);
         assert_eq!(config.broker_tombstone_revive_after_generations, 64);
         assert_eq!(config.broker_full_rescan_interval_ms, 60_000);
+        assert_eq!(config.lease_reaper_full_scan_interval_ms, 60_000);
     }
 }
