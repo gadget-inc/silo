@@ -635,6 +635,175 @@ async fn the_seeding_scan_deletes_leases_outside_the_shard_range() {
     assert_eq!(shard.tracked_lease_count(), 1);
 }
 
+/// Write `task_id`'s lease row for a tenant outside `[, 8000)`, as a change
+/// to the shard's range leaves a lease the index already holds.
+async fn move_lease_outside_the_shard_range(shard: &JobStoreShard, task_id: &str, expiry_ms: i64) {
+    // aaa hashes to ae01, outside [, 8000).
+    write_run_attempt_lease(
+        shard,
+        "worker",
+        task_id,
+        "aaa",
+        "job",
+        "default",
+        expiry_ms,
+        now_ms(),
+    )
+    .await;
+}
+
+/// A full scan that deletes an indexed lease for a tenant outside the
+/// shard's range drops its index entry with the row.
+#[silo::test]
+async fn a_full_scan_drops_the_entry_of_a_lease_outside_the_shard_range() {
+    // bbb hashes to 3a4f, inside [, 8000).
+    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", "8000")).await;
+    let expiry_ms = now_ms() + 10 * FULL_SCAN_INTERVAL_MS;
+    write_run_attempt_lease(
+        &shard,
+        "worker",
+        "moved",
+        "bbb",
+        "job",
+        "default",
+        expiry_ms,
+        now_ms(),
+    )
+    .await;
+    let seeded_at = seed(&shard).await;
+    assert_eq!(shard.tracked_lease_count(), 1);
+    move_lease_outside_the_shard_range(&shard, "moved", expiry_ms).await;
+
+    let pass = shard
+        .reap_due_leases_at(seeded_at + FULL_SCAN_INTERVAL_MS)
+        .await
+        .expect("full scan pass");
+
+    assert_eq!(
+        pass,
+        LeaseReapPass {
+            full_scan: true,
+            ..Default::default()
+        }
+    );
+    assert!(!lease_exists(&shard, "moved").await);
+    assert_eq!(shard.tracked_lease_count(), 0);
+}
+
+/// A due lease for a tenant outside the shard's range is deleted by key and
+/// leaves the index.
+#[silo::test]
+async fn a_due_lease_outside_the_shard_range_is_deleted_and_dropped() {
+    let (_tmp, shard) = open_temp_shard_with_range(ShardRange::new("", "8000")).await;
+    let expiry_ms = now_ms() + 5_000;
+    write_run_attempt_lease(
+        &shard,
+        "worker",
+        "moved",
+        "bbb",
+        "job",
+        "default",
+        expiry_ms,
+        now_ms(),
+    )
+    .await;
+    seed(&shard).await;
+    move_lease_outside_the_shard_range(&shard, "moved", expiry_ms).await;
+
+    let pass = shard.reap_due_leases_at(expiry_ms).await.expect("pass");
+
+    assert_eq!(
+        pass,
+        LeaseReapPass {
+            checked: 1,
+            ..Default::default()
+        }
+    );
+    assert!(!lease_exists(&shard, "moved").await);
+    assert_eq!(shard.tracked_lease_count(), 0);
+}
+
+/// A due lease whose row does not decode leaves the index, so later passes
+/// have nothing due and read nothing.
+#[silo::test]
+async fn a_due_lease_that_does_not_decode_leaves_the_index() {
+    let (_tmp, shard) = open_temp_shard().await;
+    seed(&shard).await;
+    let task_ids = lease_jobs(&shard, "garbled", 1).await;
+    let expiry_ms = lease_expiry_ms(&shard, &task_ids[0]).await;
+    shard
+        .db()
+        .put(
+            silo::keys::leased_task_key(&task_ids[0]),
+            b"not a lease record",
+        )
+        .await
+        .expect("overwrite lease");
+    shard.db().flush().await.expect("flush lease");
+
+    let pass = shard.reap_due_leases_at(expiry_ms).await.expect("pass");
+
+    assert_eq!(
+        pass,
+        LeaseReapPass {
+            checked: 1,
+            ..Default::default()
+        }
+    );
+    assert_eq!(shard.tracked_lease_count(), 0);
+    assert!(!shard.lease_reap_is_due(expiry_ms + 1));
+    assert_eq!(
+        shard
+            .reap_due_leases_at(expiry_ms + 1)
+            .await
+            .expect("next pass"),
+        LeaseReapPass::default()
+    );
+}
+
+/// Leases released while a full scan is running are not put back in the
+/// index by that scan, which read their rows before they were deleted.
+#[silo::test]
+async fn a_full_scan_does_not_index_leases_released_while_it_runs() {
+    let (_tmp, shard) = open_temp_shard().await;
+    let released = lease_jobs(&shard, "released", 20).await;
+    assert_eq!(shard.tracked_lease_count(), 20);
+    // Expired leases that sort ahead of the dequeued task ids keep the scan
+    // busy reaping while the releases below commit.
+    let now = now_ms();
+    for i in 0..20 {
+        write_run_attempt_lease(
+            &shard,
+            "worker",
+            &format!("-expired-{i:02}"),
+            "-",
+            "job",
+            "default",
+            now - 1,
+            now - 10_000,
+        )
+        .await;
+    }
+
+    let (pass, ()) = tokio::join!(shard.reap_due_leases_at(now), async {
+        for task_id in &released {
+            shard
+                .report_attempt_outcome(task_id, AttemptOutcome::Success { result: vec![] })
+                .await
+                .expect("report success");
+        }
+    });
+
+    let pass = pass.expect("seeding pass");
+    assert!(pass.full_scan);
+    assert_eq!(pass.reaped, 20);
+    assert_eq!(
+        shard.tracked_lease_count(),
+        0,
+        "every lease is reaped or released, so the index holds none"
+    );
+}
+
 /// `reap_expired_leases` scans the whole range on every call, reaping a
 /// lease whose row expired without the index hearing of it. The index entry
 /// left at the lease's original expiry is dropped when it comes due.

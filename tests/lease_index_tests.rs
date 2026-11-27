@@ -1,7 +1,7 @@
 //! Tests for the in-memory lease index: which leases it reports due, and how
 //! writes, renewals and releases move an entry.
 
-use silo::lease_index::LeaseIndex;
+use silo::lease_index::{LeaseIndex, ScannedLease};
 
 fn due_ids(index: &LeaseIndex, now_ms: i64) -> Vec<String> {
     index
@@ -110,6 +110,116 @@ fn releasing_an_unknown_lease_is_a_no_op() {
     let index = LeaseIndex::default();
     index.release("a", 1_000);
     assert_eq!(index.len(), 0);
+}
+
+#[test]
+fn forgetting_a_lease_drops_its_entry_whatever_expiry_it_holds() {
+    let index = LeaseIndex::default();
+    index.expect_written("a", 1_000);
+    index.confirm_written("a", 2_000);
+
+    index.forget("a");
+    index.forget("never written");
+
+    assert_eq!(index.len(), 0);
+    assert_eq!(index.next_expiry_ms(), None);
+}
+
+#[test]
+fn a_full_scan_adds_a_lease_the_index_has_not_heard_of() {
+    let index = LeaseIndex::default();
+    let scan = index.begin_full_scan();
+
+    assert_eq!(scan.lookup("a"), ScannedLease::Untracked);
+    assert!(scan.seed("a", 1_000));
+
+    assert_eq!(scan.lookup("a"), ScannedLease::Tracked);
+    assert_eq!(due_ids(&index, 1_000), ["a"]);
+}
+
+/// The scan's snapshot can trail a renewal, and a release names the expiry
+/// its writer recorded, so the scan leaves an entry it finds where it is.
+#[test]
+fn a_full_scan_leaves_an_indexed_lease_at_its_expiry() {
+    let index = LeaseIndex::default();
+    index.expect_written("a", 2_000);
+    let scan = index.begin_full_scan();
+
+    assert_eq!(scan.lookup("a"), ScannedLease::Tracked);
+    assert!(!scan.seed("a", 1_000));
+
+    assert_eq!(index.next_expiry_ms(), Some(2_000));
+    index.release("a", 2_000);
+    assert_eq!(index.len(), 0);
+}
+
+/// A row the scan read before its lease was released is gone from the
+/// database, so the scan adds no entry for it.
+#[test]
+fn a_full_scan_does_not_add_a_lease_released_since_it_began() {
+    let index = LeaseIndex::default();
+    index.expect_written("tracked", 1_000);
+    let scan = index.begin_full_scan();
+
+    index.release("tracked", 1_000);
+    index.release("never tracked", 1_000);
+    index.expect_written("forgotten", 1_000);
+    index.forget("forgotten");
+
+    for task_id in ["tracked", "never tracked", "forgotten"] {
+        assert_eq!(scan.lookup(task_id), ScannedLease::Released, "{task_id}");
+        assert!(!scan.seed(task_id, 1_000), "{task_id}");
+    }
+    assert_eq!(index.len(), 0);
+}
+
+/// A release that leaves the entry in place, because the entry belongs to a
+/// newer write of the task id, leaves the lease tracked.
+#[test]
+fn a_lease_written_again_after_its_release_is_tracked_by_a_full_scan() {
+    let index = LeaseIndex::default();
+    let scan = index.begin_full_scan();
+    index.expect_written("a", 1_000);
+    index.release("a", 1_000);
+    index.expect_written("a", 3_000);
+    index.release("a", 1_000);
+
+    assert_eq!(scan.lookup("a"), ScannedLease::Tracked);
+    assert!(!scan.seed("a", 1_000));
+    assert_eq!(index.next_expiry_ms(), Some(3_000));
+}
+
+#[test]
+fn a_release_before_a_full_scan_began_does_not_hide_the_lease_from_it() {
+    let index = LeaseIndex::default();
+    index.release("before any scan", 1_000);
+    {
+        let earlier = index.begin_full_scan();
+        index.release("during the earlier scan", 1_000);
+        assert_eq!(
+            earlier.lookup("during the earlier scan"),
+            ScannedLease::Released
+        );
+    }
+
+    let scan = index.begin_full_scan();
+
+    assert!(scan.seed("before any scan", 1_000));
+    assert!(scan.seed("during the earlier scan", 1_000));
+    assert_eq!(index.len(), 2);
+}
+
+#[test]
+fn releases_stay_recorded_until_the_last_overlapping_full_scan_ends() {
+    let index = LeaseIndex::default();
+    let first = index.begin_full_scan();
+    let second = index.begin_full_scan();
+    index.release("a", 1_000);
+
+    drop(first);
+
+    assert_eq!(second.lookup("a"), ScannedLease::Released);
+    assert!(!second.seed("a", 1_000));
 }
 
 #[test]

@@ -25,6 +25,7 @@ use crate::keys::{
     idx_enqueue_time_key, idx_metadata_key, job_cancelled_key, job_info_key, leased_task_key,
     parse_concurrency_holder_key, parse_lease_key,
 };
+use crate::lease_index::ScannedLease;
 use crate::task::{DEFAULT_LEASE_MS, HeartbeatResult};
 use tracing::{debug, info_span};
 
@@ -52,6 +53,13 @@ enum LeaseRow {
     Live { expiry_ms: i64 },
     /// The lease had expired and the reaper acted on it.
     Reaped,
+}
+
+/// A lease row to delete because its tenant is outside the shard's range.
+struct DefunctLease {
+    key: Vec<u8>,
+    /// The task id in the row's key, when the key parses.
+    task_id: Option<String>,
 }
 
 impl JobStoreShard {
@@ -600,7 +608,7 @@ impl JobStoreShard {
 
         let shard_range = self.get_range();
         let mut pass = LeaseReapPass::default();
-        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
+        let mut defunct: Vec<DefunctLease> = Vec::new();
         for due in self.leases.due(now_ms) {
             let key = leased_task_key(&due.task_id);
             pass.checked += 1;
@@ -615,15 +623,17 @@ impl JobStoreShard {
                 LeaseRow::Live { expiry_ms } => {
                     self.leases.confirm_written(&due.task_id, expiry_ms);
                 }
-                LeaseRow::Defunct => {
-                    self.leases.release(&due.task_id, due.expiry_ms);
-                    defunct_keys.push(key);
-                }
+                LeaseRow::Defunct => defunct.push(DefunctLease {
+                    key,
+                    task_id: Some(due.task_id),
+                }),
                 LeaseRow::Reaped => pass.reaped += 1,
-                LeaseRow::Unreadable => {}
+                // No pass acts on this row, so an entry left in place would
+                // be due, and the row read, on every pass.
+                LeaseRow::Unreadable => self.leases.release(&due.task_id, due.expiry_ms),
             }
         }
-        self.delete_defunct_leases(defunct_keys).await;
+        self.delete_defunct_leases(defunct).await;
         Ok(pass)
     }
 
@@ -650,10 +660,14 @@ impl JobStoreShard {
     }
 
     /// Scan the whole lease range: reap expired leases, delete leases for
-    /// tenants outside the shard's range, and add every other lease to the
-    /// index.
+    /// tenants outside the shard's range, and add every other lease the
+    /// index does not hold. A lease the index already holds keeps the entry
+    /// its writer gave it.
     async fn scan_and_reap_leases(&self, now_ms: i64) -> Result<LeaseReapPass, JobStoreShardError> {
         let seeded = self.leases.seeded();
+        // Opened before the iterator, so the index records every release
+        // that lands after the iterator's snapshot.
+        let scan = self.leases.begin_full_scan();
         let start = crate::keys::leases_prefix();
         let end = crate::keys::end_bound(&start);
         let mut iter = self
@@ -666,47 +680,40 @@ impl JobStoreShard {
             full_scan: true,
             ..Default::default()
         };
-        let mut defunct_keys: Vec<Vec<u8>> = Vec::new();
+        let mut defunct: Vec<DefunctLease> = Vec::new();
 
         while let Some(kv) = iter.next().await? {
             let task_id = parse_lease_key(&kv.key).map(|parsed| parsed.task_id);
-            let tracked = task_id
-                .as_deref()
-                .is_some_and(|task_id| self.leases.contains(task_id));
-            let mut value = kv.value;
-            if seeded && !tracked {
-                // A lease the index does not hold was either written without
-                // the index hearing of it or released since the scan's
-                // snapshot. Only the first is still in the database.
-                match self.db.get(&kv.key).await? {
-                    Some(current) => value = current,
-                    None => continue,
-                }
+            let known = task_id.as_deref().map(|task_id| scan.lookup(task_id));
+            if known == Some(ScannedLease::Released) {
+                // The row was deleted after the snapshot.
+                continue;
             }
             match self
-                .reap_lease_if_expired(&kv.key, value, now_ms, &shard_range)
+                .reap_lease_if_expired(&kv.key, kv.value, now_ms, &shard_range)
                 .await
             {
                 LeaseRow::Live { expiry_ms } => {
                     if let Some(task_id) = task_id.as_deref() {
-                        // The snapshot can trail a renewal, so only add or
-                        // lower the entry.
-                        self.leases.expect_written(task_id, expiry_ms);
+                        scan.seed(task_id, expiry_ms);
                     }
                 }
                 LeaseRow::Defunct => {
-                    defunct_keys.push(kv.key.to_vec());
+                    defunct.push(DefunctLease {
+                        key: kv.key.to_vec(),
+                        task_id,
+                    });
                     continue;
                 }
                 LeaseRow::Reaped => pass.reaped += 1,
                 LeaseRow::Unreadable => continue,
             }
-            if seeded && !tracked {
+            if seeded && known != Some(ScannedLease::Tracked) {
                 pass.untracked += 1;
             }
         }
 
-        self.delete_defunct_leases(defunct_keys).await;
+        self.delete_defunct_leases(defunct).await;
         self.leases.record_full_scan(now_ms);
         Ok(pass)
     }
@@ -791,23 +798,27 @@ impl JobStoreShard {
         LeaseRow::Reaped
     }
 
-    /// Delete lease rows that belong to tenants outside the shard's range.
-    async fn delete_defunct_leases(&self, defunct_keys: Vec<Vec<u8>>) {
-        if defunct_keys.is_empty() {
+    /// Delete lease rows that belong to tenants outside the shard's range,
+    /// then drop their index entries.
+    async fn delete_defunct_leases(&self, defunct: Vec<DefunctLease>) {
+        if defunct.is_empty() {
             return;
         }
         let mut batch = WriteBatch::new();
-        for key in &defunct_keys {
-            batch.delete(key);
+        for lease in &defunct {
+            batch.delete(&lease.key);
         }
         if let Err(e) = self.db.write(batch).await {
-            debug!(error = %e, count = defunct_keys.len(), "failed to delete defunct leases");
-        } else {
-            debug!(
-                count = defunct_keys.len(),
-                "deleted defunct leases outside shard range"
-            );
+            debug!(error = %e, count = defunct.len(), "failed to delete defunct leases");
+            return;
         }
+        for task_id in defunct.iter().filter_map(|lease| lease.task_id.as_deref()) {
+            self.leases.forget(task_id);
+        }
+        debug!(
+            count = defunct.len(),
+            "deleted defunct leases outside shard range"
+        );
     }
 
     /// Handle expiry of a RefreshFloatingLimit task lease.
