@@ -14,10 +14,11 @@ use crate::job_store_shard::counters::decode_counter;
 use crate::job_store_shard::helpers::{DbWriteBatcher, WriteBatcher, now_epoch_ms};
 use crate::job_store_shard::{JobStoreShard, JobStoreShardError, ScheduledRefreshes};
 use crate::keys::{
-    concurrency_request_prefix, concurrency_requester_counter_key, end_bound,
-    floating_limit_state_key, job_info_key, leased_task_key, parse_refresh_task_key,
-    refresh_task_group_prefix, refresh_task_key, refresh_tasks_prefix,
+    concurrency_requester_counter_key, end_bound, floating_limit_state_key, job_info_key,
+    leased_task_key, parse_refresh_task_key, refresh_task_group_prefix, refresh_task_key,
+    refresh_tasks_prefix,
 };
+use crate::request_floor::RequestRead;
 use crate::task::{DEFAULT_LEASE_MS, LeaseRecord, LeasedRefreshTask, Task};
 
 /// Row TTL on refresh index rows. Longer than any stale window, so it only
@@ -85,11 +86,13 @@ impl JobStoreShard {
         }
     }
 
-    /// Nudge the grant scanner for every queue on which a chain yielded a
-    /// free slot to waiting jobs, after the batch that wrote the chain's
-    /// request record is durable. A missed nudge is recovered by the
-    /// periodic requester sweep.
+    /// Called once the batch `refreshes` belongs to is durable. Confirms the
+    /// batch's request rows to the grant scanner's request floors, then
+    /// nudges the scanner for every queue on which a chain yielded a free
+    /// slot to waiting jobs. A missed nudge is recovered by the periodic
+    /// requester sweep.
     pub(crate) fn request_grants_for_yielded_queues(&self, refreshes: &ScheduledRefreshes) {
+        refreshes.confirm_request_writes();
         for (tenant, queue) in refreshes.yielded_queues() {
             self.concurrency.request_grant(tenant, queue);
         }
@@ -392,11 +395,17 @@ impl JobStoreShard {
         tenant: &str,
         queue_key: &str,
     ) -> Result<Option<String>, JobStoreShardError> {
-        let start = concurrency_request_prefix(tenant, queue_key);
-        let end = end_bound(&start);
-        let mut iter = self.db.scan::<Vec<u8>, _>(start..end).await?;
-        let Some(kv) = iter.next().await? else {
-            return Ok(None);
+        let kv = {
+            let mut requests = self
+                .concurrency
+                .peek_request_rows(&self.db, tenant, queue_key);
+            loop {
+                match requests.next().await? {
+                    RequestRead::Row(row) => break row,
+                    RequestRead::Missing => continue,
+                    RequestRead::End => return Ok(None),
+                }
+            }
         };
         let decoded = match decode_concurrency_action(kv.value) {
             Ok(decoded) => decoded,

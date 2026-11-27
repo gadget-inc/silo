@@ -796,6 +796,42 @@ path = "/tmp/silo-shard"
 }
 
 #[silo::test]
+fn parse_toml_grant_scanner_request_floor_settings() {
+    let toml_str = r#"
+[coordination]
+backend = "none"
+
+[database]
+backend = "memory"
+path = "/tmp/silo-%shard%"
+grant_scanner_request_floor = false
+grant_scanner_request_floor_min_lag_ms = 72057594037927936
+grant_scanner_request_noted_max_keys = 16
+grant_scanner_request_floor_rebuild_interval_ms = 0
+"#;
+    let cfg: AppConfig = toml::from_str(toml_str).expect("parse TOML");
+    assert!(!cfg.database.grant_scanner_request_floor);
+    assert_eq!(
+        cfg.database.grant_scanner_request_floor_min_lag_ms,
+        silo::request_floor::OTHER_BAND_LAG_MS
+    );
+    assert_eq!(cfg.database.grant_scanner_request_noted_max_keys, 16);
+    assert_eq!(
+        cfg.database.grant_scanner_request_floor_rebuild_interval_ms,
+        0
+    );
+
+    let defaults = DatabaseConfig::default();
+    assert!(defaults.grant_scanner_request_floor);
+    assert_eq!(defaults.grant_scanner_request_floor_min_lag_ms, 1_000);
+    assert_eq!(defaults.grant_scanner_request_noted_max_keys, 4_096);
+    assert_eq!(
+        defaults.grant_scanner_request_floor_rebuild_interval_ms,
+        60_000
+    );
+}
+
+#[silo::test]
 fn parse_toml_server_statement_timeout_uses_default() {
     let toml_str = r#"
 [database]

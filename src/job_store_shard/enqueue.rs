@@ -25,6 +25,7 @@ use crate::keys::{
     status_index_timestamp, tenant_status_counter_key,
 };
 use crate::metrics::FloatingWaiterProbeResult;
+use crate::request_floor::RequestRowWrite;
 use crate::retry::RetryPolicy;
 use crate::task::{GubernatorRateLimitData, Task};
 
@@ -42,10 +43,17 @@ use crate::task::{GubernatorRateLimitData, Task};
 /// durable, its owner nudges the grant scanner for each with
 /// `JobStoreShard::request_grants_for_yielded_queues`, so the slot is filled
 /// from the queue the arrival just joined.
+///
+/// It also holds the tracker of every concurrency request row written into
+/// the batch. The batch's owner keeps this record alive across the commit
+/// and confirms the trackers once the commit has succeeded
+/// ([`Self::confirm_request_writes`]). A record dropped without that tells
+/// the grant scanner the rows may never have been written.
 #[derive(Debug, Default)]
 pub struct ScheduledRefreshes {
     refreshes: Vec<(String, String, String)>,
     yielded_queues: Vec<(String, String)>,
+    request_writes: Vec<RequestRowWrite>,
 }
 
 impl ScheduledRefreshes {
@@ -81,6 +89,21 @@ impl ScheduledRefreshes {
         self.yielded_queues
             .iter()
             .map(|(t, q)| (t.as_str(), q.as_str()))
+    }
+
+    /// Hold the tracker of a request row written into this batch.
+    pub(crate) fn track_request_write(&mut self, write: RequestRowWrite) {
+        if write.is_tracked() {
+            self.request_writes.push(write);
+        }
+    }
+
+    /// The batch has committed: its request rows are visible to every read
+    /// that starts from now on.
+    pub(crate) fn confirm_request_writes(&self) {
+        for write in &self.request_writes {
+            write.confirm();
+        }
     }
 }
 
@@ -850,7 +873,7 @@ impl JobStoreShard {
             match &limits[current_index] {
                 Limit::Concurrency(cl) => {
                     // Try immediate grant for concurrency limits
-                    let outcome = self
+                    let mut outcome = self
                         .concurrency
                         .handle_enqueue(
                             &self.db,
@@ -874,11 +897,13 @@ impl JobStoreShard {
                         )
                         .await?;
 
-                    if matches!(
-                        outcome,
-                        Some(RequestTicketOutcome::TicketRequested { yielded: true, .. })
-                    ) {
-                        scheduled_refreshes.record_yield(tenant, &cl.key);
+                    if let Some(RequestTicketOutcome::TicketRequested { yielded, write, .. }) =
+                        outcome.as_mut()
+                    {
+                        scheduled_refreshes.track_request_write(std::mem::take(write));
+                        if *yielded {
+                            scheduled_refreshes.record_yield(tenant, &cl.key);
+                        }
                     }
 
                     // Cache the resolved limit for the query system
@@ -932,7 +957,7 @@ impl JobStoreShard {
                         max_concurrency: current_max,
                     };
 
-                    let outcome = self
+                    let mut outcome = self
                         .concurrency
                         .handle_enqueue(
                             &self.db,
@@ -956,11 +981,13 @@ impl JobStoreShard {
                         )
                         .await?;
 
-                    if matches!(
-                        outcome,
-                        Some(RequestTicketOutcome::TicketRequested { yielded: true, .. })
-                    ) {
-                        scheduled_refreshes.record_yield(tenant, &fl.key);
+                    if let Some(RequestTicketOutcome::TicketRequested { yielded, write, .. }) =
+                        outcome.as_mut()
+                    {
+                        scheduled_refreshes.track_request_write(std::mem::take(write));
+                        if *yielded {
+                            scheduled_refreshes.record_yield(tenant, &fl.key);
+                        }
                     }
 
                     // Cache the resolved floating limit for the query system

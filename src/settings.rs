@@ -363,6 +363,44 @@ fn default_lease_reaper_full_scan_interval_ms() -> u64 {
     DEFAULT_LEASE_REAPER_FULL_SCAN_INTERVAL_MS
 }
 
+/// Default for `grant_scanner_request_floor`: whether a grant scanner pass
+/// starts reading a queue's request rows at the queue's request floor, the
+/// key below which earlier passes proved every row granted or deleted.
+pub const DEFAULT_GRANT_SCANNER_REQUEST_FLOOR: bool = true;
+
+fn default_grant_scanner_request_floor() -> bool {
+    DEFAULT_GRANT_SCANNER_REQUEST_FLOOR
+}
+
+/// Default for `grant_scanner_request_floor_min_lag_ms`: a request row
+/// written at most this much start time below its queue's floor lowers the
+/// floor to its key, and one written further below is read by key instead.
+pub const DEFAULT_GRANT_SCANNER_REQUEST_FLOOR_MIN_LAG_MS: u64 = 1_000;
+
+fn default_grant_scanner_request_floor_min_lag_ms() -> u64 {
+    DEFAULT_GRANT_SCANNER_REQUEST_FLOOR_MIN_LAG_MS
+}
+
+/// Default for `grant_scanner_request_noted_max_keys`: most request keys a
+/// queue keeps noted below its floor, each read by key on every pass until
+/// its row is granted or deleted.
+pub const DEFAULT_GRANT_SCANNER_REQUEST_NOTED_MAX_KEYS: usize = 4096;
+
+fn default_grant_scanner_request_noted_max_keys() -> usize {
+    DEFAULT_GRANT_SCANNER_REQUEST_NOTED_MAX_KEYS
+}
+
+/// Default for `grant_scanner_request_floor_rebuild_interval_ms`: how long a
+/// queue's request floor is used before a pass drops it and reads the
+/// queue's request rows from the start. Every writer of a request row tells
+/// the floor; the rebuild bounds how long a row a writer failed to report
+/// can wait below it.
+pub const DEFAULT_GRANT_SCANNER_REQUEST_FLOOR_REBUILD_INTERVAL_MS: u64 = 60_000;
+
+fn default_grant_scanner_request_floor_rebuild_interval_ms() -> u64 {
+    DEFAULT_GRANT_SCANNER_REQUEST_FLOOR_REBUILD_INTERVAL_MS
+}
+
 /// Default for `grant_scanner_commit_chunk_size`: max grants a
 /// `process_grants` pass accumulates before committing their edits durably
 /// and waking the granted task groups' brokers. Smaller chunks stream grants
@@ -502,6 +540,34 @@ pub struct DatabaseTemplate {
     /// below 1 are treated as 1. Defaults to 16.
     #[serde(default = "default_grant_scanner_commit_chunk_size")]
     pub grant_scanner_commit_chunk_size: usize,
+    /// Whether a grant scanner pass starts reading a queue's request rows at
+    /// the queue's request floor: the key below which earlier passes proved
+    /// every row granted or deleted, so the pass does not step over their
+    /// SlateDB tombstones. When false every pass reads from the start of the
+    /// queue's request rows. Defaults to true.
+    #[serde(default = "default_grant_scanner_request_floor")]
+    pub grant_scanner_request_floor: bool,
+    /// A request row written below its queue's request floor, in the floor's
+    /// band and at most this much start time (ms) under it, lowers the floor
+    /// to its key, and the next pass scans from there. A row written further
+    /// below, or in another band, leaves the floor in place and is read by
+    /// key. `72057594037927936` (2^56, more than two start times can differ
+    /// by) or above lowers the floor for every write below it, so no row is
+    /// read by key. Defaults to 1000.
+    #[serde(default = "default_grant_scanner_request_floor_min_lag_ms")]
+    pub grant_scanner_request_floor_min_lag_ms: u64,
+    /// Most request keys a queue keeps noted below its request floor. Each
+    /// is read by key on every pass until its row is granted or deleted. A
+    /// write that would exceed the limit lowers the floor to its key
+    /// instead. Defaults to 4096.
+    #[serde(default = "default_grant_scanner_request_noted_max_keys")]
+    pub grant_scanner_request_noted_max_keys: usize,
+    /// How long (ms) a queue's request floor is used before a pass drops it
+    /// and reads the queue's request rows from the start. Bounds how long a
+    /// request row written without telling the floor can wait below it.
+    /// Zero drops the floor on every pass. Defaults to 60000.
+    #[serde(default = "default_grant_scanner_request_floor_rebuild_interval_ms")]
+    pub grant_scanner_request_floor_rebuild_interval_ms: u64,
     /// How long (ms) a floating limit's outstanding-refresh flag is trusted
     /// before the refresh is treated as lost and a replacement may be
     /// scheduled. Rows carrying no scheduled-at stamp are treated as stale
@@ -656,6 +722,12 @@ impl Default for DatabaseTemplate {
             concurrency_request_priority_order: false,
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
+            grant_scanner_request_floor: default_grant_scanner_request_floor(),
+            grant_scanner_request_floor_min_lag_ms: default_grant_scanner_request_floor_min_lag_ms(
+            ),
+            grant_scanner_request_noted_max_keys: default_grant_scanner_request_noted_max_keys(),
+            grant_scanner_request_floor_rebuild_interval_ms:
+                default_grant_scanner_request_floor_rebuild_interval_ms(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
             floating_refresh_stale_max_ms: default_floating_refresh_stale_max_ms(),
             broker_tombstone_revive_after_generations:
@@ -1120,6 +1192,26 @@ pub struct DatabaseConfig {
     /// Defaults to 16.
     #[serde(default = "default_grant_scanner_commit_chunk_size")]
     pub grant_scanner_commit_chunk_size: usize,
+    /// Whether grant scanner passes start at a queue's request floor. See
+    /// `DatabaseTemplate::grant_scanner_request_floor` for details. Defaults
+    /// to true.
+    #[serde(default = "default_grant_scanner_request_floor")]
+    pub grant_scanner_request_floor: bool,
+    /// Start time (ms) under the floor within which a write lowers it. See
+    /// `DatabaseTemplate::grant_scanner_request_floor_min_lag_ms` for
+    /// details. Defaults to 1000.
+    #[serde(default = "default_grant_scanner_request_floor_min_lag_ms")]
+    pub grant_scanner_request_floor_min_lag_ms: u64,
+    /// Most request keys a queue keeps noted below its request floor. See
+    /// `DatabaseTemplate::grant_scanner_request_noted_max_keys` for details.
+    /// Defaults to 4096.
+    #[serde(default = "default_grant_scanner_request_noted_max_keys")]
+    pub grant_scanner_request_noted_max_keys: usize,
+    /// How long (ms) a queue's request floor is used before it is dropped.
+    /// See `DatabaseTemplate::grant_scanner_request_floor_rebuild_interval_ms`
+    /// for details. Defaults to 60000.
+    #[serde(default = "default_grant_scanner_request_floor_rebuild_interval_ms")]
+    pub grant_scanner_request_floor_rebuild_interval_ms: u64,
     /// How long (ms) an outstanding floating limit refresh is trusted. See
     /// `DatabaseTemplate::floating_refresh_stale_ms` for details. Defaults
     /// to 60000.
@@ -1215,6 +1307,12 @@ impl Default for DatabaseConfig {
             concurrency_request_priority_order: false,
             grant_scanner_live_headroom_fraction: default_grant_scanner_live_headroom_fraction(),
             grant_scanner_commit_chunk_size: default_grant_scanner_commit_chunk_size(),
+            grant_scanner_request_floor: default_grant_scanner_request_floor(),
+            grant_scanner_request_floor_min_lag_ms: default_grant_scanner_request_floor_min_lag_ms(
+            ),
+            grant_scanner_request_noted_max_keys: default_grant_scanner_request_noted_max_keys(),
+            grant_scanner_request_floor_rebuild_interval_ms:
+                default_grant_scanner_request_floor_rebuild_interval_ms(),
             floating_refresh_stale_ms: default_floating_refresh_stale_ms(),
             floating_refresh_stale_max_ms: default_floating_refresh_stale_max_ms(),
             broker_tombstone_revive_after_generations:
@@ -1542,6 +1640,13 @@ mod tests {
         assert_eq!(template.broker_keyed_read_min_lag_ms, 1_000);
         assert_eq!(template.broker_keyed_read_max_keys, 8_192);
         assert_eq!(template.lease_reaper_full_scan_interval_ms, 60_000);
+        assert!(template.grant_scanner_request_floor);
+        assert_eq!(template.grant_scanner_request_floor_min_lag_ms, 1_000);
+        assert_eq!(template.grant_scanner_request_noted_max_keys, 4_096);
+        assert_eq!(
+            template.grant_scanner_request_floor_rebuild_interval_ms,
+            60_000
+        );
 
         let config: DatabaseConfig = toml::from_str(
             r#"
@@ -1558,5 +1663,12 @@ mod tests {
         assert_eq!(config.broker_keyed_read_min_lag_ms, 1_000);
         assert_eq!(config.broker_keyed_read_max_keys, 8_192);
         assert_eq!(config.lease_reaper_full_scan_interval_ms, 60_000);
+        assert!(config.grant_scanner_request_floor);
+        assert_eq!(config.grant_scanner_request_floor_min_lag_ms, 1_000);
+        assert_eq!(config.grant_scanner_request_noted_max_keys, 4_096);
+        assert_eq!(
+            config.grant_scanner_request_floor_rebuild_interval_ms,
+            60_000
+        );
     }
 }

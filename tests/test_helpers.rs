@@ -300,6 +300,25 @@ pub async fn open_temp_shard_with_grant_scanner_config(
     std::sync::Arc<JobStoreShard>,
     silo::metrics::Metrics,
 ) {
+    open_temp_shard_with_grant_scanner_config_and_slatedb(
+        grant_scanner,
+        fast_flush_slatedb_settings(),
+    )
+    .await
+}
+
+/// Open a temp shard with a custom grant scanner config and SlateDB
+/// settings (and metrics), for tests that commit often enough for the flush
+/// interval to decide how long they run.
+#[allow(dead_code)]
+pub async fn open_temp_shard_with_grant_scanner_config_and_slatedb(
+    grant_scanner: silo::concurrency::GrantScannerConfig,
+    slatedb_settings: slatedb::config::Settings,
+) -> (
+    tempfile::TempDir,
+    std::sync::Arc<JobStoreShard>,
+    silo::metrics::Metrics,
+) {
     let metrics = silo::metrics::init().expect("init metrics");
     let rate_limiter = MockGubernatorClient::new_arc();
     let tmp = tempfile::tempdir().unwrap();
@@ -312,7 +331,7 @@ pub async fn open_temp_shard_with_grant_scanner_config(
             store: resolved.store,
             wal_store: None,
             wal_close_config: None,
-            slatedb_settings: Some(fast_flush_slatedb_settings()),
+            slatedb_settings: Some(slatedb_settings),
             memory_cache: None,
             rate_limiter,
             metrics: Some(metrics.clone()),

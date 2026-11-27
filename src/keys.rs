@@ -702,6 +702,19 @@ pub fn concurrency_request_band_start(tenant: &str, queue: &str, band: u8) -> Ve
     )
 }
 
+/// Band and start time of a request key, read from its ordering field alone.
+/// `prefix_len` is the length of the key's queue prefix
+/// ([`concurrency_request_prefix`]). `None` when the key is too short to
+/// hold an ordering field.
+pub fn concurrency_request_key_order(key: &[u8], prefix_len: usize) -> Option<(u8, u64)> {
+    let field: [u8; 8] = key
+        .get(prefix_len..prefix_len.checked_add(8)?)?
+        .try_into()
+        .ok()?;
+    let order = u64::from_be_bytes(field);
+    Some(((order >> 56) as u8, order & CONCURRENCY_REQUEST_START_MASK))
+}
+
 /// Prefix for scanning all requests for a tenant/queue.
 pub fn concurrency_request_prefix(tenant: &str, queue: &str) -> Vec<u8> {
     encode_with_prefix(prefix::CONCURRENCY_REQUEST, &(tenant, queue))

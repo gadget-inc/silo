@@ -39,6 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use futures::FutureExt;
@@ -63,13 +64,17 @@ use crate::job::{ConcurrencyLimit, JobStatus, JobStatusKind, JobView, Limit};
 use crate::job_store_shard::helpers::decode_job_status_owned;
 use crate::keys::{
     concurrency_counts_key, concurrency_holder_key, concurrency_holders_prefix,
-    concurrency_holders_queue_prefix, concurrency_request_band_start, concurrency_request_key,
+    concurrency_holders_queue_prefix, concurrency_request_key,
     concurrency_request_key_start_time_first, concurrency_request_prefix,
     concurrency_requester_counter_key, end_bound, floating_limit_state_key,
     holder_reconcile_barrier_key, job_info_key, job_status_key, parse_concurrency_holder_key,
     parse_concurrency_request_key, parse_concurrency_requester_counter_key, task_key,
 };
 use crate::metrics::Metrics;
+use crate::request_floor::{
+    RequestFloorConfig, RequestFloors, RequestRead, RequestReadObserver, RequestRowCursor,
+    RequestRowWrite, RowFate,
+};
 use crate::shard_range::ShardRange;
 use crate::task::{ConcurrencyAction, HolderRecord, Task};
 use crate::task_broker::TaskBrokerRegistry;
@@ -263,8 +268,13 @@ pub enum RequestTicketOutcome {
     /// Ticket queued as a request record (for immediate start time but no capacity)
     /// `yielded` is set when the queue had a free slot the job left to jobs
     /// already waiting; the grant scanner must then be nudged for the queue
-    /// once the request record is durable.
-    TicketRequested { queue: String, yielded: bool },
+    /// once the request record is durable. `write` tracks the request row
+    /// until the batch holding it commits.
+    TicketRequested {
+        queue: String,
+        yielded: bool,
+        write: RequestRowWrite,
+    },
     /// Job queued as a RequestTicket task (for future start time)
     FutureRequestTaskWritten {
         queue: String,
@@ -997,6 +1007,23 @@ pub struct GrantScannerConfig {
     /// long pass earlier (lower leasable latency); larger chunks amortize
     /// commit overhead.
     pub commit_chunk_size: usize,
+    /// Whether a pass starts reading a queue's request rows at the queue's
+    /// request floor. When false every pass reads from the queue's prefix.
+    pub request_floor: bool,
+    /// A request row written at most this much start time below its queue's
+    /// floor, in the floor's band, lowers the floor to its key. One written
+    /// further below is read by key and leaves the floor where it is.
+    /// [`crate::request_floor::OTHER_BAND_LAG_MS`] or above lowers the
+    /// floor for every write below it.
+    pub request_floor_min_lag_ms: u64,
+    /// Most request keys a queue keeps noted below its floor.
+    pub request_noted_max_keys: usize,
+    /// How long (ms) a queue's floor is used before a pass drops it and
+    /// reads from the prefix. Zero drops it on every pass.
+    pub request_floor_rebuild_interval_ms: u64,
+    /// How long (ms) a request row write whose batch was not confirmed
+    /// committed is still treated as possibly committing.
+    pub request_write_abandon_grace_ms: u64,
 }
 
 impl Default for GrantScannerConfig {
@@ -1011,9 +1038,22 @@ impl Default for GrantScannerConfig {
             priority_ordered_requests: false,
             live_headroom_fraction: crate::settings::DEFAULT_GRANT_SCANNER_LIVE_HEADROOM_FRACTION,
             commit_chunk_size: crate::settings::DEFAULT_GRANT_SCANNER_COMMIT_CHUNK_SIZE,
+            request_floor: crate::settings::DEFAULT_GRANT_SCANNER_REQUEST_FLOOR,
+            request_floor_min_lag_ms:
+                crate::settings::DEFAULT_GRANT_SCANNER_REQUEST_FLOOR_MIN_LAG_MS,
+            request_noted_max_keys: crate::settings::DEFAULT_GRANT_SCANNER_REQUEST_NOTED_MAX_KEYS,
+            request_floor_rebuild_interval_ms:
+                crate::settings::DEFAULT_GRANT_SCANNER_REQUEST_FLOOR_REBUILD_INTERVAL_MS,
+            request_write_abandon_grace_ms: DEFAULT_REQUEST_WRITE_ABANDON_GRACE_MS,
         }
     }
 }
+
+/// Default for `GrantScannerConfig::request_write_abandon_grace_ms`. SlateDB
+/// applies a batch it was handed even when the future that submitted it is
+/// dropped, so a dropped write may still commit; this bounds how long the
+/// grant scanner allows for that.
+pub const DEFAULT_REQUEST_WRITE_ABANDON_GRACE_MS: u64 = 10_000;
 
 /// The grant scanner's cold pending lane: (tenant, queue) entries seeded by
 /// the periodic `reconcile_pending_requests` sweep, drained in bounded
@@ -1213,6 +1253,12 @@ pub struct ConcurrencyManager {
     drift_pass: Mutex<DriftPass>,
     /// Orders scanner passes against cancel and reimport per queue.
     request_row_locks: Arc<RequestRowLocks>,
+    /// Where each queue's request rows are read from. See
+    /// [`crate::request_floor`].
+    request_floors: Arc<RequestFloors>,
+    /// Test-only: receives the trace of every read of a queue's request
+    /// rows.
+    request_read_observer_for_test: Mutex<Option<RequestReadObserver>>,
 }
 
 /// Memoized per-hop durable reads for `next_hop_should_skip`, keyed by the
@@ -1270,8 +1316,20 @@ impl ConcurrencyManager {
         hydrate_all_at_startup: bool,
         scanner: GrantScannerConfig,
     ) -> Self {
+        let shard = shard.into();
+        let request_floors = Arc::new(RequestFloors::new(
+            shard.clone(),
+            RequestFloorConfig {
+                enabled: scanner.request_floor,
+                min_lag_ms: scanner.request_floor_min_lag_ms,
+                noted_max_keys: scanner.request_noted_max_keys,
+                rebuild_interval: Duration::from_millis(scanner.request_floor_rebuild_interval_ms),
+                abandon_grace: Duration::from_millis(scanner.request_write_abandon_grace_ms),
+            },
+            metrics.clone(),
+        ));
         Self {
-            shard: shard.into(),
+            shard,
             counts: ConcurrencyCounts::with_config(hydrate_all_at_startup),
             pending_grants: Mutex::new(BTreeMap::new()),
             pending_grants_cold: Mutex::new(ColdLane::default()),
@@ -1307,12 +1365,18 @@ impl ConcurrencyManager {
             grant_scanner_commit_chunk_size: scanner.commit_chunk_size.max(1),
             drift_pass: Mutex::new(DriftPass::default()),
             request_row_locks: Arc::new(RequestRowLocks::default()),
+            request_floors,
+            request_read_observer_for_test: Mutex::new(None),
         }
     }
 
     /// Append a deferred concurrency request record and its requester
     /// counter increment, keyed in the order this shard is configured to
     /// write. See the free function [`append_request_edits`].
+    ///
+    /// The returned tracker must outlive the commit of the batch `writer`
+    /// writes into and be confirmed once that commit has succeeded: hand it
+    /// to the batch's `ScheduledRefreshes::track_request_write`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_request_edits<W: WriteBatcher>(
         &self,
@@ -1329,8 +1393,8 @@ impl ConcurrencyManager {
         held_queues: &[String],
         task_id: &str,
         all_limits: &[Limit],
-    ) -> Result<(), ConcurrencyError> {
-        append_request_edits(
+    ) -> Result<RequestRowWrite, ConcurrencyError> {
+        let request_key = append_request_edits(
             self.priority_ordered_requests,
             writer,
             tenant,
@@ -1345,7 +1409,42 @@ impl ConcurrencyManager {
             held_queues,
             task_id,
             all_limits,
-        )
+        )?;
+        let prefix_len = concurrency_request_prefix(tenant, queue).len();
+        Ok(self.request_floors.note_write(prefix_len, request_key))
+    }
+
+    /// A cursor over `(tenant, queue)`'s request rows in the order a grant
+    /// pass reads them, for a reader that only looks.
+    pub(crate) fn peek_request_rows<'a>(
+        &'a self,
+        db: &'a InstrumentedDb,
+        tenant: &'a str,
+        queue: &'a str,
+    ) -> RequestRowCursor<'a> {
+        self.request_floors
+            .peek_cursor(db, tenant, queue, self.request_read_observer_for_test())
+    }
+
+    /// The request floors of this shard's queues.
+    pub(crate) fn request_floors(&self) -> &Arc<RequestFloors> {
+        &self.request_floors
+    }
+
+    /// Test-only: install or clear the observer that receives the trace of
+    /// every read of a queue's request rows.
+    pub(crate) fn set_request_read_observer_for_test(&self, observer: Option<RequestReadObserver>) {
+        *self
+            .request_read_observer_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+    }
+
+    fn request_read_observer_for_test(&self) -> Option<RequestReadObserver> {
+        self.request_read_observer_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Lock `(tenant, queue)`'s request rows for one grant-scanner pass.
@@ -1839,7 +1938,7 @@ impl ConcurrencyManager {
             // [SILO-ENQ-CONC-4] [SILO-IMP-CONC-3] [SILO-REIMP-CONC-3] Queue is at capacity
             // [SILO-ENQ-CONC-5] [SILO-IMP-CONC-4] [SILO-REIMP-CONC-4] No task in DB queue, request created
             // [SILO-ENQ-CONC-6] Create request record instead
-            self.append_request_edits(
+            let write = self.append_request_edits(
                 writer,
                 tenant,
                 queue,
@@ -1857,6 +1956,7 @@ impl ConcurrencyManager {
             Ok(Some(RequestTicketOutcome::TicketRequested {
                 queue: queue.clone(),
                 yielded: yields_to_waiters,
+                write,
             }))
         } else {
             // Job scheduled for future: queue as RequestTicket task. The
@@ -2560,6 +2660,7 @@ impl ConcurrencyManager {
         // rediscovered. Honors the settings doc "values below 1 are treated as 1".
         let max_keys = max_keys.map(|budget| budget.max(1));
         let sweep_started = std::time::Instant::now();
+        self.request_floors.sweep_idle(sweep_started);
         let prefix_start = vec![crate::keys::prefix::COUNTER_CONCURRENCY_REQUESTERS];
         let end = end_bound(&prefix_start);
         // Sliced sweeps resume from the saved cursor; full sweeps always
@@ -2756,20 +2857,18 @@ impl ConcurrencyManager {
 
         let now_ms = crate::job_store_shard::now_epoch_ms();
 
-        // [SILO-GRANT-2] Pre: Scan for pending requests for this queue
-        let start = concurrency_request_prefix(tenant, queue);
-        let end_key = end_bound(&start);
-        let mut iter = match db
-            .scan_with_options::<Vec<u8>, _>(start..end_key, &crate::scan_options())
-            .await
-        {
-            Ok(i) => i,
-            Err(e) => {
-                tracing::warn!(error = %e, "grant scanner: failed to scan requests");
-                record_invocation(0, 0);
-                return Vec::new();
-            }
-        };
+        // [SILO-GRANT-2] Pre: Scan for pending requests for this queue. The
+        // cursor yields the queue's request rows in key order, starting past
+        // the rows earlier passes proved dead (see `crate::request_floor`).
+        // This pass begins here and ends when the cursor drops, on every
+        // exit: the cursor then moves the queue's floor over the leading
+        // rows this pass consumed.
+        let mut requests = self.request_floors.grant_cursor(
+            db,
+            tenant,
+            queue,
+            self.request_read_observer_for_test(),
+        );
 
         struct ScannedRequest {
             request_key: Vec<u8>,
@@ -2864,6 +2963,10 @@ impl ConcurrencyManager {
             // the invocation's snapshot, so each is confirmed still present
             // before it is deleted and counted (see the confirm step below).
             let mut stale_keys: Vec<Vec<u8>> = Vec::new();
+            // Request rows whose delete sits in the uncommitted `batch`.
+            // They are reported to the cursor as consumed once the batch
+            // holding them commits.
+            let mut chunk_deleted: Vec<(Vec<u8>, RowFate)> = Vec::new();
 
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
@@ -2874,9 +2977,15 @@ impl ConcurrencyManager {
                     budget_exhausted = true;
                     break;
                 }
-                let kv = match iter.next().await {
-                    Ok(Some(kv)) => kv,
-                    Ok(None) => {
+                let kv = match requests.next().await {
+                    Ok(RequestRead::Row(row)) => row,
+                    Ok(RequestRead::Missing) => {
+                        // A key read and found without a row spends budget
+                        // like any other key.
+                        scanned_this_invocation += 1;
+                        continue;
+                    }
+                    Ok(RequestRead::End) => {
                         iter_exhausted = true;
                         break;
                     }
@@ -2924,17 +3033,18 @@ impl ConcurrencyManager {
                     // rows that may be: seek to the next band and keep
                     // scanning. The skipped rows are never granted and block
                     // nothing.
-                    let Some(next_band) = parsed_req.band.checked_add(1) else {
-                        iter_exhausted = true;
-                        break;
-                    };
-                    let next_band_start = concurrency_request_band_start(tenant, queue, next_band);
-                    if let Err(e) = iter.seek(&next_band_start).await {
-                        tracing::warn!(error = %e, "grant scanner: failed to seek to the next request band");
-                        iter_exhausted = true;
-                        break;
+                    match requests.skip_band(parsed_req.band).await {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            iter_exhausted = true;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "grant scanner: failed to seek to the next request band");
+                            iter_exhausted = true;
+                            break;
+                        }
                     }
-                    continue;
                 }
 
                 let task_id_str = match et.task_id() {
@@ -3247,9 +3357,11 @@ impl ConcurrencyManager {
                 match present {
                     Ok(true) => {
                         batch.delete(&key);
+                        chunk_deleted.push((key, RowFate::Deleted));
                         stale_and_corrupt_count += 1;
                     }
                     Ok(false) => {
+                        requests.consumed(key, RowFate::Deleted);
                         if let Some(ref m) = self.metrics {
                             m.record_concurrency_grant_vanished_request(&self.shard);
                         }
@@ -3387,6 +3499,7 @@ impl ConcurrencyManager {
                                 task_id = %req.task_id,
                                 "grant scanner: skipping request whose row was deleted after the pass began"
                             );
+                            requests.consumed(req.request_key.clone(), RowFate::Deleted);
                             if let Some(ref m) = self.metrics {
                                 m.record_concurrency_grant_vanished_request(&self.shard);
                             }
@@ -3456,9 +3569,11 @@ impl ConcurrencyManager {
                     match db.get(&req.request_key).await {
                         Ok(Some(_)) => {
                             batch.delete(&req.request_key);
+                            chunk_deleted.push((req.request_key.clone(), RowFate::Deleted));
                             chunk_stale += 1;
                         }
                         Ok(None) => {
+                            requests.consumed(req.request_key.clone(), RowFate::Deleted);
                             if let Some(ref m) = self.metrics {
                                 m.record_concurrency_grant_vanished_request(&self.shard);
                             }
@@ -3499,6 +3614,7 @@ impl ConcurrencyManager {
                     &holder_val,
                 );
                 batch.delete(&req.request_key);
+                chunk_deleted.push((req.request_key.clone(), RowFate::Granted));
 
                 // [SILO-GRANT-4] Resume the limit chain. The chain walker writes
                 // either the terminal `Task::RunAttempt` (if no more limits),
@@ -3599,6 +3715,10 @@ impl ConcurrencyManager {
                         record_invocation(scanned_this_invocation, total_stale_deleted);
                         return all_granted;
                     }
+                    for (key, fate) in chunk_deleted.drain(..) {
+                        requests.consumed(key, fate);
+                    }
+                    chunk_refreshes.confirm_request_writes();
                     if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
                         resumer.refresh_index_rows_committed(&refresh_groups);
                     }
@@ -3645,6 +3765,10 @@ impl ConcurrencyManager {
                 record_invocation(scanned_this_invocation, total_stale_deleted);
                 return all_granted;
             }
+            for (key, fate) in chunk_deleted {
+                requests.consumed(key, fate);
+            }
+            chunk_scheduled_refreshes.confirm_request_writes();
             if let (Some(resumer), false) = (&chain_resumer, refresh_groups.is_empty()) {
                 resumer.refresh_index_rows_committed(&refresh_groups);
             }
@@ -3889,7 +4013,9 @@ fn append_grant_edits<W: WriteBatcher>(
 /// forfeit the job's queue position.
 ///
 /// The key is priority-ordered when `priority_ordered` is set and
-/// start-time-ordered otherwise.
+/// start-time-ordered otherwise. Returns the key, which the caller notes
+/// with the queue's request floor: a row written under a key the floor has
+/// not been told of can sit below it unread until the floor is rebuilt.
 #[allow(clippy::too_many_arguments)]
 fn append_request_edits<W: WriteBatcher>(
     priority_ordered: bool,
@@ -3906,7 +4032,7 @@ fn append_request_edits<W: WriteBatcher>(
     held_queues: &[String],
     task_id: &str,
     all_limits: &[Limit],
-) -> Result<(), ConcurrencyError> {
+) -> Result<Vec<u8>, ConcurrencyError> {
     let action = ConcurrencyAction::EnqueueTask {
         start_time_ms,
         priority,
@@ -3941,5 +4067,5 @@ fn append_request_edits<W: WriteBatcher>(
     let counter_key = concurrency_requester_counter_key(tenant, queue);
     writer.merge(&counter_key, encode_counter(1))?;
 
-    Ok(())
+    Ok(req_key)
 }
