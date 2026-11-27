@@ -1272,6 +1272,141 @@ async fn a_rebuild_finds_a_row_the_floor_was_not_told_of(priority_ordered: bool)
     );
 }
 
+/// A queue drained to empty keeps its floor through a rebuild. The pass
+/// that drops the floor reads from the prefix, finds no live row and puts
+/// the floor back, so only the rebuilding passes walk the drained rows.
+async fn an_emptied_queue_keeps_its_floor_through_a_rebuild(priority_ordered: bool) {
+    const DRAINED: usize = 200;
+    let rebuild_interval = Duration::from_millis(1_000);
+    let harness = Harness::open(GrantScannerConfig {
+        request_floor_rebuild_interval_ms: rebuild_interval.as_millis() as u64,
+        ..config(priority_ordered)
+    })
+    .await;
+    let queue = "emptied";
+    let (_, dead) = drain_single_queue(&harness, queue, DRAINED, DRAINED).await;
+    assert!(harness.request_keys(queue).await.is_empty());
+    // Free the slot so passes get past the capacity precheck.
+    harness.complete_one().await;
+
+    // Run passes across several rebuild intervals. Each interval has one
+    // pass that reads from the prefix and walks every drained row.
+    let started = std::time::Instant::now();
+    let mut walked = Vec::new();
+    while started.elapsed() < rebuild_interval * 3 {
+        let pass = harness.pass(queue, 1).await;
+        assert!(pass.granted.is_empty());
+        walked.push(pass.trace().dead_rows_walked(&dead));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rebuilds = walked.iter().filter(|rows| **rows > 0).count();
+    let intervals = (started.elapsed().as_millis() / rebuild_interval.as_millis()) as usize + 1;
+    assert!(walked.len() > 4 * intervals, "passes ran between rebuilds");
+    assert!(
+        (1..=intervals).contains(&rebuilds),
+        "only a rebuilding pass walks the drained rows: {rebuilds} of {} passes did",
+        walked.len()
+    );
+    assert!(
+        walked.contains(&DRAINED),
+        "a rebuilding pass reads from the prefix"
+    );
+    let floor = harness.floor(queue).expect("the queue has a floor");
+    assert!(dead.iter().all(|key| key < &floor));
+
+    // Rows that arrive afterwards are granted in order.
+    let start = now_ms();
+    harness.enqueue(10, start, vec![fixed(queue, 1)]).await;
+    harness
+        .enqueue_in("first", 10, start + 1, vec![fixed(queue, 1)])
+        .await;
+    harness
+        .enqueue_in("second", 10, start + 2, vec![fixed(queue, 1)])
+        .await;
+    harness.complete_one().await;
+    assert_eq!(harness.pass(queue, 1).await.granted, ["first"]);
+    harness.complete_one_in("first").await;
+    assert_eq!(harness.pass(queue, 1).await.granted, ["second"]);
+    assert!(harness.request_keys(queue).await.is_empty());
+}
+
+/// A queue with no floor whose pass finds no live row gets a floor above
+/// every row, so the next pass does not walk the drained rows again. A row
+/// that arrives with an old start time is read by key and leaves that floor
+/// in place; the first that arrives with a current one lowers the floor to
+/// its key, and passes scan from there.
+async fn a_queue_found_empty_without_a_floor_gets_one(priority_ordered: bool) {
+    const DRAINED: usize = 200;
+    let rebuild_interval = Duration::from_millis(3_000);
+    let harness = Harness::open(GrantScannerConfig {
+        request_floor_rebuild_interval_ms: rebuild_interval.as_millis() as u64,
+        ..config(priority_ordered)
+    })
+    .await;
+    let queue = "floorless";
+    let (_, dead) = drain_single_queue(&harness, queue, DRAINED, DRAINED).await;
+    harness.complete_one().await;
+
+    // The idle sweep drops the state of a queue whose floor has expired.
+    tokio::time::sleep(rebuild_interval + Duration::from_millis(100)).await;
+    harness
+        .shard
+        .request_floors_for_test()
+        .sweep_idle(std::time::Instant::now());
+    assert_eq!(harness.floor(queue), None);
+
+    let first = harness.pass(queue, 1).await;
+    assert_eq!(
+        first.trace().dead_rows_walked(&dead),
+        DRAINED,
+        "with no floor the pass reads from the prefix"
+    );
+    let whole_queue = harness.floor(queue).expect("the pass set a floor");
+    assert!(dead.iter().all(|key| key < &whole_queue));
+    for _ in 0..4 {
+        let pass = harness.pass(queue, 1).await;
+        assert_eq!(pass.trace().dead_rows_walked(&dead), 0);
+    }
+
+    // A row that starts before every drained row: a scan from its key
+    // would walk them all.
+    let now = now_ms();
+    harness.enqueue(10, now, vec![fixed(queue, 1)]).await;
+    let old = harness
+        .enqueue_in("old", 10, now - 2 * 3_600_000, vec![fixed(queue, 1)])
+        .await;
+    let old_key = harness.request_key_of(queue, &old).await;
+    assert!(dead.iter().all(|key| &old_key < key));
+    assert_eq!(harness.noted(queue), [old_key]);
+    assert_eq!(harness.floor(queue), Some(whole_queue));
+    harness.complete_one().await;
+    let pass = harness.pass(queue, 1).await;
+    assert_eq!(pass.granted, ["old"]);
+    assert_eq!(pass.trace().point_reads, 1);
+    assert_eq!(pass.trace().dead_rows_walked(&dead), 0);
+
+    let first = harness
+        .enqueue_in("first", 10, now + 1, vec![fixed(queue, 1)])
+        .await;
+    harness
+        .enqueue_in("second", 10, now + 2, vec![fixed(queue, 1)])
+        .await;
+    assert_eq!(
+        harness.floor(queue),
+        Some(harness.request_key_of(queue, &first).await),
+        "a row with a current start time lowers the floor to its key"
+    );
+    assert!(harness.noted(queue).is_empty());
+    for (running, next) in [("old", "first"), ("first", "second")] {
+        harness.complete_one_in(running).await;
+        let pass = harness.pass(queue, 1).await;
+        assert_eq!(pass.granted, [next]);
+        assert_eq!(pass.trace().point_reads, 0);
+        assert_eq!(pass.trace().dead_rows_walked(&dead), 0);
+    }
+    assert!(harness.request_keys(queue).await.is_empty());
+}
+
 /// Run a queue through grants, an arrival far below the floor, an arrival
 /// in a higher band and a cancel. Returns the task groups in grant order.
 async fn scripted_grants(harness: &Harness) -> Vec<String> {
@@ -1470,6 +1605,8 @@ both_orders!(
     a_future_dated_row_holds_the_floor_and_blocks_nothing,
     a_cancelled_noted_row_is_retired_on_its_next_read,
     a_rebuild_finds_a_row_the_floor_was_not_told_of,
+    an_emptied_queue_keeps_its_floor_through_a_rebuild,
+    a_queue_found_empty_without_a_floor_gets_one,
     the_floor_off_grants_the_same_rows_in_the_same_order,
     a_reopened_shard_grants_the_same_rows_in_the_same_order,
 );

@@ -26,6 +26,14 @@
 //! such a gap was not settled when the pass began, so its key is still
 //! noted. The floor stops at the first row the pass read and left in place.
 //!
+//! A scan that opened at the prefix and ran to the end of the queue's rows,
+//! with every row it returned dead, proved the whole queue dead at its
+//! snapshot, and by the same argument any key is then a sound floor. A pass
+//! that dropped the floor for a rebuild puts it back. A pass that began
+//! with no floor and read no row sets one in the last band at the time it
+//! began, above every row with an earlier start time. The first row written
+//! close under that floor by start time, in any band, lowers it to its key.
+//!
 //! The floor is dropped every [`RequestFloorConfig::rebuild_interval`], and
 //! the pass that drops it reads from the prefix. A row written without a
 //! [`RequestRowWrite`] therefore waits at most one interval.
@@ -40,8 +48,8 @@ use slatedb::bytes::Bytes;
 
 use crate::instrumented_db::{InstrumentedDb, InstrumentedDbIterator};
 use crate::keys::{
-    concurrency_request_band_start, concurrency_request_key_order, concurrency_request_prefix,
-    end_bound,
+    concurrency_request_band_start, concurrency_request_key_order, concurrency_request_order_start,
+    concurrency_request_prefix, end_bound,
 };
 use crate::metrics::{Metrics, RequestNotedReadOutcome};
 
@@ -56,6 +64,8 @@ pub struct RequestFloorConfig {
     /// further below, or in another band, leaves the floor and is read by
     /// key. A write in another band counts as [`OTHER_BAND_LAG_MS`] below,
     /// so that value or more lowers the floor for every write below it.
+    /// Under a floor set by a pass that found the whole queue dead, a write
+    /// in any band counts by its start time.
     pub min_lag_ms: u64,
     /// Most keys a queue keeps noted below its floor. A write that would
     /// exceed it lowers the floor to its key instead.
@@ -592,20 +602,21 @@ impl RequestFloors {
             ),
             None => (prefix.clone(), VecDeque::new()),
         };
+        let began_ms = crate::job_store_shard::now_epoch_ms();
         if let (Some(m), Some(pass)) = (&self.metrics, &pass) {
             let lag_ms = pass
                 .floor
                 .as_deref()
                 .and_then(|floor| concurrency_request_key_order(floor, prefix.len()))
                 .map(|(_, start_ms)| {
-                    u64::try_from(crate::job_store_shard::now_epoch_ms())
+                    u64::try_from(began_ms)
                         .unwrap_or(0)
                         .saturating_sub(start_ms)
                 })
                 .unwrap_or(0);
             m.record_concurrency_request_floor_lag(&self.shard, lag_ms);
         }
-        RequestRowCursor::new(
+        let mut cursor = RequestRowCursor::new(
             self,
             db,
             tenant,
@@ -616,7 +627,9 @@ impl RequestFloors {
             open_at,
             noted,
             observer,
-        )
+        );
+        cursor.began_ms = began_ms;
+        cursor
     }
 
     /// A cursor that reads `(tenant, queue)`'s rows in the order a grant
@@ -654,19 +667,34 @@ impl RequestFloors {
 /// any two start times of one band can differ by.
 pub const OTHER_BAND_LAG_MS: u64 = 1 << 56;
 
-/// How far `key` starts below `floor`, when both are in one band of a queue
-/// whose request prefix is `prefix_len` bytes long. [`OTHER_BAND_LAG_MS`]
-/// when they are in different bands or either has no ordering field.
+/// How far `key` starts below `floor`, in a queue whose request prefix is
+/// `prefix_len` bytes long. [`OTHER_BAND_LAG_MS`] when they are in different
+/// bands or either has no ordering field. A whole-queue floor lies above
+/// every band, so a key's lag below it is by start time whatever its band.
 fn lag_below_floor_ms(floor: &[u8], key: &[u8], prefix_len: usize) -> u64 {
     match (
         concurrency_request_key_order(floor, prefix_len),
         concurrency_request_key_order(key, prefix_len),
     ) {
-        (Some((floor_band, floor_ms)), Some((band, start_ms))) if floor_band == band => {
+        (Some((floor_band, floor_ms)), Some((band, start_ms)))
+            if floor_band == band || is_whole_queue_floor(floor, prefix_len) =>
+        {
             floor_ms.saturating_sub(start_ms)
         }
         _ => OTHER_BAND_LAG_MS,
     }
+}
+
+/// The floor a pass sets when it began with none and found the whole queue
+/// dead: the last band at `began_ms`, above every row with an earlier start
+/// time. It is an ordering field alone, which no request row's key is.
+fn whole_queue_floor(queue: &[u8], began_ms: i64) -> Vec<u8> {
+    concurrency_request_order_start(queue, u8::MAX, began_ms)
+}
+
+/// Whether `floor` came from [`whole_queue_floor`].
+fn is_whole_queue_floor(floor: &[u8], prefix_len: usize) -> bool {
+    prefix_len.checked_add(8) == Some(floor.len())
 }
 
 /// The smallest key that sorts after `key`.
@@ -882,6 +910,9 @@ pub struct RequestRowCursor<'a> {
     /// Noted keys read whose row exists.
     noted_found: Vec<Vec<u8>>,
     iter: Option<InstrumentedDbIterator>,
+    /// When the pass began, in epoch milliseconds. Zero for a cursor that
+    /// is no pass.
+    began_ms: i64,
     /// Where the range scan opens.
     open_at: Vec<u8>,
     /// The scan opens above the floor, so what it reads proves nothing
@@ -924,6 +955,7 @@ impl<'a> RequestRowCursor<'a> {
             noted,
             noted_found: Vec::new(),
             iter: None,
+            began_ms: 0,
             open_at,
             opens_past_floor: false,
             ended: false,
@@ -1051,15 +1083,21 @@ impl<'a> RequestRowCursor<'a> {
         self.consumed.insert(key, fate);
     }
 
-    /// The key up to which the scan found nothing but rows now dead: the
-    /// first key it returned that was not consumed, or just past the last
-    /// key it returned when every one was. `None` when the scan proved
-    /// nothing from the floor up.
-    fn proven_floor(&self) -> Option<Vec<u8>> {
+    /// The key up to which `pass`'s scan found nothing but rows now dead.
+    /// `None` when the scan proved nothing from the floor up.
+    ///
+    /// It is the first key the scan returned that was not consumed, or just
+    /// past the last key it returned when every one was. A scan that also
+    /// ran to the end of the queue's rows from the prefix proved the whole
+    /// queue dead, so a higher key is as sound: the floor `pass` dropped
+    /// for a rebuild, or, for a pass that began with no floor and read no
+    /// row, a [`whole_queue_floor`].
+    fn proven_floor(&self, pass: &PassStart) -> Option<Vec<u8>> {
         if self.opens_past_floor {
             return None;
         }
         let mut last: Option<&Bytes> = None;
+        let mut reached_end = false;
         for step in &self.steps {
             match step {
                 ReadStep::Open(_) => {}
@@ -1069,17 +1107,31 @@ impl<'a> RequestRowCursor<'a> {
                     }
                     last = Some(key);
                 }
-                ReadStep::Seek(_) | ReadStep::End => break,
+                ReadStep::Seek(_) => break,
+                ReadStep::End => {
+                    reached_end = true;
+                    break;
+                }
             }
         }
-        last.map(|key| successor(key))
+        let past_last = last.map(|key| successor(key));
+        if !reached_end || pass.floor.is_some() {
+            return past_last;
+        }
+        // The scan ran from the prefix to the end: the whole queue is dead.
+        let over_dead_queue = match &pass.rebuild {
+            Some(rebuild) => Some(rebuild.floor.clone()),
+            None if past_last.is_none() => Some(whole_queue_floor(&self.prefix, self.began_ms)),
+            None => None,
+        };
+        past_last.max(over_dead_queue)
     }
 }
 
 impl Drop for RequestRowCursor<'_> {
     fn drop(&mut self) {
         if let Some(pass) = self.pass.take() {
-            let proven_floor = self.proven_floor();
+            let proven_floor = self.proven_floor(&pass);
             self.floors.finish_pass(
                 &self.prefix,
                 &pass,

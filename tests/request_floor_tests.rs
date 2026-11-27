@@ -14,8 +14,8 @@ use rand::{Rng, SeedableRng};
 use silo::instrumented_db::InstrumentedDb;
 use silo::keys::{
     concurrency_request_key, concurrency_request_key_order,
-    concurrency_request_key_start_time_first, concurrency_request_prefix, end_bound,
-    parse_concurrency_request_key,
+    concurrency_request_key_start_time_first, concurrency_request_order_start,
+    concurrency_request_prefix, end_bound, parse_concurrency_request_key,
 };
 use silo::request_floor::{
     OTHER_BAND_LAG_MS, PassStart, RequestFloorConfig, RequestFloors, RequestRead, RequestRowCursor,
@@ -198,6 +198,35 @@ fn a_write_far_below_the_floor_or_in_another_band_is_read_by_key() {
         vec![other_band, far],
         "a row read and left in place stays noted"
     );
+}
+
+/// A whole-queue floor, the kind a pass sets when it began with none and
+/// found no live row, lies above every band: a write is close to it by its
+/// start time whatever its band.
+#[silo::test]
+fn a_write_under_a_whole_queue_floor_counts_by_start_time_in_any_band() {
+    let floors = floors(config());
+    let whole_queue = concurrency_request_order_start(&prefix(), u8::MAX, 100_000);
+    pass(&floors, &[], Some(&whole_queue));
+
+    let old = key(3, 50_000, "old");
+    note(&floors, &old).confirm();
+    assert_eq!(floors.floor(&prefix()), Some(whole_queue));
+    assert_eq!(floors.noted_keys(&prefix()), vec![old.clone()]);
+
+    let current = key(3, 99_500, "current");
+    note(&floors, &current).confirm();
+    assert_eq!(
+        floors.floor(&prefix()),
+        Some(current.clone()),
+        "a write with a start time close under the floor lowers it"
+    );
+
+    // The floor is a row's key again, so another band is read by key.
+    let other_band = key(1, 99_400, "band");
+    note(&floors, &other_band).confirm();
+    assert_eq!(floors.floor(&prefix()), Some(current));
+    assert_eq!(floors.noted_keys(&prefix()), vec![other_band, old]);
 }
 
 #[silo::test]
@@ -518,9 +547,15 @@ impl Model {
     }
 }
 
+/// A request key with a random band and start time. Most start long ago
+/// and close together; some start now, where a whole-queue floor lies.
 fn random_key(rng: &mut StdRng, serial: &mut u32) -> Vec<u8> {
     *serial += 1;
-    let start_ms = 1_000_000 + rng.random_range(0..24) * 250;
+    let start_ms = if rng.random_bool(0.1) {
+        now_ms() + rng.random_range(0..4)
+    } else {
+        1_000_000 + rng.random_range(0..24) * 250
+    };
     let priority = if rng.random_bool(0.3) { 2 } else { 6 };
     let job = format!("job{serial}");
     let suffix = format!("{:08x}", rng.random::<u32>());
@@ -531,6 +566,156 @@ fn random_key(rng: &mut StdRng, serial: &mut u32) -> Vec<u8> {
     } else {
         concurrency_request_key(TENANT, QUEUE, start_ms, priority, &job, 1, &suffix)
     }
+}
+
+/// Read `cursor` to the end, consuming every row for which `consume` says
+/// so, and return the keys it returned.
+async fn read_to_end(
+    db: &InstrumentedDb,
+    mut cursor: RequestRowCursor<'_>,
+    consume: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let mut returned = Vec::new();
+    loop {
+        match cursor.next().await.expect("read") {
+            RequestRead::Row(row) => {
+                if consume(&row.key) {
+                    delete(db, &row.key).await;
+                    cursor.consumed(row.key.to_vec(), RowFate::Granted);
+                }
+                returned.push(row.key.to_vec());
+            }
+            RequestRead::Missing => {}
+            RequestRead::End => break,
+        }
+    }
+    returned
+}
+
+/// A pass that began with no floor and read to the end of a queue with no
+/// live row sets a whole-queue floor. One that stopped before the end, or
+/// left a row in place, proved less.
+#[silo::test]
+async fn a_pass_that_finds_no_live_row_without_a_floor_sets_a_whole_queue_floor() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let db = shard.db();
+    let floors = floors(config());
+
+    drop(floors.grant_cursor(db, TENANT, QUEUE, None));
+    assert_eq!(
+        floors.floor(&prefix()),
+        None,
+        "a pass that read nothing proved nothing"
+    );
+
+    let before = now_ms();
+    assert!(
+        read_to_end(db, floors.grant_cursor(db, TENANT, QUEUE, None), |_| true)
+            .await
+            .is_empty()
+    );
+    let floor = floors.floor(&prefix()).expect("the pass set a floor");
+    let (band, start_ms) = concurrency_request_key_order(&floor, prefix().len()).unwrap();
+    assert_eq!(band, u8::MAX);
+    assert!((before..=now_ms()).contains(&(start_ms as i64)));
+    assert_eq!(floor.len(), prefix().len() + 8);
+
+    let floors = self::floors(config());
+    let row = key(3, 5_000, "row");
+    put(db, &row).await;
+    let returned = read_to_end(db, floors.grant_cursor(db, TENANT, QUEUE, None), |_| false).await;
+    assert_eq!(returned, vec![row.clone()]);
+    assert_eq!(
+        floors.floor(&prefix()),
+        Some(row),
+        "the floor stops at a row left in place"
+    );
+}
+
+/// A rebuilding pass that reads from the prefix to the end and leaves no
+/// live row puts back the floor it dropped. One that leaves a row below
+/// that floor stops the floor there.
+#[silo::test]
+async fn a_rebuild_that_finds_no_live_row_puts_the_floor_back() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let db = shard.db();
+    let floors = floors(RequestFloorConfig {
+        rebuild_interval: Duration::ZERO,
+        ..config()
+    });
+    let floor = key(3, 100_000, "floor");
+    pass(&floors, &[], Some(&floor));
+
+    assert!(
+        read_to_end(db, floors.grant_cursor(db, TENANT, QUEUE, None), |_| true)
+            .await
+            .is_empty()
+    );
+    assert_eq!(floors.floor(&prefix()), Some(floor.clone()));
+
+    // A row the floor was not told of, below it: the rebuild reads and
+    // consumes it, and the floor it dropped is still the higher key.
+    let hidden = key(3, 40_000, "hidden");
+    put(db, &hidden).await;
+    let returned = read_to_end(db, floors.grant_cursor(db, TENANT, QUEUE, None), |_| true).await;
+    assert_eq!(returned, vec![hidden]);
+    assert_eq!(floors.floor(&prefix()), Some(floor.clone()));
+
+    // A consumed row above the dropped floor moves the floor past it.
+    let above = key(3, 200_000, "above");
+    put(db, &above).await;
+    let returned = read_to_end(db, floors.grant_cursor(db, TENANT, QUEUE, None), |_| true).await;
+    assert_eq!(returned, vec![above.clone()]);
+    let raised = floors.floor(&prefix()).expect("floor");
+    assert!(raised > above);
+
+    // A row left in place below the floor holds the floor at its key.
+    let left = key(3, 60_000, "left");
+    put(db, &left).await;
+    let returned = read_to_end(db, floors.grant_cursor(db, TENANT, QUEUE, None), |_| false).await;
+    assert_eq!(returned, vec![left.clone()]);
+    assert_eq!(floors.floor(&prefix()), Some(left));
+}
+
+/// A rebuilding pass that left a band proved nothing about the rows it
+/// skipped, so it does not put back the floor it dropped: the floor ends
+/// just past the last row it consumed.
+#[silo::test]
+async fn a_rebuild_that_left_a_band_does_not_put_the_floor_back() {
+    let (_tmp, shard) = open_temp_shard().await;
+    shard.stop_grant_scanner();
+    let db = shard.db();
+    let floors = floors(RequestFloorConfig {
+        rebuild_interval: Duration::ZERO,
+        ..config()
+    });
+    let floor = key(3, 100_000, "floor");
+    pass(&floors, &[], Some(&floor));
+
+    // Two rows the floor was not told of, both below it in one band.
+    let read = key(3, 40_000, "read");
+    let skipped = key(3, 50_000, "skipped");
+    put(db, &read).await;
+    put(db, &skipped).await;
+
+    let mut cursor = floors.grant_cursor(db, TENANT, QUEUE, None);
+    let RequestRead::Row(row) = cursor.next().await.expect("read") else {
+        panic!("the rebuild reads from the prefix");
+    };
+    assert_eq!(row.key.as_ref(), read.as_slice());
+    delete(db, &read).await;
+    cursor.consumed(read.clone(), RowFate::Granted);
+    assert!(cursor.skip_band(3).await.expect("skip band"));
+    assert!(matches!(
+        cursor.next().await.expect("read"),
+        RequestRead::End
+    ));
+    drop(cursor);
+
+    let ended_at = floors.floor(&prefix()).expect("floor");
+    assert!(read < ended_at && ended_at < skipped);
 }
 
 /// Interleave writers and passes at random. `late_writes` lets a write be

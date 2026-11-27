@@ -126,7 +126,7 @@ Concurrency limits control how many jobs with the same concurrency key can run s
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `silo_concurrency_tickets_granted_total` | Counter | - | Total concurrency tickets granted |
-| `silo_concurrency_request_floor_lag_ms` | Histogram | `shard` | For each grant scanner pass that reads a queue's request rows, how far in the past (ms) the request floor it started from lies; 0 when it read from the start of the queue's rows |
+| `silo_concurrency_request_floor_lag_ms` | Histogram | `shard` | For each grant scanner pass that reads a queue's request rows, how far in the past (ms) the request floor it started from lies (for a queue last found empty, the time since the pass that found it so); 0 when it read from the start of the queue's rows |
 | `silo_concurrency_request_noted_reads_total` | Counter | `shard`, `outcome` | Request rows read by key from below a queue's request floor. `outcome` is `granted`, `deleted` (stale, or deleted by another writer), `left` (read and left in place), `missing` (no row; the key was retired) or `pending` (no row yet; the write may still commit, so the key is kept) |
 | `silo_concurrency_request_noted_keys` | Gauge | `shard` | Request keys the shard's queues hold noted: rows below a request floor, and rows whose write has not settled |
 | `silo_concurrency_request_noted_overflows_total` | Counter | `shard` | Request row writes that lowered a queue's request floor because the queue already held `grant_scanner_request_noted_max_keys` noted keys |
