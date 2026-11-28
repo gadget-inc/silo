@@ -15,9 +15,11 @@
 mod test_helpers;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use silo::codec::encode_concurrency_action;
 use silo::concurrency::GrantScannerConfig;
 use silo::job::{ConcurrencyLimit, FloatingConcurrencyLimit, Limit};
 use silo::job_attempt::AttemptOutcome;
@@ -27,6 +29,7 @@ use silo::keys::{
     concurrency_requester_counter_key, end_bound, parse_concurrency_request_key,
 };
 use silo::request_floor::{RequestReadTrace, RequestReader};
+use silo::task::ConcurrencyAction;
 use slatedb::WriteBatch;
 
 use test_helpers::*;
@@ -845,6 +848,175 @@ async fn a_row_committed_during_a_pass_is_granted_by_the_next(priority_ordered: 
     assert!(harness.noted(queue).is_empty());
 }
 
+/// Write a request row on `queue` for a job that does not exist, as the
+/// writer of a request row does: the key is noted, the requester counter is
+/// incremented with the row, and the write is confirmed. A pass that reads
+/// the row deletes it. Returns the row's key.
+async fn write_request_of_a_missing_job(
+    harness: &Harness,
+    queue: &str,
+    priority_ordered: bool,
+    start_time_ms: i64,
+    job_id: &str,
+    max_concurrency: u32,
+) -> Vec<u8> {
+    let priority = 10;
+    let build = if priority_ordered {
+        concurrency_request_key
+    } else {
+        concurrency_request_key_start_time_first
+    };
+    let key = build(TENANT, queue, start_time_ms, priority, job_id, 1, "a");
+    let action = ConcurrencyAction::EnqueueTask {
+        start_time_ms,
+        priority,
+        job_id: job_id.to_string(),
+        attempt_number: 1,
+        relative_attempt_number: 1,
+        task_group: TASK_GROUP.to_string(),
+        limit_index: 0,
+        held_queues: Vec::new(),
+        task_id: format!("{job_id}-task"),
+        limits: vec![fixed(queue, max_concurrency)],
+    };
+    let write = harness
+        .shard
+        .request_floors_for_test()
+        .note_write(concurrency_request_prefix(TENANT, queue).len(), key.clone());
+    let mut batch = WriteBatch::new();
+    batch.put(&key, encode_concurrency_action(&action));
+    batch.merge(
+        concurrency_requester_counter_key(TENANT, queue),
+        1i64.to_le_bytes(),
+    );
+    harness
+        .shard
+        .db()
+        .write(batch)
+        .await
+        .expect("write the request row");
+    write.confirm();
+    key
+}
+
+/// One invocation grants a job from a row it reads by key, and before it
+/// opens its scan the job finishes, is deleted, and is enqueued again under
+/// the same id. The scan returns the new job's request row, for the same
+/// job id and attempt as the grant already made. That row is granted: the
+/// earlier grant belongs to the job that held the id before.
+async fn a_job_enqueued_again_under_its_id_during_a_pass_is_granted(priority_ordered: bool) {
+    const QUEUE: &str = "same-id";
+    const JOB_GROUP: &str = "same-id-job";
+    const MAX: u32 = 2;
+
+    let harness = Harness::open(config(priority_ordered)).await;
+    let base = now_ms() - 3_600_000;
+    for _ in 0..MAX {
+        harness.enqueue(10, base, vec![fixed(QUEUE, MAX)]).await;
+    }
+    harness
+        .enqueue_in("first", 10, base + 10, vec![fixed(QUEUE, MAX)])
+        .await;
+    harness.complete_one().await;
+    assert_eq!(harness.pass(QUEUE, 1).await.granted, ["first"]);
+    let floor = harness.floor(QUEUE).expect("the pass set a floor");
+
+    // Three rows below the floor, read by key in this order: the job's, and
+    // two a pass deletes without granting.
+    let job = harness
+        .enqueue_in(JOB_GROUP, 10, base - 50_000, vec![fixed(QUEUE, MAX)])
+        .await;
+    let job_key = harness.request_key_of(QUEUE, &job).await;
+    let mut noted = vec![job_key];
+    for (i, start_time_ms) in [base - 40_000, base - 30_000].into_iter().enumerate() {
+        noted.push(
+            write_request_of_a_missing_job(
+                &harness,
+                QUEUE,
+                priority_ordered,
+                start_time_ms,
+                &format!("missing-job-{i}"),
+                MAX,
+            )
+            .await,
+        );
+    }
+    assert!(noted.iter().all(|key| key < &floor));
+    assert_eq!(harness.noted(QUEUE), noted);
+    // One slot is free.
+    harness.complete_one().await;
+
+    // The invocation is asked for two grants. Its first read takes the
+    // job's row and one missing-job row, and grants the job. Its second read
+    // takes the other missing-job row. Between that read and its third, the
+    // first to open the scan, the job is replaced under its id. The new
+    // job joins the waiters, behind the missing-job row still in place, at
+    // a key above the floor.
+    let shard = Arc::clone(&harness.shard);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let replaced_job = job.clone();
+    harness
+        .shard
+        .set_grant_scan_hook_for_test(Some(Arc::new(move || {
+            let shard = Arc::clone(&shard);
+            let read = reads.fetch_add(1, Ordering::SeqCst) + 1;
+            let job_id = replaced_job.clone();
+            Box::pin(async move {
+                if read != 2 {
+                    return;
+                }
+                let tasks = shard
+                    .dequeue("w", JOB_GROUP, 1)
+                    .await
+                    .expect("dequeue the granted job")
+                    .tasks;
+                assert_eq!(tasks.len(), 1, "the first read's grant is committed");
+                shard
+                    .report_attempt_outcome(
+                        tasks[0].attempt().task_id(),
+                        AttemptOutcome::Success { result: vec![] },
+                    )
+                    .await
+                    .expect("finish the job");
+                shard
+                    .delete_job(TENANT, &job_id)
+                    .await
+                    .expect("delete the finished job");
+                shard
+                    .enqueue(
+                        TENANT,
+                        Some(job_id),
+                        10,
+                        base + 20,
+                        None,
+                        msgpack_payload(&serde_json::json!({})),
+                        vec![fixed(QUEUE, MAX)],
+                        None,
+                        JOB_GROUP,
+                    )
+                    .await
+                    .expect("enqueue the job again under its id");
+            })
+        })));
+    let pass = harness.pass(QUEUE, 2).await;
+    harness.shard.set_grant_scan_hook_for_test(None);
+
+    assert_eq!(pass.trace().point_reads, 3);
+    assert_eq!(
+        pass.trace().scans_opened,
+        1,
+        "the scan opened after the job was replaced"
+    );
+    assert_eq!(pass.granted, [JOB_GROUP, JOB_GROUP]);
+    assert!(harness.request_keys(QUEUE).await.is_empty());
+    assert_eq!(harness.requester_count(QUEUE).await, 0);
+    assert_eq!(
+        harness.complete_one_in(JOB_GROUP).await,
+        job,
+        "the job enqueued under the same id runs"
+    );
+}
+
 /// A noted key whose row does not exist yet is read on every pass while its
 /// write may still commit. A write that commits later is granted from that
 /// read; one that never commits is dropped after its grace period and not
@@ -1605,6 +1777,7 @@ both_orders!(
     backlogs_of_different_ages_feeding_one_queue_stay_cheap,
     a_noted_row_is_granted_in_key_order,
     a_row_committed_during_a_pass_is_granted_by_the_next,
+    a_job_enqueued_again_under_its_id_during_a_pass_is_granted,
     a_noted_key_waits_for_its_write_to_settle,
     a_write_past_the_noted_limit_lowers_the_floor,
     the_floor_stops_at_the_first_row_capacity_left,

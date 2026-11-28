@@ -3024,13 +3024,6 @@ impl ConcurrencyManager {
         let mut total_stale_deleted: usize = 0;
         let mut budget_exhausted = false;
         let chain_resumer = self.chain_resumer();
-        // Duplicate-materialization guard, in-memory half: (job_id, attempt)
-        // pairs whose chain this invocation has already resumed. The durable
-        // half is read for a window of candidates at a time, ahead of the
-        // grants made within that window, so it cannot see them — whether
-        // they sit in an uncommitted chunk batch or a chunk committed since
-        // the read. Bounded by the grants one invocation can make.
-        let mut materialized_attempts: HashSet<(String, u32)> = HashSet::new();
 
         // Scan→validate→grant loop: keeps pulling from the iterator until we've
         // granted `count` requests, or hit the end / capacity limit. Each pass
@@ -3086,6 +3079,21 @@ impl ConcurrencyManager {
             // They are reported to the cursor as consumed once the batch
             // holding them commits.
             let mut chunk_deleted: Vec<(Vec<u8>, RowFate)> = Vec::new();
+            // Duplicate-materialization guard, in-memory half: (job_id,
+            // attempt) pairs whose chain this pass has resumed. The durable
+            // half is read for a window of candidates at a time, ahead of
+            // the grants made within that window, so it cannot see them —
+            // whether they sit in the uncommitted chunk batch or in a chunk
+            // this pass committed since the read.
+            //
+            // The set lives for one pass. Every row a pass handles was read
+            // before the pass made its first grant, so a second row for an
+            // attempt the pass has granted is a second grant source for the
+            // same chain. A row a later pass reads can be one written after
+            // that grant, for a job enqueued under the same id once the
+            // granted one finished and was deleted; the durable half, read
+            // after this pass's commits, tells the two apart.
+            let mut materialized_attempts: HashSet<(String, u32)> = HashSet::new();
 
             // --- Scan batch of candidates ---
             let mut scanned: Vec<ScannedRequest> = Vec::new();
