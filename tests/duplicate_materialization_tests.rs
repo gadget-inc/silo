@@ -291,7 +291,8 @@ async fn two_limit_chain_with_first_grant_processed_twice_delivers_once() {
 
 /// R2 — the same duplicate request rows reaching the scanner within ONE
 /// commit chunk: the durable check cannot see the chunk's uncommitted batch,
-/// so the guard's per-chunk seen-set is what drops the second row.
+/// so the guard's record of the attempts the pass has granted is what drops
+/// the second row.
 #[silo::test]
 async fn duplicate_request_rows_granted_in_one_chunk_keep_single_terminal_row() {
     let (_tmp, shard) = open_temp_shard().await;
@@ -335,6 +336,68 @@ async fn duplicate_request_rows_granted_in_one_chunk_keep_single_terminal_row() 
         count_concurrency_requests(shard.db()).await,
         0,
         "the dropped duplicate row must be deleted"
+    );
+}
+
+/// Two attempts with two request rows each, read by one pass that commits
+/// every two grants. The durable checks for the second attempt's two rows
+/// are read together, before the grant of the first of them commits, and
+/// that commit lands before the second row is handled. The check read for
+/// the second row saw no terminal row; the guard's record of the attempts
+/// the pass has granted, kept across the commit, is what drops it.
+#[silo::test]
+async fn duplicate_request_rows_checked_before_a_chunk_commit_keep_single_terminal_row() {
+    let (_tmp, shard) = open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
+        silo::concurrency::GrantScannerConfig {
+            commit_chunk_size: 2,
+            ..Default::default()
+        },
+        60 * 60 * 1000,
+    )
+    .await;
+    shard.stop_grant_scanner();
+    let tenant = "dup-across-chunk-commit";
+    let limits = one_concurrency_limit(4);
+
+    // Rows in key order: the first job's two, then the second job's two.
+    let ready_at = now_ms() - 1_000;
+    let mut job_ids = Vec::new();
+    for (i, task_id) in ["dup-chain-task-1", "dup-chain-task-2"]
+        .into_iter()
+        .enumerate()
+    {
+        let job_id = enqueue_parked_job(&shard, tenant, limits.clone()).await;
+        for suffix in ["aaaa0001", "bbbb0002"] {
+            write_request_row(
+                &shard,
+                tenant,
+                &job_id,
+                task_id,
+                ready_at + i as i64,
+                suffix,
+                &limits,
+            )
+            .await;
+        }
+        job_ids.push(job_id);
+    }
+
+    let granted = shard.process_concurrency_grants(tenant, QUEUE, 4).await;
+    assert_eq!(
+        granted.len(),
+        2,
+        "one row of each attempt grants; the other is dropped"
+    );
+
+    assert_single_live_terminal_task_row_per_attempt(shard.db()).await;
+    for job_id in &job_ids {
+        assert_eq!(count_live_run_attempt_rows(&shard, job_id).await, 1);
+    }
+    assert_eq!(shard.concurrency_holder_count(tenant, QUEUE), 2);
+    assert_eq!(
+        count_concurrency_requests(shard.db()).await,
+        0,
+        "the dropped duplicate rows must be deleted"
     );
 }
 

@@ -316,6 +316,12 @@ pub struct Metrics {
     /// Sizes of the grant scanner's pending lanes, labeled `lane=hot|cold`.
     concurrency_pending_grants: GaugeVec,
     concurrency_grant_next_hop_skips: CounterVec,
+    /// Follow-up passes the grant scanner queued for a queue it left with
+    /// free capacity and request rows it did not reach.
+    concurrency_grant_unfilled_capacity_passes: CounterVec,
+    /// Task-keyspace scans the grant scanner ran to check candidates for an
+    /// attempt that is already materialized.
+    concurrency_grant_duplicate_checks: CounterVec,
     /// Grant-scanner candidates skipped because their request row was gone
     /// by the time the scanner re-read it.
     concurrency_grant_vanished_requests: CounterVec,
@@ -1041,8 +1047,8 @@ impl Metrics {
     }
 
     /// Update the grant scanner pending-lane size gauges (hot = event-driven
-    /// nudges drained fully each iteration; cold = reconciler sweep entries
-    /// drained in bounded batches).
+    /// nudges drained fully each iteration; cold = reconcile sweep entries
+    /// and follow-up passes, drained in bounded batches).
     pub fn set_concurrency_pending_grants(&self, shard: &str, hot: usize, cold: usize) {
         self.concurrency_pending_grants
             .with_label_values(&[shard, "hot"])
@@ -1058,6 +1064,22 @@ impl Metrics {
         self.concurrency_grant_next_hop_skips
             .with_label_values(&[shard])
             .inc();
+    }
+
+    /// Record a follow-up pass queued for a queue whose pass ended with free
+    /// capacity and request rows it did not reach.
+    pub fn record_concurrency_grant_unfilled_capacity_pass(&self, shard: &str) {
+        self.concurrency_grant_unfilled_capacity_passes
+            .with_label_values(&[shard])
+            .inc();
+    }
+
+    /// Record `checks` task-keyspace scans the grant scanner ran to check
+    /// candidates for an attempt that is already materialized.
+    pub fn record_concurrency_grant_duplicate_checks(&self, shard: &str, checks: usize) {
+        self.concurrency_grant_duplicate_checks
+            .with_label_values(&[shard])
+            .inc_by(checks as f64);
     }
 
     /// Record a grant-scanner candidate skipped because its request row was
@@ -2959,7 +2981,7 @@ pub fn init() -> anyhow::Result<Metrics> {
         GaugeVec::new(
             Opts::new(
                 "silo_concurrency_pending_grants",
-                "Number of (tenant, queue) entries pending in the grant scanner's lanes: lane=hot (event-driven nudges, drained fully each iteration) vs lane=cold (reconciler sweep entries, drained in bounded batches)",
+                "Number of (tenant, queue) entries pending in the grant scanner's lanes: lane=hot (event-driven nudges, drained fully each iteration) vs lane=cold (reconcile sweep entries and follow-up passes for queues left with free capacity, drained in bounded batches)",
             ),
             &["shard", "lane"],
         )?,
@@ -2971,6 +2993,28 @@ pub fn init() -> anyhow::Result<Metrics> {
             Opts::new(
                 "silo_concurrency_grant_next_hop_skips_total",
                 "Grant-scanner candidates deferred because their next concurrency hop was saturated with a deep requester backlog",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_grant_unfilled_capacity_passes = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_grant_unfilled_capacity_passes_total",
+                "Follow-up grant-scanner passes queued for a queue left with free capacity and request rows the pass did not reach",
+            ),
+            &["shard"],
+        )?,
+    );
+
+    let concurrency_grant_duplicate_checks = register(
+        &registry,
+        CounterVec::new(
+            Opts::new(
+                "silo_concurrency_grant_duplicate_checks_total",
+                "Task-keyspace scans the grant scanner ran to check candidates for an attempt that is already materialized",
             ),
             &["shard"],
         )?,
@@ -3224,6 +3268,8 @@ pub fn init() -> anyhow::Result<Metrics> {
         concurrency_reconcile_duration,
         concurrency_pending_grants,
         concurrency_grant_next_hop_skips,
+        concurrency_grant_unfilled_capacity_passes,
+        concurrency_grant_duplicate_checks,
         concurrency_grant_vanished_requests,
         concurrency_request_floor_lag_ms,
         concurrency_request_noted_reads,
