@@ -4035,33 +4035,38 @@ impl ConcurrencyManager {
                 max_concurrency.map(|(capacity, _)| capacity),
             )
         {
-            let rows_unreached =
-                if budget_exhausted || walk_interrupted || candidates_left_ungranted {
-                    true
-                } else if iter_exhausted {
-                    false
-                } else {
-                    // Stopped at the requested count without looking past the
-                    // last grant: the next row the cursor returns, if any, is
-                    // a row left. A noted key read without a row is not one,
-                    // and spends budget like any other key. A spent budget or
-                    // a read error leaves the answer unknown, which counts as
-                    // a row.
-                    loop {
-                        match requests.next().await {
-                            Ok(RequestRead::End) => break false,
-                            Ok(RequestRead::Missing) => {
-                                scanned_this_invocation += 1;
-                                if scanned_this_invocation
-                                    >= self.grant_scanner_max_scan_per_invocation
-                                {
-                                    break true;
-                                }
+            let rows_unreached = if budget_exhausted
+                || walk_interrupted
+                || candidates_left_ungranted
+            {
+                true
+            } else if iter_exhausted {
+                false
+            } else {
+                // Stopped at the requested count without looking past the
+                // last grant: the next row the cursor returns, if any, is
+                // a row left. A noted key read without a row is not one,
+                // and spends budget like any other key. A spent budget or
+                // a read error leaves the answer unknown, which counts as
+                // a row.
+                loop {
+                    match requests.next().await {
+                        Ok(RequestRead::End) => break false,
+                        Ok(RequestRead::Missing) => {
+                            scanned_this_invocation += 1;
+                            if scanned_this_invocation >= self.grant_scanner_max_scan_per_invocation
+                            {
+                                break true;
                             }
-                            Ok(RequestRead::Row(_)) | Err(_) => break true,
+                        }
+                        Ok(RequestRead::Row(_)) => break true,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "grant scanner: failed to read past the last grant");
+                            break true;
                         }
                     }
-                };
+                }
+            };
             if rows_unreached {
                 self.request_unfilled_capacity_pass(tenant, queue, follow_up);
             }
