@@ -888,6 +888,134 @@ async fn waiters_a_widened_read_took_and_did_not_grant_get_a_follow_up() {
     assert_eq!(shard.pending_grant_count_for_test(TENANT, queue), 0);
 }
 
+/// A pass asked for eight grants holds four waiters on a queue with two free
+/// slots. It reads duplicate checks for as many candidates as the queue has
+/// room for, grants them, and reads one more for the candidate that finds
+/// the queue full.
+#[silo::test]
+async fn pass_reads_duplicate_checks_for_no_more_candidates_than_free_slots() {
+    const MAX: u32 = 2;
+    const WAITERS: usize = 5;
+    const DUPLICATE_CHECKS: &str = "silo_concurrency_grant_duplicate_checks_total";
+
+    let metrics = silo::metrics::init().expect("init metrics");
+    let (_tmp, shard) = open_temp_shard_with_scanner_config_reconcile_interval_ms_and_metrics(
+        small_scanner_config(),
+        NO_SWEEP_INTERVAL_MS,
+        Some(metrics.clone()),
+    )
+    .await;
+    shard.stop_grant_scanner();
+    let queue = "checks-within-free-slots";
+    let now = now_ms();
+
+    // Arrivals join the waiters behind the future waiter, so no slot is held.
+    write_future_waiter(&shard, queue, MAX).await;
+    for i in 0..WAITERS {
+        enqueue(
+            &shard,
+            &format!("waiter-{i}"),
+            vec![fixed_limit(queue, MAX)],
+            now,
+        )
+        .await;
+    }
+    let discarded = shard.take_pending_grant_batch_for_test();
+    assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
+    assert_eq!(holders(&shard, queue), 0);
+
+    shard.seed_hot_pending_grant_for_test(TENANT, queue, 8);
+    let taken = run_scanner_iteration(&shard).await;
+    assert_eq!(taken, vec![(queue.to_string(), 8)]);
+    assert_eq!(holders(&shard, queue), MAX as usize);
+    assert_eq!(
+        requester_count(&shard, queue).await,
+        (WAITERS - MAX as usize) as i64 + 1
+    );
+    assert_eq!(
+        metric_value_or_zero(&gather_metrics_text(&metrics), &[DUPLICATE_CHECKS]),
+        3.0,
+        "two checks for the free slots and one for the candidate behind them, of the four read"
+    );
+    assert_eq!(
+        shard.pending_grant_count_for_test(TENANT, queue),
+        0,
+        "a full queue asks for no follow-up"
+    );
+}
+
+/// A follow-up is queued for a queue the reconcile sweep has already put in
+/// the cold lane. The two share one entry that asks for the larger count,
+/// and the pass that takes the entry is asked for that count.
+#[silo::test]
+async fn follow_up_shares_a_cold_lane_entry_with_the_sweep_and_the_larger_count_wins() {
+    const MAX: u32 = 16;
+    const WAITERS: usize = 12;
+    const SWEEP_LARGER: u32 = 9;
+    const SWEEP_SMALLER: u32 = 1;
+
+    let (_tmp, shard) = open_shard_with_scanner_stopped().await;
+    let larger = "sweep-asks-for-more";
+    let smaller = "sweep-asks-for-less";
+    let now = now_ms();
+
+    // Arrivals join the waiters behind the future waiter, so no slot is held.
+    for queue in [larger, smaller] {
+        write_future_waiter(&shard, queue, MAX).await;
+        for i in 0..WAITERS {
+            enqueue(
+                &shard,
+                &format!("{queue}-waiter-{i:02}"),
+                vec![fixed_limit(queue, MAX)],
+                now,
+            )
+            .await;
+        }
+    }
+    shard.take_pending_grant_batch_for_test();
+    assert_eq!(holders(&shard, larger), 0);
+    assert_eq!(holders(&shard, smaller), 0);
+
+    // The iteration takes a one-grant nudge for each queue. The sweep's
+    // entries land in the cold lane before the passes run.
+    shard.seed_hot_pending_grant_for_test(TENANT, larger, 1);
+    shard.seed_hot_pending_grant_for_test(TENANT, smaller, 1);
+    let work = shard.take_pending_grant_batch_for_test();
+    assert_eq!(work.len(), 2);
+    shard.seed_cold_pending_grant_for_test(TENANT, larger, SWEEP_LARGER);
+    shard.seed_cold_pending_grant_for_test(TENANT, smaller, SWEEP_SMALLER);
+    for (tenant, queue, count) in work {
+        assert_eq!(count, 1);
+        shard
+            .process_concurrency_grants(&tenant, &queue, count)
+            .await;
+    }
+    assert_eq!(holders(&shard, larger), 1);
+    assert_eq!(holders(&shard, smaller), 1);
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(TENANT, larger),
+        SWEEP_LARGER,
+        "the sweep's count is above a follow-up's commit chunk"
+    );
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(TENANT, smaller),
+        COMMIT_CHUNK as u32,
+        "the follow-up's commit chunk is above the sweep's count"
+    );
+
+    let mut second = run_scanner_iteration(&shard).await;
+    second.sort();
+    assert_eq!(
+        second,
+        vec![
+            (smaller.to_string(), COMMIT_CHUNK as u32),
+            (larger.to_string(), SWEEP_LARGER),
+        ]
+    );
+    assert_eq!(holders(&shard, larger), 1 + SWEEP_LARGER as usize);
+    assert_eq!(holders(&shard, smaller), 1 + COMMIT_CHUNK);
+}
+
 /// A scanner that leaves half of each queue's slots to arriving jobs asks a
 /// follow-up only for the slots it may still fill itself, and for none once
 /// it has filled them.
