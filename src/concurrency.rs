@@ -3754,10 +3754,13 @@ impl ConcurrencyManager {
                             );
                             continue;
                         }
-                        // No durable read was made for this candidate because
-                        // its attempt was already in `materialized_attempts`,
-                        // which only grows.
-                        None => true,
+                        // A window reads no check for an attempt already in
+                        // `materialized_attempts`, and the set only grows
+                        // within a pass, so the branch above takes every
+                        // such candidate. A candidate that reaches here has
+                        // no answer from either half of the guard: leave
+                        // its row in place for a later pass.
+                        None => continue,
                     }
                 };
                 if already_materialized {
