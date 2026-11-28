@@ -30,6 +30,7 @@ const NO_SWEEP_INTERVAL_MS: u64 = 60 * 60 * 1000;
 const REFRESH_INTERVAL_MS: i64 = 100;
 const WAIT: Duration = Duration::from_secs(30);
 const PRIORITY: u8 = 10;
+const FOLLOW_UP_PASSES: &str = "silo_concurrency_grant_unfilled_capacity_passes_total";
 
 /// Scanner sizes small enough that a modest backlog spans several passes:
 /// a pass scans 4 candidates at a time, walks at most 16 request keys, and
@@ -540,7 +541,9 @@ async fn jobs_parked_on_a_floating_limit_start_and_their_first_queue_turns_over(
 /// slot still goes to the first live waiter on a following iteration.
 #[silo::test]
 async fn slot_is_filled_after_a_pass_spends_its_walk_budget_on_stale_requests() {
-    assert_slot_is_filled_behind_a_stale_front("stale-front", StaleRow::MissingJob).await;
+    // The pass learns the queue's capacity from the rows it deletes, and
+    // asks for the one slot that is free.
+    assert_slot_is_filled_behind_a_stale_front("stale-front", StaleRow::MissingJob, 1).await;
 }
 
 /// The same release, with a front of request rows that do not decode: the
@@ -548,20 +551,27 @@ async fn slot_is_filled_after_a_pass_spends_its_walk_budget_on_stale_requests() 
 /// queue's capacity, and the freed slot is still filled.
 #[silo::test]
 async fn slot_is_filled_after_a_pass_spends_its_walk_budget_on_undecodable_requests() {
-    assert_slot_is_filled_behind_a_stale_front("undecodable-front", StaleRow::Undecodable).await;
+    // With no capacity to compare against, the pass asks for a whole commit
+    // chunk.
+    assert_slot_is_filled_behind_a_stale_front(
+        "undecodable-front",
+        StaleRow::Undecodable,
+        COMMIT_CHUNK as u32,
+    )
+    .await;
 }
 
-/// A release asks for one grant, and 40 stale rows sit ahead of the live
+/// A release asks for one grant, and 50 stale rows sit ahead of the live
 /// waiters. The pass doubles how many rows it reads each time a read yields
-/// nothing to grant, so it clears the front and fills the slot in six reads
-/// rather than one read per stale row.
+/// nothing to grant, up to the scanner's batch size, so it clears the front
+/// and fills the slot in seven reads rather than one read per stale row.
 #[silo::test]
 async fn pass_reads_wider_batches_while_it_finds_nothing_to_grant() {
     // The stale rows written by `write_stale_requests` carry a limit of 4,
     // and a pass takes the queue's capacity from the first row it decodes.
     const MAX: u32 = 4;
     const BATCH: usize = 16;
-    const STALE: usize = 40;
+    const STALE: usize = 50;
     const WAITERS: usize = 2;
 
     let (_tmp, shard) = open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
@@ -620,9 +630,10 @@ async fn pass_reads_wider_batches_while_it_finds_nothing_to_grant() {
         (WAITERS - 1) as i64,
         "every stale row is deleted and one waiter is left"
     );
-    // Reads of 1, 2, 4, 8 and 16 rows cover 31 stale rows; the sixth covers
-    // the last 9 and both waiters.
-    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 6);
+    // Reads of 1, 2, 4, 8 and 16 rows cover 31 stale rows. The sixth stays
+    // at the batch size and covers 16 more; the seventh covers the last 3
+    // and both waiters.
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 7);
     assert_eq!(
         shard.pending_grant_count_for_test(TENANT, queue),
         0,
@@ -695,7 +706,8 @@ async fn one_grant_pass_runs_one_duplicate_check_however_many_candidates_it_hold
     );
 }
 
-async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow) {
+/// `follow_up` is the number of grants the first pass's follow-up asks for.
+async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow, follow_up: u32) {
     const MAX: u32 = 4;
     const STALE: usize = WALK_BUDGET + 4;
     const WAITERS: usize = 3;
@@ -743,6 +755,11 @@ async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow)
         (STALE - WALK_BUDGET + WAITERS) as i64,
         "the first pass deletes exactly its walk budget of stale rows"
     );
+    assert_eq!(shard.hot_pending_grant_count_for_test(TENANT, queue), 0);
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(TENANT, queue),
+        follow_up
+    );
 
     let more_iterations = run_scanner_until_idle(&shard, 3).await;
     assert_eq!(
@@ -760,12 +777,22 @@ async fn assert_slot_is_filled_behind_a_stale_front(queue: &str, kind: StaleRow)
 /// A queue with slots free holds one ready waiter and one waiter that starts
 /// in an hour. The pass that grants the ready waiter sees a row behind it and
 /// asks for a follow-up; the follow-up walks to the end of the ready rows,
-/// grants nothing, and asks for no more.
+/// grants nothing, and asks for no more. The follow-up waits in the cold
+/// lane and is counted once.
 #[silo::test]
 async fn follow_ups_stop_at_the_end_of_the_ready_rows_with_slots_free() {
     const MAX: u32 = 8;
 
-    let (_tmp, shard) = open_shard_with_scanner_stopped().await;
+    let metrics = silo::metrics::init().expect("init metrics");
+    let (_tmp, shard) = open_temp_shard_with_scanner_config_reconcile_interval_ms_and_metrics(
+        small_scanner_config(),
+        NO_SWEEP_INTERVAL_MS,
+        Some(metrics.clone()),
+    )
+    .await;
+    shard.stop_grant_scanner();
+    let follow_up_passes =
+        || metric_value_or_zero(&gather_metrics_text(&metrics), &[FOLLOW_UP_PASSES]);
     let queue = "ready-rows-end";
 
     write_future_waiter(&shard, queue, MAX).await;
@@ -774,23 +801,253 @@ async fn follow_ups_stop_at_the_end_of_the_ready_rows_with_slots_free() {
     assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
     assert_eq!(holders(&shard, queue), 0);
     assert_eq!(requester_count(&shard, queue).await, 2);
+    assert_eq!(follow_up_passes(), 0.0);
 
     shard.seed_hot_pending_grant_for_test(TENANT, queue, 1);
     let first = run_scanner_iteration(&shard).await;
     assert_eq!(first, vec![(queue.to_string(), 1)]);
     assert_eq!(holders(&shard, queue), 1);
     assert_eq!(
-        shard.pending_grant_count_for_test(TENANT, queue),
+        shard.cold_pending_grant_count_for_test(TENANT, queue),
         COMMIT_CHUNK as u32,
         "a row is left behind the grant and slots are free"
     );
+    assert_eq!(
+        shard.hot_pending_grant_count_for_test(TENANT, queue),
+        0,
+        "a follow-up does not go to the hot lane"
+    );
+    assert_eq!(follow_up_passes(), 1.0);
 
     let second = run_scanner_iteration(&shard).await;
     assert_eq!(second, vec![(queue.to_string(), COMMIT_CHUNK as u32)]);
     assert_eq!(holders(&shard, queue), 1);
     assert_eq!(requester_count(&shard, queue).await, 1);
     assert_eq!(shard.pending_grant_count_for_test(TENANT, queue), 0);
+    assert_eq!(
+        follow_up_passes(),
+        1.0,
+        "the pass that reached the end of the ready rows asked for none"
+    );
     assert_eq!(run_scanner_until_idle(&shard, 1).await, 0);
+}
+
+/// A pass asked for one grant widens its read past three stale rows, and the
+/// widened read takes the queue's three ready waiters and reaches the end of
+/// the ready rows. The pass grants one of them. The two it read and did not
+/// grant get a follow-up, which grants them.
+#[silo::test]
+async fn waiters_a_widened_read_took_and_did_not_grant_get_a_follow_up() {
+    // The stale rows written by `write_stale_requests` carry a limit of 4,
+    // and a pass takes the queue's capacity from the first row it decodes.
+    const MAX: u32 = 4;
+    const STALE: usize = 3;
+    const WAITERS: usize = 3;
+
+    let (_tmp, shard) = open_shard_with_scanner_stopped().await;
+    let queue = "wide-read-to-the-end";
+    let now = now_ms();
+
+    // Arrivals join the waiters behind the future waiter, so no slot is held.
+    write_future_waiter(&shard, queue, MAX).await;
+    write_stale_requests(&shard, queue, StaleRow::MissingJob, STALE, now).await;
+    for i in 0..WAITERS {
+        enqueue(
+            &shard,
+            &format!("waiter-{i}"),
+            vec![fixed_limit(queue, MAX)],
+            now,
+        )
+        .await;
+    }
+    let discarded = shard.take_pending_grant_batch_for_test();
+    assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
+    assert_eq!(holders(&shard, queue), 0);
+
+    // Reads of 1 and 2 rows cover the stale rows; the third read asks for
+    // four rows, takes the three waiters and finds no ready row behind them.
+    shard.seed_hot_pending_grant_for_test(TENANT, queue, 1);
+    let first = run_scanner_iteration(&shard).await;
+    assert_eq!(first, vec![(queue.to_string(), 1)]);
+    assert_eq!(holders(&shard, queue), 1);
+    assert_eq!(
+        requester_count(&shard, queue).await,
+        WAITERS as i64,
+        "the stale rows are deleted, one waiter is granted, and the future waiter stays"
+    );
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(TENANT, queue),
+        MAX - 1,
+        "the walk reached the end of the ready rows, and the waiters it took still get a follow-up"
+    );
+
+    let second = run_scanner_iteration(&shard).await;
+    assert_eq!(second, vec![(queue.to_string(), MAX - 1)]);
+    assert_eq!(holders(&shard, queue), WAITERS);
+    assert_eq!(requester_count(&shard, queue).await, 1);
+    assert_eq!(shard.pending_grant_count_for_test(TENANT, queue), 0);
+}
+
+/// A scanner that leaves half of each queue's slots to arriving jobs asks a
+/// follow-up only for the slots it may still fill itself, and for none once
+/// it has filled them.
+#[silo::test]
+async fn follow_ups_ask_only_for_the_slots_the_scanner_may_fill() {
+    const MAX: u32 = 8;
+    const SCANNER_SLOTS: usize = 4;
+    const WAITERS: usize = 6;
+
+    let (_tmp, shard) = open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
+        GrantScannerConfig {
+            live_headroom_fraction: 0.5,
+            ..small_scanner_config()
+        },
+        NO_SWEEP_INTERVAL_MS,
+    )
+    .await;
+    shard.stop_grant_scanner();
+    let queue = "headroom";
+    let now = now_ms();
+
+    // Arrivals join the waiters behind the future waiter, so no slot is held.
+    write_future_waiter(&shard, queue, MAX).await;
+    for i in 0..WAITERS {
+        enqueue(
+            &shard,
+            &format!("waiter-{i}"),
+            vec![fixed_limit(queue, MAX)],
+            now,
+        )
+        .await;
+    }
+    let discarded = shard.take_pending_grant_batch_for_test();
+    assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
+    assert_eq!(holders(&shard, queue), 0);
+
+    shard.seed_hot_pending_grant_for_test(TENANT, queue, 1);
+    let first = run_scanner_iteration(&shard).await;
+    assert_eq!(first, vec![(queue.to_string(), 1)]);
+    assert_eq!(holders(&shard, queue), 1);
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(TENANT, queue),
+        (SCANNER_SLOTS - 1) as u32,
+        "seven slots are free and the scanner may fill three of them"
+    );
+
+    let second = run_scanner_iteration(&shard).await;
+    assert_eq!(
+        second,
+        vec![(queue.to_string(), (SCANNER_SLOTS - 1) as u32)]
+    );
+    assert_eq!(holders(&shard, queue), SCANNER_SLOTS);
+    assert_eq!(
+        requester_count(&shard, queue).await,
+        (WAITERS - SCANNER_SLOTS) as i64 + 1
+    );
+    assert_eq!(
+        shard.pending_grant_count_for_test(TENANT, queue),
+        0,
+        "the slots left are not the scanner's to fill"
+    );
+    assert_eq!(run_scanner_until_idle(&shard, 1).await, 0);
+}
+
+/// A chain resumer that fails the chain of one job and resumes every other.
+struct FailsOneJob {
+    inner: Arc<dyn silo::concurrency::LimitChainResumer>,
+    job_id: &'static str,
+}
+
+#[async_trait::async_trait]
+impl silo::concurrency::LimitChainResumer for FailsOneJob {
+    async fn resume_chain(
+        &self,
+        batch: &mut WriteBatch,
+        scheduled_refreshes: &mut silo::job_store_shard::ScheduledRefreshes,
+        params: silo::concurrency::ResumeChainParams,
+    ) -> Result<silo::concurrency::ResumedChain, silo::concurrency::ConcurrencyError> {
+        if params.job_id == self.job_id {
+            return Err(silo::concurrency::ConcurrencyError::ChainResume(
+                "the test fails this job's chain".to_string(),
+            ));
+        }
+        self.inner
+            .resume_chain(batch, scheduled_refreshes, params)
+            .await
+    }
+
+    fn tasks_written(&self, task_keys: &[Vec<u8>]) {
+        self.inner.tasks_written(task_keys)
+    }
+
+    fn expect_tasks(&self, task_keys: &[Vec<u8>]) {
+        self.inner.expect_tasks(task_keys)
+    }
+
+    fn refresh_index_rows_committed(&self, task_groups: &[String]) {
+        self.inner.refresh_index_rows_committed(task_groups)
+    }
+}
+
+/// A pass commits one chunk of grants and then fails to resume the chain of
+/// the next waiter. It keeps the grants it committed, holds no slot for the
+/// waiter that failed, and asks for a follow-up. Once chains resume, the
+/// follow-up grants the waiters left.
+#[silo::test]
+async fn pass_that_fails_to_resume_a_chain_after_a_committed_chunk_asks_for_a_follow_up() {
+    const MAX: u32 = 8;
+    const WAITERS: usize = 6;
+
+    let (_tmp, shard) = open_shard_with_scanner_stopped().await;
+    let queue = "resume-fails";
+    let first_ms = now_ms() - 1_000;
+
+    // Arrivals join the waiters behind the future waiter. Start times a
+    // millisecond apart fix the order of the ready rows.
+    write_future_waiter(&shard, queue, MAX).await;
+    for i in 0..WAITERS {
+        enqueue(
+            &shard,
+            &format!("waiter-{i}"),
+            vec![fixed_limit(queue, MAX)],
+            first_ms + i as i64,
+        )
+        .await;
+    }
+    let discarded = shard.take_pending_grant_batch_for_test();
+    assert!(discarded.iter().all(|(_, taken, _)| taken == queue));
+    assert_eq!(holders(&shard, queue), 0);
+
+    let resumer = shard
+        .take_chain_resumer_for_test()
+        .expect("resumer installed at open");
+    shard.set_chain_resumer_for_test(Arc::new(FailsOneJob {
+        inner: Arc::clone(&resumer),
+        job_id: "waiter-4",
+    }));
+    shard.seed_hot_pending_grant_for_test(TENANT, queue, WAITERS as u32);
+    let first = run_scanner_iteration(&shard).await;
+    shard.set_chain_resumer_for_test(resumer);
+
+    assert_eq!(first, vec![(queue.to_string(), WAITERS as u32)]);
+    assert_eq!(
+        holders(&shard, queue),
+        COMMIT_CHUNK,
+        "the committed chunk stands and the failed waiter holds no slot"
+    );
+    assert_eq!(
+        requester_count(&shard, queue).await,
+        (WAITERS - COMMIT_CHUNK) as i64 + 1
+    );
+    assert_eq!(shard.hot_pending_grant_count_for_test(TENANT, queue), 0);
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(TENANT, queue),
+        COMMIT_CHUNK as u32
+    );
+
+    assert_eq!(run_scanner_until_idle(&shard, 2).await, 1);
+    assert_eq!(holders(&shard, queue), WAITERS);
+    assert_eq!(requester_count(&shard, queue).await, 1);
 }
 
 /// A queue with slots free holds one waiter the scanner can grant, then more
@@ -947,6 +1204,15 @@ async fn small_queues_are_served_every_iteration_while_a_deep_queue_catches_up()
     let first = run_scanner_iteration(&shard).await;
     assert_eq!(first, vec![(deep_queue.to_string(), 1)]);
     assert_eq!(holders(&shard, deep_queue), 1);
+    assert_eq!(
+        shard.hot_pending_grant_count_for_test(TENANT, deep_queue),
+        0
+    );
+    assert_eq!(
+        shard.cold_pending_grant_count_for_test(TENANT, deep_queue),
+        COMMIT_CHUNK as u32,
+        "the deep queue's follow-up waits in the cold lane"
+    );
 
     // While the deep queue catches up, release one small-queue slot before
     // each iteration.
