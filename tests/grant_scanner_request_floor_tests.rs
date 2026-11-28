@@ -1015,6 +1015,120 @@ async fn a_job_enqueued_again_under_its_id_during_a_pass_is_granted(priority_ord
     );
 }
 
+/// What a one-grant pass did on a queue whose only rows are below its
+/// floor: a waiter's row, and behind it noted keys whose writes have not
+/// landed.
+struct GrantAheadOfUnwrittenKeys {
+    pass: Pass,
+    /// Grants the pass's follow-up asks for, zero when it queued none.
+    follow_up: u32,
+}
+
+/// Grant one waiter from a noted row on a three-slot queue that keeps a slot
+/// free afterwards, with `unwritten` noted keys behind the row that have no
+/// row under them and nothing at or above the floor. The scanner walks at
+/// most four keys per invocation.
+async fn grant_ahead_of_unwritten_keys(
+    priority_ordered: bool,
+    queue: &str,
+    unwritten: usize,
+) -> GrantAheadOfUnwrittenKeys {
+    const MAX: u32 = 3;
+
+    let harness = Harness::open(GrantScannerConfig {
+        batch_size: 1,
+        ..config(priority_ordered)
+    })
+    .await;
+    let base = now_ms() - 3_600_000;
+    for _ in 0..MAX {
+        harness.enqueue(10, base, vec![fixed(queue, MAX)]).await;
+    }
+    harness
+        .enqueue_in("first", 10, base + 10, vec![fixed(queue, MAX)])
+        .await;
+    let waiter = harness
+        .enqueue_in("waiter", 10, base + 20, vec![fixed(queue, MAX)])
+        .await;
+    harness.complete_one().await;
+    assert_eq!(harness.pass(queue, 1).await.granted, ["first"]);
+    let floor = harness.floor(queue).expect("the pass set a floor");
+
+    // Move the waiter's row below the floor and note it, as its writer
+    // would have. Behind it, note keys whose rows are never written.
+    let floors = harness.shard.request_floors_for_test();
+    let prefix_len = concurrency_request_prefix(TENANT, queue).len();
+    let (_, waiter_key, _) = harness
+        .rekey(queue, &waiter, priority_ordered, base - 50_000, "a", true)
+        .await;
+    assert!(waiter_key < floor);
+    floors.note_write(prefix_len, waiter_key.clone()).confirm();
+    let build = if priority_ordered {
+        concurrency_request_key
+    } else {
+        concurrency_request_key_start_time_first
+    };
+    let mut noted = vec![waiter_key];
+    let mut writes_in_flight = Vec::new();
+    for i in 0..unwritten {
+        let key = build(
+            TENANT,
+            queue,
+            base - 40_000 + i as i64,
+            10,
+            &format!("unwritten-job-{i}"),
+            1,
+            "a",
+        );
+        assert!(key < floor);
+        writes_in_flight.push(floors.note_write(prefix_len, key.clone()));
+        noted.push(key);
+    }
+    assert_eq!(harness.noted(queue), noted);
+
+    // Two slots are free; the grant takes one.
+    harness.complete_in(TASK_GROUP, 2).await;
+    let pass = harness.pass(queue, 1).await;
+    assert_eq!(pass.granted, ["waiter"]);
+    assert_eq!(harness.shard.concurrency_holder_count(TENANT, queue), 2);
+    assert!(harness.request_keys(queue).await.is_empty());
+    let follow_up = harness
+        .shard
+        .cold_pending_grant_count_for_test(TENANT, queue);
+    drop(writes_in_flight);
+    GrantAheadOfUnwrittenKeys { pass, follow_up }
+}
+
+/// A pass that grants what it was asked for, with a slot still free, looks
+/// for a waiter behind its grant. A noted key with no row under it is not
+/// one: the pass reads past two of them to the end of the queue's rows and
+/// asks for no follow-up.
+async fn a_noted_key_without_a_row_is_no_waiter_behind_a_grant(priority_ordered: bool) {
+    let outcome = grant_ahead_of_unwritten_keys(priority_ordered, "no-row-behind", 2).await;
+    assert_eq!(
+        outcome.pass.trace().point_reads,
+        3,
+        "the granted row and both keys without a row"
+    );
+    assert_eq!(outcome.pass.trace().scans_opened, 1);
+    assert_eq!(outcome.follow_up, 0);
+}
+
+/// The keys that look reads count against the invocation's walk. With three
+/// keys without a row behind the grant, the walk of four keys is spent
+/// before the pass learns whether a waiter is left, so it asks for a
+/// follow-up for the free slot.
+async fn a_walk_spent_on_noted_keys_behind_a_grant_gets_a_follow_up(priority_ordered: bool) {
+    let outcome = grant_ahead_of_unwritten_keys(priority_ordered, "walk-spent-behind", 3).await;
+    assert_eq!(
+        outcome.pass.trace().point_reads,
+        4,
+        "the granted row and three keys without a row"
+    );
+    assert_eq!(outcome.pass.trace().scans_opened, 0);
+    assert_eq!(outcome.follow_up, 1);
+}
+
 /// A noted key whose row does not exist yet is read on every pass while its
 /// write may still commit. A write that commits later is granted from that
 /// read; one that never commits is dropped after its grace period and not
@@ -1776,6 +1890,8 @@ both_orders!(
     a_noted_row_is_granted_in_key_order,
     a_row_committed_during_a_pass_is_granted_by_the_next,
     a_job_enqueued_again_under_its_id_during_a_pass_is_granted,
+    a_noted_key_without_a_row_is_no_waiter_behind_a_grant,
+    a_walk_spent_on_noted_keys_behind_a_grant_gets_a_follow_up,
     a_noted_key_waits_for_its_write_to_settle,
     a_write_past_the_noted_limit_lowers_the_floor,
     the_floor_stops_at_the_first_row_capacity_left,
