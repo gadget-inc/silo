@@ -965,15 +965,13 @@ async fn a_job_enqueued_again_under_its_id_during_a_pass_is_granted(priority_ord
                 if read != 2 {
                     return;
                 }
-                let tasks = shard
-                    .dequeue("w", JOB_GROUP, 1)
-                    .await
-                    .expect("dequeue the granted job")
-                    .tasks;
-                assert_eq!(tasks.len(), 1, "the first read's grant is committed");
+                // The first read's grant is committed, so the job's task is
+                // there to lease. A dequeue can come back empty while the
+                // broker's scan catches up, so ask until it returns the task.
+                let task_ids = dequeue_task_ids_until(&shard, "w", JOB_GROUP, 1).await;
                 shard
                     .report_attempt_outcome(
-                        tasks[0].attempt().task_id(),
+                        &task_ids[0],
                         AttemptOutcome::Success { result: vec![] },
                     )
                     .await
