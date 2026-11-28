@@ -194,7 +194,6 @@ pub async fn open_temp_shard_with_reconcile_interval_ms(
 /// Open a temp shard with a custom grant scanner config and a concurrency
 /// reconcile interval. Pass a long interval so the periodic requester sweep
 /// never runs during the test and the scanner is driven by event nudges only.
-#[allow(dead_code)]
 pub async fn open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
     grant_scanner: silo::concurrency::GrantScannerConfig,
     interval_ms: u64,
@@ -210,7 +209,6 @@ pub async fn open_temp_shard_with_scanner_config_and_reconcile_interval_ms(
 /// Open a temp shard with a custom grant scanner config, a concurrency
 /// reconcile interval, and an optional Metrics registry for the shard to
 /// record into.
-#[allow(dead_code)]
 pub async fn open_temp_shard_with_scanner_config_reconcile_interval_ms_and_metrics(
     grant_scanner: silo::concurrency::GrantScannerConfig,
     interval_ms: u64,
